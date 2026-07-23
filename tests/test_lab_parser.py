@@ -1,0 +1,213 @@
+"""Tests for the deterministic lab value parser."""
+
+import sys
+import os
+import unittest
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from emr_analyzer.extraction.lab_parser import LabParser
+from emr_analyzer.extraction.normalizer import LabNormalizer
+from emr_analyzer.pipeline.classifier import DocumentClassifier
+
+
+def test_normalize_italian_number():
+    normalizer = LabNormalizer()
+    assert normalizer.normalize_value("1.234,56") == 1234.56
+    assert normalizer.normalize_value("98") == 98.0
+    assert normalizer.normalize_value("0,9") == 0.9
+    assert normalizer.normalize_value("14.5") == 14.5
+
+
+def test_normalize_parameter():
+    normalizer = LabNormalizer()
+    assert normalizer.normalize_parameter("Hb") == "emoglobina"
+    assert normalizer.normalize_parameter("GOT") == "ast"  # GOT -> AST abbreviation
+    assert normalizer.normalize_parameter("Creatinina") == "creatinina"
+    assert normalizer.normalize_parameter("Glicemia") == "glucosio"
+    assert normalizer.normalize_parameter("PLT") == "piastrine"
+
+
+def test_normalize_unit():
+    normalizer = LabNormalizer()
+    assert normalizer.normalize_unit("mg/dl") == "mg/dL"
+    assert normalizer.normalize_unit("u/l") == "U/L"
+    assert normalizer.normalize_unit("mg/100ml") == "mg/dL"
+
+
+def test_parse_reference_range():
+    normalizer = LabNormalizer()
+    low, high = normalizer.parse_reference_range("70-110")
+    assert low == 70.0
+    assert high == 110.0
+
+    low, high = normalizer.parse_reference_range("< 0.5")
+    assert low is None
+    assert high == 0.5
+
+    low, high = normalizer.parse_reference_range("> 60")
+    assert low == 60.0
+    assert high is None
+
+
+def test_lab_parser_tabular():
+    parser = LabParser(LabNormalizer())
+
+    text = """Glucosio           98 mg/dL        (70-110)
+Creatinina         0.9 mg/dL       (0.7-1.2)
+Emoglobina         14.5 g/dL       (12.0-16.0)
+GB                 7.500 /μL       (4.000-10.000)
+Piastrine          234.000 /μL     (150.000-450.000)"""
+
+    results = parser.parse(text, patient_id="TEST", document_id="DOC_TEST")
+
+    assert len(results) > 0
+    glucose = [r for r in results if "glucosio" in r.normalized_name]
+    assert len(glucose) > 0
+    assert glucose[0].value == 98.0
+    assert glucose[0].unit == "mg/dL"
+    assert glucose[0].reference_low == 70.0
+    assert glucose[0].reference_high == 110.0
+
+
+def test_is_abnormal():
+    normalizer = LabNormalizer()
+    is_ab, flag = normalizer.is_abnormal(150.0, 70.0, 110.0)
+    assert is_ab is True
+    assert flag == "H"
+
+    is_ab, flag = normalizer.is_abnormal(50.0, 70.0, 110.0)
+    assert is_ab is True
+    assert flag == "L"
+
+    is_ab, flag = normalizer.is_abnormal(90.0, 70.0, 110.0)
+    assert is_ab is False
+    assert flag is None
+
+
+class LabParserRegressionTest(unittest.TestCase):
+    """Expose the original function-style checks to unittest discovery."""
+
+    test_normalize_italian_number = staticmethod(test_normalize_italian_number)
+    test_normalize_parameter = staticmethod(test_normalize_parameter)
+    test_normalize_unit = staticmethod(test_normalize_unit)
+    test_parse_reference_range = staticmethod(test_parse_reference_range)
+    test_lab_parser_tabular = staticmethod(test_lab_parser_tabular)
+    test_is_abnormal = staticmethod(test_is_abnormal)
+
+    def test_real_laboratory_layout_preserves_flags_units_and_ranges(self):
+        text = """EMOCROMO
+GLOBULI BIANCHI : 6.55 x10^3/µl 4.00 - 11.00
+GLOBULI ROSSI : 4.21 x10^6/µl 3.80 - 5.80
+HGB : 12.2 g/dl 11.5 - 16.5
+HCT : 37 * % 40 - 54
+MCV : 87 fl 76 - 96
+MCH : 29.0 pg 27.0 - 32.0
+MCHC : 33.3 g/dl 30.0 - 35.0
+PLT : 249 x10^3/µl 150 - 450
+ERITROBLASTI : 0.00 %
+NEUTROFILI : 4.51 x10^3/µl 2.00 - 7.50
+LINFOCITI : 1.11 * x10^3/µl 1.50 - 5.00
+MONOCITI : 0.83 x10^3/µl 0.20 - 1.00
+EOSINOFILI: 0.06 x10^3/µl 0.04 - 0.40
+BASOFILI : 0.04 x10^3/µl 0.01 - 0.10
+Neutrofili : 68.90 %
+Linfociti : 16.90 %
+Monociti : 12.70 %
+Eosinofili : 0.90 %
+Basofili : 0.60 %
+PT (INR): 1.02 INR Per pazienti in terapia con AVK
+PT (Ratio): 1.02 Ratio 0.80 - 1.20
+APTT: 0.98 Ratio 0.82 - 1.20
+GLUCOSIO : 112 * mg/dl 70 - 110
+UREA : 38 mg/dl 17 - 43
+CREATININA : 0.78 mg/dl 0.50 - 1.20
+Vel. Filtr. Glomerulare (eGFR) 76 ml/min Rapportato alla superficie standard
+BILIRUBINA TOTALE : 1.25 * mg/dl < 1.20
+BILIRUBINA DIRETTA : 0.23 mg/dl 0.00 - 0.30
+SODIO : 133 * mmol/l 136 - 145
+POTASSIO : 3.8 mmol/l 3.5 - 5.3
+ALT : 77 * U/L < 35
+CPK : 104 U/L < 145
+LDH : 515 * U/L < 247
+LIPASI: 22 U/L < 67
+PCR : 2.41 * mg/dl < 0.50
+TROPONINA I HS: 5 ng/L < 12
+LoD: 2 ng/L
+valido dal 16/10/2018
+"""
+        values = LabParser().parse(
+            text,
+            patient_id="P001",
+            document_id="DOC_LAB",
+            sample_date="2023-08-25",
+        )
+        by_name = {value.normalized_name: value for value in values}
+
+        self.assertEqual(len(values), 36)
+        self.assertNotIn("lod", by_name)
+        self.assertEqual(by_name["globuli_bianchi"].unit, "×10³/μL")
+        self.assertEqual(by_name["globuli_rossi"].unit, "×10⁶/μL")
+        self.assertEqual(
+            by_name["neutrofili_assoluti"].value, 4.51
+        )
+        self.assertEqual(
+            by_name["neutrofili_percentuale"].value, 68.9
+        )
+        self.assertEqual(by_name["ematocrito"].flag, "L")
+        self.assertEqual(by_name["linfociti_assoluti"].flag, "L")
+        self.assertEqual(by_name["glucosio"].flag, "H")
+        self.assertEqual(by_name["sodio"].flag, "L")
+        self.assertEqual(
+            by_name["proteina_c_reattiva"].reference_high, 0.5
+        )
+        self.assertEqual(by_name["proteina_c_reattiva"].flag, "H")
+        self.assertEqual(by_name["egfr"].unit, "mL/min")
+        self.assertEqual(
+            by_name["tempo_protrombina_inr"].unit, "INR"
+        )
+        self.assertTrue(all(
+            value.sample_date == "2023-08-25" for value in values
+        ))
+
+    def test_fragmented_layout_table_does_not_create_zero_value_garbage(self):
+        import pandas as pd
+
+        fragmented = pd.DataFrame(
+            [
+                ["E", "sam", "", ""],
+                ["Mate", "rial", "", ""],
+                ["Referto id. 20", "593", "", ""],
+                ["Dott.ssa Le", "tizia", "", ""],
+            ],
+            columns=["column_1", "column_2", "column_3", "column_4"],
+        )
+
+        values = LabParser().parse(
+            "", tables=[fragmented],
+            patient_id="P001", document_id="DOC_LAYOUT",
+        )
+
+        self.assertEqual(values, [])
+
+    def test_short_lab_sheet_from_oncology_is_still_laboratory(self):
+        text = """DEG.ONCOLOGIA CLINICA
+Esame Esito U.M. Intervalli Riferimento
+Materiale: Siero
+ISOAMILASI PANCREATICA : 20 U/L 13 - 53
+LIPASI: 21 U/L < 67
+Referto Completo
+Risultati validati da:
+"""
+
+        self.assertEqual(
+            DocumentClassifier().classify(text, "documento.pdf"),
+            "laboratorio",
+        )
+
+    def test_invalid_numeric_cell_is_not_converted_to_zero(self):
+        with self.assertRaises(ValueError):
+            LabNormalizer().normalize_value("Siero")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
