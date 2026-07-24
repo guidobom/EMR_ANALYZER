@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal
 
 from ..pipeline.converter import DoclingConverter
 from ..pipeline.classifier import DocumentClassifier
@@ -186,6 +186,111 @@ class ExtractionWorker(QThread):
             self.error.emit(f"Errore estrazione: {str(e)}")
 
 
+class ClinicalStateBuildWorker(QThread):
+    """Build a ClinicalState from all normalized clinical texts."""
+    progress = pyqtSignal(int, str)           # percent, message
+    finished = pyqtSignal(object)             # ClinicalState
+    error = pyqtSignal(str)
+
+    def __init__(self, cs_manager, patient_id: str, parent=None):
+        super().__init__(parent)
+        self.cs_manager = cs_manager
+        self.patient_id = patient_id
+
+    def run(self):
+        try:
+            state = self.cs_manager.build_from_normalized_texts(
+                self.patient_id,
+                progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
+            )
+            self.finished.emit(state)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
+class BatchClinicalStateWorker(QThread):
+    """Build ClinicalState for multiple patients concurrently.
+
+    Manages up to *max_concurrent* build workers at a time, cycling through
+    the patient list until all have been processed.
+    """
+
+    progress = pyqtSignal(int, str)           # percent, message
+    patient_started = pyqtSignal(str)         # patient_id
+    patient_completed = pyqtSignal(str, int, int)  # patient_id, diag_count, treat_count
+    patient_failed = pyqtSignal(str, str)     # patient_id, error
+    all_completed = pyqtSignal(int, int)      # success_count, fail_count
+
+    def __init__(self, cs_manager, patient_ids: list[str],
+                 max_concurrent: int = 2, parent=None):
+        super().__init__(parent)
+        self.cs_manager = cs_manager
+        self.patient_ids = list(patient_ids)
+        self.max_concurrent = max_concurrent
+
+    def run(self):
+        import threading
+        total = len(self.patient_ids)
+        completed = 0
+        success = 0
+        failed = 0
+        lock = threading.Lock()
+        errors = []
+
+        def process_one(pid: str):
+            nonlocal completed, success, failed
+            self.patient_started.emit(pid)
+            try:
+                state = self.cs_manager.build_from_normalized_texts(pid)
+                with lock:
+                    completed += 1
+                    success += 1
+                    pct = int(completed * 100 / total)
+                    self.progress.emit(
+                        pct,
+                        f"[{completed}/{total}] {pid} — "
+                        f"{len(state.active_diagnoses)} diagnosi, "
+                        f"{len(state.active_treatments)} terapie",
+                    )
+                    self.patient_completed.emit(
+                        pid,
+                        len(state.active_diagnoses),
+                        len(state.active_treatments),
+                    )
+            except Exception as e:
+                with lock:
+                    completed += 1
+                    failed += 1
+                    errors.append(f"{pid}: {e}")
+                    pct = int(completed * 100 / total)
+                    self.progress.emit(pct, f"[{completed}/{total}] {pid} — ❌ {e}")
+                    self.patient_failed.emit(pid, str(e))
+
+        threads = []
+        for pid in self.patient_ids:
+            t = threading.Thread(target=process_one, args=(pid,), daemon=True)
+            threads.append(t)
+
+        # Start up to max_concurrent threads, wait for one batch to drain
+        # before starting the next.
+        idx = 0
+        running = []
+        while idx < total or running:
+            while len(running) < self.max_concurrent and idx < total:
+                t = threads[idx]
+                t.start()
+                running.append(t)
+                idx += 1
+            for t in running[:]:
+                t.join(timeout=0.3)
+                if not t.is_alive():
+                    running.remove(t)
+
+        self.all_completed.emit(success, failed)
+
+
 class ClinicalQueryWorker(QThread):
     """Run a clinical query against the Clinical State."""
     finished = pyqtSignal(str)                # Answer text
@@ -207,3 +312,93 @@ class ClinicalQueryWorker(QThread):
             self.finished.emit(answer)
         except Exception as e:
             self.error.emit(f"Errore query: {str(e)}")
+
+
+class BatchQueryWorker(QThread):
+    """Run the same question against the ClinicalState of all patients
+    that have one, collecting answers concurrently."""
+
+    progress = pyqtSignal(int, str)           # percent, message
+    patient_result = pyqtSignal(str, str)     # patient_id, answer_markdown
+    patient_skipped = pyqtSignal(str, str)    # patient_id, reason
+    patient_error = pyqtSignal(str, str)      # patient_id, error
+    all_completed = pyqtSignal(int, int, int, int)  # total, success, skipped, failed
+
+    def __init__(self, qwen_client: QwenClient,
+                 cs_repo, event_repo,
+                 patient_ids: list[str], question: str,
+                 max_concurrent: int = 2, parent=None):
+        super().__init__(parent)
+        self.qwen_client = qwen_client
+        self.cs_repo = cs_repo
+        self.event_repo = event_repo
+        self.patient_ids = list(patient_ids)
+        self.question = question
+        self.max_concurrent = max_concurrent
+
+    def run(self):
+        import threading
+        total = len(self.patient_ids)
+        completed = 0
+        success = 0
+        skipped = 0
+        failed = 0
+        lock = threading.Lock()
+
+        def query_one(pid: str):
+            nonlocal completed, success, skipped, failed
+            try:
+                state = self.cs_repo.load(pid)
+                if state is None:
+                    with lock:
+                        completed += 1
+                        skipped += 1
+                        self.progress.emit(
+                            int(completed * 100 / total),
+                            f"[{completed}/{total}] {pid} — ⏭️ nessun CS",
+                        )
+                        self.patient_skipped.emit(pid, "Nessun Clinical State")
+                    return
+
+                events = []
+                if self.event_repo:
+                    events = [e.to_dict()
+                              for e in self.event_repo.get_by_patient(pid)]
+
+                answer = self.qwen_client.query_clinical_state(
+                    state.to_dict(), events, self.question
+                )
+                with lock:
+                    completed += 1
+                    success += 1
+                    self.progress.emit(
+                        int(completed * 100 / total),
+                        f"[{completed}/{total}] {pid} — ✅ risposta ricevuta",
+                    )
+                    self.patient_result.emit(pid, answer)
+            except Exception as e:
+                with lock:
+                    completed += 1
+                    failed += 1
+                    self.progress.emit(
+                        int(completed * 100 / total),
+                        f"[{completed}/{total}] {pid} — ❌ {e}",
+                    )
+                    self.patient_error.emit(pid, str(e))
+
+        # --- concurrent execution (same pattern as BatchClinicalStateWorker) ---
+        threads = [threading.Thread(target=query_one, args=(pid,), daemon=True)
+                   for pid in self.patient_ids]
+        idx = 0
+        running = []
+        while idx < total or running:
+            while len(running) < self.max_concurrent and idx < total:
+                threads[idx].start()
+                running.append(threads[idx])
+                idx += 1
+            for t in running[:]:
+                t.join(timeout=0.3)
+                if not t.is_alive():
+                    running.remove(t)
+
+        self.all_completed.emit(total, success, skipped, failed)

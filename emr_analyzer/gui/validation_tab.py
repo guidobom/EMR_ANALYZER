@@ -2,12 +2,13 @@
 
 from datetime import datetime
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QLabel, QAbstractItemView, QMessageBox,
     QTextEdit, QSplitter,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 
 from ..models.validation import ValidationStatus, Severity
 
@@ -37,7 +38,7 @@ class ValidationTab(QWidget):
         layout.addLayout(header)
 
         # Splitter: table on top, detail on bottom
-        splitter = QSplitter(Qt.Vertical)
+        splitter = QSplitter(Qt.Orientation.Vertical)
 
         # Validation queue table
         self._table = QTableWidget()
@@ -47,9 +48,9 @@ class ValidationTab(QWidget):
             "Stato", "Data"
         ])
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         splitter.addWidget(self._table)
@@ -131,15 +132,15 @@ class ValidationTab(QWidget):
             self._table.setItem(i, 5, QTableWidgetItem(row["created_at"][:10] if row["created_at"] else ""))
 
             # Color by severity
-            sev_colors = {"high": Qt.red, "medium": Qt.darkYellow, "low": Qt.darkGreen}
-            color = sev_colors.get(severity, Qt.black)
+            sev_colors = {"high": QColor(Qt.GlobalColor.red), "medium": QColor(Qt.GlobalColor.darkYellow), "low": QColor(Qt.GlobalColor.darkGreen)}
+            color = sev_colors.get(severity, QColor(Qt.GlobalColor.black))
             for col in range(6):
                 item = self._table.item(i, col)
                 if item:
                     item.setForeground(color)
 
             # Store row data
-            self._table.item(i, 0).setData(Qt.UserRole, dict(row))
+            self._table.item(i, 0).setData(Qt.ItemDataRole.UserRole, dict(row))
 
         self._count_label.setText(
             f"({len(items)} elementi da validare)"
@@ -156,7 +157,7 @@ class ValidationTab(QWidget):
         if has_selection:
             item = self._table.item(row, 0)
             if item:
-                row_data = item.data(Qt.UserRole)
+                row_data = item.data(Qt.ItemDataRole.UserRole)
                 detail = (
                     f"Tipo: {row_data.get('item_type')}\n"
                     f"ID: {row_data.get('item_id')}\n"
@@ -177,7 +178,7 @@ class ValidationTab(QWidget):
         if not item:
             return
 
-        row_data = item.data(Qt.UserRole)
+        row_data = item.data(Qt.ItemDataRole.UserRole)
         item_id = row_data.get("id")
         db = self._services.get("db")
 
@@ -231,8 +232,8 @@ class ValidationTab(QWidget):
         if not item:
             return
 
-        row_data = item.data(Qt.UserRole)
-        from PyQt5.QtWidgets import QInputDialog
+        row_data = item.data(Qt.ItemDataRole.UserRole)
+        from PyQt6.QtWidgets import QInputDialog
 
         new_value, ok = QInputDialog.getText(
             self, "Correggi Valore",
@@ -262,9 +263,9 @@ class ValidationTab(QWidget):
             self, "Conferma",
             "Accettare tutti gli elementi a basso rischio?\n"
             "Questa azione è reversibile solo manualmente.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
         )
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             db.execute(
                 """UPDATE validation_queue
                    SET status='accepted', resolved_at=?

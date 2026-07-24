@@ -1,4 +1,4 @@
-PyQt5>=5.15,<6
+PyQt6>=6.4,<7
 pdfplumber>=0.11,<1
 PyMuPDF>=1.26,<2
 pandas>=2.2,<4

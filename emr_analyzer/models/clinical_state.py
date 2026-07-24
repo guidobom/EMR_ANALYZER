@@ -151,6 +151,8 @@ class ClinicalState:
     follow_up: list[dict] = field(default_factory=list)
     functional_status: Optional[str] = None
     last_known_status: Optional[str] = None
+    symptoms: list[dict] = field(default_factory=list)
+    performance_status: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -177,6 +179,8 @@ class ClinicalState:
             "follow_up": self.follow_up,
             "functional_status": self.functional_status,
             "last_known_status": self.last_known_status,
+            "symptoms": self.symptoms,
+            "performance_status": self.performance_status,
         }
 
     @classmethod
@@ -198,6 +202,8 @@ class ClinicalState:
             follow_up=data.get("follow_up", []),
             functional_status=data.get("functional_status"),
             last_known_status=data.get("last_known_status"),
+            symptoms=data.get("symptoms", []),
+            performance_status=data.get("performance_status"),
         )
         state.active_diagnoses = [Diagnosis(**d) for d in data.get("active_diagnoses", [])]
         state.past_diagnoses = [Diagnosis(**d) for d in data.get("past_diagnoses", [])]

@@ -1,11 +1,12 @@
 """Laboratory tab — lab values table with temporal charts."""
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QLabel, QComboBox, QPushButton, QAbstractItemView,
     QSplitter,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 
 # Try to import pyqtgraph for charts
 try:
@@ -60,7 +61,7 @@ class LaboratoryTab(QWidget):
         layout.addLayout(selector_layout)
 
         # Splitter: chart on top, table below
-        self._splitter = QSplitter(Qt.Vertical)
+        self._splitter = QSplitter(Qt.Orientation.Vertical)
 
         # Chart widget
         self._chart_widget = None
@@ -79,11 +80,12 @@ class LaboratoryTab(QWidget):
             "Esito", "Confidenza", "Fonte", "Pagina"
         ])
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.setObjectName("labTable")
+        self._table.setSortingEnabled(True)
         self._table.doubleClicked.connect(self._on_double_click)
         self._splitter.addWidget(self._table)
 
@@ -127,6 +129,7 @@ class LaboratoryTab(QWidget):
 
     def _refresh_table(self):
         """Filter and display lab values."""
+        self._table.setSortingEnabled(False)
         values = self._all_lab_values
 
         # Filter by parameter
@@ -143,10 +146,19 @@ class LaboratoryTab(QWidget):
 
         self._table.setRowCount(len(values))
         for i, lv in enumerate(values):
-            self._table.setItem(i, 0, QTableWidgetItem(lv.sample_date or ""))
+            # Data — sort by ISO date via UserRole
+            item_date = QTableWidgetItem(lv.sample_date or "")
+            item_date.setData(Qt.ItemDataRole.UserRole, lv.sample_date or "")
+            self._table.setItem(i, 0, item_date)
             self._table.setItem(i, 1, QTableWidgetItem(lv.parameter_name))
+            # Valore — sort by numeric value via UserRole
             val_str = f"{lv.operator or ''}{lv.value}".strip()
-            self._table.setItem(i, 2, QTableWidgetItem(val_str))
+            item_val = QTableWidgetItem(val_str)
+            try:
+                item_val.setData(Qt.ItemDataRole.UserRole, float(lv.value))
+            except (TypeError, ValueError):
+                item_val.setData(Qt.ItemDataRole.UserRole, 0.0)
+            self._table.setItem(i, 2, item_val)
             self._table.setItem(i, 3, QTableWidgetItem(lv.unit or ""))
             self._table.setItem(i, 4, QTableWidgetItem(lv.reference_text))
             if lv.flag == "H":
@@ -158,26 +170,31 @@ class LaboratoryTab(QWidget):
             else:
                 outcome = "✓ Normale"
             self._table.setItem(i, 5, QTableWidgetItem(outcome))
-            self._table.setItem(i, 6, QTableWidgetItem(f"{lv.confidence:.2f}"))
+            # Confidenza — sort by float via UserRole
+            item_conf = QTableWidgetItem(f"{lv.confidence:.2f}")
+            item_conf.setData(Qt.ItemDataRole.UserRole, lv.confidence)
+            self._table.setItem(i, 6, item_conf)
             self._table.setItem(i, 7, QTableWidgetItem(lv.document_id))
             self._table.setItem(i, 8, QTableWidgetItem(str(lv.page or "")))
 
             # Color abnormal rows
             if lv.is_abnormal:
                 if lv.flag == "H":
-                    bg = Qt.red
+                    bg = QColor(Qt.GlobalColor.red)
                 elif lv.flag == "L":
-                    bg = Qt.blue
+                    bg = QColor(Qt.GlobalColor.blue)
                 else:
-                    bg = Qt.darkYellow
+                    bg = QColor(Qt.GlobalColor.darkYellow)
                 for col in range(9):
                     item = self._table.item(i, col)
                     if item:
                         item.setBackground(bg)
-                        item.setForeground(Qt.white)
+                        item.setForeground(QColor(Qt.GlobalColor.white))
 
-            # Store data
-            self._table.item(i, 0).setData(Qt.UserRole, lv.to_dict())
+            # Store data (use UserRole+1 to avoid interfering with sort role)
+            self._table.item(i, 0).setData(Qt.ItemDataRole.UserRole + 1, lv.to_dict())
+
+        self._table.setSortingEnabled(True)
 
         # Update stats
         abnormal_count = sum(1 for v in values if v.is_abnormal)
@@ -238,11 +255,11 @@ class LaboratoryTab(QWidget):
             if min_x < max_x:
                 low_line = pg.PlotDataItem(
                     [min_x, max_x], [ref_low, ref_low],
-                    pen=pg.mkPen(231, 76, 60, 100, style=Qt.DashLine)
+                    pen=pg.mkPen(231, 76, 60, 100, style=Qt.PenStyle.DashLine)
                 )
                 high_line = pg.PlotDataItem(
                     [min_x, max_x], [ref_high, ref_high],
-                    pen=pg.mkPen(231, 76, 60, 100, style=Qt.DashLine)
+                    pen=pg.mkPen(231, 76, 60, 100, style=Qt.PenStyle.DashLine)
                 )
                 self._chart_widget.addItem(low_line)
                 self._chart_widget.addItem(high_line)
@@ -258,7 +275,7 @@ class LaboratoryTab(QWidget):
         row = index.row()
         item = self._table.item(row, 0)
         if item:
-            lab_data = item.data(Qt.UserRole)
+            lab_data = item.data(Qt.ItemDataRole.UserRole + 1)
             if lab_data:
                 self.lab_selected.emit(lab_data)
 

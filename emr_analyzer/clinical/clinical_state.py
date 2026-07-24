@@ -59,6 +59,22 @@ class ClinicalStateManager:
         self._cs_repo.save(state)
         return state
 
+    def build_from_normalized_texts(
+        self,
+        patient_id: str,
+        progress_callback=None,
+    ) -> ClinicalState:
+        """Build a ClinicalState from the patient's normalized clinical
+        texts using the dedicated ClinicalStateBuilder.
+
+        This is the entry point called by the UI rebuild action when the
+        new clinical-text pipeline is in use.
+        """
+        from .clinical_state_builder import ClinicalStateBuilder
+
+        builder = ClinicalStateBuilder(self._cs_repo, self._qwen_client)
+        return builder.build_for_patient(patient_id, progress_callback)
+
     def propose_delta(self, patient_id: str,
                       new_events: list[ClinicalEvent]) -> ClinicalStateDelta:
         """
@@ -245,34 +261,59 @@ class ClinicalStateManager:
             if item.normalized_entity not in state.open_problems:
                 state.open_problems.append(item.normalized_entity)
 
-    def _deduplicate_state(self, state: ClinicalState) -> ClinicalState:
-        """Remove duplicate diagnoses and treatments, normalize names."""
+    @staticmethod
+    def _deduplicate_state(state: ClinicalState) -> ClinicalState:
+        """Remove duplicate diagnoses and treatments, normalize names.
+
+        When two entities match (by name similarity), their fields are
+        enriched rather than simply choosing one: the longer name is kept,
+        and missing fields (ICD code, grade, date, notes) are filled in
+        from the duplicate.
+        """
         from difflib import SequenceMatcher
 
+        def _enrich(existing, new_item):
+            """Copy non-empty fields from *new_item* to *existing*."""
+            for field_name in (
+                f.name for f in getattr(existing, '__dataclass_fields__', {}).values()
+            ):
+                if field_name == "source_document_id":
+                    continue
+                new_val = getattr(new_item, field_name, None)
+                old_val = getattr(existing, field_name, None)
+                if new_val and not old_val:
+                    setattr(existing, field_name, new_val)
+                elif new_val and old_val and isinstance(new_val, str) and isinstance(old_val, str):
+                    if len(new_val) > len(old_val):
+                        setattr(existing, field_name, new_val)
+
+        def _clean_treatment_name(name: str) -> str:
+            name = name.strip()
+            for prefix in ['terapia ', 'trattamento ', 'farmaco ', 'agente ']:
+                if name.lower().startswith(prefix):
+                    name = name[len(prefix):]
+            return name
+
         # --- Deduplicate diagnoses ---
-        seen = []
         unique_diagnoses = []
         for d in state.active_diagnoses:
             name_lower = d.name.lower().strip()
-            # Skip garbage entries (too short, wrong dates)
             if len(name_lower) < 3:
                 continue
-            if d.date and len(d.date) < 4:  # "2" is not a valid date
+            if d.date and len(d.date) < 4:
                 d.date = None
-            # Check similarity with existing diagnoses
-            is_dup = False
+            matched = False
             for existing in unique_diagnoses:
-                ratio = SequenceMatcher(None, name_lower, existing.name.lower()).ratio()
-                if ratio > 0.75:
-                    is_dup = True
-                    # Keep the longer (more detailed) version
+                if SequenceMatcher(None, name_lower, existing.name.lower()).ratio() > 0.75:
+                    matched = True
+                    # Keep longer name + enrich missing fields
                     if len(name_lower) > len(existing.name):
                         existing.name = d.name
+                    _enrich(existing, d)
                     break
-            if not is_dup:
+            if not matched:
                 unique_diagnoses.append(d)
 
-        # Move inactive ones to past
         state.active_diagnoses = []
         state.past_diagnoses = list(state.past_diagnoses or [])
         for d in unique_diagnoses:
@@ -282,70 +323,51 @@ class ClinicalStateManager:
                 state.active_diagnoses.append(d)
 
         # --- Deduplicate treatments ---
-        def _clean_treatment_name(name: str) -> str:
-            """Normalize treatment names."""
-            name = name.strip()
-            # Remove generic prefixes
-            for prefix in ['terapia ', 'trattamento ', 'farmaco ', 'agente ']:
-                if name.lower().startswith(prefix):
-                    name = name[len(prefix):]
-            return name
+        def _merge_treatments(target_list, source_list):
+            for t in source_list:
+                name = _clean_treatment_name(t.name)
+                if len(name) < 3:
+                    continue
+                matched = False
+                for existing in target_list:
+                    if SequenceMatcher(None, name.lower(), existing.name.lower()).ratio() > 0.7:
+                        matched = True
+                        _enrich(existing, t)
+                        break
+                if not matched:
+                    t.name = name
+                    target_list.append(t)
 
         unique_active = []
-        for t in state.active_treatments:
-            name = _clean_treatment_name(t.name)
-            if len(name) < 3:
-                continue
-            # Check for duplicates
-            is_dup = False
-            for existing in unique_active:
-                if SequenceMatcher(None, name.lower(), existing.name.lower()).ratio() > 0.7:
-                    is_dup = True
-                    break
-            if not is_dup:
-                t.name = name
-                unique_active.append(t)
-
-        unique_completed = []
-        for t in (state.completed_treatments or []):
-            name = _clean_treatment_name(t.name)
-            if len(name) < 3:
-                continue
-            is_dup = False
-            for existing in unique_active + unique_completed:
-                if SequenceMatcher(None, name.lower(), existing.name.lower()).ratio() > 0.7:
-                    is_dup = True
-                    break
-            if not is_dup:
-                t.name = name
-                unique_completed.append(t)
-
+        unique_completed = list(state.completed_treatments or [])
+        _merge_treatments(unique_active, state.active_treatments)
+        _merge_treatments(unique_completed, state.completed_treatments)
         state.active_treatments = unique_active
         state.completed_treatments = unique_completed
 
         # --- Deduplicate toxicities ---
         unique_tox = []
         for t in state.toxicities:
-            is_dup = False
+            matched = False
             for existing in unique_tox:
                 if SequenceMatcher(None, t.name.lower(), existing.name.lower()).ratio() > 0.7:
-                    is_dup = True
-                    if t.grade is not None and existing.grade is None:
-                        existing.grade = t.grade
+                    matched = True
+                    _enrich(existing, t)
                     break
-            if not is_dup and len(t.name) > 3:
+            if not matched and len(t.name) > 3:
                 unique_tox.append(t)
         state.toxicities = unique_tox
 
         # --- Deduplicate procedures ---
         unique_proc = []
         for p in state.procedures:
-            is_dup = False
+            matched = False
             for existing in unique_proc:
                 if SequenceMatcher(None, p.name.lower(), existing.name.lower()).ratio() > 0.75:
-                    is_dup = True
+                    matched = True
+                    _enrich(existing, p)
                     break
-            if not is_dup and len(p.name) > 3:
+            if not matched and len(p.name) > 3:
                 unique_proc.append(p)
         state.procedures = unique_proc
 

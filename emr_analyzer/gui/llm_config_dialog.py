@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PyQt5.QtCore import QThread, QTimer, pyqtSignal
-from PyQt5.QtWidgets import (
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal
+from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -80,10 +80,10 @@ class LLMConfigDialog(QDialog):
         layout.addLayout(gpu_actions)
 
         self._buttons = QDialogButtonBox(
-            QDialogButtonBox.Save | QDialogButtonBox.Cancel
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
-        self._buttons.button(QDialogButtonBox.Save).setText("Salva e applica")
-        self._buttons.button(QDialogButtonBox.Cancel).setText("Annulla")
+        self._buttons.button(QDialogButtonBox.StandardButton.Save).setText("Salva e applica")
+        self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Annulla")
         self._buttons.accepted.connect(self.accept)
         self._buttons.rejected.connect(self.reject)
         layout.addWidget(self._buttons)

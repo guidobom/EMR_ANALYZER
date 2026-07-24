@@ -3,12 +3,13 @@
 import os
 from pathlib import Path
 
-from PyQt5.QtWidgets import (
-    QMainWindow, QToolBar, QStatusBar, QAction,
+from PyQt6.QtWidgets import (
+    QMainWindow, QToolBar, QStatusBar,
     QSplitter, QMessageBox, QFileDialog, QWidget,
-    QLabel, QApplication,
+    QLabel, QApplication, QDialog,
 )
-from PyQt5.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtGui import QAction
 
 from .patient_panel import PatientPanel
 from .workspace_tabs import WorkspaceTabs
@@ -118,7 +119,7 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Toolbar principale")
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(24, 24))
-        self.addToolBar(Qt.TopToolBarArea, toolbar)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
 
         new_patient_btn = QAction("👤 Nuovo", self)
         new_patient_btn.triggered.connect(self._on_new_patient)
@@ -187,7 +188,7 @@ class MainWindow(QMainWindow):
         self.context_panel = ContextPanel()
 
         # Horizontal splitter: left | center | right
-        h_splitter = QSplitter(Qt.Horizontal)
+        h_splitter = QSplitter(Qt.Orientation.Horizontal)
         h_splitter.addWidget(self.patient_panel)
         h_splitter.addWidget(self.workspace_tabs)
         h_splitter.addWidget(self.context_panel)
@@ -203,7 +204,7 @@ class MainWindow(QMainWindow):
     def _on_new_patient(self):
         from .patient_panel import NewPatientDialog
         dialog = NewPatientDialog(self._services.get("patient_repo"), self)
-        if dialog.exec_():
+        if dialog.exec():
             self.patient_panel.refresh()
 
     def _on_open_workspace(self):
@@ -220,10 +221,10 @@ class MainWindow(QMainWindow):
                     f"La cartella {patient_id} esiste, ma il paziente non è "
                     "presente nel registro corrente.\n\n"
                     "Registrare nuovamente questo workspace?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
                 )
-                if reply != QMessageBox.Yes:
+                if reply != QMessageBox.StandardButton.Yes:
                     return
                 from datetime import datetime
                 from ..models import Patient
@@ -268,7 +269,7 @@ class MainWindow(QMainWindow):
         if not self._current_patient_id:
             return
         dialog = ExportDialog(self._services, self._current_patient_id, self)
-        dialog.exec_()
+        dialog.exec()
 
     def _on_about(self):
         QMessageBox.about(
@@ -327,7 +328,7 @@ class MainWindow(QMainWindow):
             self._ollama_available = False
 
         dialog = LLMConfigDialog(configs, available_models, self)
-        if dialog.exec_() != LLMConfigDialog.Accepted:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             self.update_model_status(self._ollama_available)
             return
         try:

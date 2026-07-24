@@ -1,11 +1,11 @@
 """Export dialog — select format and content for data export."""
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QRadioButton, QCheckBox,
     QPushButton, QLabel, QFileDialog, QButtonGroup, QGroupBox,
     QMessageBox,
 )
-from PyQt5.QtCore import Qt
+from PyQt6.QtCore import Qt
 
 
 class ExportDialog(QDialog):

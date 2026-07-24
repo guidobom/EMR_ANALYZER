@@ -5,12 +5,12 @@ import os
 import shutil
 from pathlib import Path
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QHeaderView, QMessageBox, QComboBox,
     QCheckBox, QDialogButtonBox,
 )
-from PyQt5.QtCore import Qt, QThread
+from PyQt6.QtCore import Qt, QThread
 
 from ..utils.file_utils import compute_file_hash, verify_pdf, get_file_info, is_supported_file
 from ..models.document import DocumentType, DocumentRecord, ParsingStatus
@@ -58,7 +58,7 @@ class ImportDialog(QDialog):
             "Duplicato", "Tipo presunto", "Stato"
         ])
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._table.setAlternatingRowColors(True)
         layout.addWidget(self._table, stretch=1)
 
@@ -92,8 +92,8 @@ class ImportDialog(QDialog):
         self._import_btn.clicked.connect(self._on_import)
         cancel_btn = QPushButton("Annulla")
         cancel_btn.clicked.connect(self.reject)
-        buttons.addButton(self._import_btn, QDialogButtonBox.AcceptRole)
-        buttons.addButton(cancel_btn, QDialogButtonBox.RejectRole)
+        buttons.addButton(self._import_btn, QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton(cancel_btn, QDialogButtonBox.ButtonRole.RejectRole)
         bottom.addWidget(buttons)
 
         layout.addLayout(bottom)
@@ -181,7 +181,7 @@ class ImportDialog(QDialog):
         self._table.setItem(i, 6, QTableWidgetItem(status))
 
         # Store full path
-        self._table.item(i, 1).setData(Qt.UserRole, fp)
+        self._table.item(i, 1).setData(Qt.ItemDataRole.UserRole, fp)
 
     def _guess_document_type(self, filename: str) -> str:
         """Quick type guess based on filename."""

@@ -1,10 +1,10 @@
 """Progress dialog for long-running processing tasks."""
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QProgressBar, QLabel, QPushButton,
     QTextEdit, QHBoxLayout,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 
 
 class ProgressDialog(QDialog):

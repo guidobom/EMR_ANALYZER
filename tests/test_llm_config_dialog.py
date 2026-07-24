@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 from emr_analyzer.extraction.qwen_client import QwenClient
 from emr_analyzer.gui.llm_config_dialog import LLMConfigDialog

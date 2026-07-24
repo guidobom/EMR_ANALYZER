@@ -4,12 +4,12 @@ import os
 
 import fitz  # PyMuPDF
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QScrollArea, QSpinBox, QWidget,
 )
-from PyQt5.QtCore import Qt, QRectF
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen
+from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPen
 
 
 class PDFViewerDialog(QDialog):
@@ -69,10 +69,10 @@ class PDFViewerDialog(QDialog):
         # Page display
         self._scroll_area = QScrollArea()
         self._scroll_area.setWidgetResizable(True)
-        self._scroll_area.setAlignment(Qt.AlignCenter)
+        self._scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self._page_label = QLabel()
-        self._page_label.setAlignment(Qt.AlignCenter)
+        self._page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._scroll_area.setWidget(self._page_label)
 
         layout.addWidget(self._scroll_area, stretch=1)
@@ -116,7 +116,7 @@ class PDFViewerDialog(QDialog):
 
         # Convert to QImage and then QPixmap
         img = QImage(pix.samples, pix.width, pix.height,
-                     pix.stride, QImage.Format_RGB888)
+                     pix.stride, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(img)
 
         # v2 coordinates use PDF points with a top-left origin, the same

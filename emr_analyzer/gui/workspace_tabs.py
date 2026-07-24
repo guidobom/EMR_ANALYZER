@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PyQt5.QtWidgets import QTabWidget, QWidget, QVBoxLayout, QLabel
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import QTabWidget, QWidget, QVBoxLayout, QLabel
+from PyQt6.QtCore import Qt, pyqtSignal
 
 from .documents_tab import DocumentsTab
 from .timeline_tab import TimelineTab
@@ -12,6 +12,7 @@ from .clinical_state_tab import ClinicalStateTab
 from .validation_tab import ValidationTab
 from .dashboard_tab import DashboardTab
 from .import_dialog import ImportDialog
+from ..pipeline.patient_routing import build_routing_plan
 
 
 class WorkspaceTabs(QTabWidget):
@@ -78,7 +79,7 @@ class WorkspaceTabs(QTabWidget):
         from pathlib import Path
         import shutil
 
-        from PyQt5.QtWidgets import QApplication, QMessageBox, QProgressDialog
+        from PyQt6.QtWidgets import QApplication, QMessageBox, QProgressDialog
         from ..config import WORKSPACES_DIR
         from ..models import Patient
 
@@ -140,11 +141,10 @@ class WorkspaceTabs(QTabWidget):
             duplicates = [document for document in batch.documents if document.is_duplicate]
             errors = [document for document in batch.documents if document.error]
 
-            matched_groups = [
-                group for group in groups
-                if group.patient_id and not group.needs_review
-            ]
-            new_groups = [group for group in groups if group.create_new]
+            plan = build_routing_plan(groups)
+            matched_groups = plan.matched_groups
+            new_groups = plan.new_groups
+            blocked_groups = plan.blocked_groups
             # First import into a manually-created empty workspace: bind its
             # identity instead of creating a redundant second patient.
             if (
@@ -161,50 +161,71 @@ class WorkspaceTabs(QTabWidget):
                 initial_group.patient_id = self._current_patient_id
                 initial_group.reason = "prima identità del workspace selezionato"
                 matched_groups.append(initial_group)
-            review_assignable = [
-                group for group in groups
-                if (
-                    group.needs_review and not group.conflict
-                    and self._current_patient_id
-                    and patient_repo.get_by_id(self._current_patient_id) is not None
-                )
-            ]
-            blocked_groups = [
-                group for group in groups
-                if group.conflict or (group.needs_review and not self._current_patient_id)
-            ]
-
-            lines = ["Attribuzione proposta:", ""]
-            for group in matched_groups:
-                lines.append(
-                    f"• {group.patient_id}: {len(group.documents)} documenti "
-                    f"({group.reason})"
-                )
-            for group in new_groups:
-                label = group.evidence.masked_label() if group.evidence else "identità"
-                lines.append(
-                    f"• Nuovo workspace ({label}): {len(group.documents)} documenti"
-                )
-            for group in review_assignable:
-                lines.append(
-                    f"• Revisione: {len(group.documents)} documenti saranno assegnati "
-                    f"al workspace selezionato {self._current_patient_id}"
-                )
-            if duplicates:
-                lines.append(f"• Duplicati globali esclusi: {len(duplicates)}")
-            if blocked_groups:
-                lines.append(
-                    f"• Non attribuiti per identità assente/conflittuale: "
-                    f"{sum(len(group.documents) for group in blocked_groups)}"
-                )
-            if errors:
-                lines.append(f"• File non leggibili esclusi: {len(errors)}")
-            lines.extend(["", "Confermare l'importazione e la creazione dei nuovi workspace?"])
 
             importable_count = sum(
                 len(group.documents)
-                for group in matched_groups + new_groups + review_assignable
+                for group in matched_groups + new_groups
             )
+
+            lines = ["Attribuzione proposta:", ""]
+
+            for group in matched_groups:
+                partial_note = (
+                    f"; {group.partial_matches} con identificatori parziali, "
+                    "da verificare"
+                    if group.partial_matches else ""
+                )
+                lines.append(
+                    f"• {group.patient_id}: {len(group.documents)} documenti "
+                    f"({group.reason}{partial_note})"
+                )
+
+            for group in new_groups:
+                label = (
+                    group.evidence.masked_label()
+                    if group.evidence else "identità"
+                )
+                partial_note = (
+                    f" ({group.partial_matches} con identificatori parziali, "
+                    "da verificare)"
+                    if group.partial_matches else ""
+                )
+                lines.append(
+                    f"• Nuovo workspace ({label}): "
+                    f"{len(group.documents)} documenti{partial_note}"
+                )
+
+            if duplicates:
+                lines.append(f"• Duplicati globali esclusi: {len(duplicates)}")
+            if blocked_groups:
+                conflict_count = sum(
+                    len(group.documents)
+                    for group in blocked_groups if group.conflict
+                )
+                unresolved_count = (
+                    sum(len(group.documents) for group in blocked_groups)
+                    - conflict_count
+                )
+                if unresolved_count:
+                    lines.append(
+                        f"• Identità insufficiente, non importati: "
+                        f"{unresolved_count} documenti"
+                    )
+                if conflict_count:
+                    lines.append(
+                        f"• Conflitto d'identità, non importati: "
+                        f"{conflict_count} documenti"
+                    )
+            if errors:
+                lines.append(
+                    f"• File non leggibili esclusi: {len(errors)}"
+                )
+            lines.extend([
+                "",
+                f"Confermare l'importazione? "
+                f"({importable_count} documenti importabili)",
+            ])
+
             if importable_count == 0:
                 QMessageBox.warning(
                     self, "Nessun documento attribuibile", "\n".join(lines)
@@ -212,16 +233,14 @@ class WorkspaceTabs(QTabWidget):
                 return
             reply = QMessageBox.question(
                 self, "Assegnazione pazienti", "\n".join(lines),
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
             )
-            if reply != QMessageBox.Yes:
+            if reply != QMessageBox.StandardButton.Yes:
                 return
 
             routing = defaultdict(list)
             for group in matched_groups:
                 routing[group.patient_id].extend(group.documents)
-            for group in review_assignable:
-                routing[self._current_patient_id].extend(group.documents)
             for group in new_groups:
                 new_id = patient_repo.get_next_id()
                 evidence = group.evidence
@@ -266,7 +285,7 @@ class WorkspaceTabs(QTabWidget):
                     paths, self._services, patient_id, self,
                     workspace_tabs=self, file_metadata=metadata,
                 )
-                if dialog.exec_():
+                if dialog.exec():
                     imported_patients.append(patient_id)
                     self._documents_tab.load_patient(patient_id)
                     self._dashboard_tab.load_patient(patient_id)

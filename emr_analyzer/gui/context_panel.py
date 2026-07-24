@@ -2,11 +2,11 @@
 
 import json
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QGroupBox,
     QFormLayout, QScrollArea, QPushButton, QMessageBox,
 )
-from PyQt5.QtCore import Qt
+from PyQt6.QtCore import Qt
 
 
 class ContextPanel(QWidget):
@@ -277,9 +277,9 @@ class ContextPanel(QWidget):
             "Salvare le modifiche al testo clinico attivo?\n"
             "Il testo grezzo e la sorgente PDF resteranno conservati "
             "separatamente.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         from pathlib import Path
@@ -319,5 +319,5 @@ class ContextPanel(QWidget):
         """Add a read-only field to the metadata panel."""
         value_label = QLabel(str(value))
         value_label.setWordWrap(True)
-        value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._meta_form.addRow(f"{label}:", value_label)

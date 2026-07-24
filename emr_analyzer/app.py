@@ -3,8 +3,8 @@
 import sys
 from pathlib import Path
 
-from PyQt5.QtWidgets import QApplication, QMessageBox
-from PyQt5.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtCore import Qt
 
 from .config import (
     APP_NAME, APP_VERSION, WORKSPACES_DIR, CACHE_DIR, LOG_DIR,
@@ -67,7 +67,6 @@ class EMRAnalyzerApp:
         self._qapp = QApplication(sys.argv)
         self._qapp.setApplicationName(APP_NAME)
         self._qapp.setApplicationVersion(APP_VERSION)
-        self._qapp.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     def _init_services(self):
         """Initialize all backend services."""
@@ -248,4 +247,4 @@ class EMRAnalyzerApp:
 
     def run(self):
         """Run the application event loop."""
-        return self._qapp.exec_()
+        return self._qapp.exec()

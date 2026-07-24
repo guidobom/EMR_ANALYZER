@@ -18,8 +18,10 @@ from ..models.patient_identity import IdentityField, PatientIdentityEvidence
 
 
 NAME_LABELS = ("NOME E COGNOME", "COGNOME E NOME")
-FISCAL_LABELS = ("CODICE FISCALE",)
-BIRTH_LABELS = ("LUOGO E DATA DI NASCITA", "DATA DI NASCITA")
+FISCAL_LABELS = ("CODICE FISCALE", "C.F.", "COD.FISC", "CODICE FIS")
+BIRTH_LABELS = ("LUOGO E DATA DI NASCITA", "DATA DI NASCITA",
+                "NATO IL", "NATA IL", "NATO/A IL", "NASCITA",
+                "DATA DI NASC")
 SEX_LABELS = ("SESSO",)
 
 
@@ -75,6 +77,9 @@ class PatientIdentityExtractor:
         "UNITÀ", "OPERATIVA", "DAY", "SERVICE", "OSPEDALE", "AZIENDA",
         "SANITARIA", "DATI", "ANAGRAFICI", "PRESTAZIONI", "EROGATE",
         "REFERTO", "MEDICO", "DIRETTORE", "LABORATORIO",
+        "DIPARTIMENTO", "DIREZIONE", "GESTIONE", "DOCUMENTALE",
+        "PRESIDIO", "POLICLINICO", "ISTITUTO", "STRUTTURA",
+        "COMPLESSA", "SERVIZIO", "REGIONE", "UOC", "UOS", "UOSD",
     }
 
     def extract(self, file_path: str | Path) -> PatientIdentityEvidence:
@@ -92,26 +97,37 @@ class PatientIdentityExtractor:
             if document.page_count == 0:
                 evidence.warnings.append("Documento senza pagine")
                 return evidence
+
+            # Patient routing is deliberately restricted to page 1. Searching
+            # later clinical pages (or accepting an arbitrary date) can pair a
+            # department heading with a report date and invent an identity.
             page = document[0]
             words = page.get_text("words", sort=False)
             method = "native_text"
             if len(words) < 5:
-                words = self._ocr_words(page)
-                method = "ocr" if words else "unavailable"
-            evidence.extraction_method = method
+                ocr_words = self._ocr_words(page)
+                if ocr_words:
+                    words = ocr_words
+                    method = "ocr"
+            evidence.extraction_method = method if words else "unavailable"
             if not words:
                 evidence.warnings.append("Testo anagrafico non disponibile")
                 return evidence
+
             rows = self._rows_from_words(words)
             confidence = 0.97 if method == "native_text" else 0.84
-            evidence.name = self._extract_name(rows, page.rect.height, method, confidence)
+            evidence.name = self._extract_name(
+                rows, page.rect.height, method, confidence
+            )
             evidence.fiscal_code = self._extract_fiscal_code(
                 rows, page.rect.height, method, confidence
             )
             evidence.birth_date = self._extract_birth_date(
                 rows, page.rect.height, method, confidence
             )
-            evidence.sex = self._extract_sex(rows, page.rect.height, method, confidence)
+            evidence.sex = self._extract_sex(
+                rows, page.rect.height, method, confidence
+            )
             if not evidence.name:
                 evidence.warnings.append("Nome non trovato nel campo anagrafico")
             if not evidence.fiscal_code:
@@ -161,9 +177,10 @@ class PatientIdentityExtractor:
     @staticmethod
     def _label_row_indices(rows: list[dict], labels: tuple[str, ...]) -> list[int]:
         indices = []
+        normalized_labels = tuple(normalize_text(label) for label in labels)
         for index, row in enumerate(rows):
             row_text = normalize_text(row["text"])
-            if any(label in row_text for label in labels):
+            if any(label in row_text for label in normalized_labels):
                 indices.append(index)
         return indices
 
@@ -184,10 +201,10 @@ class PatientIdentityExtractor:
             width = max(1.0, min(row["x1"] - row["x0"], label["x1"] - label["x0"]))
             overlap_ratio = overlap / width
             aligned_left = abs(row["x0"] - label["x0"]) <= 6.0
-            if -max_vertical <= vertical < 0 and (overlap_ratio >= 0.35 or aligned_left):
-                candidates.append((0, abs(vertical), abs(row["x0"] - label["x0"]), row))
-            elif abs(vertical) <= 8.0 and row["x0"] >= label["x1"] - 3.0:
-                candidates.append((1, abs(row["x0"] - label["x1"]), 0.0, row))
+            if abs(vertical) <= 8.0 and row["x0"] >= label["x1"] - 3.0:
+                candidates.append((0, abs(row["x0"] - label["x1"]), 0.0, row))
+            elif -max_vertical <= vertical < 0 and (overlap_ratio >= 0.35 or aligned_left):
+                candidates.append((1, abs(vertical), abs(row["x0"] - label["x0"]), row))
             elif 0 < vertical <= max_vertical and (overlap_ratio >= 0.35 or aligned_left):
                 candidates.append((2, abs(vertical), abs(row["x0"] - label["x0"]), row))
         candidates.sort(key=lambda item: item[:3])

@@ -1,10 +1,10 @@
 """Dashboard tab — summary overview of the patient workspace."""
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox,
     QGridLayout, QFrame,
 )
-from PyQt5.QtCore import Qt
+from PyQt6.QtCore import Qt
 
 
 class StatCard(QFrame):
@@ -13,7 +13,7 @@ class StatCard(QFrame):
     def __init__(self, title: str, value: str, color: str = "#2c3e50",
                  parent=None):
         super().__init__(parent)
-        self.setFrameStyle(QFrame.Box | QFrame.Raised)
+        self.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
         self.setStyleSheet(
             f"QFrame {{ border: 1px solid #dcdde1; border-radius: 8px; "
             f"background-color: #ffffff; padding: 12px; }}"
@@ -22,14 +22,14 @@ class StatCard(QFrame):
         layout = QVBoxLayout(self)
         title_label = QLabel(title)
         title_label.setStyleSheet("color: #7f8c8d; font-size: 12px;")
-        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title_label)
 
         value_label = QLabel(str(value))
         value_label.setStyleSheet(
             f"color: {color}; font-size: 28px; font-weight: bold;"
         )
-        value_label.setAlignment(Qt.AlignCenter)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(value_label)
 
 

@@ -7,13 +7,13 @@ import json
 import traceback
 from datetime import datetime
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QLabel,
-    QFileDialog, QMessageBox, QMenu, QAction,
+    QFileDialog, QMessageBox, QMenu,
 )
-from PyQt5.QtCore import pyqtSignal, Qt, QMimeData
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import pyqtSignal, Qt, QMimeData
+from PyQt6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent
 
 from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
 from ..extraction.clinical_text_isolator import ClinicalTextIsolationError
@@ -31,13 +31,13 @@ class DropZoneWidget(QWidget):
         self.setMinimumHeight(120)
 
         layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label = QLabel(
             "📂 Trascina qui i file PDF\n"
             "I pazienti verranno rilevati automaticamente\n"
             "oppure fai clic per selezionare i file"
         )
-        label.setAlignment(Qt.AlignCenter)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("color: #7f8c8d; font-size: 14px; padding: 24px;")
         layout.addWidget(label)
 
@@ -147,16 +147,17 @@ class DocumentsTab(QWidget):
             "Lab Values", "Validato"
         ])
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
-        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_context_menu)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.doubleClicked.connect(self._on_double_click)
         self._table.installEventFilter(self)
+        self._table.setSortingEnabled(True)
         layout.addWidget(self._table, stretch=1)
 
     def set_services(self, services: dict):
@@ -171,6 +172,8 @@ class DocumentsTab(QWidget):
         if not self._current_patient_id or not self._services.get("document_repo"):
             return
 
+        self._table.setSortingEnabled(False)
+
         doc_repo = self._services["document_repo"]
         docs = doc_repo.list_by_patient(self._current_patient_id)
 
@@ -182,14 +185,28 @@ class DocumentsTab(QWidget):
         for i, doc in enumerate(docs):
             self._table.setItem(i, 0, QTableWidgetItem(doc.filename))
             self._table.setItem(i, 1, QTableWidgetItem(doc.document_type))
-            self._table.setItem(i, 2, QTableWidgetItem(doc.document_date or ""))
-            self._table.setItem(i, 3, QTableWidgetItem(str(doc.page_count)))
+            # Data Doc — sort by ISO date via UserRole
+            item_date = QTableWidgetItem(doc.document_date or "")
+            sort_date = doc.document_date or ""
+            item_date.setData(Qt.ItemDataRole.UserRole, sort_date)
+            self._table.setItem(i, 2, item_date)
+            # Page count — sort by int via UserRole
+            item_pages = QTableWidgetItem(str(doc.page_count))
+            item_pages.setData(Qt.ItemDataRole.UserRole, doc.page_count)
+            self._table.setItem(i, 3, item_pages)
             # Size from original path
             size_mb = ""
+            size_value = 0.0
             if os.path.exists(doc.original_path):
-                size_mb = f"{os.path.getsize(doc.original_path) / (1024*1024):.1f} MB"
-            self._table.setItem(i, 4, QTableWidgetItem(size_mb))
-            self._table.setItem(i, 5, QTableWidgetItem(doc.import_date[:10]))
+                size_value = os.path.getsize(doc.original_path) / (1024*1024)
+                size_mb = f"{size_value:.1f} MB"
+            item_size = QTableWidgetItem(size_mb)
+            item_size.setData(Qt.ItemDataRole.UserRole, size_value)
+            self._table.setItem(i, 4, item_size)
+            # Importato il — sort by ISO date via UserRole
+            item_import = QTableWidgetItem(doc.import_date[:10])
+            item_import.setData(Qt.ItemDataRole.UserRole, doc.import_date[:10])
+            self._table.setItem(i, 5, item_import)
             if doc.extraction_status == ExtractionStatus.DONE.value:
                 processing_status = "completato"
             elif (
@@ -220,20 +237,20 @@ class DocumentsTab(QWidget):
                 for col in range(10):
                     item = self._table.item(i, col)
                     if item:
-                        item.setForeground(Qt.red)
+                        item.setForeground(QColor(Qt.GlobalColor.red))
 
             if processing_status == "da elaborare":
                 pending_clinical_text += 1
-                self._table.item(i, 6).setForeground(Qt.darkYellow)
+                self._table.item(i, 6).setForeground(QColor(Qt.GlobalColor.darkYellow))
             elif processing_status == "errore":
                 pending_clinical_text += 1
-                self._table.item(i, 6).setForeground(Qt.red)
+                self._table.item(i, 6).setForeground(QColor(Qt.GlobalColor.red))
             elif processing_status == "completato":
-                self._table.item(i, 6).setForeground(Qt.darkGreen)
+                self._table.item(i, 6).setForeground(QColor(Qt.GlobalColor.darkGreen))
 
             # Store doc_id in the first column
-            self._table.item(i, 0).setData(Qt.UserRole, doc.id)
-            self._table.item(i, 0).setData(Qt.UserRole + 1, doc.to_dict())
+            self._table.item(i, 0).setData(Qt.ItemDataRole.UserRole, doc.id)
+            self._table.item(i, 0).setData(Qt.ItemDataRole.UserRole + 1, doc.to_dict())
 
         self._extract_clinical_text_btn.setEnabled(pending_clinical_text > 0)
         self._extract_clinical_text_btn.setToolTip(
@@ -242,6 +259,8 @@ class DocumentsTab(QWidget):
             if pending_clinical_text else
             "Tutti i documenti hanno già un testo clinico normalizzato"
         )
+
+        self._table.setSortingEnabled(True)
 
     def _on_selection_changed(self):
         rows = set()
@@ -255,8 +274,8 @@ class DocumentsTab(QWidget):
             row = min(rows)
             item = self._table.item(row, 0)
             if item:
-                doc_id = item.data(Qt.UserRole)
-                doc_data = item.data(Qt.UserRole + 1)
+                doc_id = item.data(Qt.ItemDataRole.UserRole)
+                doc_data = item.data(Qt.ItemDataRole.UserRole + 1)
                 self.document_selected.emit(doc_id, doc_data)
         else:
             self._delete_btn.setText("🗑 Elimina selezionati")
@@ -267,7 +286,7 @@ class DocumentsTab(QWidget):
         row = index.row()
         item = self._table.item(row, 0)
         if item:
-            doc_data = item.data(Qt.UserRole + 1)
+            doc_data = item.data(Qt.ItemDataRole.UserRole + 1)
             self._open_pdf_viewer(doc_data)
 
     def _on_import_click(self):
@@ -307,7 +326,7 @@ class DocumentsTab(QWidget):
         rows = set()
         for item in self._table.selectedItems():
             rows.add(item.row())
-        return [self._table.item(r, 0).data(Qt.UserRole)
+        return [self._table.item(r, 0).data(Qt.ItemDataRole.UserRole)
                 for r in rows if self._table.item(r, 0)]
 
     def _process_documents(self, doc_ids: list[str],
@@ -459,7 +478,7 @@ class DocumentsTab(QWidget):
             # Run LLM extraction with granular progress
             pct_base = int((index / len(doc_ids)) * 100)
             progress.set_progress(pct_base, f"{base_msg} — estrazione LLM...")
-            from PyQt5.QtWidgets import QApplication
+            from PyQt6.QtWidgets import QApplication
             QApplication.processEvents()
 
             try:
@@ -503,7 +522,7 @@ class DocumentsTab(QWidget):
                 return
 
             self._refresh_table()
-            from PyQt5.QtWidgets import QApplication
+            from PyQt6.QtWidgets import QApplication
             QApplication.processEvents()
             self._process_next_document(doc_ids, index + 1, progress, converter,
                                         parse_only, llm_only)
@@ -718,7 +737,7 @@ class DocumentsTab(QWidget):
             return
 
         self._refresh_table()
-        from PyQt5.QtWidgets import QApplication
+        from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
 
         self._process_next_document(doc_ids, index + 1, progress, converter,
@@ -836,7 +855,7 @@ class DocumentsTab(QWidget):
                             parsing_result=None) -> list:
         """Replace the active parser text with normalized clinical prose."""
         doc_id = doc.id
-        from PyQt5.QtWidgets import QApplication
+        from PyQt6.QtWidgets import QApplication
 
         isolator = self._services.get("clinical_text_isolator")
         llm_client = self._services.get("document_llm_client")
@@ -1167,13 +1186,13 @@ class DocumentsTab(QWidget):
             return
         item = self._table.item(row, 0)
         if item:
-            doc_data = item.data(Qt.UserRole + 1)
+            doc_data = item.data(Qt.ItemDataRole.UserRole + 1)
             self._open_pdf_viewer(doc_data)
 
     def _open_pdf_viewer(self, doc_data: dict):
         from .pdf_viewer import PDFViewerDialog
         viewer = PDFViewerDialog(doc_data, self._services, self)
-        viewer.exec_()
+        viewer.exec()
 
     def _on_context_menu(self, pos):
         row = self._table.currentRow()
@@ -1182,8 +1201,8 @@ class DocumentsTab(QWidget):
         item = self._table.item(row, 0)
         if not item:
             return
-        doc_id = item.data(Qt.UserRole)
-        doc_data = item.data(Qt.UserRole + 1)
+        doc_id = item.data(Qt.ItemDataRole.UserRole)
+        doc_data = item.data(Qt.ItemDataRole.UserRole + 1)
 
         menu = QMenu(self)
         extraction_done = (
@@ -1200,7 +1219,7 @@ class DocumentsTab(QWidget):
         menu.addSeparator()
         delete_action = menu.addAction("🗑 Elimina dal workspace")
 
-        action = menu.exec_(self._table.viewport().mapToGlobal(pos))
+        action = menu.exec(self._table.viewport().mapToGlobal(pos))
         if action == extract_action:
             self._process_documents([doc_id])
         elif action == open_action:
@@ -1214,7 +1233,7 @@ class DocumentsTab(QWidget):
 
     def _view_extracted_text(self, doc_id: str, doc_data: dict):
         """Show the extracted markdown text in a dialog."""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout
 
         extraction_dir = self._get_extraction_dir()
         md_path = extraction_dir / f"{doc_id}.md"
@@ -1253,10 +1272,10 @@ class DocumentsTab(QWidget):
         btn_layout.addWidget(close_btn)
         dlg_layout.addLayout(btn_layout)
 
-        dialog.exec_()
+        dialog.exec()
 
     def _edit_document_metadata(self, doc_id: str, doc_data: dict):
-        from PyQt5.QtWidgets import QInputDialog
+        from PyQt6.QtWidgets import QInputDialog
         from ..models.document import DocumentType
 
         new_type, ok = QInputDialog.getItem(
@@ -1274,10 +1293,10 @@ class DocumentsTab(QWidget):
 
     def eventFilter(self, obj, event):
         """Handle key press events on the table."""
-        from PyQt5.QtCore import QEvent
-        from PyQt5.QtWidgets import QApplication
-        if obj == self._table and event.type() == QEvent.KeyPress:
-            if event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace:
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtWidgets import QApplication
+        if obj == self._table and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Delete or event.key() == Qt.Key.Key_Backspace:
                 doc_ids = self._get_selected_doc_ids()
                 if doc_ids:
                     self._delete_documents(doc_ids)
@@ -1302,9 +1321,9 @@ class DocumentsTab(QWidget):
             f"Eliminare {count} document{'o' if count == 1 else 'i'} dal workspace?\n"
             "Verranno cancellati PDF, testo estratto, eventi, valori di "
             "laboratorio e dati derivati. Il Clinical State verrà ricostruito.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         deletion = self._services.get("document_deletion")

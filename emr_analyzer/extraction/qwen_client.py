@@ -368,6 +368,29 @@ class QwenClient:
             else response.get("done_reason")
         )
         if done_reason == "length":
+            # Retry once with double the output token limit — long documents
+            # (discharge letters, full clinical records) often need more than
+            # the configured max_output_tokens for a single chunk.
+            retry_limit = min(
+                self.max_output_tokens * 2,
+                self.context_length,
+            )
+            if retry_limit > self.max_output_tokens:
+                request["options"]["num_predict"] = retry_limit
+                response = client.chat(**request)
+                done_reason = (
+                    getattr(response, "done_reason", None)
+                    if not isinstance(response, dict)
+                    else response.get("done_reason")
+                )
+                if done_reason != "length":
+                    if hasattr(response, 'message'):
+                        return response.message.content or ""
+                    if isinstance(response, dict):
+                        msg = response.get("message", {})
+                        if isinstance(msg, dict):
+                            return msg.get("content", "")
+                    return ""
             raise RuntimeError(
                 "Ollama ha interrotto la risposta al limite di token; "
                 "il testo normalizzato sarebbe incompleto"

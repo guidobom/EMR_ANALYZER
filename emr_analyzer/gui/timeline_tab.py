@@ -1,10 +1,11 @@
 """Timeline tab — chronological view of clinical events."""
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QLabel, QComboBox, QPushButton, QAbstractItemView,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 
 
 class TimelineTab(QWidget):
@@ -51,9 +52,9 @@ class TimelineTab(QWidget):
             "Confidenza", "Fonte", "Pagina"
         ])
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.doubleClicked.connect(self._on_double_click)
@@ -133,19 +134,19 @@ class TimelineTab(QWidget):
             self._table.setItem(i, 7, QTableWidgetItem(str(event.page or "")))
 
             # Store event data
-            self._table.item(i, 0).setData(Qt.UserRole, event.to_dict())
+            self._table.item(i, 0).setData(Qt.ItemDataRole.UserRole, event.to_dict())
 
             # Color by status
             if event.status == "rejected":
                 for col in range(8):
                     item = self._table.item(i, col)
                     if item:
-                        item.setForeground(Qt.gray)
+                        item.setForeground(QColor(Qt.GlobalColor.gray))
             elif event.confidence < 0.6:
                 for col in range(8):
                     item = self._table.item(i, col)
                     if item:
-                        item.setForeground(Qt.darkYellow)
+                        item.setForeground(QColor(Qt.GlobalColor.darkYellow))
 
         self._summary_label.setText(
             f"{len(events)} eventi visualizzati | "
@@ -161,5 +162,5 @@ class TimelineTab(QWidget):
         row = index.row()
         item = self._table.item(row, 0)
         if item:
-            event_data = item.data(Qt.UserRole)
+            event_data = item.data(Qt.ItemDataRole.UserRole)
             self.event_selected.emit(event_data)

@@ -2,13 +2,13 @@
 
 from datetime import datetime
 
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QDialog, QFormLayout, QLineEdit, QComboBox,
     QTextEdit, QDialogButtonBox, QLabel, QMessageBox, QHBoxLayout,
     QInputDialog,
 )
-from PyQt5.QtCore import pyqtSignal, Qt
+from PyQt6.QtCore import pyqtSignal, Qt
 
 from ..models import Patient
 
@@ -55,7 +55,7 @@ class NewPatientDialog(QDialog):
         layout.addRow("Note:", self._notes)
 
         # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._on_create)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
@@ -170,27 +170,27 @@ class PatientPanel(QWidget):
                 info_parts.append(p.main_pathology)
             item.setToolTip(f"Patologia: {p.main_pathology or 'N/D'}\n"
                             f"Creato: {p.created_at[:10]}")
-            item.setData(Qt.UserRole, p.id)
-            item.setData(Qt.UserRole + 1, p.to_dict())
+            item.setData(Qt.ItemDataRole.UserRole, p.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, p.to_dict())
             self._patient_list.addItem(item)
 
     def _on_search(self, text: str):
         self.refresh(text)
 
     def _on_item_clicked(self, item: QListWidgetItem):
-        patient_id = item.data(Qt.UserRole)
+        patient_id = item.data(Qt.ItemDataRole.UserRole)
         self.patient_selected.emit(patient_id)
 
     def _on_new_patient(self):
         dialog = NewPatientDialog(self._patient_repo, self)
-        if dialog.exec_():
+        if dialog.exec():
             self.refresh()
 
     def _on_edit_patient(self):
         item = self._patient_list.currentItem()
         if not item:
             return
-        patient_id = item.data(Qt.UserRole)
+        patient_id = item.data(Qt.ItemDataRole.UserRole)
         patient = self._patient_repo.get_by_id(patient_id)
         if patient:
             # Simple edit via input dialogs
@@ -207,7 +207,7 @@ class PatientPanel(QWidget):
         item = self._patient_list.currentItem()
         if not item:
             return
-        patient_id = item.data(Qt.UserRole)
+        patient_id = item.data(Qt.ItemDataRole.UserRole)
         reply = QMessageBox.question(
             self, "Conferma eliminazione",
             f"Eliminare definitivamente il workspace {patient_id} e TUTTI "
@@ -219,8 +219,8 @@ class PatientPanel(QWidget):
             f"• identità di routing, audit e copie temporanee riconducibili\n"
             f"• l'intera cartella workspace e la cache dedicata\n\n"
             f"Questa azione è IRREVERSIBILE.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.Yes:
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
             deletion = self._services.get("patient_workspace_deletion")
             if deletion is None:
                 QMessageBox.critical(
