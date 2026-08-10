@@ -141,6 +141,11 @@ class LLMConfigDialog(QDialog):
         status = QLabel("● verifica…")
         status.setMinimumWidth(112)
         test_button = QPushButton("▶ Carica e testa")
+        optimize_button = QPushButton("⚡ Ottimizza")
+        optimize_button.setToolTip(
+            "Analizza l'hardware e il modello per suggerire "
+            "i parametri ottimali (contesto, token, worker)."
+        )
         unload_button = QPushButton("■ Scarica dalla GPU")
         unload_button.setEnabled(False)
 
@@ -148,6 +153,7 @@ class LLMConfigDialog(QDialog):
         grid.addWidget(model, 1, 1, 1, 3)
         grid.addWidget(status, 1, 4)
         grid.addWidget(test_button, 1, 5)
+        grid.addWidget(optimize_button, 1, 6)
 
         max_context = QLabel("Contesto massimo: verifica in corso…")
         max_context.setStyleSheet("color: #5d6d7e;")
@@ -241,10 +247,23 @@ class LLMConfigDialog(QDialog):
             grid.addWidget(workers_combo, 7, 1)
             grid.addWidget(workers_info, 7, 3, 1, 3)
 
+        # Recommendation label (shown below the parameter grid)
+        rec_label = QLabel("")
+        rec_label.setWordWrap(True)
+        rec_label.setStyleSheet(
+            "color: #2c3e50; background: #eaf2f8; "
+            "border: 1px solid #aed6f1; border-radius: 4px; "
+            "padding: 6px; margin-top: 4px;"
+        )
+        rec_label.setVisible(False)
+        grid.addWidget(rec_label, 8, 0, 1, 7)
+
         self._widgets[role] = {
             "model": model,
             "status": status,
             "test": test_button,
+            "optimize": optimize_button,
+            "rec_label": rec_label,
             "unload": unload_button,
             "max_context": max_context,
             "temperature": temperature,
@@ -264,6 +283,11 @@ class LLMConfigDialog(QDialog):
         )
         test_button.clicked.connect(
             lambda _checked=False, selected_role=role: self._test_model(
+                selected_role
+            )
+        )
+        optimize_button.clicked.connect(
+            lambda _checked=False, selected_role=role: self._optimize_params(
                 selected_role
             )
         )
@@ -304,7 +328,9 @@ class LLMConfigDialog(QDialog):
             widgets["max_context"].setText("Contesto massimo: —")
             widgets["context_length"].setMaximum(2_000_000)
             widgets["test"].setEnabled(False)
+            widgets["optimize"].setEnabled(False)
             widgets["unload"].setEnabled(False)
+            widgets["rec_label"].setVisible(False)
             self._set_status(role, "non_selezionato")
             return
         if model not in self._installed_models:
@@ -313,11 +339,14 @@ class LLMConfigDialog(QDialog):
             )
             widgets["context_length"].setMaximum(2_000_000)
             widgets["test"].setEnabled(False)
+            widgets["optimize"].setEnabled(False)
             widgets["unload"].setEnabled(False)
+            widgets["rec_label"].setVisible(False)
             self._set_status(role, "errore", "Modello non installato")
             return
 
         widgets["test"].setEnabled(role not in self._workers)
+        widgets["optimize"].setEnabled(True)
         widgets["unload"].setEnabled(False)
         try:
             capabilities = self._capability_cache.get(model)
@@ -341,10 +370,16 @@ class LLMConfigDialog(QDialog):
             widgets["max_context"].setText(
                 "Contesto massimo: impossibile leggere i metadati"
             )
+            widgets["optimize"].setEnabled(False)
             self._set_status(role, "errore", str(exc))
             return
         self._refresh_runtime_status(role)
         self._refresh_worker_options(role)
+
+        # Auto-optimize when a model is first selected (only if the user
+        # hasn't already manually changed parameters).
+        if not initial and model:
+            self._optimize_params(role, silent=True)
 
     def _refresh_worker_options(self, role: str) -> None:
         """Populate the parallel-workers combo based on hardware limits."""
@@ -412,6 +447,78 @@ class LLMConfigDialog(QDialog):
                 info_label.setText(
                     f"RAM disp: {available:.1f} GB — max stimato: {max_safe} worker"
                 )
+
+    def _optimize_params(self, role: str, silent: bool = False) -> None:
+        """Analyse hardware + model and fill recommended parameters.
+
+        When *silent* is True the recommendation label is updated without
+        a popup dialog (used on initial model selection).
+        """
+        widgets = self._widgets[role]
+        model = str(widgets["model"].currentData() or "")
+        if not model:
+            return
+
+        from ..utils.hardware import recommend_all
+
+        try:
+            rec = recommend_all(model, role)
+        except Exception:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Ottimizzazione non disponibile",
+                    "Impossibile analizzare l'hardware o il modello.\n"
+                    "Verifica che Ollama sia in esecuzione.",
+                )
+            return
+
+        if rec is None:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Modello non trovato",
+                    f"Impossibile leggere i metadati di {model}.\n"
+                    "Assicurati che il modello sia installato in Ollama.",
+                )
+            return
+
+        # Apply recommended values
+        widgets["context_length"].setValue(rec.context_length)
+        widgets["max_output_tokens"].setValue(rec.max_output_tokens)
+
+        # Workers: pick the recommended value if it's in the combo
+        combo = widgets.get("workers_combo")
+        if combo is not None and combo.count() > 0:
+            idx = combo.findData(rec.parallel_workers)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        # Build recommendation text
+        lines = [
+            "<b>⚡ Parametri ottimizzati automaticamente</b>",
+            f"• Contesto: {self._format_integer(rec.context_length)} token — "
+            f"{rec.context_rationale}",
+            f"• Token risposta: {self._format_integer(rec.max_output_tokens)} — "
+            f"{rec.output_rationale}",
+            f"• Worker paralleli: {rec.parallel_workers} — "
+            f"{rec.workers_rationale}",
+        ]
+        widgets["rec_label"].setText(
+            "<br>".join(lines)
+        )
+        widgets["rec_label"].setVisible(True)
+
+        if not silent:
+            QMessageBox.information(
+                self,
+                "Parametri ottimizzati",
+                f"I parametri per {model} ({role}) sono stati "
+                f"configurati in base all'hardware disponibile.\n\n"
+                f"Contesto: {self._format_integer(rec.context_length)} token\n"
+                f"Token risposta: {self._format_integer(rec.max_output_tokens)}\n"
+                f"Worker paralleli: {rec.parallel_workers}",
+            )
 
     def _refresh_runtime_statuses(self) -> None:
         for role in self._widgets:
@@ -649,7 +756,7 @@ class LLMConfigDialog(QDialog):
 
     def _set_role_enabled(self, role: str, enabled: bool) -> None:
         for key, widget in self._widgets[role].items():
-            if key in {"status", "max_context"}:
+            if key in {"status", "max_context", "rec_label"}:
                 continue
             if widget is not None:
                 widget.setEnabled(enabled)

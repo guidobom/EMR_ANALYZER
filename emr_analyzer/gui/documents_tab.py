@@ -972,9 +972,12 @@ class DocumentsTab(QWidget):
         except (TypeError, ValueError):
             metadata = {}
         header_metadata = metadata.get("header") or {}
+        # Classify from the *raw* text so the heading bonus can match
+        # "LETTERA DI DIMISSIONE" and similar markers that the cleaner
+        # would strip from the clinical body.
         doc_type = (
             classifier.classify(
-                cleaned,
+                text,
                 doc.filename,
                 header_metadata=header_metadata,
             )

@@ -202,6 +202,21 @@ class ClinicalTextIsolator:
                     ),
                     _SYSTEM_PROMPT,
                 )
+            except RuntimeError as exc:
+                # Output-length errors are transient — treat as a validation
+                # failure so the corrective-retry → section-fallback chain
+                # can shrink the chunk and retry.
+                if "limite di token" in str(exc):
+                    raise ValueError(
+                        "il modello ha raggiunto il limite di token "
+                        "in output — riprovo con un chunk più piccolo"
+                    ) from exc
+                if validation_categories:
+                    raise RuntimeError(
+                        "chiamata di retry fallita dopo "
+                        f"{validation_categories[-1]}: {exc}"
+                    ) from exc
+                raise
             except Exception as exc:
                 if validation_categories:
                     raise RuntimeError(
@@ -295,6 +310,8 @@ TESTO SORGENTE:
             return "formato JSON non consentito"
         if "vuoto" in message:
             return "risposta vuota"
+        if "limite di token" in message or "token" in message:
+            return "risposta troppo lunga"
         return "errore di validazione"
 
     @staticmethod
@@ -329,6 +346,11 @@ TESTO SORGENTE:
             "formato JSON non consentito": (
                 "Non restituire JSON, liste di oggetti o metadati: produci "
                 "soltanto testo clinico."
+            ),
+            "risposta troppo lunga": (
+                "La risposta precedente ha superato il limite di token. Sii "
+                "più conciso: rimuovi il testo amministrativo ridondante e "
+                "conserva soltanto il contenuto clinico essenziale."
             ),
             "risposta vuota": (
                 "La risposta precedente era vuota. Riporta tutto il contenuto "
@@ -618,10 +640,16 @@ TESTO SORGENTE:
             )
             or DEFAULT_MAX_OUTPUT_TOKENS
         )
-        output_reserve = min(configured_output, max(512, context // 2))
-        available_tokens = max(
-            480, context - output_reserve - PROMPT_TOKEN_RESERVE
+        # The filtered output can approach the source size for dense
+        # clinical text.  Bound the source so the model's response
+        # never exceeds ``max_output_tokens``.  2× is conservative
+        # (filtering typically removes ≥50 % of administrative text).
+        max_source_for_output = configured_output * 2
+        # Also honour the model's total context window.
+        max_source_for_context = max(
+            480, context - configured_output - PROMPT_TOKEN_RESERVE
         )
+        available_tokens = min(max_source_for_context, max_source_for_output)
         return max(
             MIN_CHUNK_CHARS,
             int(available_tokens * CHARS_PER_TOKEN_ESTIMATE),

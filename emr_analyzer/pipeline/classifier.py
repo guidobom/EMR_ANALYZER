@@ -26,7 +26,6 @@ class DocumentClassifier:
         Classify a document into one or more DocumentType categories.
         Returns the primary type as a string.
         """
-        signals = []
         header_metadata = header_metadata or {}
 
         # An explicit performance listed in the first-page header is more
@@ -53,32 +52,30 @@ class DocumentClassifier:
         if self._looks_like_lab_result_sheet(combined_text):
             return DocumentType.LABORATORIO.value
 
-        # Signal 1: Filename-based
+        # Accumulate weighted scores from every signal source.
+        scores: dict[str, float] = {}
+
+        # Signal 1: Filename-based (fixed weight per match)
         if filename:
             fn_type = self._classify_filename(filename)
             if fn_type:
-                signals.append(("filename", fn_type))
+                scores[fn_type] = scores.get(fn_type, 0) + 4.0
 
-        # Signal 2: Lexical keywords in text
-        text_types = self._classify_text(combined_text)
-        signals.extend(("text", t) for t in text_types)
+        # Signal 2: Lexical keywords — use the raw weighted scores
+        # returned by _classify_text_scored (not just presence/absence).
+        for doc_type, weight in self._classify_text_scored(combined_text):
+            scores[doc_type] = scores.get(doc_type, 0) + weight
 
         # Signal 3: Structural cues (tables, sections)
         struct_type = self._classify_structure(text)
         if struct_type:
-            signals.append(("structure", struct_type))
+            scores[struct_type] = scores.get(struct_type, 0) + 3.0
 
-        # Determine primary type
-        if not signals:
+        if not scores:
             return DocumentType.NON_CLASSIFICATO.value
 
-        # Count occurrences of each type
-        type_counts = {}
-        for source, doc_type in signals:
-            type_counts[doc_type] = type_counts.get(doc_type, 0) + 1
-
-        # Return the most frequent type
-        primary = max(type_counts, key=type_counts.get)
+        # Return the type with the highest weighted score
+        primary = max(scores, key=scores.get)
         return primary
 
     @staticmethod
@@ -193,8 +190,8 @@ class DocumentClassifier:
 
         return None
 
-    def _classify_text(self, text: str) -> list[str]:
-        """Classify by lexical patterns in the text content — scored approach."""
+    def _classify_text_scored(self, text: str) -> list[tuple[str, float]]:
+        """Classify by lexical patterns — returns (type, score) pairs."""
         # Define keyword groups with their document type
         keyword_groups = [
             (RADIOLOGY_KEYWORDS, DocumentType.RADIOLOGIA.value, 1),
@@ -296,7 +293,7 @@ class DocumentClassifier:
         ]
 
         # Score each document type
-        scores = {}
+        scores: dict[str, float] = {}
         for keywords, doc_type, weight in keyword_groups:
             count = sum(
                 1 for kw in keywords
@@ -304,6 +301,28 @@ class DocumentClassifier:
             )
             if count > 0:
                 scores[doc_type] = scores.get(doc_type, 0) + count * weight
+
+        # ---- Heading bonus: when the document opens with a clear type
+        #      marker, that type gets a large fixed boost.  This prevents
+        #      incidental body-text keywords from overriding the document's
+        #      own heading (e.g. a discharge letter that happens to mention
+        #      oncology drugs must still be classified as a discharge letter).
+        _first_300 = text[:300] if len(text) >= 300 else text
+        _heading_boosts = [
+            (r"\bLETTERA\s+DI\s+DIMISSIONE\b", DocumentType.LETTERA_DIMISSIONE.value, 60),
+            (r"\bDIMISSIONE\s+(?:PROTETTA|ORDINARIA)\b", DocumentType.LETTERA_DIMISSIONE.value, 60),
+            (r"\bSCHEDA\s+DI\s+DIMISSIONE\s+OSPEDALIERA\b", DocumentType.SDO.value, 60),
+            (r"\bREFERTO\s+(?:RADIOLOGICO|RADIOLOGIA)\b", DocumentType.RADIOLOGIA.value, 40),
+            (r"\bESAME\s+ESITO\s+U\.?M\.?\s+INTERVALLI?\s+RIFERIMENTO\b", DocumentType.LABORATORIO.value, 40),
+            (r"\bVERBALE\s+OPERATORIO\b", DocumentType.VERBALE_OPERATORIO.value, 40),
+            (r"\bPRONTO\s+SOCCORSO\b", DocumentType.PRONTO_SOCCORSO.value, 40),
+            (r"\bDIARIO\s+(?:MEDICO|INFERMIERISTICO)\b", DocumentType.DIARIO_MEDICO.value, 40),
+            (r"\bCARTELLA\s+CLINICA\b", DocumentType.CARTELLA_CLINICA.value, 40),
+        ]
+        for pattern, doc_type, boost in _heading_boosts:
+            if re.search(pattern, _first_300, re.IGNORECASE):
+                scores[doc_type] = scores.get(doc_type, 0) + boost
+                break  # Only the first matching heading counts
 
         if not scores:
             return []
@@ -314,7 +333,11 @@ class DocumentClassifier:
         # Only return types that are clearly above noise
         # (at least 2 points or the top result)
         threshold = max(2, sorted_types[0][1] * 0.5)
-        return [t for t, s in sorted_types if s >= threshold]
+        return [(t, s) for t, s in sorted_types if s >= threshold]
+
+    def _classify_text(self, text: str) -> list[str]:
+        """Backward-compatible wrapper — returns only type names."""
+        return [t for t, _s in self._classify_text_scored(text)]
 
     def _classify_structure(self, text: str) -> Optional[str]:
         """Classify by structural properties of the text."""
