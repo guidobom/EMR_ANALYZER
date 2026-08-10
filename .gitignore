@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+.Rhistory
+*.swp
+*~
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+identity.key
+
+# EMR Analyzer local runtime
+/.emr_analyzer/
+/workspaces/
+/workspace/
+/cache/
+/logs/
+/inbox/
+/extraction/
+/docling/
+/ollama/
+*.log
+
+# Databases and exports
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.csv
+*.tsv
+*.xls
+*.xlsx
+
+# Clinical documents and images: never commit real patient data
+*.pdf
+*.dcm
+*.dicom
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.bmp
+
+# Generated document-extraction layers
+*_source.txt
+*_raw.md
+*_cleaned_source.md
+*_pages.jsonl
+*_words.jsonl
+*_tables.json
+*_clinical_evidence.json
+
+# Local model weights
+*.gguf
+*.safetensors
+*.bin
