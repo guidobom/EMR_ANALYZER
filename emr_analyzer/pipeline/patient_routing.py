@@ -78,10 +78,21 @@ class PatientRoutingService:
             key = document.evidence.group_key or f"unresolved:{index}"
             grouped[key].append(document)
 
+        initial = [
+            RoutingGroup(key=key, documents=members, evidence=members[0].evidence)
+            for key, members in grouped.items()
+        ]
+        # Documents describing the same person may land in different groups
+        # (e.g. one report carries a fiscal code, another only name+birth).
+        # No patient is created until resolve() returns, so these groups could
+        # never see each other through the persistent registry and would each
+        # spawn a new workspace.  Merge them up-front by shared strong signals.
+        merged_groups = self._merge_batch_identities(initial)
+
         result = []
-        for key, members in grouped.items():
-            evidence = members[0].evidence
-            group = RoutingGroup(key=key, documents=members, evidence=evidence)
+        for group in merged_groups:
+            members = group.documents
+            evidence = group.evidence
             conflict_fields = self._conflicting_fields(members)
             if conflict_fields:
                 group.needs_review = True
@@ -106,6 +117,89 @@ class PatientRoutingService:
                 group.reason = "Identità insufficiente per l'attribuzione automatica"
             result.append(group)
         return result
+
+    @staticmethod
+    def _identity_fingerprints(
+        evidence: PatientIdentityEvidence | None,
+    ) -> tuple[tuple, ...]:
+        """Strong identity signals used to merge groups within one batch.
+
+        Mirrors the matching rules of the identity repository: a fiscal code
+        alone is authoritative, otherwise name+birth date together.  Only the
+        ordering-insensitive name is used, so inverted initials still match.
+        """
+        if evidence is None:
+            return ()
+        fingerprints = []
+        if evidence.fiscal_code:
+            fingerprints.append(("cf", evidence.fiscal_code.normalized))
+        if evidence.name and evidence.birth_date:
+            canonical_name = " ".join(sorted(evidence.name.normalized.split()))
+            fingerprints.append(("nb", canonical_name, evidence.birth_date.normalized))
+        return tuple(fingerprints)
+
+    @classmethod
+    def _merge_batch_identities(
+        cls, groups: list[RoutingGroup]
+    ) -> list[RoutingGroup]:
+        """Merge groups whose evidence identifies the same person.
+
+        Two groups describe the same person when they share a fiscal code or
+        share name+birth date.  The representative evidence kept is the most
+        identifying one (fiscal code preferred), so the created workspace
+        registers the richest identity available in the batch.
+        """
+        merged: list[RoutingGroup] = []
+        by_fingerprint: dict[tuple, RoutingGroup] = {}
+        for group in groups:
+            if not group.documents:
+                continue
+            fingerprints = cls._identity_fingerprints(group.evidence)
+            target = next(
+                (by_fingerprint[fp] for fp in fingerprints if fp in by_fingerprint),
+                None,
+            )
+            if target is None:
+                target = RoutingGroup(
+                    key=group.key,
+                    documents=list(group.documents),
+                    evidence=group.evidence,
+                )
+                merged.append(target)
+            else:
+                target.documents.extend(group.documents)
+                target.evidence = cls._prefer_evidence(target.evidence, group.evidence)
+            for fp in fingerprints:
+                by_fingerprint.setdefault(fp, target)
+        return merged
+
+    @staticmethod
+    def _prefer_evidence(
+        current: PatientIdentityEvidence | None,
+        candidate: PatientIdentityEvidence | None,
+    ) -> PatientIdentityEvidence | None:
+        """Keep the most identifying evidence when merging groups."""
+        if candidate is None:
+            return current
+        if current is None:
+            return candidate
+
+        def rank(evidence: PatientIdentityEvidence) -> int:
+            if evidence.fiscal_code:
+                return 3
+            if evidence.name and evidence.birth_date:
+                return 2
+            if evidence.name:
+                return 1
+            return 0
+
+        candidate_rank = rank(candidate)
+        current_rank = rank(current)
+        if candidate_rank > current_rank:
+            return candidate
+        if candidate_rank < current_rank:
+            return current
+        return candidate if candidate.confidence > current.confidence else current
 
     @staticmethod
     def _conflicting_fields(documents: list[StagedDocument]) -> list[str]:

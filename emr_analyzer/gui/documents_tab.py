@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView, QLabel,
     QFileDialog, QMessageBox, QMenu, QAction,
 )
-from PyQt5.QtCore import pyqtSignal, Qt, QMimeData
+from PyQt5.QtCore import pyqtSignal, Qt, QMimeData, QTimer
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 
 from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
@@ -55,6 +55,12 @@ class DropZoneWidget(QWidget):
         )
 
     def dropEvent(self, event: QDropEvent):
+        # Finalize the drop immediately: the import below can show modal
+        # dialogs and take a long time.  Running it synchronously here keeps
+        # the X11 drag transaction open, and the file manager's drag "ghost"
+        # pixmap stays stuck on screen (even after the app exits) because the
+        # compositor never receives the drag-end.
+        event.accept()
         self.setStyleSheet(
             "QWidget#dropZone { border: 3px dashed #bdc3c7; "
             "background-color: #f8f9fa; border-radius: 8px; }"
@@ -71,7 +77,7 @@ class DropZoneWidget(QWidget):
                         if f.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png')):
                             files.append(fp)
         if files:
-            self.files_dropped.emit(files)
+            QTimer.singleShot(0, lambda: self.files_dropped.emit(files))
 
     def mousePressEvent(self, event):
         """Click to open file dialog."""

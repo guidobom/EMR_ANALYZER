@@ -1,4 +1,4 @@
-#!/Users/massimoguidoboni/miniconda3/envs/emr-analyzer/bin/python
+#!/home/utente/miniconda3/envs/emr_analyzer/bin/python
 """EMR Analyzer — Entry point for the clinical document analysis system.
 
 Usage:

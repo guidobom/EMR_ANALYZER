@@ -15,7 +15,30 @@ from emr_analyzer.database.patient_identity_repo import (
 from emr_analyzer.database.patient_repo import PatientRepository
 from emr_analyzer.models import Patient
 from emr_analyzer.models.patient_identity import IdentityField, PatientIdentityEvidence
+from emr_analyzer.pipeline.import_staging import StagedDocument
 from emr_analyzer.pipeline.patient_identity import PatientIdentityExtractor
+from emr_analyzer.pipeline.patient_routing import PatientRoutingService
+
+
+def _staged(evidence: PatientIdentityEvidence, index: int) -> StagedDocument:
+    return StagedDocument(
+        original_path=f"/tmp/doc{index}.pdf",
+        staged_path=f"/tmp/staged{index}.pdf",
+        original_name=f"doc{index}.pdf",
+        file_hash=f"hash{index}",
+        check={},
+        evidence=evidence,
+    )
+
+
+def _evidence(name: str, birth: str, cf: str | None = None) -> PatientIdentityEvidence:
+    fields = {
+        "name": IdentityField(name, name, confidence=0.97),
+        "birth_date": IdentityField(birth, birth, confidence=0.97),
+    }
+    if cf:
+        fields["fiscal_code"] = IdentityField(cf, cf, confidence=0.97)
+    return PatientIdentityEvidence(source_path="/tmp/doc.pdf", **fields)
 
 
 VALID_CF = "RSSMRA85M01H501Q"
@@ -104,6 +127,38 @@ class PatientRoutingTest(unittest.TestCase):
             )
             self.assertNotIn("MARIO ROSSI", serialized_rows)
             self.assertNotIn(VALID_CF, serialized_rows)
+
+    def test_resolve_merges_cf_and_cfless_groups_for_same_patient(self):
+        # One report carries the fiscal code, another the same name (initials
+        # inverted between the two) and birth date but no code.  Both describe
+        # the same person, so a single workspace must be created.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = DatabaseEngine(tmp_path / "registry.db")
+            init_database(db)
+            identity_repo = PatientIdentityRepository(
+                db, IdentityKeyService(tmp_path / "identity.key")
+            )
+            router = PatientRoutingService(
+                identity_repo, None, None, None, audit_repo=None
+            )
+
+            with_cf = _evidence("MARIO ROSSI", "1985-08-01", VALID_CF)
+            without_cf = _evidence("ROSSI MARIO", "1985-08-01")
+            documents = [_staged(with_cf, 0), _staged(without_cf, 1)]
+
+            self.assertNotEqual(
+                with_cf.group_key, without_cf.group_key,
+                "precondition: the two documents must land in different groups",
+            )
+
+            groups = router.resolve(documents)
+            self.assertEqual(len(groups), 1)
+            self.assertTrue(groups[0].create_new)
+            self.assertFalse(groups[0].conflict)
+            self.assertEqual(len(groups[0].documents), 2)
+            # The created identity keeps the richest evidence of the batch.
+            self.assertIsNotNone(groups[0].evidence.fiscal_code)
 
 
 if __name__ == "__main__":
