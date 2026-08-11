@@ -60,6 +60,33 @@ class _RecordingLabParser:
         return []
 
 
+class _FakeIsolatorResult:
+    warnings = []
+    redaction_counts = {}
+    text = "testo clinico normalizzato"
+    chunk_count = 1
+    character_count = len(text)
+    prompt_version = "v1"
+    deidentification_version = "v1"
+    model_name = "fake-model"
+    output_format = "normalized_plain_text"
+
+
+class _FakeIsolator:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def isolate(self, text, **kwargs):
+        self.calls.append((text, kwargs))
+        return self.result
+
+
+class _FakeLlmClient:
+    is_available = True
+    model = "fake-model"
+
+
 class DocumentsTabTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -177,6 +204,25 @@ class DocumentsTabTest(unittest.TestCase):
         self.assertEqual(values, sorted(values))
         self.assertGreater(values[-1], values[0])
         self.assertLess(values[-1], 100)
+
+    def test_run_llm_extraction_tolerates_none_progress(self):
+        """Parallel LLM workers pass progress=None; internal logs swallowed."""
+        tab = DocumentsTab()
+        tab.set_services({
+            "clinical_text_isolator": _FakeIsolator(_FakeIsolatorResult()),
+            "document_llm_client": _FakeLlmClient(),
+        })
+        tab._save_normalized_clinical_text = lambda doc, result: None
+        tab._current_patient_id = "P001"
+        document = DocumentRecord(
+            id="DOC_000020", patient_id="P001", filename="report.pdf",
+            original_path="/nonexistent/report.pdf", file_hash="report",
+        )
+
+        events = tab._run_llm_extraction(document, "testo clinico", None)
+
+        self.assertEqual(events, [])
+        tab.deleteLater()
 
 
 if __name__ == "__main__":

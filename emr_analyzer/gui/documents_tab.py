@@ -19,6 +19,19 @@ from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
 from ..extraction.clinical_text_isolator import ClinicalTextIsolationError
 
 
+class _NullProgressLogger:
+    """No-op ``add_log`` for parallel LLM workers.
+
+    ``_run_llm_extraction`` is invoked from worker threads with
+    ``progress=None``; the shared ProgressDialog widget must only be touched
+    from the GUI thread, so the per-document internal logs are discarded and
+    the parallel loop reports each document's outcome on the main thread.
+    """
+
+    def add_log(self, message: str) -> None:
+        pass
+
+
 class DropZoneWidget(QWidget):
     """Widget that accepts drag-and-drop of PDF/image files."""
 
@@ -1004,6 +1017,11 @@ class DocumentsTab(QWidget):
         """Replace the active parser text with normalized clinical prose."""
         doc_id = doc.id
         from PyQt5.QtWidgets import QApplication
+
+        # Parallel LLM workers pass progress=None: the widget is not
+        # thread-safe, so swallow the internal log lines there.
+        if progress is None:
+            progress = _NullProgressLogger()
 
         isolator = self._services.get("clinical_text_isolator")
         llm_client = self._services.get("document_llm_client")
