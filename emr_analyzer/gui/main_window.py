@@ -83,6 +83,10 @@ class MainWindow(QMainWindow):
         import_patient_action.triggered.connect(self._on_import_patient)
         file_menu.addAction(import_patient_action)
 
+        merge_action = QAction("Unisci &workspace pazienti...", self)
+        merge_action.triggered.connect(self._on_merge_workspaces)
+        file_menu.addAction(merge_action)
+
         file_menu.addSeparator()
 
         export_action = QAction("&Esporta...", self)
@@ -288,6 +292,20 @@ class MainWindow(QMainWindow):
         dialog = ImportPatientDialog(self)
         if dialog.exec_() == ImportPatientDialog.Accepted:
             self.patient_panel.refresh()
+
+    def _on_merge_workspaces(self):
+        """Merge one or more patient workspaces into others (same project)."""
+        from .merge_workspace_dialog import MergeWorkspaceDialog
+        dialog = MergeWorkspaceDialog(self._services, self)
+        if dialog.exec_() != MergeWorkspaceDialog.Accepted:
+            return
+        self.patient_panel.refresh()
+        if self._current_patient_id in dialog.removed_sources:
+            # The selected workspace no longer exists.
+            self._on_patient_selected("")
+        else:
+            # Reload so moved documents appear in the target workspace.
+            self.workspace_tabs.load_patient(self._current_patient_id)
 
     def _on_export(self):
         from .export_dialog import ExportDialog
