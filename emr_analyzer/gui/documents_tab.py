@@ -290,12 +290,19 @@ class DocumentsTab(QWidget):
 
         This is the shared entry point used both by the visible button and by
         "Elabora automaticamente dopo l'importazione".
+
+        Two phases so the configured parallel workers are actually used for
+        the GPU-bound LLM step:
+          1. parse + classify + lab for every document that still needs it
+             (CPU-bound, sequential, fast);
+          2. LLM isolation over every parsed document, in parallel.
         """
         doc_repo = self._services.get("document_repo")
         if not doc_repo or not self._current_patient_id:
             return
         requested = set(doc_ids) if doc_ids is not None else None
-        eligible = []
+        to_parse = []
+        parsed = []
         for doc in doc_repo.list_by_patient(self._current_patient_id):
             if requested is not None and doc.id not in requested:
                 continue
@@ -306,9 +313,21 @@ class DocumentsTab(QWidget):
                 or doc.extraction_status == ExtractionStatus.PROCESSING.value
             ):
                 continue
-            eligible.append(doc.id)
-        if eligible:
-            self._process_documents(eligible)
+            if doc.parsing_status in (
+                ParsingStatus.COMPLETED.value,
+                ParsingStatus.COMPLETED_WITH_WARNINGS.value,
+            ):
+                parsed.append(doc.id)
+            else:
+                to_parse.append(doc.id)
+
+        if to_parse:
+            # Phase 1 (CPU): parse + classify + lab, no LLM.
+            self._process_documents(to_parse, parse_only=True)
+        llm_ids = parsed + to_parse
+        if llm_ids:
+            # Phase 2 (GPU): parallel LLM isolation over every parsed document.
+            self._process_documents(llm_ids, llm_only=True)
 
     def _get_selected_doc_ids(self) -> list[str]:
         rows = set()
@@ -488,83 +507,6 @@ class DocumentsTab(QWidget):
 
                 progress.set_progress(
                     pct, f"Completati {completed}/{total} ({elapsed:.0f}s)",
-                )
-                QApplication.processEvents()
-
-        progress.set_progress(
-            100,
-            f"✓ {total} documenti in {elapsed:.0f}s "
-            f"({self._batch_success_count} ok, {self._batch_error_count} errori)",
-        )
-        self.processing_complete.emit(self._current_patient_id)
-        self._refresh_table()
-
-        progress = ProgressDialog(
-            f"Estrazione parallela ({num_workers} worker)", self.window()
-        )
-        progress.set_progress(
-            0, f"LLM su {len(doc_ids)} documenti con {num_workers} worker..."
-        )
-        progress.show()
-        QApplication.processEvents()
-
-        total = len(doc_ids)
-        completed = 0
-        t0 = time.monotonic()
-        doc_repo = self._services.get("document_repo")
-        actual_workers = min(num_workers, total)
-
-        def _llm_isolate_one(doc_id: str):
-            """Run ClinicalTextIsolator on one already-parsed document."""
-            doc = doc_repo.get_by_id(doc_id)
-            if doc is None or doc_repo is None:
-                return doc_id, "documento non trovato"
-
-            extraction_dir = self._get_extraction_dir()
-            source_path = next(
-                (p for p in [
-                    extraction_dir / f"{doc_id}_source.txt",
-                    extraction_dir / f"{doc_id}_cleaned_source.md",
-                    extraction_dir / f"{doc_id}_raw.md",
-                ] if p.exists()), None
-            )
-            if source_path is None:
-                return doc_id, "testo sorgente non trovato"
-
-            source_text = source_path.read_text(encoding="utf-8")
-            try:
-                doc_repo.update_extraction_status(doc_id, "processing")
-                self._run_llm_extraction(doc, source_text, progress=None)
-                doc.extraction_status = ExtractionStatus.DONE.value
-                doc.event_count = 0
-                doc.error_message = None
-                doc_repo.update(doc)
-                return doc_id, None
-            except Exception as e:
-                doc.extraction_status = ExtractionStatus.ERROR.value
-                doc.error_message = str(e)
-                doc_repo.update(doc)
-                return doc_id, str(e)[:200]
-
-        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-            futures = {executor.submit(_llm_isolate_one, did): did for did in doc_ids}
-            for future in as_completed(futures):
-                completed += 1
-                doc_id, error = future.result()
-                elapsed = time.monotonic() - t0
-                pct = int((completed / total) * 100)
-
-                if error:
-                    progress.add_log(f"❌ {doc_id}: {error}")
-                    self._batch_error_count += 1
-                else:
-                    progress.add_log(f"✓ {doc_id}: testo clinico normalizzato")
-                    self._batch_success_count += 1
-
-                progress.set_progress(
-                    pct,
-                    f"Completati {completed}/{total} documenti "
-                    f"({elapsed:.0f}s)",
                 )
                 QApplication.processEvents()
 

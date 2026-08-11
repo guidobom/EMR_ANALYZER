@@ -97,8 +97,11 @@ class DocumentsTabTest(unittest.TestCase):
         self.assertTrue(tab._extract_clinical_text_btn.isEnabled())
         tab._extract_clinical_text_btn.click()
 
+        # Two-phase: parse-only for docs still needing parsing, then one
+        # parallel LLM pass over every parsed doc (already-parsed first).
         self.assertEqual(observed, [
-            (["DOC_000001", "DOC_000002"], {})
+            (["DOC_000001"], {"parse_only": True}),
+            (["DOC_000002", "DOC_000001"], {"llm_only": True}),
         ])
 
         pending.parsing_status = ParsingStatus.COMPLETED.value
