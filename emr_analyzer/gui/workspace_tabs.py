@@ -105,8 +105,9 @@ class WorkspaceTabs(QTabWidget):
             return
 
         # Build a map: patient_id → list of file paths
-        patient_files: dict[str | None, list[str]] = {}
+        patient_files: dict[str, list[str]] = {}
         routed_files: set[str] = set()
+        unassigned_files: list[str] = []
 
         if groups:
             for g in groups:
@@ -116,7 +117,6 @@ class WorkspaceTabs(QTabWidget):
                 ]
                 if not group_file_paths:
                     continue
-                routed_files.update(group_file_paths)
 
                 if g.patient_id:
                     # Existing patient
@@ -161,17 +161,21 @@ class WorkspaceTabs(QTabWidget):
                     if identity_repo and evidence:
                         identity_repo.upsert(pid, evidence)
                 else:
-                    # Needs review — use current patient if available
-                    pid = self._current_patient_id
-                    if not pid:
-                        continue
+                    # Identity insufficient: never drop silently.  Files stay
+                    # visible so the user can assign them in the dialog.
+                    unassigned_files.extend(group_file_paths)
+                    continue
 
+                routed_files.update(group_file_paths)
                 if pid not in patient_files:
                     patient_files[pid] = []
                 patient_files[pid].extend(group_file_paths)
 
         # Any files not routed → assign to current patient
-        unrouted = [f for f in files if f not in routed_files]
+        unrouted = [
+            f for f in files
+            if f not in routed_files and f not in unassigned_files
+        ]
         if unrouted:
             pid = self._current_patient_id
             if not pid:
@@ -191,13 +195,20 @@ class WorkspaceTabs(QTabWidget):
         imported_any = False
         last_patient_id = self._current_patient_id
 
-        if len(patient_files) > 1:
-            # Multi-patient: one window lists every workspace with a checkbox
-            # and expandable per-file detail; then a single sequential queue
-            # runs the extraction for the checked patients without further
-            # prompts between them.
+        if len(patient_files) > 1 or unassigned_files:
+            # Multi-patient (or files still needing a patient): one window
+            # lists every workspace with a checkbox and expandable per-file
+            # detail; a "Da assegnare" bucket shows the needs_review files;
+            # then a single sequential queue runs the extraction for the
+            # checked patients without further prompts between them.
+            candidates = list(patient_files)
+            if (self._current_patient_id
+                    and self._current_patient_id not in candidates):
+                candidates.append(self._current_patient_id)
             batch_dialog = BatchImportDialog(
                 patient_files, self._services, parent=self,
+                unassigned_files=unassigned_files,
+                candidate_pids=candidates,
             )
             if batch_dialog.exec_() == BatchImportDialog.Accepted:
                 if batch_dialog.should_run_queue:

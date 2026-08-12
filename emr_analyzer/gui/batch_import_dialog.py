@@ -21,16 +21,24 @@ from .import_dialog import run_file_checks, import_checked_documents
 class BatchImportDialog(QDialog):
     """Confirm the import of several patients' documents in one window."""
 
+    _UNASSIGNED = "__unassigned__"
+
     def __init__(self, patient_files: dict[str, list[str]], services: dict,
-                 parent=None):
+                 parent=None, unassigned_files: list[str] | None = None,
+                 candidate_pids: list[str] | None = None):
         super().__init__(parent)
         self.setWindowTitle("Importazione Documenti — più pazienti")
-        self.setMinimumSize(920, 580)
+        self.setMinimumSize(1020, 580)
         self._services = services
         self._patient_files = patient_files
         self._patient_repo = services.get("patient_repo")
         self._file_checks: dict[str, list[dict]] = {}
         self._type_combos: dict[tuple[str, int], QComboBox] = {}
+        self._unassigned_files = list(unassigned_files or [])
+        self._candidate_pids = list(candidate_pids or [])
+        self._unassigned_checks: list[dict] = []
+        self._unassigned_target_combos: dict[int, QComboBox] = {}
+        self._unassigned_type_combos: dict[int, QComboBox] = {}
         self._syncing = False
 
         # Public API consumed by workspace_tabs after accept()
@@ -52,9 +60,10 @@ class BatchImportDialog(QDialog):
         layout.addWidget(header)
 
         self._tree = QTreeWidget()
-        self._tree.setColumnCount(6)
+        self._tree.setColumnCount(7)
         self._tree.setHeaderLabels([
             "Importa", "Nome / File", "Pagine", "Testo", "Tipo", "Stato",
+            "Assegna a",
         ])
         self._tree.header().setStretchLastSection(True)
         self._tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -133,6 +142,62 @@ class BatchImportDialog(QDialog):
                 self._tree.setItemWidget(child, 4, combo)
                 self._type_combos[(pid, i)] = combo
 
+        if self._unassigned_files:
+            self._load_unassigned_bucket()
+
+    def _load_unassigned_bucket(self):
+        """Rows for documents no automatic rule could assign to a patient.
+
+        Each row offers a target-patient combo (default: non importare) so
+        the user can assign files that routing could not, without a single
+        review dialog per file.
+        """
+        checks = run_file_checks(self._services, self._unassigned_files)
+        self._unassigned_checks = checks
+        parent = QTreeWidgetItem(self._tree)
+        parent.setText(1, f"⚠️ Documenti senza paziente ({len(checks)})")
+        parent.setText(2, str(len(checks)))
+        parent.setText(5, "Da assegnare")
+        parent.setExpanded(True)
+        parent.setData(0, Qt.UserRole, self._UNASSIGNED)
+        # Header row only: no checkbox, the user acts on individual files.
+        parent.setFlags(parent.flags() & ~Qt.ItemIsUserCheckable)
+
+        for i, check_data in enumerate(checks):
+            child = QTreeWidgetItem(parent)
+            if "check" not in check_data:
+                child.setText(1, os.path.basename(check_data["path"]))
+                child.setText(5, "❌ Formato non supportato")
+                child.setDisabled(True)
+                continue
+            child.setText(1, check_data.get("original_name")
+                          or os.path.basename(check_data["path"]))
+            child.setText(2, str(check_data["check"].get("page_count", 1)))
+            child.setText(
+                3, "Sì" if check_data["check"].get("has_text") else "No"
+            )
+            child.setText(
+                5, "⚠️ Duplicato" if check_data["is_duplicate"] else "Pronto"
+            )
+            child.setCheckState(0, Qt.Unchecked)
+            child.setDisabled(bool(check_data["is_duplicate"]))
+            child.setData(0, Qt.UserRole, (self._UNASSIGNED, i))
+
+            type_combo = QComboBox()
+            for dt in DocumentType:
+                type_combo.addItem(dt.value, dt.value)
+            type_combo.setCurrentText(check_data["guessed_type"])
+            self._tree.setItemWidget(child, 4, type_combo)
+            self._unassigned_type_combos[i] = type_combo
+
+            target_combo = QComboBox()
+            for pid in self._candidate_pids:
+                target_combo.addItem(str(pid), str(pid))
+            target_combo.addItem("(non importare)", None)
+            target_combo.setCurrentIndex(target_combo.count() - 1)
+            self._tree.setItemWidget(child, 6, target_combo)
+            self._unassigned_target_combos[i] = target_combo
+
     @staticmethod
     def _patient_label(pid: str, patient) -> str:
         bits = [str(pid)]
@@ -168,13 +233,52 @@ class BatchImportDialog(QDialog):
                 child.setText(5, message)
         return cb
 
+    def _import_unassigned(self, parent: QTreeWidgetItem) -> int:
+        """Import checked "Da assegnare" rows into their chosen patients."""
+        by_target: dict[str, list[int]] = {}
+        type_overrides: dict[int, str] = {}
+        for j in range(parent.childCount()):
+            child = parent.child(j)
+            if child.checkState(0) != Qt.Checked:
+                continue
+            target_combo = self._unassigned_target_combos.get(j)
+            target = target_combo.currentData() if target_combo else None
+            if not target:
+                continue
+            by_target.setdefault(target, []).append(j)
+            type_combo = self._unassigned_type_combos.get(j)
+            if type_combo:
+                type_overrides[j] = type_combo.currentText()
+
+        imported_count = 0
+        for target, indexes in by_target.items():
+            try:
+                imported = import_checked_documents(
+                    self._services, target, self._unassigned_checks,
+                    indexes,
+                    status_callback=self._make_status_callback(parent),
+                    type_overrides=type_overrides,
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Importazione non riuscita",
+                    f"Errore per il paziente {target}:\n{exc}",
+                )
+                continue
+            self.imported_by_patient.setdefault(target, []).extend(imported)
+            imported_count += len(imported)
+        return imported_count
+
     def _on_import(self, run_queue: bool):
         total_imported = 0
         for i in range(self._tree.topLevelItemCount()):
             parent = self._tree.topLevelItem(i)
+            pid = parent.data(0, Qt.UserRole)
+            if pid == self._UNASSIGNED:
+                total_imported += self._import_unassigned(parent)
+                continue
             if parent.checkState(0) != Qt.Checked:
                 continue
-            pid = parent.data(0, Qt.UserRole)
             checks = self._file_checks[pid]
 
             selected = []
@@ -211,8 +315,8 @@ class BatchImportDialog(QDialog):
             return
 
         self.queue_patient_ids = [
-            pid for pid in self._patient_files
-            if self.imported_by_patient.get(pid)
+            pid for pid in self.imported_by_patient
+            if self.imported_by_patient[pid]
         ]
         self.should_run_queue = run_queue
         self.accept()

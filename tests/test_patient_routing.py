@@ -60,6 +60,30 @@ def _make_header_pdf(path: Path) -> None:
     document.close()
 
 
+def _make_text_pdf(path: Path, *lines: str) -> None:
+    """PDF with arbitrary raw text, used for the auto-assignment second pass."""
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    y = 150
+    for line in lines:
+        page.insert_text((72, y), line)
+        y += 20
+    document.save(path)
+    document.close()
+
+
+def _staged_on_disk(path: Path, evidence: PatientIdentityEvidence,
+                    index: int) -> StagedDocument:
+    return StagedDocument(
+        original_path=str(path),
+        staged_path=str(path),
+        original_name=path.name,
+        file_hash=f"hash{index}",
+        check={},
+        evidence=evidence,
+    )
+
+
 class PatientRoutingTest(unittest.TestCase):
     def test_coordinate_identity_extraction(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,6 +183,161 @@ class PatientRoutingTest(unittest.TestCase):
             self.assertEqual(len(groups[0].documents), 2)
             # The created identity keeps the richest evidence of the batch.
             self.assertIsNotNone(groups[0].evidence.fiscal_code)
+
+    # --- best-effort auto-assignment of unresolved groups -----------------
+
+    def test_resolve_auto_assigns_unresolved_by_surname_and_birth(self):
+        # A needs_review document whose header layout defeats the extractor
+        # still carries the patient's name and birth date in its text.  The
+        # second pass must absorb it into the matching strong group.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = DatabaseEngine(tmp_path / "registry.db")
+            init_database(db)
+            identity_repo = PatientIdentityRepository(
+                db, IdentityKeyService(tmp_path / "identity.key")
+            )
+            router = PatientRoutingService(
+                identity_repo, None, None, None, audit_repo=None
+            )
+
+            pb_path = tmp_path / "pb.pdf"
+            _make_text_pdf(
+                pb_path, "Paziente: BOCCAFOGLI PAOLO",
+                "Data di nascita: 19/12/1958", "CF BCCPLA58T19D548S",
+            )
+            gb_path = tmp_path / "gb.pdf"
+            _make_text_pdf(
+                gb_path, "Paziente: BISAN GRAZIELLA",
+                "Data di nascita: 04/09/1953", "CF BSNGZL53P44H620F",
+            )
+            unresolved_path = tmp_path / "unresolved.pdf"
+            _make_text_pdf(
+                unresolved_path, "BOCCAFOGLI PAOLO", "Paziente:",
+                "19/12/1958", "Data Nascita:",
+            )
+
+            documents = [
+                _staged_on_disk(
+                    pb_path, _evidence("PAOLO BOCCAFOGLI", "1958-12-19",
+                                       "BCCPLA58T19D548S"), 0),
+                _staged_on_disk(
+                    gb_path, _evidence("GRAZIELLA BISAN", "1953-09-04",
+                                       "BSNGZL53P44H620F"), 1),
+                _staged_on_disk(
+                    unresolved_path,
+                    PatientIdentityEvidence(source_path=str(unresolved_path)),
+                    2),
+            ]
+
+            groups = router.resolve(documents)
+
+            self.assertEqual(len(groups), 2)
+            self.assertTrue(all(group.create_new for group in groups))
+            self.assertFalse(any(group.needs_review for group in groups))
+            pb = next(g for g in groups
+                      if g.evidence.name.normalized == "PAOLO BOCCAFOGLI")
+            self.assertEqual(len(pb.documents), 2)
+
+    def test_resolve_auto_assigns_by_birth_date_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = DatabaseEngine(tmp_path / "registry.db")
+            init_database(db)
+            identity_repo = PatientIdentityRepository(
+                db, IdentityKeyService(tmp_path / "identity.key")
+            )
+            router = PatientRoutingService(
+                identity_repo, None, None, None, audit_repo=None
+            )
+
+            pb_path = tmp_path / "pb.pdf"
+            _make_text_pdf(pb_path, "BOCCAFOGLI PAOLO", "19/12/1958")
+            birth_only = tmp_path / "birth_only.pdf"
+            _make_text_pdf(birth_only, "REFERTO N. 1234", "Data: 19/12/1958")
+
+            documents = [
+                _staged_on_disk(
+                    pb_path, _evidence("PAOLO BOCCAFOGLI", "1958-12-19",
+                                       "BCCPLA58T19D548S"), 0),
+                _staged_on_disk(
+                    birth_only,
+                    PatientIdentityEvidence(source_path=str(birth_only)), 1),
+            ]
+
+            groups = router.resolve(documents)
+
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(len(groups[0].documents), 2)
+
+    def test_resolve_keeps_ambiguous_group_needs_review(self):
+        # The unresolved document mentions both surnames: no candidate wins
+        # unambiguously, so it must remain needs_review (and visible).
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = DatabaseEngine(tmp_path / "registry.db")
+            init_database(db)
+            identity_repo = PatientIdentityRepository(
+                db, IdentityKeyService(tmp_path / "identity.key")
+            )
+            router = PatientRoutingService(
+                identity_repo, None, None, None, audit_repo=None
+            )
+
+            pb_path = tmp_path / "pb.pdf"
+            _make_text_pdf(pb_path, "BOCCAFOGLI PAOLO", "19/12/1958")
+            gb_path = tmp_path / "gb.pdf"
+            _make_text_pdf(gb_path, "BISAN GRAZIELLA", "04/09/1953")
+            both_path = tmp_path / "both.pdf"
+            _make_text_pdf(both_path, "BOCCAFOGLI e BISAN")
+
+            documents = [
+                _staged_on_disk(
+                    pb_path, _evidence("PAOLO BOCCAFOGLI", "1958-12-19",
+                                       "BCCPLA58T19D548S"), 0),
+                _staged_on_disk(
+                    gb_path, _evidence("GRAZIELLA BISAN", "1953-09-04",
+                                       "BSNGZL53P44H620F"), 1),
+                _staged_on_disk(
+                    both_path,
+                    PatientIdentityEvidence(source_path=str(both_path)), 2),
+            ]
+
+            groups = router.resolve(documents)
+
+            unresolved = [g for g in groups if g.needs_review]
+            self.assertEqual(len(unresolved), 1)
+            self.assertEqual(len(unresolved[0].documents), 1)
+            self.assertEqual(unresolved[0].reason, (
+                "Identità insufficiente per l'attribuzione automatica"
+            ))
+
+    def test_resolve_without_candidates_leaves_unresolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = DatabaseEngine(tmp_path / "registry.db")
+            init_database(db)
+            identity_repo = PatientIdentityRepository(
+                db, IdentityKeyService(tmp_path / "identity.key")
+            )
+            router = PatientRoutingService(
+                identity_repo, None, None, None, audit_repo=None
+            )
+
+            path = tmp_path / "only.pdf"
+            _make_text_pdf(path, "Nessun nome riconoscibile")
+            documents = [
+                _staged_on_disk(
+                    path,
+                    PatientIdentityEvidence(source_path=str(path)), 0),
+            ]
+
+            groups = router.resolve(documents)
+
+            self.assertEqual(len(groups), 1)
+            self.assertTrue(groups[0].needs_review)
+            self.assertIsNone(groups[0].patient_id)
+            self.assertFalse(groups[0].create_new)
 
 
 if __name__ == "__main__":

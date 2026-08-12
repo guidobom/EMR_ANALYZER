@@ -2,11 +2,58 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 from ..models.patient_identity import PatientIdentityEvidence
 from .import_staging import StagedDocument
+from .patient_identity import normalize_text
+
+
+def _extract_document_text(path: str) -> str:
+    """Raw text of the first pages, for the surname/birth-date search.
+
+    The coordinate-aware extractor may miss the demographic header when the
+    label/value order differs (value above the label, two-column layouts),
+    yet the text still carries the patient's name.  This returns the raw
+    page text so a second pass can search it directly.
+    """
+    import fitz
+
+    try:
+        document = fitz.open(str(path))
+    except Exception:
+        return ""
+    try:
+        chunks = []
+        for index in range(min(document.page_count, 3)):
+            chunks.append(document[index].get_text())
+        return " ".join(chunks)
+    finally:
+        document.close()
+
+
+def _birth_date_in_text(text: str, birth_iso: str) -> bool:
+    """True if the dd/mm/yyyy form of the birth date appears in the text."""
+    parts = birth_iso.split("-")
+    if len(parts) != 3:
+        return False
+    year, month, day = parts
+
+    def variants(value: str) -> set[str]:
+        number = int(value)
+        return {str(number), f"{number:02d}"}
+
+    alternatives = [
+        f"{d}[./\\-]{m}[./\\-]{year}"
+        for d in variants(day)
+        for m in variants(month)
+    ]
+    pattern = re.compile(
+        r"(?<!\d)(?:%s)(?!\d)" % "|".join(alternatives)
+    )
+    return pattern.search(text) is not None
 
 
 @dataclass
@@ -116,6 +163,7 @@ class PatientRoutingService:
                 group.needs_review = True
                 group.reason = "Identità insufficiente per l'attribuzione automatica"
             result.append(group)
+        self._auto_assign_unresolved(result)
         return result
 
     @staticmethod
@@ -217,3 +265,104 @@ class PatientRoutingService:
             if len(values) > 1:
                 conflicts.append(field_name)
         return conflicts
+
+    # --- best-effort auto-assignment of unresolved groups ------------------
+
+    def _auto_assign_unresolved(self, groups: list[RoutingGroup]) -> None:
+        """Absorb needs_review groups whose text names a batch candidate.
+
+        A batch often resolves a few solid identities (new workspaces to
+        create, or existing patients).  A needs_review group that the
+        coordinate-aware extractor could not anchor may still carry the
+        candidate's surname or birth date in its text.  When every document
+        of the group votes for the same candidate, and no candidate ties,
+        the group is merged into it; whatever remains is genuinely
+        unassigned and is surfaced to the user instead of being dropped.
+        """
+        candidates = [
+            (index, group)
+            for index, group in enumerate(groups)
+            if (group.create_new or group.patient_id) and group.evidence
+        ]
+        if not candidates:
+            return
+        signals = [
+            (index, self._candidate_surname(group),
+             self._candidate_birth(group))
+            for index, group in candidates
+        ]
+
+        absorbed: dict[int, list[StagedDocument]] = defaultdict(list)
+        survivors: list[RoutingGroup] = []
+        for group in groups:
+            if group.patient_id or group.create_new or not group.needs_review:
+                survivors.append(group)
+                continue
+            target = self._vote_target(group, signals)
+            if target is None:
+                survivors.append(group)
+            else:
+                absorbed[target].extend(group.documents)
+        for index, extra in absorbed.items():
+            groups[index].documents.extend(extra)
+        groups[:] = survivors
+
+    @staticmethod
+    def _candidate_surname(group: RoutingGroup) -> str | None:
+        """The surname token of a candidate identity, if trustworthy."""
+        evidence = group.evidence
+        if not evidence or not evidence.name or not evidence.name.normalized:
+            return None
+        tokens = [
+            token for token in evidence.name.normalized.split()
+            if len(token) >= 4
+        ]
+        return tokens[-1] if tokens else None
+
+    @staticmethod
+    def _candidate_birth(group: RoutingGroup) -> str | None:
+        evidence = group.evidence
+        if not evidence or not evidence.birth_date \
+                or not evidence.birth_date.normalized:
+            return None
+        return evidence.birth_date.normalized
+
+    def _vote_target(self, group: RoutingGroup, signals) -> int | None:
+        """Index of the candidate every document in the group votes for."""
+        targets: list[int] = []
+        for document in group.documents:
+            target = self._document_target(document, signals)
+            if target is None:
+                return None
+            targets.append(target)
+        if targets and len(set(targets)) == 1:
+            return targets[0]
+        return None
+
+    def _document_target(self, document: StagedDocument, signals) -> int | None:
+        """Best candidate for one document, or None when ambiguous/weak."""
+        raw_text = _extract_document_text(document.original_path)
+        if not raw_text:
+            return None
+        words = set(normalize_text(raw_text).split())
+
+        best_score = 0
+        best_index = None
+        ambiguous = False
+        for index, surname, birth in signals:
+            score = 0
+            if surname and surname in words:
+                score += 2
+            if birth and _birth_date_in_text(raw_text, birth):
+                score += 3
+            if score == 0:
+                continue
+            if score > best_score:
+                best_score = score
+                best_index = index
+                ambiguous = False
+            elif score == best_score:
+                ambiguous = True
+        if ambiguous or best_score < 2:
+            return None
+        return best_index
