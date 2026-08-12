@@ -17,6 +17,214 @@ from ..models.document import DocumentType, DocumentRecord, ParsingStatus
 from ..config import active_workspace
 
 
+def guess_document_type(filename: str) -> str:
+    """Quick type guess based on filename."""
+    fn = filename.lower()
+    if any(k in fn for k in ["lab", "laboratorio", "esami", "analisi", "emocromo"]):
+        return DocumentType.LABORATORIO.value
+    if any(k in fn for k in ["tac", "rm", "rx", "eco", "radiologia", "mammo"]):
+        return DocumentType.RADIOLOGIA.value
+    if any(k in fn for k in ["visita", "ambulatori", "specialist", "onco"]):
+        return DocumentType.VISITA_SPECIALISTICA.value
+    if any(k in fn for k in ["dimissione", "lettera"]):
+        return DocumentType.LETTERA_DIMISSIONE.value
+    if any(k in fn for k in ["sdo"]):
+        return DocumentType.SDO.value
+    if any(k in fn for k in ["cartella", "ricovero", "clinica"]):
+        return DocumentType.CARTELLA_CLINICA.value
+    if any(k in fn for k in ["diario", "medico"]):
+        return DocumentType.DIARIO_MEDICO.value
+    if any(k in fn for k in ["terapi", "piano"]):
+        return DocumentType.PIANO_TERAPEUTICO.value
+    return DocumentType.NON_CLASSIFICATO.value
+
+
+def run_file_checks(services: dict, file_paths: list[str],
+                    file_metadata: dict[str, dict] | None = None) -> list[dict]:
+    """Run all file checks and return per-file metadata dictionaries.
+
+    Each entry mirrors what the import table shows: path, info, check (PDF
+    verify result), hash, duplicate flag, guessed type, status.
+    """
+    doc_repo = services.get("document_repo")
+    file_metadata = file_metadata or {}
+    checks = []
+    for fp in file_paths:
+        staged_metadata = file_metadata.get(str(fp), {})
+        info = get_file_info(fp)
+        if staged_metadata.get("original_name"):
+            info["filename"] = staged_metadata["original_name"]
+        if not is_supported_file(fp):
+            checks.append({"path": fp, "status": "Formato non supportato"})
+            continue
+
+        check = staged_metadata.get("check") or (
+            verify_pdf(fp) if info["extension"] == ".pdf" else {
+                "readable": True, "page_count": 1, "has_text": True,
+                "is_protected": False,
+            }
+        )
+
+        file_hash = staged_metadata.get("hash") or compute_file_hash(fp)
+
+        is_duplicate = False
+        if doc_repo:
+            is_duplicate = doc_repo.get_by_hash_global(file_hash) is not None
+
+        checks.append({
+            "path": fp,
+            "info": info,
+            "check": check,
+            "hash": file_hash,
+            "is_duplicate": is_duplicate,
+            "guessed_type": guess_document_type(info["filename"]),
+            "original_name": info["filename"],
+            "identity_evidence": staged_metadata.get("identity_evidence"),
+            "status": "Pronto" if not check.get("error") and not is_duplicate
+                      else "⚠️ " + check.get("error", "Duplicato"),
+        })
+    return checks
+
+
+def import_checked_documents(services: dict, patient_id: str,
+                             file_checks: list[dict], selected_indexes,
+                             status_callback=None,
+                             type_overrides: dict[int, str] | None = None
+                             ) -> list[str]:
+    """Copy the checked files into a patient workspace and create records.
+
+    Returns the imported document ids.  Duplicate files and unreadable ones
+    are skipped silently.  Raises on hard failures (workspace missing, copy
+    error, database error) so the caller can surface a message.
+    """
+    doc_repo = services.get("document_repo")
+    if not doc_repo:
+        raise RuntimeError("Repository documenti non disponibile.")
+
+    patient_repo = services.get("patient_repo")
+    if not patient_repo or not patient_repo.get_by_id(patient_id):
+        raise ValueError(
+            f"Il paziente {patient_id} non esiste nel registro.\n"
+            "Chiudi questa finestra, riapri il workspace e conferma il "
+            "suo recupero prima di importare i documenti."
+        )
+
+    workspace_dir = active_workspace.path / patient_id / "documents" / "original"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    type_overrides = type_overrides or {}
+    selected = set(selected_indexes)
+    imported: list[str] = []
+    for i, check_data in enumerate(file_checks):
+        if i not in selected or "hash" not in check_data:
+            continue
+
+        # Re-check here as well: an earlier row in the same batch may have
+        # inserted an identical file after the preview was built.
+        if doc_repo.get_by_hash_global(check_data["hash"]):
+            continue
+
+        doc_type = type_overrides.get(i) or check_data.get("guessed_type") \
+            or DocumentType.NON_CLASSIFICATO.value
+
+        src_path = check_data["path"]
+        dst_name = check_data.get("original_name") or os.path.basename(src_path)
+        dst_path = workspace_dir / dst_name
+        needs_copy = True
+
+        # Preserve both files when two different reports share a filename.
+        if dst_path.exists():
+            existing_hash = compute_file_hash(dst_path)
+            if existing_hash == check_data["hash"]:
+                needs_copy = False
+            else:
+                source_name = Path(dst_name)
+                dst_name = (
+                    f"{source_name.stem}__{check_data['hash'][:8]}"
+                    f"{source_name.suffix}"
+                )
+                dst_path = workspace_dir / dst_name
+                suffix = 2
+                while dst_path.exists():
+                    dst_name = (
+                        f"{source_name.stem}__{check_data['hash'][:8]}_{suffix}"
+                        f"{source_name.suffix}"
+                    )
+                    dst_path = workspace_dir / dst_name
+                    suffix += 1
+
+        copied_by_this_import = False
+        if needs_copy:
+            try:
+                shutil.copy2(src_path, dst_path)
+                copied_by_this_import = True
+            except OSError as exc:
+                if status_callback:
+                    status_callback(i, f"❌ Copia fallita: {exc}")
+                raise
+
+        doc_id = doc_repo.get_next_id()
+        identity_evidence = check_data.get("identity_evidence")
+        identity_metadata = None
+        if identity_evidence:
+            identity_metadata = {
+                "confidence": identity_evidence.confidence,
+                "method": identity_evidence.extraction_method,
+                "fields": sorted(identity_evidence.fields),
+            }
+        doc = DocumentRecord(
+            id=doc_id,
+            patient_id=patient_id,
+            filename=dst_name,
+            original_path=str(dst_path),
+            file_hash=check_data["hash"],
+            page_count=check_data["check"].get("page_count", 1),
+            document_date=None,  # Will be extracted later
+            document_type=doc_type,
+            parsing_status=ParsingStatus.PENDING.value,
+            metadata_json=(
+                json.dumps({"identity_assignment": identity_metadata})
+                if identity_metadata else None
+            ),
+        )
+        try:
+            doc_repo.insert(doc)
+        except Exception as exc:
+            # Roll back only a file created by this attempt. A pre-existing
+            # identical file may belong to a recoverable older workspace.
+            if copied_by_this_import:
+                try:
+                    dst_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if status_callback:
+                status_callback(i, f"❌ Database: {exc}")
+            raise
+
+        identity_repo = services.get("identity_repo")
+        if identity_repo and identity_evidence:
+            identity_repo.add_document_evidence(
+                doc_id, patient_id, identity_evidence
+            )
+            if identity_evidence.is_strong and not identity_repo.has_identity(
+                patient_id
+            ):
+                identity_repo.upsert(
+                    patient_id,
+                    identity_evidence,
+                    source_document_id=doc_id,
+                    status="import",
+                )
+        imported.append(doc_id)
+
+        audit_repo = services.get("audit_repo")
+        if audit_repo:
+            audit_repo.log(patient_id, "import", "document", doc_id,
+                           {"filename": dst_name, "hash": check_data["hash"]})
+
+    return imported
+
+
 class ImportDialog(QDialog):
     """Dialog showing import status for each file before processing."""
 
@@ -99,55 +307,28 @@ class ImportDialog(QDialog):
         layout.addLayout(bottom)
 
     def _run_checks(self):
-        """Run all file checks."""
-        doc_repo = self._services.get("document_repo")
-        self._table.setRowCount(len(self._file_paths))
+        """Run all file checks and populate the table."""
+        self._file_checks = run_file_checks(
+            self._services, self._file_paths, self._file_metadata
+        )
+        self._table.setRowCount(len(self._file_checks))
 
-        for i, fp in enumerate(self._file_paths):
-            staged_metadata = self._file_metadata.get(str(fp), {})
-            info = get_file_info(fp)
-            if staged_metadata.get("original_name"):
-                info["filename"] = staged_metadata["original_name"]
-            if not is_supported_file(fp):
-                self._file_checks.append({"path": fp, "status": "Formato non supportato"})
-                self._fill_row(i, fp, check={}, status="❌ Formato non supportato")
+        for i, check_data in enumerate(self._file_checks):
+            if "check" not in check_data:
+                self._fill_row(i, fp=check_data["path"], check={},
+                               status="❌ Formato non supportato")
                 continue
-
-            check = staged_metadata.get("check") or (
-                verify_pdf(fp) if info["extension"] == ".pdf" else {
-                "readable": True, "page_count": 1, "has_text": True, "is_protected": False
-                }
+            check = check_data["check"]
+            status = (
+                "✓ Pronto" if not check.get("error")
+                and not check_data["is_duplicate"]
+                else ("⚠️ Duplicato" if check_data["is_duplicate"]
+                      else f"⚠️ {check.get('error', '')}")
             )
-
-            file_hash = staged_metadata.get("hash") or compute_file_hash(fp)
-
-            # Check duplicate
-            is_duplicate = False
-            if doc_repo:
-                existing = doc_repo.get_by_hash_global(file_hash)
-                is_duplicate = existing is not None
-
-            # Guess document type
-            guessed_type = self._guess_document_type(info["filename"])
-
-            self._file_checks.append({
-                "path": fp,
-                "info": info,
-                "check": check,
-                "hash": file_hash,
-                "is_duplicate": is_duplicate,
-                "guessed_type": guessed_type,
-                "original_name": info["filename"],
-                "identity_evidence": staged_metadata.get("identity_evidence"),
-                "status": "Pronto" if not check.get("error") and not is_duplicate
-                          else "⚠️ " + check.get("error", "Duplicato"),
-            })
-
-            status = "✓ Pronto" if not check.get("error") and not is_duplicate else (
-                "⚠️ Duplicato" if is_duplicate else f"⚠️ {check.get('error', '')}"
+            self._fill_row(
+                i, check_data["path"], check, status,
+                check_data["is_duplicate"], check_data["guessed_type"],
             )
-
-            self._fill_row(i, fp, check, status, is_duplicate, guessed_type)
 
     def _fill_row(self, i: int, fp: str, check: dict, status: str,
                   is_duplicate: bool = False, guessed_type: str = ""):
@@ -183,27 +364,6 @@ class ImportDialog(QDialog):
         # Store full path
         self._table.item(i, 1).setData(Qt.UserRole, fp)
 
-    def _guess_document_type(self, filename: str) -> str:
-        """Quick type guess based on filename."""
-        fn = filename.lower()
-        if any(k in fn for k in ["lab", "laboratorio", "esami", "analisi", "emocromo"]):
-            return DocumentType.LABORATORIO.value
-        if any(k in fn for k in ["tac", "rm", "rx", "eco", "radiologia", "mammo"]):
-            return DocumentType.RADIOLOGIA.value
-        if any(k in fn for k in ["visita", "ambulatori", "specialist", "onco"]):
-            return DocumentType.VISITA_SPECIALISTICA.value
-        if any(k in fn for k in ["dimissione", "lettera"]):
-            return DocumentType.LETTERA_DIMISSIONE.value
-        if any(k in fn for k in ["sdo"]):
-            return DocumentType.SDO.value
-        if any(k in fn for k in ["cartella", "ricovero", "clinica"]):
-            return DocumentType.CARTELLA_CLINICA.value
-        if any(k in fn for k in ["diario", "medico"]):
-            return DocumentType.DIARIO_MEDICO.value
-        if any(k in fn for k in ["terapi", "piano"]):
-            return DocumentType.PIANO_TERAPEUTICO.value
-        return DocumentType.NON_CLASSIFICATO.value
-
     def _on_type_override(self, index):
         """Apply type override to all selected rows."""
         new_type = self._type_combo.currentData()
@@ -216,152 +376,53 @@ class ImportDialog(QDialog):
 
     def _on_import(self):
         """Copy files to workspace and create DocumentRecords."""
-        doc_repo = self._services.get("document_repo")
-        if not doc_repo:
-            QMessageBox.warning(self, "Errore", "Repository documenti non disponibile.")
-            return
-
-        # Never copy a file for an unregistered workspace: the documents table
-        # has a foreign key to patients and the copy would otherwise be left on
-        # disk when SQLite correctly rejects the record.
-        patient_repo = self._services.get("patient_repo")
-        if not patient_repo or not patient_repo.get_by_id(self._patient_id):
-            QMessageBox.critical(
-                self,
-                "Workspace non registrato",
-                f"Il paziente {self._patient_id} non esiste nel registro.\n"
-                "Chiudi questa finestra, riapri il workspace e conferma il "
-                "suo recupero prima di importare i documenti.",
-            )
-            return
-
-        workspace_dir = active_workspace.path / self._patient_id / "documents" / "original"
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-
-        imported = 0
-        for i, check_data in enumerate(self._file_checks):
+        selected = []
+        for i in range(len(self._file_checks)):
             chk = self._table.cellWidget(i, 0)
-            if not chk or not chk.isChecked():
-                continue
-
-            # Re-check here as well: an earlier row in the same batch may have
-            # inserted an identical file after the preview was built.
-            if doc_repo.get_by_hash_global(check_data["hash"]):
-                continue
-
-            # Get the type from the table (may have been overridden)
+            if chk and chk.isChecked():
+                selected.append(i)
+        type_overrides = {}
+        for i in range(len(self._file_checks)):
             type_item = self._table.item(i, 5)
-            doc_type = type_item.text() if type_item else DocumentType.NON_CLASSIFICATO.value
+            if type_item:
+                type_overrides[i] = type_item.text()
 
-            src_path = check_data["path"]
-            dst_name = check_data.get("original_name") or os.path.basename(src_path)
-            dst_path = workspace_dir / dst_name
-            needs_copy = True
-
-            # Preserve both files when two different reports share a filename.
-            if dst_path.exists():
-                existing_hash = compute_file_hash(dst_path)
-                if existing_hash == check_data["hash"]:
-                    needs_copy = False
-                else:
-                    source_name = Path(dst_name)
-                    dst_name = (
-                        f"{source_name.stem}__{check_data['hash'][:8]}"
-                        f"{source_name.suffix}"
-                    )
-                    dst_path = workspace_dir / dst_name
-                    suffix = 2
-                    while dst_path.exists():
-                        dst_name = (
-                            f"{source_name.stem}__{check_data['hash'][:8]}_{suffix}"
-                            f"{source_name.suffix}"
-                        )
-                        dst_path = workspace_dir / dst_name
-                        suffix += 1
-
-            # Copy file to workspace
-            copied_by_this_import = False
-            if needs_copy:
-                try:
-                    shutil.copy2(src_path, dst_path)
-                    copied_by_this_import = True
-                except OSError as exc:
-                    self._table.item(i, 6).setText(f"❌ Copia fallita: {exc}")
-                    QMessageBox.critical(
-                        self, "Errore di copia",
-                        f"Impossibile copiare {dst_name}:\n{exc}",
-                    )
-                    return
-
-            # Create document record
-            doc_id = doc_repo.get_next_id()
-            identity_evidence = check_data.get("identity_evidence")
-            identity_metadata = None
-            if identity_evidence:
-                identity_metadata = {
-                    "confidence": identity_evidence.confidence,
-                    "method": identity_evidence.extraction_method,
-                    "fields": sorted(identity_evidence.fields),
-                }
-            doc = DocumentRecord(
-                id=doc_id,
-                patient_id=self._patient_id,
-                filename=dst_name,
-                original_path=str(dst_path),
-                file_hash=check_data["hash"],
-                page_count=check_data["check"].get("page_count", 1),
-                document_date=None,  # Will be extracted later
-                document_type=doc_type,
-                parsing_status=ParsingStatus.PENDING.value,
-                metadata_json=(
-                    json.dumps({"identity_assignment": identity_metadata})
-                    if identity_metadata else None
-                ),
+        try:
+            self._imported_doc_ids = import_checked_documents(
+                self._services, self._patient_id, self._file_checks,
+                selected,
+                status_callback=self._set_row_status,
+                type_overrides=type_overrides,
             )
-            try:
-                doc_repo.insert(doc)
-            except Exception as exc:
-                # Roll back only a file created by this attempt. A pre-existing
-                # identical file may belong to a recoverable older workspace.
-                if copied_by_this_import:
-                    try:
-                        dst_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                self._table.item(i, 6).setText(f"❌ Database: {exc}")
-                QMessageBox.critical(
-                    self, "Importazione non riuscita",
-                    f"Il documento {dst_name} non è stato registrato.\n\n{exc}",
-                )
-                return
+        except ValueError as exc:
+            QMessageBox.critical(self, "Workspace non registrato", str(exc))
+            return
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Errore di copia",
+                f"Impossibile copiare i file:\n{exc}",
+            )
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Importazione non riuscita",
+                f"Il documento non è stato registrato.\n\n{exc}",
+            )
+            return
 
-            identity_repo = self._services.get("identity_repo")
-            if identity_repo and identity_evidence:
-                identity_repo.add_document_evidence(
-                    doc_id, self._patient_id, identity_evidence
-                )
-                if identity_evidence.is_strong and not identity_repo.has_identity(
-                    self._patient_id
-                ):
-                    identity_repo.upsert(
-                        self._patient_id,
-                        identity_evidence,
-                        source_document_id=doc_id,
-                        status="import",
-                    )
-            self._imported_doc_ids.append(doc_id)
-            imported += 1
-
-            # Log audit
-            audit_repo = self._services.get("audit_repo")
-            if audit_repo:
-                audit_repo.log(self._patient_id, "import", "document", doc_id,
-                               {"filename": dst_name, "hash": check_data["hash"]})
-
-        if imported > 0:
+        if self._imported_doc_ids:
             self.accept()
         else:
-            QMessageBox.information(self, "Nessun import", "Nessun file selezionato per l'importazione.")
+            QMessageBox.information(
+                self, "Nessun import",
+                "Nessun file selezionato per l'importazione.",
+            )
+
+    def _set_row_status(self, index: int, message: str):
+        """Update the status cell of a row (used as import callback)."""
+        item = self._table.item(index, 6)
+        if item:
+            item.setText(message)
 
     def should_auto_process(self) -> bool:
         """Whether the user wants to auto-process after import."""

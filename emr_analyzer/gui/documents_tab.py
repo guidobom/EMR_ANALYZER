@@ -298,11 +298,15 @@ class DocumentsTab(QWidget):
         if files:
             self.import_requested.emit(files)
 
-    def extract_clinical_text(self, doc_ids=None):
+    def extract_clinical_text(self, doc_ids=None, progress=None,
+                              patient_label=None):
         """Run the complete clinical-text pipeline for unprocessed documents.
 
         This is the shared entry point used both by the visible button and by
-        "Elabora automaticamente dopo l'importazione".
+        the extraction queue.  When *progress* is None a single ProgressDialog
+        is created and reused for both phases (the two phases never stack two
+        dialogs); when a shared dialog is passed (extraction queue) it is
+        reused and *patient_label* sets its title.
 
         Two phases so the configured parallel workers are actually used for
         the GPU-bound LLM step:
@@ -310,6 +314,9 @@ class DocumentsTab(QWidget):
              (CPU-bound, sequential, fast);
           2. LLM isolation over every parsed document, in parallel.
         """
+        from PyQt5.QtWidgets import QApplication
+        from .progress_dialog import ProgressDialog
+
         doc_repo = self._services.get("document_repo")
         if not doc_repo or not self._current_patient_id:
             return
@@ -334,13 +341,20 @@ class DocumentsTab(QWidget):
             else:
                 to_parse.append(doc.id)
 
+        if progress is None:
+            progress = ProgressDialog("Estrazione testo clinico", self.window())
+            progress.show()
+            QApplication.processEvents()
+        if patient_label:
+            progress.setWindowTitle(patient_label)
+
         if to_parse:
             # Phase 1 (CPU): parse + classify + lab, no LLM.
-            self._process_documents(to_parse, parse_only=True)
+            self._process_documents(to_parse, parse_only=True, progress=progress)
         llm_ids = parsed + to_parse
         if llm_ids:
             # Phase 2 (GPU): parallel LLM isolation over every parsed document.
-            self._process_documents(llm_ids, llm_only=True)
+            self._process_documents(llm_ids, llm_only=True, progress=progress)
 
     def _get_selected_doc_ids(self) -> list[str]:
         rows = set()
@@ -351,14 +365,20 @@ class DocumentsTab(QWidget):
 
     def _process_documents(self, doc_ids: list[str],
                            parse_only: bool = False,
-                           llm_only: bool = False):
+                           llm_only: bool = False,
+                           progress=None):
         """
         Run the processing pipeline.
 
         parse_only=True:  pdfplumber + classification + lab (NO LLM)
         llm_only=True:    normalized clinical text from already-parsed docs
         both False:       full pipeline (parse + LLM)
+
+        *progress* is an optional shared ProgressDialog (used by the extraction
+        queue).  When given it is reset and reused; when None a fresh dialog is
+        created for the phase.
         """
+        from PyQt5.QtWidgets import QApplication
         from .progress_dialog import ProgressDialog
 
         self._consecutive_llm_errors = 0
@@ -393,15 +413,22 @@ class DocumentsTab(QWidget):
             self._process_documents_parallel(
                 doc_ids, num_workers,
                 parse_only=parse_only, llm_only=llm_only,
+                progress=progress,
             )
             return
 
         if llm_only:
-            progress = ProgressDialog("Isolamento testo clinico", self.window())
+            if progress is None:
+                progress = ProgressDialog(
+                    "Isolamento testo clinico", self.window()
+                )
+                progress.show()
+                QApplication.processEvents()
+            else:
+                progress.reset_for_reuse()
             progress.set_progress(
                 0, f"Normalizzazione LLM di {len(doc_ids)} documento/i..."
             )
-            progress.show()
             self._process_next_document(doc_ids, 0, progress, None,
                                         parse_only=False, llm_only=True)
             return
@@ -415,11 +442,15 @@ class DocumentsTab(QWidget):
         title = (
             "Parsing Documenti" if parse_only else "Estrazione testo clinico"
         )
-        progress = ProgressDialog(title, self.window())
+        if progress is None:
+            progress = ProgressDialog(title, self.window())
+            progress.show()
+            QApplication.processEvents()
+        else:
+            progress.reset_for_reuse()
         progress.set_progress(
             0, f"Estrazione del testo clinico da {len(doc_ids)} documento/i..."
         )
-        progress.show()
 
         self._process_next_document(doc_ids, 0, progress, converter,
                                     parse_only=parse_only, llm_only=False)
@@ -427,11 +458,15 @@ class DocumentsTab(QWidget):
     def _process_documents_parallel(self, doc_ids: list[str],
                                      num_workers: int,
                                      parse_only: bool = False,
-                                     llm_only: bool = False):
+                                     llm_only: bool = False,
+                                     progress=None):
         """Run LLM isolation on multiple already-parsed documents in parallel.
 
         For new documents (llm_only=False), falls back to the standard
         sequential pipeline which handles parsing + LLM per document.
+
+        *progress* is an optional shared ProgressDialog (used by the extraction
+        queue); when given it is reset and reused instead of creating a new one.
         """
         import time
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -459,14 +494,17 @@ class DocumentsTab(QWidget):
         # ---- Parallel LLM isolation ------------------------------------
         t0 = time.monotonic()
         actual_workers = min(num_workers, total)
-        progress = ProgressDialog(
-            f"Estrazione parallela ({actual_workers} worker)", self.window()
-        )
+        if progress is None:
+            progress = ProgressDialog(
+                f"Estrazione parallela ({actual_workers} worker)", self.window()
+            )
+            progress.show()
+        else:
+            progress.reset_for_reuse()
         progress.set_progress(
             50 if not llm_only else 0,
             f"LLM su {total} documenti con {actual_workers} worker...",
         )
-        progress.show()
         QApplication.processEvents()
 
         completed = 0
@@ -547,13 +585,7 @@ class DocumentsTab(QWidget):
                 f"RIEPILOGO: {self._batch_success_count} riusciti, "
                 f"{self._batch_error_count} falliti"
             )
-            progress._cancel_btn.setText("Chiudi")
-            if hasattr(progress._cancel_btn, 'clicked'):
-                try:
-                    progress._cancel_btn.clicked.disconnect()
-                except TypeError:
-                    pass
-                progress._cancel_btn.clicked.connect(progress.accept)
+            progress.mark_done()
             self._refresh_table()
             self.processing_complete.emit(self._current_patient_id)
             return
@@ -908,12 +940,7 @@ class DocumentsTab(QWidget):
         )
         progress.add_log(f"❌ {message}")
         progress.set_progress(100, message)
-        progress._cancel_btn.setText("Chiudi")
-        try:
-            progress._cancel_btn.clicked.disconnect()
-        except TypeError:
-            pass
-        progress._cancel_btn.clicked.connect(progress.accept)
+        progress.mark_done()
         self._refresh_table()
         self.processing_complete.emit(self._current_patient_id)
 

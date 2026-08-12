@@ -62,6 +62,26 @@ class ProgressDialog(QDialog):
         self._status_label.setText("Annullamento richiesto...")
         self.cancelled.emit()
 
+    def reset_for_reuse(self):
+        """Prepare the dialog for another phase/patient: re-enable Cancel."""
+        self._cancelled = False
+        self._cancel_btn.setText("Annulla")
+        self._cancel_btn.setEnabled(True)
+        try:
+            self._cancel_btn.clicked.disconnect()
+        except TypeError:
+            pass
+        self._cancel_btn.clicked.connect(self._on_cancel)
+
+    def mark_done(self):
+        """Turn the Cancel button into a Close button at the end."""
+        self._cancel_btn.setText("Chiudi")
+        try:
+            self._cancel_btn.clicked.disconnect()
+        except TypeError:
+            pass
+        self._cancel_btn.clicked.connect(self.accept)
+
     def is_cancelled(self) -> bool:
         return self._cancelled
 

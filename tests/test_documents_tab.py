@@ -115,7 +115,7 @@ class DocumentsTabTest(unittest.TestCase):
         tab.load_patient("P001")
         observed = []
         tab._process_documents = lambda ids, **kwargs: observed.append(
-            (ids, kwargs)
+            (ids, {k: v for k, v in kwargs.items() if k != "progress"})
         )
 
         self.assertEqual(
@@ -204,6 +204,87 @@ class DocumentsTabTest(unittest.TestCase):
         self.assertEqual(values, sorted(values))
         self.assertGreater(values[-1], values[0])
         self.assertLess(values[-1], 100)
+
+    def test_extract_clinical_text_reuses_shared_progress(self):
+        """A shared progress dialog is passed through to both phases."""
+        pending = DocumentRecord(
+            id="DOC_000021", patient_id="P001", filename="pending.pdf",
+            original_path="/nonexistent/pending.pdf", file_hash="pending",
+        )
+        repository = _DocumentRepository([pending])
+        tab = DocumentsTab()
+        tab.set_services({"document_repo": repository})
+        tab.load_patient("P001")
+
+        class _SharedProgress:
+            def __init__(self):
+                self.titles = []
+
+            def setWindowTitle(self, title):
+                self.titles.append(title)
+
+        progress = _SharedProgress()
+        observed = []
+        tab._process_documents = lambda ids, **kwargs: observed.append(
+            (ids, kwargs.get("progress"))
+        )
+
+        tab.extract_clinical_text(
+            progress=progress, patient_label="Paziente 1/2: P001"
+        )
+
+        self.assertEqual(
+            [ids for ids, _ in observed],
+            [["DOC_000021"], ["DOC_000021"]],
+        )
+        self.assertEqual([p for _, p in observed], [progress, progress])
+        self.assertEqual(progress.titles, ["Paziente 1/2: P001"])
+        tab.deleteLater()
+
+    def test_extract_clinical_text_creates_single_dialog_when_none(self):
+        """With progress=None only one dialog is created and reused by both
+        phases (fix for the two stacked dialogs)."""
+        pending = DocumentRecord(
+            id="DOC_000022", patient_id="P001", filename="pending.pdf",
+            original_path="/nonexistent/pending.pdf", file_hash="pending",
+        )
+        repository = _DocumentRepository([pending])
+        tab = DocumentsTab()
+        tab.set_services({"document_repo": repository})
+        tab.load_patient("P001")
+
+        import emr_analyzer.gui.progress_dialog as progress_module
+
+        class _FakeProgressDialog:
+            instances = []
+
+            def __init__(self, title="", parent=None):
+                self.title = title
+                _FakeProgressDialog.instances.append(self)
+
+            def show(self):
+                pass
+
+            def setWindowTitle(self, title):
+                pass
+
+        _FakeProgressDialog.instances = []
+        original = progress_module.ProgressDialog
+        progress_module.ProgressDialog = _FakeProgressDialog
+        observed = []
+        tab._process_documents = lambda ids, **kwargs: observed.append(
+            kwargs.get("progress")
+        )
+        try:
+            tab.extract_clinical_text()
+        finally:
+            progress_module.ProgressDialog = original
+
+        self.assertEqual(len(_FakeProgressDialog.instances), 1)
+        self.assertEqual(len(observed), 2)
+        self.assertIs(observed[0], _FakeProgressDialog.instances[0])
+        self.assertIs(observed[1], _FakeProgressDialog.instances[0])
+        tab.deleteLater()
 
     def test_run_llm_extraction_tolerates_none_progress(self):
         """Parallel LLM workers pass progress=None; internal logs swallowed."""

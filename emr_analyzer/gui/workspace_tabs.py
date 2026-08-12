@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PyQt5.QtWidgets import (
-    QTabWidget, QWidget, QVBoxLayout, QLabel, QMessageBox,
+    QTabWidget, QWidget, QVBoxLayout, QLabel, QMessageBox, QApplication,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
@@ -14,8 +14,9 @@ from .laboratory_tab import LaboratoryTab
 from .clinical_history_tab import ClinicalHistoryTab
 from .validation_tab import ValidationTab
 from .import_dialog import ImportDialog
+from .batch_import_dialog import BatchImportDialog
+from .progress_dialog import ProgressDialog
 from ..models import Patient
-from .import_dialog import ImportDialog
 
 
 class WorkspaceTabs(QTabWidget):
@@ -190,31 +191,83 @@ class WorkspaceTabs(QTabWidget):
         imported_any = False
         last_patient_id = self._current_patient_id
 
-        for pid, pfiles in patient_files.items():
-            if pid != self._current_patient_id:
-                self.load_patient(pid)
-            try:
-                import_dialog = ImportDialog(
-                    file_paths=pfiles,
-                    services=self._services,
-                    patient_id=pid,
-                    parent=self,
-                )
-                if import_dialog.exec_() == ImportDialog.Accepted:
+        if len(patient_files) > 1:
+            # Multi-patient: one window lists every workspace with a checkbox
+            # and expandable per-file detail; then a single sequential queue
+            # runs the extraction for the checked patients without further
+            # prompts between them.
+            batch_dialog = BatchImportDialog(
+                patient_files, self._services, parent=self,
+            )
+            if batch_dialog.exec_() == BatchImportDialog.Accepted:
+                if batch_dialog.should_run_queue:
+                    self.run_extraction_queue(batch_dialog.queue_patient_ids)
+                elif batch_dialog.imported_by_patient:
                     imported_any = True
-                    last_patient_id = pid
-                    if import_dialog.should_auto_process():
-                        self._documents_tab.extract_clinical_text(
-                            import_dialog.get_imported_doc_ids()
-                        )
-            except Exception as e:
-                QMessageBox.warning(
-                    self, "Errore importazione",
-                    f"Errore durante l'importazione per {pid}:\n{e}"
-                )
+                    last_patient_id = list(batch_dialog.imported_by_patient)[-1]
+        else:
+            for pid, pfiles in patient_files.items():
+                if pid != self._current_patient_id:
+                    self.load_patient(pid)
+                try:
+                    import_dialog = ImportDialog(
+                        file_paths=pfiles,
+                        services=self._services,
+                        patient_id=pid,
+                        parent=self,
+                    )
+                    if import_dialog.exec_() == ImportDialog.Accepted:
+                        imported_any = True
+                        last_patient_id = pid
+                        if import_dialog.should_auto_process():
+                            self._documents_tab.extract_clinical_text(
+                                import_dialog.get_imported_doc_ids()
+                            )
+                except Exception as e:
+                    QMessageBox.warning(
+                        self, "Errore importazione",
+                        f"Errore durante l'importazione per {pid}:\n{e}"
+                    )
 
         if imported_any and last_patient_id:
             self.load_patient(last_patient_id)
+
+    def run_extraction_queue(self, patient_ids: list[str]):
+        """Run the clinical-text extraction sequentially over several patients.
+
+        A single shared ProgressDialog is reused across patients: its title
+        shows the current patient (i/N) and the queue stops between patients
+        when the user cancels.  No confirmation is required between patients.
+        """
+        if not patient_ids:
+            return
+
+        total = len(patient_ids)
+        progress = ProgressDialog(
+            f"Coda di estrazione — paziente 1/{total}", parent=self,
+        )
+        progress.show()
+        QApplication.processEvents()
+
+        for idx, pid in enumerate(patient_ids, start=1):
+            if progress.is_cancelled():
+                break
+            progress.reset_for_reuse()
+            progress.setWindowTitle(
+                f"Coda di estrazione — paziente {idx}/{total}"
+            )
+            progress.add_log(f"\n===== Paziente {idx}/{total}: {pid} =====")
+            self.load_patient(pid)
+            try:
+                self._documents_tab.extract_clinical_text(
+                    progress=progress,
+                    patient_label=f"Paziente {idx}/{total}: {pid}",
+                )
+            except Exception as exc:
+                progress.add_log(f"❌ Errore per {pid}: {exc}")
+
+        progress.mark_done()
+        progress.exec_()
 
     def _on_document_selected(self, doc_id: str, doc_data: dict):
         self._current_document_id = doc_id
