@@ -8,6 +8,10 @@ from ..config import OLLAMA_BASE_URL, DEFAULT_LLM_MODEL_NAME, OLLAMA_CONTEXT_LEN
 from ..config import OFFLINE_MODE
 from ..settings import LLMRoleConfig
 from ..security.offline import require_loopback_url
+from .golden_fewshot import (
+    DISCHARGE_ALLOWED_CATEGORIES,
+    format_examples_section,
+)
 
 
 class LlmClient:
@@ -571,6 +575,8 @@ TESTO:
         registry_summary: str,
         document_date: str | None = None,
         max_text_chars: int | None = None,
+        *,
+        golden_examples: list[dict] | None = None,
     ) -> dict:
         """Extract clinical timeline entries from one normalized document.
 
@@ -581,6 +587,9 @@ TESTO:
         The *max_text_chars* parameter controls how much text is sent to the
         LLM.  When ``None`` (default), a budget is computed from the model's
         ``context_length`` so the full prompt fits in the context window.
+
+        *golden_examples* are user-confirmed entries from OTHER patients,
+        injected as few-shot style references in the prompt.
         """
         system_prompt = (
             "Sei un assistente clinico specializzato nell'estrazione di "
@@ -601,12 +610,16 @@ TESTO:
         if max_text_chars is None:
             max_text_chars = self._compute_text_budget()
 
+        golden_section = format_examples_section(golden_examples)
+
         user_prompt = f"""Analizza il seguente testo clinico ed estrai le osservazioni clinicamente rilevanti.
 
 {doc_date_info}
 
 REGISTRO CLINICO ATTUALE (per contesto — NON ri-estrarre osservazioni già presenti):
 {registry_summary if registry_summary else "(Nessuna informazione pregressa registrata)"}
+
+{golden_section}
 
 REGOLE GENERALI:
 1. Estrai SOLO informazioni esplicitamente presenti nel testo. Non dedurre, non interpretare.
@@ -682,6 +695,8 @@ TESTO DA ANALIZZARE:
         document_date: str | None = None,
         registry_summary: str = "",
         max_text_chars: int = 50000,
+        *,
+        golden_examples: list[dict] | None = None,
     ) -> dict:
         """Extract clinical events from a pre-acute discharge letter.
 
@@ -689,6 +704,10 @@ TESTO DA ANALIZZARE:
         an Italian discharge letter from a post-acute / rehabilitation ward:
         admission diagnosis, clinical course, therapies, consultations,
         adverse events, discharge outcome, and follow-up plan.
+
+        *golden_examples* are user-confirmed entries from OTHER patients,
+        injected as few-shot style references (filtered to the discharge
+        category set).
 
         Returns a dict with key ``"entries"`` containing timeline-ready dicts.
         """
@@ -710,12 +729,19 @@ TESTO DA ANALIZZARE:
             "```json ... ```, senza altro testo."
         )
 
+        golden_section = format_examples_section(
+            golden_examples,
+            allowed_categories=DISCHARGE_ALLOWED_CATEGORIES,
+        )
+
         user_prompt = f"""Analizza la seguente LETTERA DI DIMISSIONE ed estrai gli eventi clinicamente rilevanti.
 
 {doc_date_info}
 
 REGISTRO CLINICO ATTUALE (per contesto — NON ri-estrarre osservazioni già presenti):
 {registry_summary if registry_summary else "(Nessuna informazione pregressa registrata)"}
+
+{golden_section}
 
 STRUTTURA TIPICA DI UNA LETTERA DI DIMISSIONE PRE-ACUTI:
 1. Diagnosi di ingresso e diagnosi alla dimissione

@@ -13,7 +13,11 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from ..config import active_workspace
+from ..config import (
+    active_workspace,
+    GOLDEN_FEWSHOT_ENABLED,
+    GOLDEN_FEWSHOT_MAX_EXAMPLES,
+)
 from ..models.clinical_timeline import ClinicalTimelineEntry
 
 
@@ -58,6 +62,10 @@ class ClinicalHistoryBuilder:
                 "Configuralo in Strumenti → Configura LLM."
             )
 
+        # Few-shot style examples from the golden set (OTHER patients),
+        # fetched once for the whole run.
+        golden_examples = self._load_golden_examples(patient_id)
+
         # ---- 1. Load normalized texts sorted by document date ----------
         normalized_docs = self._load_normalized_docs(patient_id)
         if not normalized_docs:
@@ -92,7 +100,9 @@ class ClinicalHistoryBuilder:
 
             registry_summary = self._format_registry_context(registry_entries)
 
-            result = self._extract_for_document(ndoc, registry_summary)
+            result = self._extract_for_document(
+                ndoc, registry_summary, golden_examples
+            )
 
             doc_entry_count = 0
             for entry_data in result.get("entries", []):
@@ -208,6 +218,9 @@ class ClinicalHistoryBuilder:
         for e in existing_entries:
             existing_ids.update(e.source_document_ids)
 
+        # Few-shot style examples from the golden set (OTHER patients).
+        golden_examples = self._load_golden_examples(patient_id)
+
         # ---- 2. Load only NEW normalized texts ---------------------------
         all_docs = self._load_normalized_docs(patient_id)
         new_docs = [d for d in all_docs if d["doc_id"] not in existing_ids]
@@ -244,7 +257,9 @@ class ClinicalHistoryBuilder:
                     f"({total_all - total_new} saltati)",
                 )
 
-            result = self._extract_for_document(ndoc, "")
+            result = self._extract_for_document(
+                ndoc, "", golden_examples
+            )
 
             for entry_data in result.get("entries", []):
                 entry_id = f"CTL_{next(_id_seq):06d}"
@@ -356,6 +371,11 @@ class ClinicalHistoryBuilder:
                 "Configuralo in Strumenti → Configura LLM."
             )
 
+        # Few-shot style examples from the golden set (OTHER patients).
+        # Fetched once before the pool and only read by the workers
+        # (a plain list of dicts — thread-safe).
+        golden_examples = self._load_golden_examples(patient_id)
+
         # ---- 1. Load normalized texts ------------------------------------
         normalized_docs = self._load_normalized_docs(patient_id)
         if not normalized_docs:
@@ -394,7 +414,9 @@ class ClinicalHistoryBuilder:
 
         def _extract_one(ndoc: dict) -> tuple[str, list[dict], str | None]:
             """Extract entries from a single document (no registry context)."""
-            result = self._extract_for_document(ndoc, "")
+            result = self._extract_for_document(
+                ndoc, "", golden_examples
+            )
             return ndoc["doc_id"], result.get("entries", []), None
 
         with ThreadPoolExecutor(max_workers=actual_workers) as executor:
@@ -947,12 +969,16 @@ OSSERVAZIONI CLINICHE:
         self,
         ndoc: dict,
         registry_summary: str,
+        golden_examples: Optional[list[dict]] = None,
     ) -> dict:
         """Route to the best extraction method based on document type.
 
         Discharge letters from pre-acute / post-acute wards get a
         specialised prompt that understands their clinical structure.
         All other documents use the generic timeline extractor.
+
+        *golden_examples* are passed as keyword arguments because the two
+        LLM methods use a different positional argument order.
         """
         from ..pipeline.classifier import DocumentClassifier
 
@@ -966,6 +992,7 @@ OSSERVAZIONI CLINICHE:
                 ndoc["text"],
                 ndoc.get("document_date"),
                 registry_summary,
+                golden_examples=golden_examples,
             )
         elif is_discharge:
             # Standard discharge letter — still benefits from the
@@ -974,12 +1001,14 @@ OSSERVAZIONI CLINICHE:
                 ndoc["text"],
                 ndoc.get("document_date"),
                 registry_summary,
+                golden_examples=golden_examples,
             )
         else:
             return self._llm.extract_timeline_entries(
                 ndoc["text"],
                 registry_summary,
                 ndoc.get("document_date"),
+                golden_examples=golden_examples,
             )
 
     @staticmethod
@@ -1008,3 +1037,25 @@ OSSERVAZIONI CLINICHE:
                 f"{e.get('description', '')}"
             )
         return "\n".join(lines)
+
+    def _load_golden_examples(self, patient_id: str) -> list[dict]:
+        """Golden few-shot examples for the extraction prompt.
+
+        Returns user-confirmed timeline entries from OTHER patients (the
+        current patient's own confirmations are excluded) capped at
+        ``GOLDEN_FEWSHOT_MAX_EXAMPLES``. Must never block the extraction:
+        any failure — missing repo, disabled toggle, DB error — yields ``[]``.
+        """
+        if not GOLDEN_FEWSHOT_ENABLED:
+            return []
+        if self._timeline_repo is None:
+            return []
+        try:
+            from ..extraction.golden_fewshot import select_examples
+
+            golden = self._timeline_repo.get_golden()
+            return select_examples(
+                golden, patient_id, GOLDEN_FEWSHOT_MAX_EXAMPLES
+            )
+        except Exception:
+            return []

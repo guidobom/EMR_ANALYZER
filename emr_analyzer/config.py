@@ -4,13 +4,21 @@ from pathlib import Path
 
 # --- Application paths ---
 APP_NAME = "EMR Analyzer"
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.5.0"
 OFFLINE_MODE = True
 # Verify each document's workspace attribution with the LLM before its
 # clinical text is normalized. The check runs on the pre-anonymization
 # text and blocks extraction of a document whose LLM identity points to a
 # different workspace. Set to False to skip the per-document identity call.
 ATTRIBUTION_VERIFICATION_ENABLED = True
+# Inietta nel prompt di estrazione un few-shot di voci canoniche tratte dalle
+# voci timeline golden (confermate dall'utente) di ALTRI pazienti, così le
+# nuove estrazioni replicano lo stile di descrizione confermato. Gli esempi
+# sono contenuti clinici de-identificati già presenti nel DB locale.
+# False disabilita la lettura DB e la sezione nel prompt.
+GOLDEN_FEWSHOT_ENABLED = True
+# Numero massimo di esempi golden iniettati in un singolo prompt di estrazione.
+GOLDEN_FEWSHOT_MAX_EXAMPLES = 10
 BASE_DIR = Path.home() / ".emr_analyzer"
 _workspace_path: Path = BASE_DIR / "workspaces"
 
