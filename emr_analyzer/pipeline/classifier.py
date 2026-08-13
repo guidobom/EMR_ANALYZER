@@ -28,14 +28,6 @@ class DocumentClassifier:
         """
         header_metadata = header_metadata or {}
 
-        # An explicit performance listed in the first-page header is more
-        # authoritative than diagnoses mentioned in the body. For example,
-        # an oncological history must not turn a cardiology visit into an
-        # oncology visit.
-        header_hint = header_metadata.get("document_type_hint")
-        if header_hint in {item.value for item in DocumentType}:
-            return header_hint
-
         header_text = "\n".join(
             str(value)
             for value in (
@@ -49,8 +41,21 @@ class DocumentClassifier:
         combined_text = (
             f"{header_text}\n{text}" if header_text else text
         )
+
+        # A document that is structurally a dedicated lab result sheet wins
+        # over a "VISITA DI CONTROLLO" header hint — otherwise the lab parser
+        # never runs on the values. The detector is conservative: it backs
+        # off on discharge letters, clinical charts, and specialist visits.
         if self._looks_like_lab_result_sheet(combined_text):
             return DocumentType.LABORATORIO.value
+
+        # An explicit performance listed in the first-page header is more
+        # authoritative than diagnoses mentioned in the body. For example,
+        # an oncological history must not turn a cardiology visit into an
+        # oncology visit.
+        header_hint = header_metadata.get("document_type_hint")
+        if header_hint in {item.value for item in DocumentType}:
+            return header_hint
 
         # Accumulate weighted scores from every signal source.
         scores: dict[str, float] = {}

@@ -23,8 +23,9 @@ class TimelineRepository:
             """INSERT OR REPLACE INTO clinical_timeline
                (entry_id, patient_id, date_observed, date_resolved, category,
                 description, source_document_ids, source_texts,
-                merged_into_ids, status, confidence, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                merged_into_ids, status, confidence, is_golden,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     e.entry_id, e.patient_id, e.date_observed, e.date_resolved,
@@ -32,7 +33,8 @@ class TimelineRepository:
                     json.dumps(e.source_document_ids, ensure_ascii=False),
                     json.dumps(e.source_texts, ensure_ascii=False),
                     json.dumps(e.merged_into_ids, ensure_ascii=False),
-                    e.status, e.confidence, e.created_at or now, now,
+                    e.status, e.confidence, e.is_golden,
+                    e.created_at or now, now,
                 )
                 for e in entries
             ],
@@ -71,8 +73,8 @@ class TimelineRepository:
                        (entry_id, patient_id, date_observed, date_resolved,
                         category, description, source_document_ids,
                         source_texts, merged_into_ids, status, confidence,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        is_golden, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     [
                         (
                             e.entry_id, e.patient_id, e.date_observed,
@@ -80,7 +82,8 @@ class TimelineRepository:
                             json.dumps(e.source_document_ids, ensure_ascii=False),
                             json.dumps(e.source_texts, ensure_ascii=False),
                             json.dumps(e.merged_into_ids, ensure_ascii=False),
-                            e.status, e.confidence, e.created_at or now, now,
+                            e.status, e.confidence, e.is_golden,
+                            e.created_at or now, now,
                         )
                         for e in entries
                     ],
@@ -98,6 +101,50 @@ class TimelineRepository:
         """Delete a single timeline entry by its ID."""
         self.db.execute(
             "DELETE FROM clinical_timeline WHERE entry_id=?", (entry_id,)
+        )
+        self.db.commit()
+
+    def get_golden(
+        self, patient_id: Optional[str] = None
+    ) -> list[ClinicalTimelineEntry]:
+        """Return the user-confirmed golden entries, optionally scoped to a
+        single patient."""
+        if patient_id is not None:
+            cursor = self.db.execute(
+                """SELECT * FROM clinical_timeline
+                   WHERE is_golden=1 AND patient_id=?
+                   ORDER BY date_observed ASC, entry_id ASC""",
+                (patient_id,),
+            )
+        else:
+            cursor = self.db.execute(
+                """SELECT * FROM clinical_timeline
+                   WHERE is_golden=1
+                   ORDER BY patient_id ASC, date_observed ASC, entry_id ASC"""
+            )
+        return [self._row_to_entry(r) for r in cursor.fetchall()]
+
+    def set_golden(self, entry_id: str, is_golden: bool) -> None:
+        """Mark a timeline entry as user-confirmed golden (or unmark it)."""
+        now = datetime.now().isoformat()
+        self.db.execute(
+            "UPDATE clinical_timeline SET is_golden=?, updated_at=? "
+            "WHERE entry_id=?",
+            (1 if is_golden else 0, now, entry_id),
+        )
+        self.db.commit()
+
+    def update_description(self, entry_id: str, description: str) -> None:
+        """Set a user-edited canonical description.
+
+        Editing a description implies a human confirmation, so the entry is
+        also marked as golden.
+        """
+        now = datetime.now().isoformat()
+        self.db.execute(
+            "UPDATE clinical_timeline SET description=?, is_golden=1, "
+            "updated_at=? WHERE entry_id=?",
+            (description, now, entry_id),
         )
         self.db.commit()
 
@@ -127,6 +174,7 @@ class TimelineRepository:
             merged_into_ids=json.loads(row["merged_into_ids"] or "[]"),
             status=row["status"],
             confidence=row["confidence"] or 0.5,
+            is_golden=row["is_golden"] or 0,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

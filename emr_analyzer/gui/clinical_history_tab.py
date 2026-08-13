@@ -7,8 +7,10 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
     QTreeWidget, QTreeWidgetItem, QComboBox, QLabel, QSplitter,
     QMessageBox, QProgressBar, QFileDialog, QMenu, QAction,
+    QInputDialog,
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor
 
 from ..models.clinical_timeline import CATEGORY_LABELS
 
@@ -177,6 +179,15 @@ class ClinicalHistoryTab(QWidget):
         self._export_btn.clicked.connect(self._on_export)
         bottom_layout.addWidget(self._export_btn)
 
+        self._golden_export_btn = QPushButton("⭐ Esporta golden set")
+        self._golden_export_btn.setToolTip(
+            "Esporta le voci confermate dall'utente, le decisioni di "
+            "validazione risolte e i valori di laboratorio validati come "
+            "golden set per la valutazione dei prompt LLM."
+        )
+        self._golden_export_btn.clicked.connect(self._on_export_golden_set)
+        bottom_layout.addWidget(self._golden_export_btn)
+
         bottom_layout.addStretch()
 
         self._clear_narrative_btn = QPushButton("🗑️ Elimina Profilo")
@@ -298,17 +309,31 @@ class ClinicalHistoryTab(QWidget):
                 f"{cat_icon} {cat_label}",
                 e.description,
             ])
+            child.setData(0, Qt.UserRole, e.entry_id)
+            child.setData(0, Qt.UserRole + 1, e.is_golden)
 
-            if e.status == "superseded":
-                for col in range(3):
-                    child.setForeground(col, Qt.gray)
-
+            tooltip = ""
             if e.source_texts:
                 tooltip = "\n---\n".join(e.source_texts[:3])
                 child.setToolTip(2, tooltip)
 
-            # Color-code confidence
-            if e.confidence < 0.6:
+            if e.is_golden:
+                # User-confirmed entry — the gold highlight wins over the
+                # other color codes below.
+                child.setText(0, f"⭐ {date_text}")
+                child.setToolTip(
+                    2,
+                    (f"{tooltip}\n\n" if tooltip else "")
+                    + "Confermata dall'utente (golden set)",
+                )
+                gold = QColor(0x9A, 0x6A, 0x00)  # dark goldenrod
+                for col in range(3):
+                    child.setForeground(col, gold)
+            elif e.status == "superseded":
+                for col in range(3):
+                    child.setForeground(col, Qt.gray)
+            elif e.confidence < 0.6:
+                # Color-code confidence
                 child.setForeground(0, Qt.darkYellow)
                 child.setForeground(1, Qt.darkYellow)
                 child.setForeground(2, Qt.darkYellow)
@@ -339,17 +364,43 @@ class ClinicalHistoryTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_tree_context_menu(self, pos):
-        """Right-click menu to delete a single timeline entry."""
+        """Right-click menu to confirm, edit or delete a timeline entry."""
         item = self._tree.itemAt(pos)
         if not item:
             return
 
-        entry_date = item.text(0)
-        entry_desc = item.text(2)
-        if not entry_desc:
+        entry_id = item.data(0, Qt.UserRole)
+        if not entry_id:
             return
+        is_golden = bool(item.data(0, Qt.UserRole + 1))
 
         menu = QMenu(self)
+
+        if is_golden:
+            confirm_action = QAction("⭐ Rimuovi conferma golden", self)
+        else:
+            confirm_action = QAction("⭐ Conferma come golden", self)
+        confirm_action.setToolTip(
+            "Marca la voce come confermata dall'utente: entra nel golden "
+            "set usato per valutare i prompt di estrazione."
+        )
+        confirm_action.triggered.connect(
+            lambda: self._toggle_golden(item)
+        )
+        menu.addAction(confirm_action)
+
+        edit_action = QAction("✏️ Modifica descrizione canonica", self)
+        edit_action.setToolTip(
+            "Modifica la descrizione e marca automaticamente la voce come "
+            "confermata (golden set)."
+        )
+        edit_action.triggered.connect(
+            lambda: self._edit_canonical(item)
+        )
+        menu.addAction(edit_action)
+
+        menu.addSeparator()
+
         delete_action = QAction("🗑️ Elimina questa voce", self)
         delete_action.triggered.connect(
             lambda: self._delete_single_entry(item)
@@ -357,19 +408,49 @@ class ClinicalHistoryTab(QWidget):
         menu.addAction(delete_action)
         menu.exec_(self._tree.viewport().mapToGlobal(pos))
 
-    def _delete_single_entry(self, item):
-        """Delete the timeline entry corresponding to the given tree item."""
-        idx = self._tree.indexOfTopLevelItem(item)
-        if idx < 0 or idx >= len(self._timeline_entries):
+    def _toggle_golden(self, item):
+        """Confirm a timeline entry as golden, or remove the confirmation."""
+        entry_id = item.data(0, Qt.UserRole)
+        if not entry_id:
+            return
+        new_state = not bool(item.data(0, Qt.UserRole + 1))
+        timeline_repo = self._services.get("timeline_repo")
+        if timeline_repo:
+            timeline_repo.set_golden(entry_id, new_state)
+        self._refresh()
+
+    def _edit_canonical(self, item):
+        """Edit the canonical description (implies a golden confirmation)."""
+        entry_id = item.data(0, Qt.UserRole)
+        if not entry_id:
+            return
+        current = item.text(2)
+
+        text, ok = QInputDialog.getText(
+            self,
+            "Modifica descrizione canonica",
+            "Nuova descrizione (la voce sara' confermata come golden):",
+            text=current,
+        )
+        if not ok or not text.strip():
             return
 
-        # Get the actual entry (tree is sorted reverse-chronological)
-        sorted_entries = sorted(
-            self._timeline_entries,
-            key=lambda e: e.date_observed,
-            reverse=True,
+        timeline_repo = self._services.get("timeline_repo")
+        if timeline_repo:
+            timeline_repo.update_description(entry_id, text.strip())
+        self._refresh()
+
+    def _delete_single_entry(self, item):
+        """Delete the timeline entry corresponding to the given tree item."""
+        entry_id = item.data(0, Qt.UserRole)
+        if not entry_id:
+            return
+        entry = next(
+            (e for e in self._timeline_entries if e.entry_id == entry_id),
+            None,
         )
-        entry = sorted_entries[idx]
+        if entry is None:
+            return
 
         reply = QMessageBox.question(
             self, "Conferma eliminazione",
@@ -384,7 +465,7 @@ class ClinicalHistoryTab(QWidget):
 
         timeline_repo = self._services.get("timeline_repo")
         if timeline_repo:
-            timeline_repo.delete_entry(entry.entry_id)
+            timeline_repo.delete_entry(entry_id)
         self._refresh()
 
     def _on_clear_registry(self):
@@ -788,3 +869,46 @@ class ClinicalHistoryTab(QWidget):
                 )
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
+
+    def _on_export_golden_set(self):
+        """Export the user-confirmed golden set for prompt evaluation."""
+        from ..export.golden_set import save_golden_set
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Esporta Golden Set", "",
+            "File JSON (*.json)",
+        )
+        if not path:
+            return
+
+        timeline_repo = self._services.get("timeline_repo")
+        if not timeline_repo:
+            QMessageBox.warning(
+                self, "Servizio non disponibile",
+                "Il repository del registro cronologico non e' disponibile."
+            )
+            return
+
+        try:
+            count = save_golden_set(
+                timeline_repo.db, path, self._current_patient_id
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Errore esportazione",
+                f"Errore durante l'esportazione del golden set:\n\n{exc}"
+            )
+            return
+
+        scope = (
+            "del paziente selezionato"
+            if self._current_patient_id
+            else "di tutti i pazienti"
+        )
+        QMessageBox.information(
+            self, "Golden set esportato",
+            f"Esportate {count} voci timeline confermate {scope}.\n\n"
+            f"Il golden set include anche le decisioni di validazione "
+            f"risolte e i valori di laboratorio validati.\n\n"
+            f"File: {path}"
+        )

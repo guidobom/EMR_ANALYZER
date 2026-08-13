@@ -61,6 +61,7 @@ class ClinicalTimelineEntry:
     merged_into_ids: list[str] = field(default_factory=list)
     status: str = "active"                  # active, resolved, superseded
     confidence: float = 0.5                 # 0.0-1.0
+    is_golden: int = 0                      # 1 = confermata dall'utente (golden set)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -77,6 +78,7 @@ class ClinicalTimelineEntry:
             "merged_into_ids": self.merged_into_ids,
             "status": self.status,
             "confidence": self.confidence,
+            "is_golden": self.is_golden,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -95,6 +97,7 @@ class ClinicalTimelineEntry:
             merged_into_ids=data.get("merged_into_ids", []),
             status=data.get("status", "active"),
             confidence=data.get("confidence", 0.5),
+            is_golden=data.get("is_golden", 0),
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
         )

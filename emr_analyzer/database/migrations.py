@@ -3,7 +3,7 @@
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -242,6 +242,8 @@ def init_database(db: DatabaseEngine) -> None:
         _safe_add_column(db, "lab_values", "value_text", "TEXT")
         # v8: provenance of canonical dedup — entry_ids merged into a survivor
         _safe_add_column(db, "clinical_timeline", "merged_into_ids", "TEXT")
+        # v9: user-confirmed timeline entries for the golden validation set
+        _safe_add_column(db, "clinical_timeline", "is_golden", "INTEGER DEFAULT 0")
 
         # Set schema version
         cursor = db.execute("SELECT MAX(version) FROM schema_version")

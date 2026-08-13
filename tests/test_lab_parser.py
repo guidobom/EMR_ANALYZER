@@ -204,6 +204,26 @@ Risultati validati da:
             "laboratorio",
         )
 
+    def test_lab_sheet_with_visit_header_hint_still_laboratory(self):
+        # Regression B6: a lab result sheet whose first-page services mention
+        # "VISITA DI CONTROLLO" gets a visita_specialistica header hint. The
+        # structural lab detection must win over that hint, otherwise the lab
+        # parser never runs on the values.
+        text = """ESAME ESITO U.M. INTERVALLI RIFERIMENTO
+Materiale: Siero
+GLUCOSIO : 112 mg/dl 70 - 110
+CREATININA: 0.9 mg/dl 0.6 - 1.2
+Referto Completo
+"""
+        self.assertEqual(
+            DocumentClassifier().classify(
+                text,
+                "documento.pdf",
+                header_metadata={"document_type_hint": "visita_specialistica"},
+            ),
+            "laboratorio",
+        )
+
     def test_invalid_numeric_cell_is_not_converted_to_zero(self):
         with self.assertRaises(ValueError):
             LabNormalizer().normalize_value("Siero")
