@@ -37,25 +37,20 @@ class MergeResult:
 
 
 # Tables whose rows carry a NOT NULL document FK.  The value maps each table
-# to the name of its document column (clinical_events uses source_document_id
-# instead of document_id).  Only the rows of the documents that were actually
-# moved follow the target; the rows of skipped duplicates stay with the source
-# and are removed by the final source workspace deletion (cascade).
+# to the name of its document column.  Only the rows of the documents that
+# were actually moved follow the target; the rows of skipped duplicates stay
+# with the source and are removed by the final source workspace deletion
+# (cascade).
 _DOCUMENT_BOUND_TABLES = {
     "clinical_evidence": "document_id",
     "lab_values": "document_id",
-    "clinical_events": "source_document_id",
-    "document_clinical_projections": "document_id",
     "document_identity_evidence": "document_id",
-    "longitudinal_evidence": "document_id",
 }
 
 # Tables that can be repointed wholesale; document references are nullable or
 # embedded in JSON and either follow the (unchanged) doc ids or are reset to
 # NULL via ON DELETE SET NULL when a skipped duplicate is deleted.
 _WHOLESALE_TABLES = (
-    "clinical_state_deltas",
-    "clinical_state_runs",
     "validation_queue",
     "audit_log",
 )

@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from .engine import DatabaseEngine
-from ..models.clinical_state import ClinicalState, ClinicalStateDelta
+from ..models.clinical_state import ClinicalState
 
 
 class ClinicalStateRepository:
@@ -42,40 +42,6 @@ class ClinicalStateRepository:
             data["version"] = row["version"]
             return ClinicalState.from_dict(data)
         return None
-
-    def save_delta(self, patient_id: str, delta: ClinicalStateDelta,
-                   document_id: Optional[str] = None,
-                   auto_applied: bool = False) -> None:
-        """Record a delta in the history table."""
-        self.db.execute(
-            """INSERT INTO clinical_state_deltas
-               (patient_id, delta_json, document_id, applied_at, auto_applied)
-               VALUES (?, ?, ?, ?, ?)""",
-            (patient_id,
-             json.dumps(delta.to_dict(), ensure_ascii=False),
-             document_id,
-             datetime.now().isoformat(),
-             1 if auto_applied else 0),
-        )
-        self.db.commit()
-
-    def get_delta_history(self, patient_id: str) -> list[dict]:
-        cursor = self.db.execute(
-            """SELECT * FROM clinical_state_deltas
-               WHERE patient_id=? ORDER BY applied_at DESC""",
-            (patient_id,),
-        )
-        return [
-            {
-                "id": r["id"],
-                "patient_id": r["patient_id"],
-                "delta": json.loads(r["delta_json"]),
-                "document_id": r["document_id"],
-                "applied_at": r["applied_at"],
-                "auto_applied": bool(r["auto_applied"]),
-            }
-            for r in cursor.fetchall()
-        ]
 
     def delete(self, patient_id: str) -> None:
         self.db.execute(

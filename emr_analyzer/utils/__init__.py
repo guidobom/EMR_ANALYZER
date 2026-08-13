@@ -16,11 +16,7 @@ from .text_utils import (
     split_into_sentences_ita,
     extract_section_text,
 )
-from .date_utils import (
-    parse_italian_date,
-    is_valid_date,
-    compare_dates,
-)
+from .date_utils import parse_italian_date
 
 __all__ = [
     "compute_file_hash",
@@ -36,6 +32,4 @@ __all__ = [
     "split_into_sentences_ita",
     "extract_section_text",
     "parse_italian_date",
-    "is_valid_date",
-    "compare_dates",
 ]

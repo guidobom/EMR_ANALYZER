@@ -1,16 +1,13 @@
 """Application orchestrator for EMR Analyzer."""
 
 import sys
-from pathlib import Path
 
-from PyQt5.QtWidgets import QApplication, QMessageBox
 from PyQt5.QtCore import Qt
 
 from .config import (
     APP_NAME, APP_VERSION, active_workspace, CACHE_DIR, LOG_DIR,
-    DB_FILENAME,
     OFFLINE_MODE,
-    DOCUMENT_LLM_MODEL_NAME, CLINICAL_STATE_LLM_MODEL_NAME,
+    DOCUMENT_LLM_MODEL_NAME,
 )
 from .security.offline import OfflinePolicy
 from .database.engine import DatabaseEngine
@@ -18,16 +15,13 @@ from .database.migrations import init_database
 from .database.patient_repo import PatientRepository
 from .database.patient_identity_repo import PatientIdentityRepository
 from .database.evidence_repo import EvidenceRepository
-from .database.document_projection_repo import DocumentProjectionRepository
 from .database.document_repo import DocumentRepository
 from .database.lab_repo import LabRepository
-from .database.event_repo import EventRepository
 from .database.clinical_state_repo import ClinicalStateRepository
 from .database.audit_repo import AuditRepository
 from .pipeline.converter import DoclingConverter
 from .pipeline.pdf_extractor import PdfPlumberExtractor
 from .pipeline.classifier import DocumentClassifier
-from .pipeline.segmenter import ClinicalSegmenter
 from .pipeline.cleaner import TextCleaner
 from .pipeline.header_metadata import HeaderMetadataExtractor
 from .pipeline.patient_identity import PatientIdentityExtractor
@@ -109,22 +103,18 @@ class EMRAnalyzerApp:
         identity_repo = PatientIdentityRepository(db)
         doc_repo = DocumentRepository(db)
         lab_repo = LabRepository(db)
-        event_repo = EventRepository(db)
         cs_repo = ClinicalStateRepository(db)
         audit_repo = AuditRepository(db)
         evidence_repo = EvidenceRepository(db)
-        projection_repo = DocumentProjectionRepository(db)
         timeline_repo = TimelineRepository(db)
         self._services.update({
             "patient_repo": patient_repo,
             "identity_repo": identity_repo,
             "document_repo": doc_repo,
             "lab_repo": lab_repo,
-            "event_repo": event_repo,
             "cs_repo": cs_repo,
             "audit_repo": audit_repo,
             "evidence_repo": evidence_repo,
-            "projection_repo": projection_repo,
             "timeline_repo": timeline_repo,
         })
         print(f"  ✓ Repositories initialized")
@@ -210,7 +200,6 @@ class EMRAnalyzerApp:
 
         # ---- Pipeline components ----
         self._services["classifier"] = DocumentClassifier()
-        self._services["segmenter"] = ClinicalSegmenter()
         self._services["cleaner"] = TextCleaner()
         self._services["header_metadata_extractor"] = HeaderMetadataExtractor()
         identity_extractor = PatientIdentityExtractor()
@@ -249,7 +238,7 @@ class EMRAnalyzerApp:
             "clinical_history_builder": clinical_history_builder,
         })
         self._services["document_deletion"] = DocumentDeletionService(
-            db, doc_repo, cs_manager=None, audit_repo=audit_repo
+            db, doc_repo, audit_repo=audit_repo
         )
         self._services["patient_workspace_deletion"] = (
             PatientWorkspaceDeletionService(db, patient_repo)

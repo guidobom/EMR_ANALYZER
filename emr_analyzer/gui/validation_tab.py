@@ -208,15 +208,11 @@ class ValidationTab(QWidget):
         self._refresh()
 
     def _accept_underlying_item(self, row_data: dict):
-        """Mark the underlying event/lab_value as validated."""
+        """Mark the underlying lab_value as validated."""
         item_type = row_data.get("item_type")
         item_ref_id = row_data.get("item_id")
 
-        if item_type == "event":
-            event_repo = self._services.get("event_repo")
-            if event_repo:
-                event_repo.confirm_event(item_ref_id)
-        elif item_type == "lab_value":
+        if item_type == "lab_value":
             lab_repo = self._services.get("lab_repo")
             if lab_repo and item_ref_id.isdigit():
                 lab_repo.update_validation(int(item_ref_id), True)

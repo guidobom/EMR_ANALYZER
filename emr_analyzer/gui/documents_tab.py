@@ -1123,17 +1123,6 @@ class DocumentsTab(QWidget):
             progress.add_log(
                 f"  ⚠️ Impossibile ripulire la coda legacy: {exc}"
             )
-        evidence_repo = self._services.get("evidence_repo")
-        if evidence_repo:
-            evidence_repo.replace_document_method(
-                doc_id, "llm_document_projection", []
-            )
-        event_repo = self._services.get("event_repo")
-        if event_repo:
-            event_repo.delete_by_document(doc_id)
-        projection_repo = self._services.get("projection_repo")
-        if projection_repo:
-            projection_repo.delete_by_document(doc_id)
         legacy_projection = (
             self._get_extraction_dir() /
             f"{doc_id}_clinical_evidence.json"
@@ -1412,21 +1401,22 @@ class DocumentsTab(QWidget):
         )
 
     def _clear_legacy_document_validation(self, document_id: str) -> None:
-        """Remove review items created by the retired document JSON phase."""
+        """Remove review items created by the retired event/document JSON phase.
+
+        The ``event``, ``clinical_event`` and ``document_projection`` item
+        types are no longer written by the live pipeline; this cleanup only
+        targets rows left behind by old DBs, scoped to the document's patient.
+        """
         db = self._services.get("db")
         if not db:
             return
         db.execute(
             """DELETE FROM validation_queue
-               WHERE (item_type='document_projection' AND item_id IN (
-                   SELECT projection_id FROM document_clinical_projections
-                   WHERE document_id=?
-               ))
-                  OR (item_type IN ('event', 'clinical_event') AND item_id IN (
-                   SELECT event_id FROM clinical_events
-                   WHERE source_document_id=?
-               ))""",
-            (document_id, document_id),
+               WHERE item_type IN ('event', 'clinical_event', 'document_projection')
+                 AND patient_id IN (
+                   SELECT patient_id FROM documents WHERE id=?
+               )""",
+            (document_id,),
         )
         db.commit()
 

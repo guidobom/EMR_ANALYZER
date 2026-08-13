@@ -22,11 +22,10 @@ class DocumentDeletionResult:
 class DocumentDeletionService:
     """Delete DB rows atomically and move files through a reversible trash."""
 
-    def __init__(self, db, document_repo, cs_manager=None, audit_repo=None,
+    def __init__(self, db, document_repo, audit_repo=None,
                  workspaces_dir=None):
         self.db = db
         self.document_repo = document_repo
-        self.cs_manager = cs_manager
         self.audit_repo = audit_repo
         self.workspaces_dir = (
             Path(workspaces_dir) if workspaces_dir
@@ -55,12 +54,6 @@ class DocumentDeletionService:
                 moved.append((source, destination))
 
             # Fetch derived item IDs before the document cascade removes them.
-            event_ids = [
-                row["event_id"] for row in self.db.execute(
-                    "SELECT event_id FROM clinical_events WHERE source_document_id=?",
-                    (document_id,),
-                ).fetchall()
-            ]
             lab_ids = [
                 str(row["id"]) for row in self.db.execute(
                     "SELECT id FROM lab_values WHERE document_id=?", (document_id,)
@@ -69,13 +62,6 @@ class DocumentDeletionService:
             evidence_ids = [
                 row["evidence_id"] for row in self.db.execute(
                     "SELECT evidence_id FROM clinical_evidence WHERE document_id=?",
-                    (document_id,),
-                ).fetchall()
-            ]
-            projection_ids = [
-                row["projection_id"] for row in self.db.execute(
-                    """SELECT projection_id
-                       FROM document_clinical_projections WHERE document_id=?""",
                     (document_id,),
                 ).fetchall()
             ]
@@ -88,14 +74,6 @@ class DocumentDeletionService:
                           OR item_id=? OR item_id LIKE ?""",
                     (document_id, document_id, f"{document_id}_%"),
                 )
-                if event_ids:
-                    placeholders = ",".join("?" for _ in event_ids)
-                    self.db.execute(
-                        f"""DELETE FROM validation_queue
-                            WHERE item_type IN ('event', 'clinical_event')
-                              AND item_id IN ({placeholders})""",
-                        tuple(event_ids),
-                    )
                 if lab_ids:
                     placeholders = ",".join("?" for _ in lab_ids)
                     self.db.execute(
@@ -112,20 +90,6 @@ class DocumentDeletionService:
                               AND item_id IN ({placeholders})""",
                         tuple(evidence_ids),
                     )
-                if projection_ids:
-                    placeholders = ",".join("?" for _ in projection_ids)
-                    self.db.execute(
-                        f"""DELETE FROM validation_queue
-                            WHERE item_type='document_projection'
-                              AND item_id IN ({placeholders})""",
-                        tuple(projection_ids),
-                    )
-                # Deltas derived from a deleted report must not survive as
-                # source-less history entries.
-                self.db.execute(
-                    "DELETE FROM clinical_state_deltas WHERE document_id=?",
-                    (document_id,),
-                )
                 cursor = self.db.execute(
                     "DELETE FROM documents WHERE id=?", (document_id,)
                 )
@@ -138,16 +102,6 @@ class DocumentDeletionService:
             self._restore_files(moved, result)
             return result
 
-        # The serialized Clinical State may contain facts that were sourced
-        # only by this report; rebuild it from the remaining Event Store.
-        if self.cs_manager:
-            try:
-                self.cs_manager.rebuild_from_events(document.patient_id)
-            except Exception as exc:
-                result.warnings.append(
-                    f"Documento eliminato, ma ricostruzione Clinical State fallita: {exc}"
-                )
-
         if self.audit_repo:
             try:
                 self.audit_repo.log(
@@ -158,10 +112,8 @@ class DocumentDeletionService:
                     {
                         "filename": document.filename,
                         "file_hash": document.file_hash,
-                        "removed_event_count": len(event_ids),
                         "removed_lab_count": len(lab_ids),
                         "removed_evidence_count": len(evidence_ids),
-                        "removed_projection_count": len(projection_ids),
                     },
                 )
             except Exception as exc:

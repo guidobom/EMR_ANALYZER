@@ -14,14 +14,6 @@ from emr_analyzer.models import Patient
 from emr_analyzer.models.document import DocumentRecord
 
 
-class RecordingClinicalStateManager:
-    def __init__(self):
-        self.rebuilt = []
-
-    def rebuild_from_events(self, patient_id):
-        self.rebuilt.append(patient_id)
-
-
 class DocumentDeletionTest(unittest.TestCase):
     def test_document_deletion_removes_files_and_derived_data(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,14 +48,6 @@ class DocumentDeletionTest(unittest.TestCase):
                 (extraction_dir / name).write_text("derived", encoding="utf-8")
 
             db.execute(
-        """INSERT INTO clinical_events
-           (event_id, patient_id, event_date, event_type, entity, status,
-            source_document_id, source_text, confidence, validated_by_user,
-            created_at)
-           VALUES ('EVT_000001', 'P001', '2024-01-01', 'diagnosis', 'x',
-                   'proposed', 'DOC_000001', 'source', 1.0, 0, '2024-01-01')"""
-            )
-            db.execute(
         """INSERT INTO lab_values
            (patient_id, document_id, parameter_name, normalized_name, value)
            VALUES ('P001', 'DOC_000001', 'Hb', 'emoglobina', 10.0)"""
@@ -73,35 +57,19 @@ class DocumentDeletionTest(unittest.TestCase):
            (evidence_id, patient_id, document_id, category, normalized_entity,
             source_text, extraction_method, schema_version, created_at)
            VALUES ('EVD_000001', 'P001', 'DOC_000001', 'symptom', 'dispnea',
-                   'dispnea', 'llm_document_projection', '1.0', '2024-01-01')"""
-            )
-            db.execute(
-        """INSERT INTO document_clinical_projections
-           (projection_id, patient_id, document_id, projection_json,
-            evidence_count, observation_count, consolidation_method,
-            schema_version, status, created_at, updated_at)
-           VALUES ('DPROJ_000001', 'P001', 'DOC_000001', '{}', 1, 1,
-                   'deterministic', '1.0', 'proposed',
-                   '2024-01-01', '2024-01-01')"""
-            )
-            db.execute(
-        """INSERT INTO clinical_state_deltas
-           (patient_id, delta_json, document_id, applied_at, auto_applied)
-           VALUES ('P001', '{}', 'DOC_000001', '2024-01-01', 1)"""
+                   'dispnea', 'deterministic_lab', '1.0', '2024-01-01')"""
             )
             db.execute(
         """INSERT INTO validation_queue
            (patient_id, item_type, item_id, issue, severity, status, created_at)
-           VALUES ('P001', 'delta', 'DOC_000001_diagnosis', 'review',
+           VALUES ('P001', 'evidence', 'EVD_000001', 'review',
                    'medium', 'pending', '2024-01-01')"""
             )
             db.commit()
 
-            cs_manager = RecordingClinicalStateManager()
             service = DocumentDeletionService(
                 db,
                 document_repo,
-                cs_manager=cs_manager,
                 audit_repo=AuditRepository(db),
                 workspaces_dir=tmp_path,
             )
@@ -112,15 +80,9 @@ class DocumentDeletionTest(unittest.TestCase):
             self.assertIsNone(document_repo.get_by_id("DOC_000001"))
             self.assertFalse(original.exists())
             self.assertFalse(any(extraction_dir.iterdir()))
-            self.assertEqual(db.get_table_count("clinical_events"), 0)
             self.assertEqual(db.get_table_count("lab_values"), 0)
             self.assertEqual(db.get_table_count("clinical_evidence"), 0)
-            self.assertEqual(
-                db.get_table_count("document_clinical_projections"), 0
-            )
-            self.assertEqual(db.get_table_count("clinical_state_deltas"), 0)
             self.assertEqual(db.get_table_count("validation_queue"), 0)
-            self.assertEqual(cs_manager.rebuilt, ["P001"])
             self.assertEqual(db.get_table_count("audit_log", "action='delete'"), 1)
 
 

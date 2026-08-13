@@ -73,37 +73,3 @@ def normalize_year(year_str: str) -> str:
     if y < 100:
         return f"{2000 + y}" if y < 50 else f"{1900 + y}"
     return str(y)
-
-
-def is_valid_date(date_str: str) -> bool:
-    """Check if a string is a valid ISO date."""
-    try:
-        dt = datetime.fromisoformat(date_str)
-        return 1900 <= dt.year <= 2100
-    except (ValueError, TypeError):
-        return False
-
-
-def compare_dates(date1: Optional[str], date2: Optional[str]) -> int:
-    """
-    Compare two ISO date strings.
-    Returns -1 if date1 < date2, 0 if equal, 1 if date1 > date2.
-    """
-    if not date1 and not date2:
-        return 0
-    if not date1:
-        return 1
-    if not date2:
-        return -1
-
-    try:
-        d1 = datetime.fromisoformat(date1)
-        d2 = datetime.fromisoformat(date2)
-    except (ValueError, TypeError):
-        return 0
-
-    if d1 < d2:
-        return -1
-    elif d1 > d2:
-        return 1
-    return 0

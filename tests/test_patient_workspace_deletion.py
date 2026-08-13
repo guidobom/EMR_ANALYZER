@@ -64,9 +64,6 @@ class PatientWorkspaceDeletionTest(unittest.TestCase):
                 (patient_id, confidence, status, source_document_id,
                  created_at, updated_at) VALUES (?, 1, 'validated', ?, ?, ?)""",
              ("P001", "DOC_000001", now, now)),
-            ("""INSERT INTO docling_elements
-                (document_id, element_id, type, text)
-                VALUES (?, 'el1', 'text', 'clinical')""", ("DOC_000001",)),
             ("""INSERT INTO document_identity_evidence
                 (document_id, patient_id, field_name, value_key,
                  extraction_method, confidence, created_at)
@@ -78,16 +75,6 @@ class PatientWorkspaceDeletionTest(unittest.TestCase):
                  schema_version, created_at)
                 VALUES ('EVD1', ?, ?, 'diagnosis', 'x', 'x',
                         'test', '1', ?)""", ("P001", "DOC_000001", now)),
-            ("""INSERT INTO document_clinical_projections
-                (projection_id, patient_id, document_id, projection_json,
-                 consolidation_method, schema_version, created_at, updated_at)
-                VALUES ('PRJ1', ?, ?, '{}', 'test', '1', ?, ?)""",
-             ("P001", "DOC_000001", now, now)),
-            ("""INSERT INTO clinical_events
-                (event_id, patient_id, event_date, event_type, entity,
-                 source_document_id, source_text, created_at)
-                VALUES ('EVT1', ?, '2024-01-01', 'diagnosis', 'x', ?, 'x', ?)""",
-             ("P001", "DOC_000001", now)),
             ("""INSERT INTO lab_values
                 (patient_id, document_id, parameter_name, normalized_name, value)
                 VALUES (?, ?, 'Hb', 'emoglobina', 10)""",
@@ -95,25 +82,6 @@ class PatientWorkspaceDeletionTest(unittest.TestCase):
             ("""INSERT INTO clinical_state
                 (patient_id, state_json, updated_at) VALUES (?, '{}', ?)""",
              ("P001", now)),
-            ("""INSERT INTO clinical_state_deltas
-                (patient_id, delta_json, document_id, applied_at)
-                VALUES (?, '{}', ?, ?)""", ("P001", "DOC_000001", now)),
-            ("""INSERT INTO clinical_state_runs
-                (run_id, patient_id, model_name, prompt_version,
-                 schema_version, status, source_signature, current_document_id,
-                 started_at)
-                VALUES ('RUN1', ?, 'model', 'prompt', '1', 'completed',
-                        'signature', ?, ?)""", ("P001", "DOC_000001", now)),
-            ("""INSERT INTO longitudinal_evidence
-                (evidence_id, run_id, patient_id, document_id, operation,
-                 category, normalized_entity, asserted_at, source_text,
-                 model_name, prompt_version, schema_version, created_at)
-                VALUES ('LE1', 'RUN1', ?, ?, 'add', 'diagnosis', 'x', ?, 'x',
-                        'model', 'prompt', '1', ?)""",
-             ("P001", "DOC_000001", now, now)),
-            ("""INSERT INTO clinical_state_checkpoints
-                (run_id, document_id, sequence_index, status)
-                VALUES ('RUN1', ?, 0, 'completed')""", ("DOC_000001",)),
             ("""INSERT INTO validation_queue
                 (patient_id, item_type, item_id, issue, created_at)
                 VALUES (?, 'document', ?, 'review', ?)""",
@@ -157,8 +125,6 @@ class PatientWorkspaceDeletionTest(unittest.TestCase):
                     f'SELECT COUNT(*) FROM "{table}" WHERE patient_id=?',
                     ("P001",),
                 ).fetchone()[0], 0, table)
-            for table in ("docling_elements", "clinical_state_checkpoints"):
-                self.assertEqual(fixture["db"].get_table_count(table), 0)
             self.assertEqual(
                 fixture["db"].get_table_count(
                     "audit_log", "patient_id='P002'"

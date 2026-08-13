@@ -88,12 +88,3 @@ class DoclingConverter:
             except (AttributeError, TypeError):
                 pass
         return 0
-
-    def get_page_images(self, result) -> dict:
-        """Get page images (if generate_page_images was True)."""
-        images = {}
-        if hasattr(result, 'document') and result.document:
-            for page_no, page_item in result.document.pages.items():
-                if hasattr(page_item, 'image') and page_item.image:
-                    images[page_no] = page_item.image
-        return images

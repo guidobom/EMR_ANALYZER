@@ -4,7 +4,7 @@ from pathlib import Path
 
 # --- Application paths ---
 APP_NAME = "EMR Analyzer"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.4.2"
 OFFLINE_MODE = True
 # Verify each document's workspace attribution with the LLM before its
 # clinical text is normalized. The check runs on the pre-anonymization
@@ -43,26 +43,11 @@ SUPPORTED_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png")
 OLLAMA_BASE_URL = "http://localhost:11434"
 # The document model can be smaller/faster; the Clinical State model can be
 # larger because it is used after the evidence has already been normalized.
-DOCUMENT_LLM_MODEL_NAME = "gemma3:12b"
+DOCUMENT_LLM_MODEL_NAME = "qwen3:14b"
 CLINICAL_STATE_LLM_MODEL_NAME = "qwen3:14b"
 # Default model for LlmClient when no LLMRoleConfig is provided.
 DEFAULT_LLM_MODEL_NAME = DOCUMENT_LLM_MODEL_NAME
-# Backward-compatible alias — prefer DEFAULT_LLM_MODEL_NAME.
-QWEN_MODEL_NAME = DOCUMENT_LLM_MODEL_NAME
 OLLAMA_CONTEXT_LENGTH = 32768
-
-# --- Processing limits ---
-MAX_PAGE_COUNT = 200
-MAX_FILE_SIZE_MB = 500
-MIN_EXTRACTION_CONFIDENCE = 0.5
-
-# --- Database ---
-DB_FILENAME = "workspace.db"
-
-# --- Lab value extraction ---
-LAB_PARAMETER_PATTERNS = {
-    # Pattern compilati dinamicamente in extraction/patterns.py
-}
 
 # Lab parameter synonyms (Italian clinical abbreviations -> canonical name)
 LAB_SYNONYMS = {

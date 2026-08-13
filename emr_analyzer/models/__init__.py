@@ -4,9 +4,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-# Document projection types are imported at the end of this module to keep the
-# long-standing Patient/Workspace public API intact.
-
 
 @dataclass
 class Patient:
@@ -76,16 +73,6 @@ class Workspace:
         }
 
 
-from .document_projection import (  # noqa: E402
-    DocumentClinicalProjection,
-    DocumentObservation,
-    DocumentObservationRelationship,
-    DocumentProjectionConflict,
-    DocumentSourceSpan,
-)
-
 __all__ = [
-    "Patient", "Workspace", "DocumentClinicalProjection",
-    "DocumentObservation", "DocumentObservationRelationship",
-    "DocumentProjectionConflict", "DocumentSourceSpan",
+    "Patient", "Workspace",
 ]

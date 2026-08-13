@@ -137,11 +137,6 @@ class RecommendedParams:
 # ---------------------------------------------------------------------------
 
 
-def get_total_ram_gb() -> float:
-    """Total physical RAM in GiB."""
-    return psutil.virtual_memory().total / (1024 ** 3)
-
-
 def get_available_ram_gb() -> float:
     """RAM currently available (free + reclaimable) in GiB."""
     return psutil.virtual_memory().available / (1024 ** 3)
