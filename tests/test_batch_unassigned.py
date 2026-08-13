@@ -10,7 +10,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QEvent, Qt
+from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtWidgets import QApplication
 
 import emr_analyzer.gui.batch_import_dialog as batch_module
@@ -31,6 +32,17 @@ class _FakeMessageBox:
     @staticmethod
     def information(*args, **kwargs):
         pass
+
+
+class _FakeViewer:
+    """Records the doc_data it is built with; never opens a real window."""
+
+    def __init__(self, doc_data, services, parent=None):
+        self.doc_data = doc_data
+        self.parent = parent
+
+    def exec_(self):
+        self.opened = True
 
 
 class BatchUnassignedTest(unittest.TestCase):
@@ -123,6 +135,91 @@ class BatchUnassignedTest(unittest.TestCase):
         combo = dialog._unassigned_target_combos[0]
         self.assertEqual(combo.count(), 1)
         self.assertIsNone(combo.currentData())
+
+    # --- PDF quick-view (double-click + spacebar) --------------------------
+
+    def _dialog_with_patient(self, name="a.pdf"):
+        path = self._root / name
+        path.write_bytes(b"pdf-content")
+        return BatchImportDialog(
+            {"P001": [str(path)]}, self._services,
+        )
+
+    @staticmethod
+    def _file_child(dialog):
+        parent = dialog._tree.topLevelItem(0)
+        return parent.child(0)
+
+    def test_double_click_opens_viewer_for_file_row(self):
+        dialog = self._dialog_with_patient()
+        child = self._file_child(dialog)
+        seen = []
+        class _Capture(_FakeViewer):
+            def __init__(self, doc_data, services, parent=None):
+                super().__init__(doc_data, services, parent)
+                seen.append(doc_data)
+        original = batch_module.PDFViewerDialog
+        batch_module.PDFViewerDialog = _Capture
+        try:
+            dialog._on_item_double_clicked(child, 1)
+        finally:
+            batch_module.PDFViewerDialog = original
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["original_path"], str(self._root / "a.pdf"))
+        self.assertEqual(seen[0]["filename"], "a.pdf")
+
+    def test_double_click_on_checkbox_column_does_not_open(self):
+        dialog = self._dialog_with_patient()
+        child = self._file_child(dialog)
+        original = batch_module.PDFViewerDialog
+        seen = []
+        class _Capture(_FakeViewer):
+            def __init__(self, doc_data, services, parent=None):
+                super().__init__(doc_data, services, parent)
+                seen.append(doc_data)
+        batch_module.PDFViewerDialog = _Capture
+        try:
+            dialog._on_item_double_clicked(child, 0)
+        finally:
+            batch_module.PDFViewerDialog = original
+        self.assertEqual(seen, [])
+
+    def test_spacebar_quick_view_opens_current_file(self):
+        dialog = self._dialog_with_patient()
+        child = self._file_child(dialog)
+        dialog._tree.setCurrentItem(child)
+        original = batch_module.PDFViewerDialog
+        seen = []
+        class _Capture(_FakeViewer):
+            def __init__(self, doc_data, services, parent=None):
+                super().__init__(doc_data, services, parent)
+                seen.append(doc_data)
+        batch_module.PDFViewerDialog = _Capture
+        try:
+            event = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier)
+            consumed = dialog.eventFilter(dialog._tree, event)
+        finally:
+            batch_module.PDFViewerDialog = original
+        self.assertTrue(consumed)
+        self.assertEqual(len(seen), 1)
+
+    def test_spacebar_on_patient_row_keeps_checkbox_toggle(self):
+        dialog = self._dialog_with_patient()
+        dialog._tree.setCurrentItem(dialog._tree.topLevelItem(0))
+        original = batch_module.PDFViewerDialog
+        seen = []
+        class _Capture(_FakeViewer):
+            def __init__(self, doc_data, services, parent=None):
+                super().__init__(doc_data, services, parent)
+                seen.append(doc_data)
+        batch_module.PDFViewerDialog = _Capture
+        try:
+            event = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier)
+            consumed = dialog.eventFilter(dialog._tree, event)
+        finally:
+            batch_module.PDFViewerDialog = original
+        self.assertFalse(consumed)
+        self.assertEqual(seen, [])
 
 
 if __name__ == "__main__":

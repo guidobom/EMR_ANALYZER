@@ -12,10 +12,11 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTreeWidget, QTreeWidgetItem, QComboBox, QMessageBox, QHeaderView,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QEvent
 
 from ..models.document import DocumentType
 from .import_dialog import run_file_checks, import_checked_documents
+from .pdf_viewer import PDFViewerDialog
 
 
 class BatchImportDialog(QDialog):
@@ -69,6 +70,9 @@ class BatchImportDialog(QDialog):
         self._tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
         self._tree.setAlternatingRowColors(True)
         self._tree.itemChanged.connect(self._on_item_changed)
+        # Open the PDF on double-click; spacebar quick-view via event filter.
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._tree.installEventFilter(self)
         layout.addWidget(self._tree, stretch=1)
 
         buttons = QHBoxLayout()
@@ -114,6 +118,7 @@ class BatchImportDialog(QDialog):
 
             for i, check_data in enumerate(checks):
                 child = QTreeWidgetItem(parent)
+                child.setData(0, Qt.UserRole + 1, check_data["path"])
                 if "check" not in check_data:
                     child.setText(0, "")
                     child.setText(1, os.path.basename(check_data["path"]))
@@ -165,6 +170,7 @@ class BatchImportDialog(QDialog):
 
         for i, check_data in enumerate(checks):
             child = QTreeWidgetItem(parent)
+            child.setData(0, Qt.UserRole + 1, check_data["path"])
             if "check" not in check_data:
                 child.setText(1, os.path.basename(check_data["path"]))
                 child.setText(5, "❌ Formato non supportato")
@@ -225,6 +231,38 @@ class BatchImportDialog(QDialog):
                     child.setCheckState(0, state)
         finally:
             self._syncing = False
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        """Open the PDF viewer for a file row (double-click)."""
+        if column == 0:
+            return  # column 0 is the checkbox; let it toggle
+        self._open_file(item)
+
+    def eventFilter(self, obj, event):
+        """Spacebar quick-view on the tree, without breaking checkbox toggle."""
+        if (
+            obj is self._tree
+            and event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Space
+            and self._open_file(self._tree.currentItem())
+        ):
+            return True  # consume: quick-view instead of toggling the checkbox
+        return super().eventFilter(obj, event)
+
+    def _open_file(self, item: QTreeWidgetItem | None) -> bool:
+        """Open the file of a row in the PDF viewer. False when not a file."""
+        if item is None or item.parent() is None:
+            return False
+        path = item.data(0, Qt.UserRole + 1)
+        if not path or not os.path.exists(str(path)):
+            return False
+        viewer = PDFViewerDialog(
+            {"filename": os.path.basename(str(path)), "original_path": str(path)},
+            self._services,
+            self,
+        )
+        viewer.exec_()
+        return True
 
     def _make_status_callback(self, parent: QTreeWidgetItem):
         def cb(index: int, message: str):
