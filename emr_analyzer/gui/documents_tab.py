@@ -17,6 +17,7 @@ from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 
 from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
 from ..extraction.clinical_text_isolator import ClinicalTextIsolationError
+from ..pipeline.sensitive_data import SensitiveDataSanitizer
 from ..config import ATTRIBUTION_VERIFICATION_ENABLED
 
 
@@ -770,12 +771,25 @@ class DocumentsTab(QWidget):
             extraction_dir = self._get_extraction_dir()
             extraction_dir.mkdir(parents=True, exist_ok=True)
 
+            # The raw parser layers still carry the patient header (name, CF,
+            # address) and the hash-only invariant does not cover these disk
+            # artifacts. De-identify them deterministically before persisting:
+            # the LLM-only re-processing path reads them back as input, so the
+            # LLM must never receive the raw identity either.
+            sanitizer = SensitiveDataSanitizer()
+            sensitive_identity = self._sensitive_identity_for_document(
+                doc, plain_text, parsing_result=result
+            )
             raw_path = extraction_dir / f"{doc_id}_raw.md"
-            raw_path.write_text(markdown_text, encoding="utf-8")
+            raw_path.write_text(
+                sanitizer.sanitize(markdown_text, sensitive_identity).text,
+                encoding="utf-8",
+            )
             # Exact plain-text input for the document LLM. This remains
             # immutable when the active .md is replaced by normalized text.
             (extraction_dir / f"{doc_id}_source.txt").write_text(
-                plain_text, encoding="utf-8"
+                sanitizer.sanitize(plain_text, sensitive_identity).text,
+                encoding="utf-8",
             )
 
             extraction_dict = active_parser.export_dict(result)

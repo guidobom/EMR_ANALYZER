@@ -91,6 +91,7 @@ class WorkspaceTabs(QTabWidget):
         staging = self._services.get("import_staging")
         router = self._services.get("patient_router")
 
+        batch = None
         try:
             if staging and router:
                 batch = staging.stage(files)
@@ -103,6 +104,14 @@ class WorkspaceTabs(QTabWidget):
                 f"Impossibile analizzare i file:\n{e}"
             )
             return
+        finally:
+            # The staged copies in _inbox carry the full identity (name, CF,
+            # address) and are only needed for hashing, verification and
+            # identity extraction. Routing and the import dialogs use the
+            # original paths, so the inbox batch is removed as soon as
+            # staging/routing completes — on success and on failure alike.
+            if batch:
+                batch.cleanup()
 
         # Build a map: patient_id → list of file paths
         patient_files: dict[str, list[str]] = {}

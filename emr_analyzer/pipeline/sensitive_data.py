@@ -24,7 +24,7 @@ _FISCAL_CODE_RE = re.compile(
 )
 _LABELLED_PHONE_RE = re.compile(
     r"(?i)\b(?P<label>tel(?:efono)?|cell(?:ulare)?|mobile|fax)"
-    r"\s*[:.]?\s*(?P<value>(?:\+?\d[\d\s()./-]{5,}\d))"
+    r"\s*(?P<sep>[:.]?)\s*(?P<value>(?:\+?\d[\d\s()./-]{5,}\d))"
 )
 _ITALIAN_PHONE_RE = re.compile(
     r"(?<![\w])(?:\+?39[\s./-]*)?(?:0\d{1,3}|3\d{2})"
@@ -38,20 +38,46 @@ _POSTAL_ADDRESS_RE = re.compile(
     r"(?m)^[ \t]*(?:Via|VIA|Viale|VIALE|Piazza|PIAZZA|Corso|CORSO|"
     r"Strada|STRADA|Vicolo|VICOLO|Largo|LARGO|Località|LOCALITÀ)"
     r"(?!\s+(?i:orale|endovenosa|intravenosa|intramuscolare|"
-    r"sottocutanea|topica|inalatoria|rettale|sublinguale)\b)"
+    r"sottocutanea|topica|inalatoria|rettale|sublinguale|transdermica)\b)"
+    r"(?:\s+(?:de(?:i|l|lla|llo|lle|gli)|di|san|santa|santo|santi|"
+    r"sant'|al|alla|allo|alle|ai|il|lo|la|le|gli|in|su|da)){0,2}"
     r"\s+[A-ZÀ-Ü][^\n;]{1,90}?"
-    r"(?:,\s*\d{1,4}(?:[/A-Za-z])?"
-    r"(?!\s*(?i:mg|mcg|µg|g|ml|ui|unità)\b)|\b\d{5}\b)"
+    r"(?:"
+    r",\s*\d{1,4}(?!\d)(?:[/A-Za-z])?"
+    r"(?!\s*(?i:mg|mcg|µg|g|ml|ui|unità)\b)"                       # ,12
+    r"|,\s*[A-ZÀ-Ü][A-Za-zÀ-ÖØ-öø-ÿ'’\-\. ]{0,30}"                 # ,Migliarino
+    r"|\s+\d{1,4}(?!\d)(?:[/A-Za-z])?"
+    r"(?!\s*(?i:mg|mcg|µg|g|ml|ui|unità)\b)"                       # 12 (no comma)
+    r"|\b\d{5}\b)"                                                 # CAP
     r"[^\n]*$"
 )
 _LABELLED_IDENTIFIER_RE = re.compile(
-    r"(?i)\b(?P<label>codice\s+fiscale|codice\s+assistito|id\s+paziente|"
+    r"(?i)(?<!\[)\b(?P<label>codice\s+fiscale|codice\s+assistito|id\s+paziente|"
     r"numero\s+cartella|n[°.]?\s*cartella|nosologico)"
-    r"\s*[:#]?\s*(?P<value>[A-Z0-9][A-Z0-9./_-]{3,})"
+    r"\s*[:#]?\s*(?P<value>(?!RIMOSS[OA]\b)[A-Z0-9][A-Z0-9./_-]{3,})"
 )
 _LABELLED_BIRTH_DATE_RE = re.compile(
     r"(?i)\b(?P<label>data\s+di\s+nascita|nato\s+il|nata\s+il)"
     r"\s*:?\s*(?P<value>\d{1,2}[./-]\d{1,2}[./-]\d{2,4})"
+)
+# Names in prose that survive even when no identity was extracted from the
+# document header (e.g. scanned PDFs without OCR). Deterministic fallback:
+# a capitalized name (1–2 tokens) after an explicit courtesy title, or a full
+# name (two consecutive capitalized tokens) after "paziente".  Only the
+# prefixes are matched case-insensitively: the name tokens must keep their
+# initial capital letter, otherwise any lowercase word ("riferisce", "in")
+# would be consumed as a name and corrupt clinical prose.
+_PROSE_SIG_NAME_RE = re.compile(
+    r"\b(?i:signor(?:a|e)?|sig(?:\.|\.ra|\.na|ra|na)?)\s+"
+    r"[A-ZÀ-Ü][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
+    r"(?:\s+[A-ZÀ-Ü][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+)?"
+    r"\b"
+)
+_PROSE_PAZIENTE_FULLNAME_RE = re.compile(
+    r"\b(?i:paziente)\s+"
+    r"[A-ZÀ-Ü][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
+    r"\s+[A-ZÀ-Ü][A-Za-zÀ-ÖØ-öø-ÿ'’\-]+"
+    r"\b"
 )
 
 
@@ -118,10 +144,14 @@ class SensitiveDataSanitizer:
         )
         counts["administrative_identifier"] += count
 
-        value, count = _LABELLED_PHONE_RE.subn(
-            lambda match: f"{match.group('label')}: [TELEFONO RIMOSSO]",
-            value,
-        )
+        def _phone_replacement(match: re.Match) -> str:
+            separator = match.group("sep")
+            # Normalise the separator to a single colon: "tel." stays "tel.:",
+            # while "tel:" and "tel 123" both become "tel: …".
+            normalized = "" if separator in ("", ":") else separator
+            return f"{match.group('label')}{normalized}: [TELEFONO RIMOSSO]"
+
+        value, count = _LABELLED_PHONE_RE.subn(_phone_replacement, value)
         counts["phone"] += count
 
         value, count = self._replace_verified_phones(value)
@@ -135,6 +165,13 @@ class SensitiveDataSanitizer:
             "[INDIRIZZO RIMOSSO]", value
         )
         counts["address"] += count
+
+        # Deterministic prose fallback: these run even when no identity was
+        # extracted, so a name introduced in narrative prose never survives.
+        value, count = _PROSE_SIG_NAME_RE.subn("[PAZIENTE]", value)
+        counts["patient_name"] += count
+        value, count = _PROSE_PAZIENTE_FULLNAME_RE.subn("[PAZIENTE]", value)
+        counts["patient_name"] += count
 
         value = self._clean_spacing(value)
         return SensitiveDataSanitizationResult(

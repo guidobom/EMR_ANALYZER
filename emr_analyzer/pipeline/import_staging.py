@@ -68,55 +68,61 @@ class ImportStagingService:
         batch_dir.mkdir(parents=True, exist_ok=False)
         batch = ImportBatch(batch_id=batch_id, directory=batch_dir)
 
-        for index, source in enumerate(file_paths, start=1):
-            if cancel_check and cancel_check():
-                break
-            source_path = Path(source)
-            if progress_callback:
-                progress_callback(index - 1, len(file_paths), source_path.name)
-            if not source_path.is_file() or not is_supported_file(source_path):
-                continue
-            item_dir = batch_dir / f"{index:05d}"
-            item_dir.mkdir(parents=True, exist_ok=True)
-            staged_path = item_dir / source_path.name
-            try:
-                shutil.copy2(source_path, staged_path)
-                file_hash = compute_file_hash(staged_path)
-                duplicate = self._document_repo.get_by_hash_global(file_hash)
-                info = get_file_info(staged_path)
-                check = (
-                    verify_pdf(staged_path)
-                    if info["extension"] == ".pdf"
-                    else {
-                        "readable": True,
-                        "page_count": 1,
-                        "has_text": False,
-                        "is_protected": False,
-                        "error": None,
-                    }
-                )
-                evidence = self._identity_extractor.extract(staged_path)
-                batch.documents.append(StagedDocument(
-                    original_path=str(source_path),
-                    staged_path=str(staged_path),
-                    original_name=source_path.name,
-                    file_hash=file_hash,
-                    check=check,
-                    evidence=evidence,
-                    duplicate_document_id=duplicate.id if duplicate else None,
-                    duplicate_patient_id=duplicate.patient_id if duplicate else None,
-                    error=check.get("error"),
-                ))
-            except Exception as exc:
-                batch.documents.append(StagedDocument(
-                    original_path=str(source_path),
-                    staged_path=str(staged_path),
-                    original_name=source_path.name,
-                    file_hash="",
-                    check={"readable": False, "page_count": 0, "has_text": False},
-                    evidence=PatientIdentityEvidence(source_path=str(source_path)),
-                    error=str(exc),
-                ))
+        try:
+            for index, source in enumerate(file_paths, start=1):
+                if cancel_check and cancel_check():
+                    break
+                source_path = Path(source)
+                if progress_callback:
+                    progress_callback(index - 1, len(file_paths), source_path.name)
+                if not source_path.is_file() or not is_supported_file(source_path):
+                    continue
+                item_dir = batch_dir / f"{index:05d}"
+                item_dir.mkdir(parents=True, exist_ok=True)
+                staged_path = item_dir / source_path.name
+                try:
+                    shutil.copy2(source_path, staged_path)
+                    file_hash = compute_file_hash(staged_path)
+                    duplicate = self._document_repo.get_by_hash_global(file_hash)
+                    info = get_file_info(staged_path)
+                    check = (
+                        verify_pdf(staged_path)
+                        if info["extension"] == ".pdf"
+                        else {
+                            "readable": True,
+                            "page_count": 1,
+                            "has_text": False,
+                            "is_protected": False,
+                            "error": None,
+                        }
+                    )
+                    evidence = self._identity_extractor.extract(staged_path)
+                    batch.documents.append(StagedDocument(
+                        original_path=str(source_path),
+                        staged_path=str(staged_path),
+                        original_name=source_path.name,
+                        file_hash=file_hash,
+                        check=check,
+                        evidence=evidence,
+                        duplicate_document_id=duplicate.id if duplicate else None,
+                        duplicate_patient_id=duplicate.patient_id if duplicate else None,
+                        error=check.get("error"),
+                    ))
+                except Exception as exc:
+                    batch.documents.append(StagedDocument(
+                        original_path=str(source_path),
+                        staged_path=str(staged_path),
+                        original_name=source_path.name,
+                        file_hash="",
+                        check={"readable": False, "page_count": 0, "has_text": False},
+                        evidence=PatientIdentityEvidence(source_path=str(source_path)),
+                        error=str(exc),
+                    ))
+        except Exception:
+            # A catastrophic staging failure must not leave the raw identity
+            # copies in _inbox behind.
+            batch.cleanup()
+            raise
         if progress_callback:
             progress_callback(len(file_paths), len(file_paths), "Completato")
         return batch

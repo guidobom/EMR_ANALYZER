@@ -10,7 +10,15 @@ from typing import Optional
 
 @dataclass
 class Patient:
-    """Patient record with pseudonymized identity."""
+    """Patient record with pseudonymized identity.
+
+    ``initials`` + ``sex`` + ``birth_year`` are a *deliberate* quasi-identifier
+    used only for display: in a small cohort, initials plus year of birth can
+    enable partial re-identification. The hash-only guarantee applies to the
+    identity repository (``patient_identities``), which persists only HMAC
+    digests of name / fiscal code / birth date — never the raw values. Do not
+    add further identifying fields here.
+    """
     id: str                              # P001, P002, ...
     pseudonym: str
     initials: Optional[str] = None       # AB, MR, ...
