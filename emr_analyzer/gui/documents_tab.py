@@ -17,6 +17,16 @@ from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 
 from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
 from ..extraction.clinical_text_isolator import ClinicalTextIsolationError
+from ..config import ATTRIBUTION_VERIFICATION_ENABLED
+
+
+class AttributionMismatchError(RuntimeError):
+    """The LLM identity of a document disagrees with its workspace.
+
+    Raised so the caller marks the document as errored instead of producing
+    a normalized text (and derived events) under the wrong patient.  The
+    document stays visible and is queued for review.
+    """
 
 
 class _NullProgressLogger:
@@ -1067,6 +1077,14 @@ class DocumentsTab(QWidget):
         sensitive_identity = self._sensitive_identity_for_document(
             doc, text, parsing_result
         )
+        # Verify the workspace attribution on the pre-anonymization text.  A
+        # document whose LLM identity points to a different workspace must not
+        # be normalized here: raising skips the isolation and leaves the doc
+        # marked as errored + queued for review (no events under the wrong
+        # patient are ever generated).
+        self._verify_document_attribution(
+            doc, text, parsing_result, progress
+        )
         result = isolator.isolate(
             text,
             document_date=doc.document_date,
@@ -1188,6 +1206,196 @@ class DocumentsTab(QWidget):
                 except Exception:
                     pass
         return values
+
+    # --- LLM attribution verification ------------------------------------
+
+    def _verify_document_attribution(self, doc, text, parsing_result,
+                                     progress):
+        """Check a document's identity against its workspace attribution.
+
+        Runs a small structured LLM call on the pre-anonymization text.  On
+        a mismatch (the LLM identity matches a different patient in the
+        registry) it flags the document and raises
+        :class:`AttributionMismatchError` so the isolation is skipped: no
+        normalized text or events are ever produced under the wrong patient.
+        Missing services, a disabled config flag or an inconclusive result
+        all leave the extraction untouched.
+        """
+        if not ATTRIBUTION_VERIFICATION_ENABLED:
+            return
+        llm_client = self._services.get("document_llm_client")
+        identity_repo = self._services.get("identity_repo")
+        extract_identity = getattr(llm_client, "extract_patient_identity", None)
+        if not callable(extract_identity) or not identity_repo:
+            return
+        raw_text = self._attribution_raw_text(doc, text, parsing_result)
+        verdict = self._attribution_verdict(
+            doc, raw_text, extract_identity, identity_repo
+        )
+        if verdict["status"] in ("mismatch", "conflict"):
+            self._flag_attribution_mismatch(doc, verdict, progress)
+            raise AttributionMismatchError(verdict["message"])
+
+    @staticmethod
+    def _attribution_raw_text(doc, text, parsing_result) -> str:
+        """The rawest available text slice carrying the patient header."""
+        raw = ""
+        if parsing_result and getattr(parsing_result, "plain_text", None):
+            raw = parsing_result.plain_text
+        if not raw or len(raw.strip()) < 60:
+            try:
+                import fitz
+                pdf = fitz.open(doc.original_path)
+                try:
+                    chunks = [
+                        pdf[i].get_text()
+                        for i in range(min(pdf.page_count, 3))
+                    ]
+                    raw = " ".join(chunks)
+                finally:
+                    pdf.close()
+            except Exception:
+                pass
+        if not raw or len(raw.strip()) < 60:
+            raw = text or ""
+        return (raw or "")[:8000]
+
+    def _attribution_verdict(self, doc, raw_text, extract_identity,
+                             identity_repo) -> dict:
+        """Decide whether the LLM identity confirms the workspace.
+
+        Returns a dict with ``status`` in
+        ``confirmed | mismatch | conflict | inconclusive``; ``mismatch``
+        carries ``suggested_patient_id``.
+        """
+        from ..models.patient_identity import (
+            PatientIdentityEvidence, IdentityField,
+        )
+        from ..pipeline.patient_identity import (
+            normalize_text, normalize_fiscal_code,
+            fiscal_code_has_valid_checksum,
+        )
+
+        if not raw_text or len(raw_text.strip()) < 60:
+            return {"status": "inconclusive"}
+        identity = extract_identity(raw_text)
+        if not identity:
+            return {"status": "inconclusive"}
+
+        name = identity.get("name") or ""
+        birth = identity.get("birth_date") or ""
+        cf = identity.get("fiscal_code") or ""
+        if birth:
+            from ..utils.date_utils import parse_italian_date
+            iso = parse_italian_date(birth)
+            if iso:
+                birth = iso
+
+        confidence = identity.get("confidence", 0.5)
+        fields = {}
+        if name:
+            fields["name"] = IdentityField(
+                name, normalize_text(name), confidence=confidence
+            )
+        if birth:
+            fields["birth_date"] = IdentityField(
+                birth, birth, confidence=confidence
+            )
+        if cf:
+            normalized_cf = normalize_fiscal_code(cf)
+            fields["fiscal_code"] = IdentityField(
+                normalized_cf, normalized_cf, confidence=confidence
+            )
+        if not fields:
+            return {"status": "inconclusive"}
+        evidence = PatientIdentityEvidence(
+            source_path="llm_attribution", **fields
+        )
+
+        # Anti-hallucination anchor: the identity must actually be in the
+        # text before its match is trusted.
+        words = set(normalize_text(raw_text).split())
+        anchored_cf = False
+        if cf and fiscal_code_has_valid_checksum(cf):
+            anchored_cf = normalize_fiscal_code(cf) in words
+        anchored_name = False
+        if name:
+            tokens = [t for t in normalize_text(name).split() if len(t) >= 4]
+            if tokens and tokens[-1] in words:
+                anchored_name = True
+        if not (anchored_cf or anchored_name):
+            return {"status": "inconclusive"}
+
+        match = identity_repo.find_match(evidence)
+        if match.conflict:
+            return {
+                "status": "conflict",
+                "message": (
+                    f"Possibile attribuzione errata: identità LLM in "
+                    f"conflitto per il paziente {doc.patient_id}"
+                ),
+                "identity": identity,
+            }
+        if match.patient_id:
+            if match.patient_id == doc.patient_id:
+                return {"status": "confirmed", "identity": identity}
+            # Only a well-anchored identity (valid CF, or name+birth date)
+            # blocks the extraction; a lone name may point to a physician
+            # or a relative cited in the report.
+            if anchored_cf or (name and birth):
+                return {
+                    "status": "mismatch",
+                    "message": (
+                        f"Possibile attribuzione errata: l'identità LLM "
+                        f"corrisponde al paziente {match.patient_id}, non "
+                        f"a {doc.patient_id}"
+                    ),
+                    "suggested_patient_id": match.patient_id,
+                    "identity": identity,
+                }
+        return {"status": "inconclusive", "identity": identity}
+
+    def _flag_attribution_mismatch(self, doc, verdict, progress) -> None:
+        """Audit + review-queue the mismatch and surface it in the log."""
+        suggested = verdict.get("suggested_patient_id") or "ignoto"
+        identity = verdict.get("identity") or {}
+        audit_repo = self._services.get("audit_repo")
+        if audit_repo:
+            try:
+                audit_repo.log(
+                    doc.patient_id, "attribution_mismatch", "document", doc.id,
+                    {
+                        "status": verdict["status"],
+                        "suggested_patient_id": suggested,
+                        "llm_identity": identity,
+                    },
+                )
+            except Exception:
+                pass
+        db = self._services.get("db")
+        if db:
+            try:
+                db.execute(
+                    """INSERT INTO validation_queue
+                       (patient_id, item_type, item_id, issue, severity, status,
+                        original_value, created_at)
+                       VALUES (?, 'attribution', ?, ?, 'high', 'pending', ?, ?)""",
+                    (
+                        doc.patient_id, doc.id, verdict["message"],
+                        json.dumps({
+                            "suggested_patient_id": suggested,
+                            "llm_identity": identity,
+                        }, ensure_ascii=False),
+                        datetime.now().isoformat(),
+                    ),
+                )
+                db.commit()
+            except Exception:
+                pass
+        progress.add_log(
+            f"  ⚠️ {doc.filename}: {verdict['message']} — "
+            "attribuzione da verificare"
+        )
 
     def _clear_legacy_document_validation(self, document_id: str) -> None:
         """Remove review items created by the retired document JSON phase."""

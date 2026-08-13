@@ -6,6 +6,11 @@ from pathlib import Path
 APP_NAME = "EMR Analyzer"
 APP_VERSION = "0.2.0"
 OFFLINE_MODE = True
+# Verify each document's workspace attribution with the LLM before its
+# clinical text is normalized. The check runs on the pre-anonymization
+# text and blocks extraction of a document whose LLM identity points to a
+# different workspace. Set to False to skip the per-document identity call.
+ATTRIBUTION_VERIFICATION_ENABLED = True
 BASE_DIR = Path.home() / ".emr_analyzer"
 _workspace_path: Path = BASE_DIR / "workspaces"
 

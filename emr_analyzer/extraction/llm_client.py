@@ -402,6 +402,68 @@ class LlmClient:
         )
         return json.loads(response)
 
+    def extract_patient_identity(self, text: str) -> dict:
+        """Extract the patient's identity fields from raw document text.
+
+        Runs on the pre-anonymization text: the model must be able to read
+        the actual name/CF/birth date so the result can confirm (or refute)
+        the workspace attribution made by the deterministic routing.
+
+        Returns a dict with keys ``name``, ``birth_date``, ``fiscal_code``
+        and ``confidence``; an empty dict when the call fails or the model
+        could not produce valid JSON.
+        """
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "birth_date": {"type": "string"},
+                "fiscal_code": {"type": "string"},
+                "confidence": {"type": "number"},
+            },
+            "required": ["name", "birth_date", "fiscal_code"],
+        }
+        system_prompt = (
+            "Sei un assistente che estrae l'identità anagrafica del paziente "
+            "da un documento clinico. Rispondi SOLO con JSON valido, senza "
+            "altro testo."
+        )
+        user_prompt = f"""Estrai l'identità del PAZIENTE a cui si riferisce il documento.
+
+Campi:
+- name: nome e cognome completi del paziente, come scritti nel documento
+- birth_date: data di nascita in formato YYYY-MM-DD, se presente
+- fiscal_code: codice fiscale a 16 caratteri, se presente; altrimenti stringa vuota
+- confidence: la tua confidenza (0.0-1.0)
+
+Regole:
+- È rilevante SOLO il paziente: ignora medici, infermieri, referenti e
+  ogni altra persona citata nel testo.
+- Se non puoi determinare il paziente con sicurezza, lascia i campi vuoti.
+- Non inventare o correggere alcun valore.
+
+TESTO:
+{text[:4000]}
+"""
+        try:
+            data = self.generate_structured(
+                user_prompt, system_prompt, schema
+            )
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        try:
+            confidence = float(data.get("confidence", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            confidence = 0.5
+        return {
+            "name": (data.get("name") or "").strip(),
+            "birth_date": (data.get("birth_date") or "").strip(),
+            "fiscal_code": (data.get("fiscal_code") or "").strip().upper(),
+            "confidence": confidence,
+        }
+
     def generate_text(self, prompt: str, system: str = "") -> str:
         """Generate plain text without JSON/schema constraints."""
         response = self._ollama_generate(prompt, system, format_schema=None)
