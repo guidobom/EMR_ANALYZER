@@ -296,3 +296,7 @@ class WorkspaceTabs(QTabWidget):
         self._laboratory_tab.load_patient(patient_id)
         self._clinical_history_tab.load_patient(patient_id)
         self._validation_tab.load_patient(patient_id)
+
+    def reprocess_document(self, doc_id: str):
+        """Re-run the clinical-text pipeline for one document."""
+        self._documents_tab.reprocess_document(doc_id)

@@ -823,8 +823,17 @@ OSSERVAZIONI CLINICHE:
 
         by_id = {e.entry_id: e for e in entries}
         removed_ids: set[str] = set()
+        known_ids = set(by_id)
         for g in groups:
-            removed_ids.update(g.get("merged_into_ids", []))
+            kept = g.get("kept_id")
+            # A hallucinated kept_id (not among the entries) must not drop the
+            # merged entries: without a survivor the clinical content would be
+            # lost. Skip such groups entirely.
+            if kept not in known_ids:
+                continue
+            removed_ids.update(
+                m for m in g.get("merged_into_ids", []) if m != kept
+            )
 
         final: list[ClinicalTimelineEntry] = []
         for entry in entries:
@@ -860,7 +869,12 @@ OSSERVAZIONI CLINICHE:
                 # among the merged entries.
                 group_date = group.get("date_observed")
                 if group_date:
-                    entry.date_observed = group_date
+                    # Normalize like extraction: the LLM may return free-form
+                    # dates ("febbraio 2024") that would break chronological
+                    # ordering. Fall back to the survivor's own date.
+                    entry.date_observed = self._normalize_date_observed(
+                        group_date, entry.date_observed
+                    )
                 elif not entry.date_observed:
                     merged_dates = [
                         by_id[m].date_observed

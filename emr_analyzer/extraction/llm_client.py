@@ -1213,8 +1213,16 @@ TESTO DA ANALIZZARE:
                     if isinstance(item, dict) and "description" in item:
                         valid.append(item)
                 return valid
-            elif isinstance(parsed, dict) and "entries" in parsed:
-                return parsed["entries"]
+            elif isinstance(parsed, dict) and isinstance(
+                parsed.get("entries"), list
+            ):
+                # Validate like the list branch: a non-list (e.g. None) here
+                # would crash the caller's iteration.
+                valid = []
+                for item in parsed["entries"]:
+                    if isinstance(item, dict) and "description" in item:
+                        valid.append(item)
+                return valid
         except (_json.JSONDecodeError, ValueError):
             pass
 

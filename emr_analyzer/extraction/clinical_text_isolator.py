@@ -207,9 +207,12 @@ class ClinicalTextIsolator:
                 # failure so the corrective-retry → section-fallback chain
                 # can shrink the chunk and retry.
                 if "limite di token" in str(exc):
-                    raise ValueError(
-                        "il modello ha raggiunto il limite di token "
-                        "in output — riprovo con un chunk più piccolo"
+                    # Surface as a validation failure so the caller's
+                    # section-fallback chain shrinks the chunk and retries,
+                    # instead of failing the whole document.
+                    raise ClinicalTextValidationError(
+                        ["il modello ha raggiunto il limite di token in output"],
+                        ["limite token output"],
                     ) from exc
                 if validation_categories:
                     raise RuntimeError(

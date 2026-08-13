@@ -290,6 +290,80 @@ class TestApplyDedupGroups(unittest.TestCase):
         out = apply_groups(entries, {"groups": []})
         self.assertEqual(len(out), 1)
 
+    def test_hallucinated_kept_id_keeps_merged_entries(self):
+        """A kept_id not in the registry must NOT drop the fused entries."""
+        entries = [
+            make_entry("CTL_000001", "2020-05-01", "treatment", "Nivolumab"),
+            make_entry("CTL_000002", "2020-05-05", "treatment",
+                       "Nivolumab: terapia avviata"),
+        ]
+        result = {
+            "groups": [{
+                "kept_id": "CTL_999999",  # hallucinated — no such entry
+                "merged_into_ids": ["CTL_000001"],
+                "canonical_description": "Inizio nivolumab",
+                "date_observed": "2020-05-01",
+            }],
+        }
+        out = apply_groups(entries, result)
+        # No entry is removed because there is no survivor to inherit it.
+        self.assertEqual(len(out), 2)
+        self.assertEqual(
+            {e.entry_id for e in out}, {"CTL_000001", "CTL_000002"}
+        )
+
+    def test_hallucinated_kept_id_also_in_merged_is_still_safe(self):
+        """kept_id inside merged_into_ids must not delete the survivor."""
+        entries = [
+            make_entry("CTL_000001", "2020-05-01", "treatment", "Nivolumab"),
+        ]
+        result = {
+            "groups": [{
+                "kept_id": "CTL_000001",
+                "merged_into_ids": ["CTL_000001"],  # self-reference
+                "canonical_description": "Inizio nivolumab",
+            }],
+        }
+        out = apply_groups(entries, result)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].entry_id, "CTL_000001")
+
+    def test_group_date_is_normalized_to_iso(self):
+        entries = [
+            make_entry("CTL_000001", "2020-05-01", "treatment", "Nivolumab"),
+            make_entry("CTL_000002", "2020-05-05", "treatment",
+                       "Nivolumab: terapia avviata"),
+        ]
+        result = {
+            "groups": [{
+                "kept_id": "CTL_000002",
+                "merged_into_ids": ["CTL_000001"],
+                "canonical_description": "Inizio nivolumab",
+                "date_observed": "01/02/2024",  # European, not ISO
+            }],
+        }
+        out = apply_groups(entries, result)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].date_observed, "2024-02-01")
+
+    def test_group_date_unparseable_falls_back_to_survivor(self):
+        entries = [
+            make_entry("CTL_000001", "2020-05-01", "treatment", "Nivolumab"),
+            make_entry("CTL_000002", "2020-05-05", "treatment",
+                       "Nivolumab: terapia avviata"),
+        ]
+        result = {
+            "groups": [{
+                "kept_id": "CTL_000002",
+                "merged_into_ids": ["CTL_000001"],
+                "canonical_description": "Inizio nivolumab",
+                "date_observed": "febbraio 2024",  # free-form
+            }],
+        }
+        out = apply_groups(entries, result)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].date_observed, "2020-05-05")
+
 
 class TestDeduplicateAll(unittest.TestCase):
     """End-to-end: deterministic pre-filter + LLM groups."""

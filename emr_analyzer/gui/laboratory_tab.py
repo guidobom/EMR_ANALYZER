@@ -236,7 +236,7 @@ class LaboratoryTab(QWidget):
         # Reference range lines
         ref_low = values[0].reference_low
         ref_high = values[0].reference_high
-        if ref_low is not None and ref_high is not None:
+        if ref_low is not None and ref_high is not None and x_vals:
             min_x = min(x_vals)
             max_x = max(x_vals)
             if min_x < max_x:
@@ -252,7 +252,7 @@ class LaboratoryTab(QWidget):
                 self._chart_widget.addItem(high_line)
 
         # Format x-axis as dates
-        if isinstance(x_vals[0], float) and x_vals[0] > 1000000000:
+        if x_vals and isinstance(x_vals[0], float) and x_vals[0] > 1000000000:
             from pyqtgraph import DateAxisItem
             date_axis = DateAxisItem(orientation='bottom')
             self._chart_widget.setAxisItems({'bottom': date_axis})

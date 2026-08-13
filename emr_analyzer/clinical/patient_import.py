@@ -45,10 +45,13 @@ class PatientImportService:
                     (row["id"],),
                 ).fetchone()[0]
                 cs_row = db.execute(
-                    "SELECT clinical_profile FROM clinical_state WHERE patient_id=?",
+                    "SELECT state_json FROM clinical_state WHERE patient_id=?",
                     (row["id"],),
                 ).fetchone()
-                has_profile = bool(cs_row and cs_row["clinical_profile"])
+                has_profile = False
+                if cs_row:
+                    data = json.loads(cs_row["state_json"] or "{}")
+                    has_profile = bool(data.get("clinical_profile"))
                 patients.append({
                     "id": row["id"],
                     "pseudonym": row["pseudonym"],
@@ -245,20 +248,21 @@ class PatientImportService:
 
         # 5. Copy clinical profile
         cs_row = source_db.execute(
-            "SELECT * FROM clinical_state WHERE patient_id=?",
+            "SELECT state_json FROM clinical_state WHERE patient_id=?",
             (patient_id,),
         ).fetchone()
-        if cs_row and cs_row.get("clinical_profile"):
-            state_json = json.loads(cs_row["state_json"])
-            state_json["patient_id"] = new_pid
-            target_db.execute(
-                """INSERT INTO clinical_state
-                   (patient_id, state_json, updated_at, version)
-                   VALUES (?, ?, ?, ?)""",
-                (new_pid, json.dumps(state_json, ensure_ascii=False),
-                 now, 1),
-            )
-            stats["profiles"] += 1
+        if cs_row:
+            state_json = json.loads(cs_row["state_json"] or "{}")
+            if state_json.get("clinical_profile"):
+                state_json["patient_id"] = new_pid
+                target_db.execute(
+                    """INSERT INTO clinical_state
+                       (patient_id, state_json, updated_at, version)
+                       VALUES (?, ?, ?, ?)""",
+                    (new_pid, json.dumps(state_json, ensure_ascii=False),
+                     now, 1),
+                )
+                stats["profiles"] += 1
 
         target_db.commit()
 
