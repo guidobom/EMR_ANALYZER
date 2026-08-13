@@ -58,6 +58,7 @@ class ClinicalTimelineEntry:
     description: str = ""                   # concise clinical description
     source_document_ids: list[str] = field(default_factory=list)
     source_texts: list[str] = field(default_factory=list)
+    merged_into_ids: list[str] = field(default_factory=list)
     status: str = "active"                  # active, resolved, superseded
     confidence: float = 0.5                 # 0.0-1.0
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -73,6 +74,7 @@ class ClinicalTimelineEntry:
             "description": self.description,
             "source_document_ids": self.source_document_ids,
             "source_texts": self.source_texts,
+            "merged_into_ids": self.merged_into_ids,
             "status": self.status,
             "confidence": self.confidence,
             "created_at": self.created_at,
@@ -90,6 +92,7 @@ class ClinicalTimelineEntry:
             description=data.get("description", ""),
             source_document_ids=data.get("source_document_ids", []),
             source_texts=data.get("source_texts", []),
+            merged_into_ids=data.get("merged_into_ids", []),
             status=data.get("status", "active"),
             confidence=data.get("confidence", 0.5),
             created_at=data.get("created_at", ""),

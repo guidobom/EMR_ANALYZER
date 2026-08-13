@@ -207,28 +207,39 @@ class PatientImportService:
                  lab_row["confidence"], lab_row["validated_by_user"]),
             )
 
-        # 4. Copy timeline entries
+        # 4. Copy timeline entries (preserving merged_into_ids provenance)
         timeline_rows = source_db.execute(
             "SELECT * FROM clinical_timeline WHERE patient_id=? ORDER BY entry_id",
             (patient_id,),
         ).fetchall()
+        # First pass: assign new ids.  merged_into_ids may reference entries
+        # that appear later in the source ordering, so build the full map
+        # before inserting anything.
+        id_map = {}
         for tl_row in timeline_rows:
-            new_entry_id = self._next_id(target_db, "clinical_timeline", "CTL_")
+            id_map[tl_row["entry_id"]] = self._next_id(
+                target_db, "clinical_timeline", "CTL_"
+            )
+        for tl_row in timeline_rows:
+            new_entry_id = id_map[tl_row["entry_id"]]
             # Remap document IDs in source_document_ids
             src_doc_ids = json.loads(tl_row["source_document_ids"] or "[]")
             new_doc_ids = [doc_map.get(d, d) for d in src_doc_ids]
+            src_merged = json.loads(tl_row["merged_into_ids"] or "[]")
+            new_merged = [id_map.get(m, m) for m in src_merged]
             target_db.execute(
                 """INSERT INTO clinical_timeline
                    (entry_id, patient_id, date_observed, date_resolved,
                     category, description, source_document_ids, source_texts,
-                    status, confidence, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    merged_into_ids, status, confidence, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (new_entry_id, new_pid, tl_row["date_observed"],
                  tl_row["date_resolved"], tl_row["category"],
                  tl_row["description"],
                  json.dumps(new_doc_ids, ensure_ascii=False),
-                 tl_row["source_texts"], tl_row["status"],
-                 tl_row["confidence"], now, now),
+                 tl_row["source_texts"],
+                 json.dumps(new_merged, ensure_ascii=False),
+                 tl_row["status"], tl_row["confidence"], now, now),
             )
             stats["timeline"] += 1
 

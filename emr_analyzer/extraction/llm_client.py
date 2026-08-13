@@ -1228,11 +1228,20 @@ TESTO DA ANALIZZARE:
 
         Sends ALL entries to the LLM using a compact format so the full
         registry fits in the context window (32K tokens ≈ 64K chars).
-        The LLM identifies semantically equivalent clinical events and
-        synthesises the most complete description from all sources.
+        The LLM groups semantically equivalent clinical events and, for
+        each group, synthesises a single **canonical description** with the
+        earliest/most precise date.  The result is a list of groups:
+
+        ``{"groups": [{"kept_id": ..., "merged_into_ids": [...],
+                        "canonical_description": ...,
+                        "date_observed": ...}]}``
+
+        Entries that are NOT part of any group are left untouched (they are
+        not removed) — the caller only needs to drop ``merged_into_ids`` and
+        replace each ``kept_id``'s description with the canonical one.
         """
         if not entries:
-            return {"removed_entry_ids": [], "enrichments": {}}
+            return {"groups": []}
 
         if len(entries) <= self._DEDUP_BATCH_SIZE:
             return self._dedup_batch(entries)
@@ -1240,8 +1249,7 @@ TESTO DA ANALIZZARE:
         # Sliding-window dedup for large registries.
         # Each batch reuses the deduplicated output of the previous batch
         # so the LLM never sees entries that have already been removed.
-        all_removed: set[str] = set()
-        all_enrichments: dict[str, str] = {}
+        survivor_groups: dict[str, dict] = {}
         working = list(entries)  # mutable copy — updated after each batch
         cursor = 0  # first entry that still needs dedup
 
@@ -1249,29 +1257,67 @@ TESTO DA ANALIZZARE:
             batch_end = min(cursor + self._DEDUP_BATCH_SIZE, len(working))
             batch = working[cursor:batch_end]
             result = self._dedup_batch(batch)
+            batch_groups = result.get("groups", [])
 
-            batch_removed = set(result.get("removed_entry_ids", []))
-            all_removed |= batch_removed
-            for eid, enrichment in result.get("enrichments", {}).items():
-                if not isinstance(enrichment, str):
-                    enrichment = str(enrichment)
-                all_enrichments[eid] = (
-                    all_enrichments.get(eid, "") + " | " + enrichment
-                    if eid in all_enrichments else enrichment
-                )
+            batch_removed: set[str] = set()
+            for g in batch_groups:
+                for mid in g.get("merged_into_ids", []):
+                    batch_removed.add(mid)
 
-            # Rebuild working list: keep-only entries, apply enrichments
+            # Absorb batch groups into the global survivor registry,
+            # resolving transitivity (an earlier survivor may itself be
+            # merged by a later batch).
+            for g in batch_groups:
+                kid = g.get("kept_id")
+                if not kid:
+                    continue
+                merged = [m for m in g.get("merged_into_ids", []) if m]
+                if kid in survivor_groups:
+                    cur = survivor_groups[kid]
+                    cur["merged_into_ids"] = list(dict.fromkeys(
+                        cur.get("merged_into_ids", []) + merged
+                    ))
+                    if g.get("canonical_description"):
+                        cur["canonical_description"] = g[
+                            "canonical_description"
+                        ]
+                else:
+                    survivor_groups[kid] = {
+                        "kept_id": kid,
+                        "merged_into_ids": list(dict.fromkeys(merged)),
+                        "canonical_description": (
+                            g.get("canonical_description") or ""
+                        ),
+                        "date_observed": g.get("date_observed") or "",
+                        "category": g.get("category") or "",
+                        "status": g.get("status") or "",
+                    }
+                # Any prior survivor that is now merged into this group's
+                # kept entry: fold its merged ids into the new survivor.
+                for mid in merged:
+                    if mid in survivor_groups:
+                        absorbed = survivor_groups.pop(mid)
+                        survivor_groups[kid]["merged_into_ids"] = (
+                            list(dict.fromkeys(
+                                survivor_groups[kid]["merged_into_ids"]
+                                + absorbed.get("merged_into_ids", [])
+                            ))
+                        )
+
+            # Rebuild working list: drop merged entries, apply canonical
+            # descriptions to survivors of this batch.
             kept = []
             for e in working[:batch_end]:
-                if e.get("entry_id") in batch_removed:
+                eid = e.get("entry_id")
+                if eid in batch_removed:
                     continue
-                enrichment = all_enrichments.get(e.get("entry_id"))
-                if enrichment:
+                g = next(
+                    (x for x in batch_groups if x.get("kept_id") == eid),
+                    None,
+                )
+                if g and g.get("canonical_description"):
                     e = dict(e)
-                    e["description"] = (
-                        str(e.get("description", ""))
-                        + "\n\n[Integrazione: " + enrichment + "]"
-                    )
+                    e["description"] = g["canonical_description"]
                 kept.append(e)
             kept.extend(working[batch_end:])
             working = kept
@@ -1279,18 +1325,12 @@ TESTO DA ANALIZZARE:
             # Advance cursor: skip the first (batch_size - overlap) kept
             # entries, which are now considered fully deduplicated.
             new_done = max(1, len(batch) - self._DEDUP_OVERLAP)
-            # Adjust for entries that were removed from the batch
-            removed_in_batch = sum(
-                1 for e in batch if e.get("entry_id") in batch_removed
-            )
+            removed_in_batch = len(batch_removed)
             cursor += max(1, new_done - removed_in_batch)
             if cursor >= len(working):
                 break
 
-        return {
-            "removed_entry_ids": sorted(all_removed),
-            "enrichments": all_enrichments,
-        }
+        return {"groups": list(survivor_groups.values())}
 
     def _dedup_batch(self, entries: list[dict]) -> dict:
         """Deduplicate a single batch that fits in the context window."""
@@ -1299,7 +1339,8 @@ TESTO DA ANALIZZARE:
         system_prompt = (
             "Sei un medico esperto di oncologia. Il tuo compito e' analizzare "
             "un registro clinico temporale ed eliminare le voci ridondanti "
-            "che descrivono lo STESSO evento clinico. "
+            "che descrivono lo STESSO evento clinico, fondendo ogni gruppo "
+            "di duplicati in un'unica voce canonica. "
             "Rispondi SOLO con JSON valido."
         )
 
@@ -1317,20 +1358,26 @@ TESTO DA ANALIZZARE:
 
         user_prompt = f"""Elimina i duplicati semantici da questo registro ({len(entries)} voci).
 
-REGOLE: Due voci sono DUPLICATE se descrivono lo STESSO evento clinico.
-NON unire: eventi diversi, sospensione/ripresa di trattamento, diagnosi vs progressione.
-Per ogni gruppo tieni la voce con descrizione PIU' COMPLETA e data PIU' PRECISA.
+REGOLE:
+1. Due voci sono DUPLICATE se descrivono lo STESSO evento clinico (stessa data/periodo e stesso contenuto clinico).
+2. NON unire: eventi diversi, sospensione/ripresa di trattamento, diagnosi vs progressione, sintomi diversi.
+3. Per ogni gruppo di duplicati scegli come kept_id la voce con la descrizione PIU' COMPLETA e la data PIU' PRECISA.
+4. SCRIVI una canonical_description: una descrizione sintetica e clinicamente precisa che riassuma il contenuto del gruppo, usando SOLO informazioni presenti nelle voci del gruppo. NON inventare dosaggi, date, indicazioni o dettagli non espliciti.
+   Esempio: 'inizia in data odierna terapia con nivolumab' + 'ha iniziato oggi nivolumab con intento adiuvante' -> 'Inizio nivolumab con intento adiuvante'.
+5. merged_into_ids: gli entry_id delle voci fuse (tutte quelle del gruppo tranne kept_id).
+6. date_observed: la data piu' precoce e piu' precisa tra quelle del gruppo.
+7. Le voci che NON sono duplicati vanno OMESSE dai gruppi: restano nel registro senza alcuna modifica.
 
 REGISTRO:
 {entries_json}
 
-Restituisci SOLO: ```json {{"removed_entry_ids": [...], "enrichments": {{...}}}} ```
+Restituisci SOLO: ```json {{"groups": [{{"kept_id": "...", "merged_into_ids": [...], "canonical_description": "...", "date_observed": "YYYY-MM-DD", "category": "...", "status": "..."}}]}} ```
 """
         try:
             raw = self.generate_text(user_prompt, system_prompt)
             return self._parse_json_dedup(raw, entries)
         except Exception:
-            return {"removed_entry_ids": [], "enrichments": {}}
+            return {"groups": []}
 
     @staticmethod
     def _parse_json_dedup(raw: str, fallback_entries: list[dict]) -> dict:
@@ -1361,9 +1408,31 @@ Restituisci SOLO: ```json {{"removed_entry_ids": [...], "enrichments": {{...}}}}
         try:
             parsed = _json.loads(text)
             if isinstance(parsed, dict):
+                if "groups" in parsed and isinstance(parsed["groups"], list):
+                    groups = []
+                    for g in parsed["groups"]:
+                        if not isinstance(g, dict):
+                            continue
+                        merged = g.get("merged_into_ids", [])
+                        groups.append({
+                            "kept_id": g.get("kept_id") or "",
+                            "merged_into_ids": (
+                                list(merged) if isinstance(merged, list)
+                                else []
+                            ),
+                            "canonical_description": (
+                                g.get("canonical_description") or ""
+                            ),
+                            "date_observed": g.get("date_observed") or "",
+                            "category": g.get("category") or "",
+                            "status": g.get("status") or "",
+                        })
+                    return {"groups": groups}
+
+                # Backward compatibility with the old {removed_entry_ids,
+                # enrichments} contract, so older stored outputs still parse.
                 removed = parsed.get("removed_entry_ids", [])
                 enrichments = parsed.get("enrichments", {})
-                # Also support old format for backward compat
                 if "deduplicated_entries" in parsed:
                     return parsed
                 return {
@@ -1377,7 +1446,4 @@ Restituisci SOLO: ```json {{"removed_entry_ids": [...], "enrichments": {{...}}}}
         except (_json.JSONDecodeError, ValueError):
             pass
 
-        return {
-            "removed_entry_ids": [],
-            "enrichments": {},
-        }
+        return {"groups": []}

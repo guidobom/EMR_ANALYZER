@@ -22,15 +22,16 @@ class TimelineRepository:
         self.db.executemany(
             """INSERT OR REPLACE INTO clinical_timeline
                (entry_id, patient_id, date_observed, date_resolved, category,
-                description, source_document_ids, source_texts, status,
-                confidence, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                description, source_document_ids, source_texts,
+                merged_into_ids, status, confidence, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     e.entry_id, e.patient_id, e.date_observed, e.date_resolved,
                     e.category, e.description,
                     json.dumps(e.source_document_ids, ensure_ascii=False),
                     json.dumps(e.source_texts, ensure_ascii=False),
+                    json.dumps(e.merged_into_ids, ensure_ascii=False),
                     e.status, e.confidence, e.created_at or now, now,
                 )
                 for e in entries
@@ -69,15 +70,16 @@ class TimelineRepository:
                     """INSERT INTO clinical_timeline
                        (entry_id, patient_id, date_observed, date_resolved,
                         category, description, source_document_ids,
-                        source_texts, status, confidence, created_at,
-                        updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        source_texts, merged_into_ids, status, confidence,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     [
                         (
                             e.entry_id, e.patient_id, e.date_observed,
                             e.date_resolved, e.category, e.description,
                             json.dumps(e.source_document_ids, ensure_ascii=False),
                             json.dumps(e.source_texts, ensure_ascii=False),
+                            json.dumps(e.merged_into_ids, ensure_ascii=False),
                             e.status, e.confidence, e.created_at or now, now,
                         )
                         for e in entries
@@ -122,6 +124,7 @@ class TimelineRepository:
             description=row["description"],
             source_document_ids=json.loads(row["source_document_ids"] or "[]"),
             source_texts=json.loads(row["source_texts"] or "[]"),
+            merged_into_ids=json.loads(row["merged_into_ids"] or "[]"),
             status=row["status"],
             confidence=row["confidence"] or 0.5,
             created_at=row["created_at"],

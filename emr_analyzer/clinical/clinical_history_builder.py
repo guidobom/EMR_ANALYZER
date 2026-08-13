@@ -100,8 +100,9 @@ class ClinicalHistoryBuilder:
                 entry = ClinicalTimelineEntry(
                     entry_id=entry_id,
                     patient_id=patient_id,
-                    date_observed=entry_data.get(
-                        "date_observed", ndoc["document_date"] or ""
+                    date_observed=self._normalize_date_observed(
+                        entry_data.get("date_observed"),
+                        ndoc["document_date"] or "",
                     ),
                     date_resolved=entry_data.get("date_resolved"),
                     category=entry_data.get("category", "other"),
@@ -140,23 +141,8 @@ class ClinicalHistoryBuilder:
         if progress_callback:
             progress_callback(65, f"Deduplicazione semantica LLM ({len(all_entries)} voci)...")
 
-        entries_dicts = [e.to_dict() for e in all_entries]
-        dedup_result = self._llm.deduplicate_timeline(entries_dicts)
-
-        removed_ids = set(dedup_result.get("removed_entry_ids", []))
-        enrichments = dedup_result.get("enrichments", {})
-
-        # Build final list: skip removed entries, apply enrichments
-        final_entries: list[ClinicalTimelineEntry] = []
-        for entry in all_entries:
-            if entry.entry_id in removed_ids:
-                continue
-            enrichment = enrichments.get(entry.entry_id)
-            if enrichment and isinstance(enrichment, str):
-                entry.description = (
-                    f"{entry.description}\n\n[Integrazione: {enrichment}]"
-                )
-            final_entries.append(entry)
+        final_entries = self._deduplicate_all(all_entries)
+        removed_count = len(all_entries) - len(final_entries)
 
         # ---- 4. Persist -------------------------------------------------
         if progress_callback:
@@ -183,14 +169,14 @@ class ClinicalHistoryBuilder:
                 {
                     "documents_processed": total,
                     "extracted_entries": len(all_entries),
-                    "deduplicated_entries": len(removed_ids),
+                    "deduplicated_entries": removed_count,
                     "final_entries": len(final_entries),
                 },
             )
 
         return {
             "total_entries": len(all_entries),
-            "deduplicated": len(removed_ids),
+            "deduplicated": removed_count,
             "final_entries": len(final_entries),
             "documents_processed": total,
             "documents_failed": len(failed_docs),
@@ -265,8 +251,9 @@ class ClinicalHistoryBuilder:
                 entry = ClinicalTimelineEntry(
                     entry_id=entry_id,
                     patient_id=patient_id,
-                    date_observed=entry_data.get(
-                        "date_observed", ndoc["document_date"] or ""
+                    date_observed=self._normalize_date_observed(
+                        entry_data.get("date_observed"),
+                        ndoc["document_date"] or "",
                     ),
                     date_resolved=entry_data.get("date_resolved"),
                     category=entry_data.get("category", "other"),
@@ -303,22 +290,8 @@ class ClinicalHistoryBuilder:
                 f"{len(new_entries)} nuovi = {len(all_entries)} totali)...",
             )
 
-        entries_dicts = [e.to_dict() for e in all_entries]
-        dedup_result = self._llm.deduplicate_timeline(entries_dicts)
-
-        removed_ids = set(dedup_result.get("removed_entry_ids", []))
-        enrichments = dedup_result.get("enrichments", {})
-
-        final_entries: list[ClinicalTimelineEntry] = []
-        for entry in all_entries:
-            if entry.entry_id in removed_ids:
-                continue
-            enrichment = enrichments.get(entry.entry_id)
-            if enrichment and isinstance(enrichment, str):
-                entry.description = (
-                    f"{entry.description}\n\n[Integrazione: {enrichment}]"
-                )
-            final_entries.append(entry)
+        final_entries = self._deduplicate_all(all_entries)
+        removed_count = len(all_entries) - len(final_entries)
 
         # ---- 6. Atomic save (delete old → save new in one shot) ---------
         if progress_callback:
@@ -343,14 +316,14 @@ class ClinicalHistoryBuilder:
                     "existing_entries": len(existing_entries),
                     "new_documents": total_new,
                     "new_entries": len(new_entries),
-                    "deduplicated_entries": len(removed_ids),
+                    "deduplicated_entries": removed_count,
                     "final_entries": len(final_entries),
                 },
             )
 
         return {
             "total_entries": len(new_entries),
-            "deduplicated": len(removed_ids),
+            "deduplicated": removed_count,
             "final_entries": len(final_entries),
             "documents_processed": total_new,
             "documents_skipped": total_all - total_new,
@@ -450,8 +423,9 @@ class ClinicalHistoryBuilder:
                     entry = ClinicalTimelineEntry(
                         entry_id=entry_id,
                         patient_id=patient_id,
-                        date_observed=entry_data.get(
-                            "date_observed", ndoc["document_date"] or ""
+                        date_observed=self._normalize_date_observed(
+                            entry_data.get("date_observed"),
+                            ndoc["document_date"] or "",
                         ),
                         date_resolved=entry_data.get("date_resolved"),
                         category=entry_data.get("category", "other"),
@@ -499,23 +473,8 @@ class ClinicalHistoryBuilder:
         if progress_callback:
             progress_callback(65, f"Deduplicazione semantica LLM ({len(all_entries)} voci)...")
 
-        entries_dicts = [e.to_dict() for e in all_entries]
-        dedup_result = self._llm.deduplicate_timeline(entries_dicts)
-
-        removed_ids = set(dedup_result.get("removed_entry_ids", []))
-        enrichments = dedup_result.get("enrichments", {})
-
-        # Build final list: skip removed entries, apply enrichments
-        final_entries: list[ClinicalTimelineEntry] = []
-        for entry in all_entries:
-            if entry.entry_id in removed_ids:
-                continue
-            enrichment = enrichments.get(entry.entry_id)
-            if enrichment and isinstance(enrichment, str):
-                entry.description = (
-                    f"{entry.description}\n\n[Integrazione: {enrichment}]"
-                )
-            final_entries.append(entry)
+        final_entries = self._deduplicate_all(all_entries)
+        removed_count = len(all_entries) - len(final_entries)
 
         # ---- 4. Persist ---------------------------------------------------
         if progress_callback:
@@ -541,7 +500,7 @@ class ClinicalHistoryBuilder:
                     "documents_processed": total,
                     "num_workers": actual_workers,
                     "extracted_entries": len(all_entries),
-                    "deduplicated_entries": len(removed_ids),
+                    "deduplicated_entries": removed_count,
                     "final_entries": len(final_entries),
                     "elapsed_seconds": round(elapsed, 1),
                 },
@@ -549,7 +508,7 @@ class ClinicalHistoryBuilder:
 
         return {
             "total_entries": len(all_entries),
-            "deduplicated": len(removed_ids),
+            "deduplicated": removed_count,
             "final_entries": len(final_entries),
             "documents_processed": total,
             "documents_failed": len(failed_docs),
@@ -721,24 +680,9 @@ OSSERVAZIONI CLINICHE:
         if len(entries) <= 1:
             return 0
 
-        entries_dicts = [e.to_dict() for e in entries]
-        result = self._llm.deduplicate_timeline(entries_dicts)
-        removed_ids = set(result.get("removed_entry_ids", []))
-        enrichments = result.get("enrichments", {})
-
-        final = []
-        for e in entries:
-            if e.entry_id in removed_ids:
-                continue
-            enrichment = enrichments.get(e.entry_id)
-            if enrichment and isinstance(enrichment, str):
-                e.description = (
-                    f"{e.description}\n\n[Integrazione: {enrichment}]"
-                )
-            final.append(e)
-
+        final = self._deduplicate_all(entries)
         self._timeline_repo.replace_all_for_patient(patient_id, final)
-        return len(removed_ids)
+        return len(entries) - len(final)
 
     def clear_narrative(self, patient_id: str) -> None:
         """Delete the clinical profile narrative, keeping the timeline."""
@@ -747,20 +691,30 @@ OSSERVAZIONI CLINICHE:
             state.clinical_profile = ""
             self._cs_repo.save(state)
 
+    # Conservative threshold: only near-verbatim entries (same date +
+    # category, ≥0.75 similarity) are merged deterministically.  The LLM
+    # stage handles the semantic duplicates the string matcher misses.
+    _DETERMINISTIC_DEDUP_THRESHOLD = 0.75
+
     @staticmethod
     def _deterministic_dedup(
         entries: list[ClinicalTimelineEntry],
     ) -> list[ClinicalTimelineEntry]:
-        """Merge entries with same date + category + similar description.
+        """Merge near-verbatim entries with same date + category.
 
         Runs before the LLM dedup to reduce the entry count and avoid
-        context-window overflow.  Uses ``SequenceMatcher`` with threshold
-        0.60 to catch the same clinical fact expressed with wording
-        differences (e.g. \"Dabrafenib 150 mg\" vs
-        \"Inizio trattamento con dabrafenib 150 mg\").
+        context-window overflow.  Uses ``SequenceMatcher`` with a
+        conservative threshold (0.75) so only entries that express the
+        same clinical fact with trivial wording differences are merged
+        (e.g. \"Inizio dabrafenib 150 mg\" vs \"inizia dabrafenib 150 mg\").
+        The survivor is the longest / highest-confidence entry of the group;
+        it accumulates the ``merged_into_ids`` (excluding its own id) and
+        the sources of the fused entries.
         """
         if len(entries) <= 1:
             return entries
+
+        threshold = ClinicalHistoryBuilder._DETERMINISTIC_DEDUP_THRESHOLD
 
         # Sort by (date, category, description) for stable grouping
         sorted_entries = sorted(
@@ -774,8 +728,9 @@ OSSERVAZIONI CLINICHE:
         for i, ei in enumerate(sorted_entries):
             if i in used:
                 continue
-            best = ei
-            best_idx = i
+
+            # Collect the group: same date + category, near-verbatim text.
+            group: list[int] = [i]
             for j, ej in enumerate(sorted_entries):
                 if j <= i or j in used:
                     continue
@@ -786,37 +741,193 @@ OSSERVAZIONI CLINICHE:
                 ratio = difflib.SequenceMatcher(
                     None, ei.description.lower(), ej.description.lower()
                 ).ratio()
-                if ratio >= 0.60:
-                    # Merge: keep the longer / higher-confidence entry
-                    if (len(ej.description) > len(best.description)
-                            or ej.confidence > best.confidence):
-                        best = ej
-                        best_idx = j
+                if ratio >= threshold:
+                    group.append(j)
                     used.add(j)
 
-            if best_idx != i:
-                # Merge source info from all merged entries
-                all_doc_ids = list(ei.source_document_ids)
-                all_texts = list(ei.source_texts)
-                for j in range(i + 1, len(sorted_entries)):
-                    if j in used and difflib.SequenceMatcher(
-                        None, ei.description.lower(),
-                        sorted_entries[j].description.lower(),
-                    ).ratio() >= 0.60:
-                        for did in sorted_entries[j].source_document_ids:
-                            if did not in all_doc_ids:
-                                all_doc_ids.append(did)
-                        for txt in sorted_entries[j].source_texts:
-                            if txt not in all_texts:
-                                all_texts.append(txt)
-                best.source_document_ids = all_doc_ids
-                best.source_texts = all_texts[:5]  # Cap at 5
-                best.confidence = max(best.confidence, ei.confidence)
+            # Survivor: longest description, then highest confidence.
+            best_idx = max(
+                group,
+                key=lambda idx: (
+                    len(sorted_entries[idx].description),
+                    sorted_entries[idx].confidence,
+                ),
+            )
+            survivor = sorted_entries[best_idx]
 
-            merged.append(best)
+            if len(group) > 1:
+                merged_ids = [
+                    sorted_entries[idx].entry_id
+                    for idx in group if idx != best_idx
+                ]
+                all_doc_ids = list(survivor.source_document_ids)
+                all_texts = list(survivor.source_texts)
+                for idx in group:
+                    if idx == best_idx:
+                        continue
+                    me = sorted_entries[idx]
+                    for did in me.source_document_ids:
+                        if did not in all_doc_ids:
+                            all_doc_ids.append(did)
+                    for txt in me.source_texts:
+                        if txt not in all_texts:
+                            all_texts.append(txt)
+                survivor.source_document_ids = all_doc_ids
+                survivor.source_texts = all_texts[:5]  # Cap at 5
+                survivor.confidence = max(
+                    survivor.confidence,
+                    max(sorted_entries[idx].confidence for idx in group),
+                )
+                survivor.merged_into_ids = list(dict.fromkeys(
+                    survivor.merged_into_ids + merged_ids
+                ))
+
+            merged.append(survivor)
             used.add(i)
 
         return merged
+
+    def _apply_dedup_groups(
+        self,
+        entries: list[ClinicalTimelineEntry],
+        dedup_result: dict,
+    ) -> list[ClinicalTimelineEntry]:
+        """Apply a dedup result to a list of timeline entries.
+
+        Handles both the new ``groups`` contract (canonical synthesis with
+        ``merged_into_ids`` provenance) and the legacy
+        ``removed_entry_ids``/``enrichments`` contract for backward
+        compatibility with older stored outputs.
+
+        Returns the final list: merged entries are dropped, each survivor
+        keeps the canonical description and accumulates the sources and the
+        ``merged_into_ids`` provenance of the entries fused into it.
+        """
+        groups = dedup_result.get("groups") or []
+        if not groups:
+            # Legacy contract: drop removed ids, append enrichments.
+            removed_ids = set(dedup_result.get("removed_entry_ids", []))
+            enrichments = dedup_result.get("enrichments", {})
+            final = []
+            for entry in entries:
+                if entry.entry_id in removed_ids:
+                    continue
+                enrichment = enrichments.get(entry.entry_id)
+                if enrichment and isinstance(enrichment, str):
+                    entry.description = (
+                        f"{entry.description}\n\n"
+                        f"[Integrazione: {enrichment}]"
+                    )
+                final.append(entry)
+            return final
+
+        by_id = {e.entry_id: e for e in entries}
+        removed_ids: set[str] = set()
+        for g in groups:
+            removed_ids.update(g.get("merged_into_ids", []))
+
+        final: list[ClinicalTimelineEntry] = []
+        for entry in entries:
+            if entry.entry_id in removed_ids:
+                continue
+            group = next(
+                (g for g in groups if g.get("kept_id") == entry.entry_id),
+                None,
+            )
+            if group:
+                canonical = group.get("canonical_description")
+                if canonical and isinstance(canonical, str):
+                    entry.description = canonical
+
+                merged = [
+                    m for m in group.get("merged_into_ids", [])
+                    if m in by_id
+                ]
+                entry.merged_into_ids = list(dict.fromkeys(
+                    entry.merged_into_ids + merged
+                ))
+                for mid in merged:
+                    me = by_id[mid]
+                    for did in me.source_document_ids:
+                        if did not in entry.source_document_ids:
+                            entry.source_document_ids.append(did)
+                    for txt in me.source_texts:
+                        if txt not in entry.source_texts:
+                            entry.source_texts.append(txt)
+
+                # Date: prefer the group's (LLM-selected, earliest/most
+                # precise), then the survivor's own, then the earliest
+                # among the merged entries.
+                group_date = group.get("date_observed")
+                if group_date:
+                    entry.date_observed = group_date
+                elif not entry.date_observed:
+                    merged_dates = [
+                        by_id[m].date_observed
+                        for m in merged if by_id[m].date_observed
+                    ]
+                    if merged_dates:
+                        entry.date_observed = min(merged_dates)
+
+            final.append(entry)
+        return final
+
+    def _deduplicate_all(
+        self, entries: list[ClinicalTimelineEntry],
+    ) -> list[ClinicalTimelineEntry]:
+        """Full dedup pipeline: deterministic pre-filter + LLM groups.
+
+        The deterministic pre-filter collapses near-verbatim entries first
+        (conservative, cheap), then the LLM groups the remaining semantic
+        duplicates and synthesises a canonical description per group.
+        """
+        deduped = self._deterministic_dedup(entries)
+        entries_dicts = [e.to_dict() for e in deduped]
+        dedup_result = self._llm.deduplicate_timeline(entries_dicts)
+        return self._apply_dedup_groups(deduped, dedup_result)
+
+    @staticmethod
+    def _normalize_date_observed(value, document_date: str = "") -> str:
+        """Normalize a ``date_observed`` extracted by the LLM.
+
+        Accepts ISO ``YYYY-MM-DD`` / ``YYYY-MM`` (month precision) and
+        European ``DD/MM/YYYY`` formats.  When the value is empty or not
+        parseable — e.g. the LLM returned ``None`` or a free-form phrase —
+        it falls back to the document date, so no registry entry is ever
+        left without a temporal anchor.
+        """
+        import re
+        from datetime import datetime
+
+        if isinstance(value, str):
+            value = value.strip()
+        if not value:
+            return document_date or ""
+
+        # ISO YYYY-MM-DD or YYYY-MM (already normalized)
+        m = re.match(r"^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?$", value)
+        if m:
+            year, month, day = m.groups()
+            try:
+                if day:
+                    datetime(int(year), int(month), int(day))
+                    return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+                datetime(int(year), int(month), 1)
+                return f"{int(year):04d}-{int(month):02d}"
+            except ValueError:
+                pass
+
+        # European DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+        m = re.match(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$", value)
+        if m:
+            day, month, year = m.groups()
+            try:
+                datetime(int(year), int(month), int(day))
+                return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+            except ValueError:
+                pass
+
+        return document_date or ""
 
     def _extract_for_document(
         self,
