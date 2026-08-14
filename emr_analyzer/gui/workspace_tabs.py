@@ -128,8 +128,15 @@ class WorkspaceTabs(QTabWidget):
                     continue
 
                 if g.patient_id:
-                    # Existing patient
+                    # Existing patient — enrich its identity with any new
+                    # strong signal the batch carried (e.g. a hospital
+                    # patient ID the registry did not know yet).  The upsert
+                    # only fills missing fields (COALESCE) and keeps the
+                    # highest confidence, so existing values are untouched.
                     pid = g.patient_id
+                    identity_repo = self._services.get("identity_repo")
+                    if identity_repo and g.evidence and g.evidence.is_strong:
+                        identity_repo.upsert(pid, g.evidence, status="enriched")
                 elif g.create_new:
                     # Auto-create workspace with identity info
                     pid = patient_repo.get_next_id()

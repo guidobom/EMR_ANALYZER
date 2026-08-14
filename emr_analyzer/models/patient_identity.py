@@ -54,9 +54,19 @@ class PatientIdentityEvidence:
     def confidence(self) -> float:
         """Confidence used for automatic routing, not clinical extraction."""
 
-        if self.fiscal_code and (self.name or self.birth_date):
+        # Strong per-hospital identifier, treated like the fiscal code: a
+        # stable anchor that uniquely names a patient within a health board.
+        def strong() -> Optional[IdentityField]:
+            if self.fiscal_code:
+                return self.fiscal_code
+            if self.hospital_patient_id:
+                return self.hospital_patient_id
+            return None
+
+        anchor = strong()
+        if anchor and (self.name or self.birth_date):
             return min(
-                self.fiscal_code.confidence,
+                anchor.confidence,
                 max(
                     self.name.confidence if self.name else 0.0,
                     self.birth_date.confidence if self.birth_date else 0.0,
@@ -64,8 +74,8 @@ class PatientIdentityEvidence:
             )
         if self.name and self.birth_date:
             return min(self.name.confidence, self.birth_date.confidence)
-        if self.fiscal_code:
-            return min(self.fiscal_code.confidence, 0.94)
+        if anchor:
+            return min(anchor.confidence, 0.94)
         if self.name:
             return min(self.name.confidence, 0.70)
         return 0.0
@@ -77,6 +87,7 @@ class PatientIdentityEvidence:
         return bool(
             (self.fiscal_code and (self.name or self.birth_date))
             or (self.name and self.birth_date)
+            or self.hospital_patient_id
         ) and self.confidence >= 0.80
 
     @property
@@ -85,6 +96,8 @@ class PatientIdentityEvidence:
 
         if self.fiscal_code:
             return f"cf:{self.fiscal_code.normalized}"
+        if self.hospital_patient_id:
+            return f"hpid:{self.hospital_patient_id.normalized}"
         if self.name and self.birth_date:
             canonical_name = " ".join(sorted(self.name.normalized.split()))
             return f"name_birth:{canonical_name}|{self.birth_date.normalized}"

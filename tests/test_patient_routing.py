@@ -60,6 +60,16 @@ def _make_header_pdf(path: Path) -> None:
     document.close()
 
 
+def _make_lines_pdf(path: Path, *lines: tuple[float, float, str]) -> None:
+    """PDF whose first page contains the given (x, baseline, text) items."""
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    for x, baseline, text in lines:
+        page.insert_text((x, baseline), text)
+    document.save(path)
+    document.close()
+
+
 def _make_text_pdf(path: Path, *lines: str) -> None:
     """PDF with arbitrary raw text, used for the auto-assignment second pass."""
     document = fitz.open()
@@ -102,6 +112,135 @@ class PatientRoutingTest(unittest.TestCase):
             self.assertIsNotNone(evidence.sex)
             self.assertEqual(evidence.sex.normalized, "M")
             self.assertIsNotNone(evidence.name.bbox)
+
+    def test_extraction_birth_label_without_di(self):
+        # Ferrara Radiologia header uses "Data Nascita:" (no "DI"): it must
+        # still be recognised and yield the value on the label's own line.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "header.pdf"
+            _make_lines_pdf(
+                pdf_path,
+                (72, 200, "Data Nascita:"),
+                (200, 200, "31/12/1950"),
+            )
+            evidence = PatientIdentityExtractor().extract(pdf_path)
+            self.assertIsNotNone(evidence.birth_date)
+            self.assertEqual(evidence.birth_date.normalized, "1950-12-31")
+
+    def test_extraction_space_separated_birth_date(self):
+        # Anatomia Patologica prints "31 12 1950" (spaces, no "./-") inline.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "header.pdf"
+            _make_lines_pdf(pdf_path, (72, 200, "Data di nascita: 31 12 1950"))
+            evidence = PatientIdentityExtractor().extract(pdf_path)
+            self.assertIsNotNone(evidence.birth_date)
+            self.assertEqual(evidence.birth_date.normalized, "1950-12-31")
+
+    def test_extraction_numeric_hospital_id_excludes_letterhead(self):
+        # "Id Paz:" carries a purely numeric patient ID.  A letterhead phone
+        # number ABOVE the label (within the vertical window) must not be
+        # mistaken for it.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "header.pdf"
+            _make_lines_pdf(
+                pdf_path,
+                (72, 178, "Segreteria Tel. 0532/236656"),
+                (72, 200, "Id Paz:"),
+                (140, 200, "8100455504"),
+            )
+            evidence = PatientIdentityExtractor().extract(pdf_path)
+            self.assertIsNotNone(evidence.hospital_patient_id)
+            self.assertEqual(
+                evidence.hospital_patient_id.normalized, "8100455504"
+            )
+
+    def test_extraction_wrapped_name_inline_is_merged(self):
+        # "Cognome e nome: GUERRA VILLIAM" with "SILVESTRO" on the next line:
+        # the inline value must be extended, not returned truncated.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "header.pdf"
+            _make_lines_pdf(
+                pdf_path,
+                (72, 200, "Cognome e nome: GUERRA VILLIAM"),
+                (72, 214, "SILVESTRO"),
+                (72, 230, "Data di nascita: 31/12/1950"),
+            )
+            evidence = PatientIdentityExtractor().extract(pdf_path)
+            self.assertIsNotNone(evidence.name)
+            self.assertEqual(evidence.name.normalized, "GUERRA VILLIAM SILVESTRO")
+            self.assertTrue(evidence.is_strong)
+
+    def test_extraction_sig_lab_report_name(self):
+        # Lab-report header has no dedicated name label; the patient is named
+        # by "Sig. COGNOME NOME" inside the demographic block.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "header.pdf"
+            _make_lines_pdf(
+                pdf_path,
+                (72, 180, "Sig. GUERRA VILLIAM SILVESTRO"),
+                (72, 196, "Data Nascita: 31/12/1950"),
+                (72, 212, "Id. Paz.: 6100573725"),
+            )
+            evidence = PatientIdentityExtractor().extract(pdf_path)
+            self.assertIsNotNone(evidence.name)
+            self.assertEqual(evidence.name.normalized, "GUERRA VILLIAM SILVESTRO")
+            self.assertIsNotNone(evidence.hospital_patient_id)
+            self.assertEqual(
+                evidence.hospital_patient_id.normalized, "6100573725"
+            )
+            self.assertTrue(evidence.is_strong)
+
+    def test_extraction_label_row_above_name_not_used_as_name(self):
+        # The "Esame Numero:" label sits 25px above "Cognome e nome:"; it must
+        # not be validated as the patient name even though its tokens look
+        # like words.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "header.pdf"
+            _make_lines_pdf(
+                pdf_path,
+                (72, 200, "Esame Numero:"),
+                (140, 200, "B2012-004006"),
+                (72, 225, "Cognome e nome:"),
+                (190, 225, "GUERRA VILLIAM SILVESTRO"),
+            )
+            evidence = PatientIdentityExtractor().extract(pdf_path)
+            self.assertIsNotNone(evidence.name)
+            self.assertEqual(evidence.name.normalized, "GUERRA VILLIAM SILVESTRO")
+            self.assertNotEqual(evidence.name.normalized, "ESAME NUMERO")
+
+    def test_resolve_merges_truncated_and_full_name_groups_by_birth(self):
+        # Even before extraction merges a wrapped name, a batch whose groups
+        # split on the truncated name must still resolve to ONE new workspace
+        # via the shared birth date (the second-pass surname/birth vote).
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = DatabaseEngine(tmp_path / "registry.db")
+            init_database(db)
+            identity_repo = PatientIdentityRepository(
+                db, IdentityKeyService(tmp_path / "identity.key")
+            )
+            router = PatientRoutingService(
+                identity_repo, None, None, None, audit_repo=None
+            )
+
+            full_path = tmp_path / "full.pdf"
+            _make_text_pdf(full_path, "GUERRA VILLIAM SILVESTRO", "31/12/1950")
+            trunc_path = tmp_path / "trunc.pdf"
+            _make_text_pdf(trunc_path, "GUERRA VILLIAM", "31/12/1950")
+
+            documents = [
+                _staged_on_disk(
+                    full_path, _evidence("GUERRA VILLIAM SILVESTRO",
+                                         "1950-12-31"), 0),
+                _staged_on_disk(
+                    trunc_path, _evidence("GUERRA VILLIAM", "1950-12-31"), 1),
+            ]
+
+            groups = router.resolve(documents)
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(len(groups[0].documents), 2)
+            self.assertTrue(groups[0].create_new)
+            self.assertFalse(groups[0].conflict)
 
     def test_identity_repository_matches_keys_and_detects_conflict(self):
         with tempfile.TemporaryDirectory() as tmp:

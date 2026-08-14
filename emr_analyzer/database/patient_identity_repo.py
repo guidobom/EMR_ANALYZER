@@ -124,6 +124,17 @@ class PatientIdentityRepository:
                 conflict=True,
             )
         cf_patient = cf_patients[0] if cf_patients else None
+
+        hp_patients = self._patients_for_key(
+            "hospital_patient_id_key", keys.get("hospital_patient_id")
+        )
+        if len(hp_patients) > 1:
+            return IdentityMatch(
+                reason="L'ID paziente ospedaliero risulta associato a più workspace",
+                conflict=True,
+            )
+        hp_patient = hp_patients[0] if hp_patients else None
+
         pair_patient = None
         if keys.get("name") and keys.get("birth_date"):
             row = self.db.execute(
@@ -138,8 +149,18 @@ class PatientIdentityRepository:
                 reason="Codice fiscale e nome/data corrispondono a workspace diversi",
                 conflict=True,
             )
+        if hp_patient and pair_patient and hp_patient != pair_patient:
+            return IdentityMatch(
+                reason="ID ospedaliero e nome/data corrispondono a workspace diversi",
+                conflict=True,
+            )
+        if cf_patient and hp_patient and cf_patient != hp_patient:
+            return IdentityMatch(
+                reason="Codice fiscale e ID ospedaliero corrispondono a workspace diversi",
+                conflict=True,
+            )
 
-        patient_id = cf_patient or pair_patient
+        patient_id = cf_patient or hp_patient or pair_patient
         if not patient_id:
             return IdentityMatch(reason="Nessuna identità registrata compatibile")
 
@@ -149,6 +170,7 @@ class PatientIdentityRepository:
         conflicts = []
         for column, key_name in (
             ("fiscal_code_key", "fiscal_code"),
+            ("hospital_patient_id_key", "hospital_patient_id"),
             ("normalized_name_key", "name"),
             ("birth_date_key", "birth_date"),
         ):
@@ -162,8 +184,15 @@ class PatientIdentityRepository:
                 reason="Conflitto negli identificatori: " + ", ".join(conflicts),
                 conflict=True,
             )
-        reason = "codice fiscale" if cf_patient else "nome e data di nascita"
-        confidence = 0.99 if cf_patient else min(evidence.confidence, 0.96)
+        if cf_patient:
+            reason = "codice fiscale"
+            confidence = 0.99
+        elif hp_patient:
+            reason = "ID paziente ospedaliero"
+            confidence = 0.98
+        else:
+            reason = "nome e data di nascita"
+            confidence = min(evidence.confidence, 0.96)
         return IdentityMatch(patient_id, confidence, f"Corrispondenza per {reason}")
 
     def add_document_evidence(

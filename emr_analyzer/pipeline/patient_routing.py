@@ -173,14 +173,17 @@ class PatientRoutingService:
         """Strong identity signals used to merge groups within one batch.
 
         Mirrors the matching rules of the identity repository: a fiscal code
-        alone is authoritative, otherwise name+birth date together.  Only the
-        ordering-insensitive name is used, so inverted initials still match.
+        or hospital patient ID alone is authoritative, otherwise name+birth
+        date together.  Only the ordering-insensitive name is used, so
+        inverted initials still match.
         """
         if evidence is None:
             return ()
         fingerprints = []
         if evidence.fiscal_code:
             fingerprints.append(("cf", evidence.fiscal_code.normalized))
+        if evidence.hospital_patient_id:
+            fingerprints.append(("hp", evidence.hospital_patient_id.normalized))
         if evidence.name and evidence.birth_date:
             canonical_name = " ".join(sorted(evidence.name.normalized.split()))
             fingerprints.append(("nb", canonical_name, evidence.birth_date.normalized))
@@ -219,7 +222,43 @@ class PatientRoutingService:
                 target.evidence = cls._prefer_evidence(target.evidence, group.evidence)
             for fp in fingerprints:
                 by_fingerprint.setdefault(fp, target)
+
+        # A name that wraps onto a second line may still yield a truncated
+        # extraction (``GUERRA VILLIAM``) next to the full one (``GUERRA
+        # VILLIAM SILVESTRO``).  Those share the birth date and differ only
+        # by a token subset, so fold them together before matching.
+        index = 0
+        while index < len(merged):
+            other = index + 1
+            while other < len(merged):
+                if cls._token_subset_merge(merged[index], merged[other]):
+                    merged[index].documents.extend(merged[other].documents)
+                    merged[index].evidence = cls._prefer_evidence(
+                        merged[index].evidence, merged[other].evidence
+                    )
+                    merged.pop(other)
+                else:
+                    other += 1
+            index += 1
         return merged
+
+    @staticmethod
+    def _token_subset_merge(
+        first: RoutingGroup, second: RoutingGroup
+    ) -> bool:
+        """True when both groups name the same person by birth + subset name."""
+        first_evidence = first.evidence
+        second_evidence = second.evidence
+        if not (first_evidence and second_evidence
+                and first_evidence.name and second_evidence.name
+                and first_evidence.birth_date and second_evidence.birth_date):
+            return False
+        if (first_evidence.birth_date.normalized
+                != second_evidence.birth_date.normalized):
+            return False
+        first_tokens = set(first_evidence.name.normalized.split())
+        second_tokens = set(second_evidence.name.normalized.split())
+        return first_tokens <= second_tokens or second_tokens <= first_tokens
 
     @staticmethod
     def _prefer_evidence(
@@ -232,25 +271,45 @@ class PatientRoutingService:
         if current is None:
             return candidate
 
-        def rank(evidence: PatientIdentityEvidence) -> int:
+        def score(evidence: PatientIdentityEvidence) -> int:
+            total = 0
             if evidence.fiscal_code:
-                return 3
+                total += 8
+            if evidence.hospital_patient_id:
+                total += 8
             if evidence.name and evidence.birth_date:
-                return 2
-            if evidence.name:
-                return 1
-            return 0
+                total += 4
+            elif evidence.name or evidence.birth_date:
+                total += 1
+            return total
 
-        candidate_rank = rank(candidate)
-        current_rank = rank(current)
-        if candidate_rank > current_rank:
+        candidate_score = score(candidate)
+        current_score = score(current)
+        if candidate_score > current_score:
             return candidate
-        if candidate_rank < current_rank:
+        if candidate_score < current_score:
             return current
         return candidate if candidate.confidence > current.confidence else current
 
     @staticmethod
-    def _conflicting_fields(documents: list[StagedDocument]) -> list[str]:
+    def _names_compatible(values: set[str]) -> bool:
+        """True when every name is a token-subset of the longest one.
+
+        A report whose name wraps onto a second line yields a truncated
+        extraction (``GUERRA VILLIAM``) next to the full one (``GUERRA
+        VILLIAM SILVESTRO``).  Those describe the same person and are not a
+        genuine conflict; only truly disjoint names are discordant.  The
+        full name is not a subset of the truncated one, so compatibility is
+        judged against the longest token set, not pairwise.
+        """
+        token_sets = [set(value.split()) for value in values]
+        if not token_sets:
+            return True
+        longest = max(token_sets, key=len)
+        return all(tokens <= longest for tokens in token_sets)
+
+    @classmethod
+    def _conflicting_fields(cls, documents: list[StagedDocument]) -> list[str]:
         conflicts = []
         for field_name in ("name", "fiscal_code", "birth_date", "sex"):
             values = set()
@@ -263,6 +322,8 @@ class PatientRoutingService:
                     value = " ".join(sorted(value.split()))
                 values.add(value)
             if len(values) > 1:
+                if field_name == "name" and cls._names_compatible(values):
+                    continue
                 conflicts.append(field_name)
         return conflicts
 
@@ -309,10 +370,21 @@ class PatientRoutingService:
 
     @staticmethod
     def _candidate_surname(group: RoutingGroup) -> str | None:
-        """The surname token of a candidate identity, if trustworthy."""
+        """The surname token of a candidate identity, if trustworthy.
+
+        ``SURNAME, FIRSTNAME`` headers (``GUERRA, VILLIAM SILVESTRO``) name
+        the surname before the comma; otherwise the last token is kept, as
+        in the plain ``NOME COGNOME`` format.
+        """
         evidence = group.evidence
         if not evidence or not evidence.name or not evidence.name.normalized:
             return None
+        raw = evidence.name.value or ""
+        if "," in raw:
+            before = raw.split(",")[0].strip()
+            tokens = [token for token in before.split() if len(token) >= 4]
+            if tokens:
+                return tokens[-1]
         tokens = [
             token for token in evidence.name.normalized.split()
             if len(token) >= 4
