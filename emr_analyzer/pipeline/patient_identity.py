@@ -93,9 +93,11 @@ class PatientIdentityExtractor:
         "SANITARIA", "DATI", "ANAGRAFICI", "PRESTAZIONI", "EROGATE",
         "REFERTO", "MEDICO", "DIRETTORE", "LABORATORIO",
         # Label vocabulary seen on Ferrara USL headers: a label row
-        # ("Esame Numero:", "Id Paziente:") must never validate as a name.
+        # ("Esame Numero:", "Id Paziente:", "Richiesto da:") must never
+        # validate as a name.
         "PAZIENTE", "ESAME", "NUMERO", "DIAGNOSI", "ISTOPATOLOGICA",
-        "ENTE", "INDIRIZZO", "PROVENIENZA", "RICHIESTA", "QUESITO",
+        "ENTE", "INDIRIZZO", "PROVENIENZA", "RICHIESTA", "RICHIESTO",
+        "QUESITO",
         "CLINICO", "VERSIONE", "PAGINA", "ACC", "NUMBER", "DICOM",
         "PRATICA", "CONSENSO", "DICHIARAZIONE", "RISERVATEZZA",
     }
@@ -341,11 +343,60 @@ class PatientIdentityExtractor:
         return base_value
 
     def _merged_name_value(self, rows: list[dict], start_row: dict) -> str | None:
-        """Validate a candidate name row, merging a wrapped continuation line."""
+        """Validate a candidate name row, merging a wrapped continuation line.
+
+        Two layouts fragment the patient name into per-word rows, and either
+        must be reconstructed before the extractor can anchor on the name:
+
+        * wrapped onto a second line (``Paziente`` / ``CARAVITA`` on one
+          line, ``CRISTIANA`` below);
+        * printed on one line but grouped into separate rows by PyMuPDF
+          (``Paziente`` / ``CARAVITA`` / ``CRISTIANA`` at the same y).
+
+        A single-word row is only accepted when it extends into a valid
+        name; otherwise the extractor falls through to a later row, which
+        would otherwise be a nearby label like ``Richiesto da``.
+        """
         value = self._validated_name(start_row["text"])
-        if not value:
+        if value:
+            return self._merge_continuation(rows, start_row, value)
+        raw = start_row["text"].strip()
+        if raw and all(
+            self._NAME_WORD.fullmatch(word.rstrip(",")) for word in raw.split()
+        ):
+            merged = self._merge_continuation(rows, start_row, raw)
+            if self._validated_name(merged):
+                return merged
+            return self._extend_same_line(rows, start_row)
+        return None
+
+    def _extend_same_line(self, rows: list[dict], start_row: dict) -> str | None:
+        """Rebuild a name from side-by-side words on the same baseline.
+
+        When PyMuPDF returns each word of a single-line header in its own
+        row (``CARAVITA`` / ``CRISTIANA`` next to the ``Paziente`` label),
+        extend the fragment rightwards one word at a time and keep the first
+        combination that validates as a name.  The label row itself is a
+        neighbor too, so the merged value is validated (label vocabulary is
+        rejected) before being accepted.
+        """
+        base = start_row["text"].strip()
+        if not base:
             return None
-        return self._merge_continuation(rows, start_row, value)
+        neighbors = [
+            row for row in rows
+            if row is not start_row
+            and abs(row["y0"] - start_row["y0"]) <= 2.0
+            and row["x0"] > start_row["x0"]
+        ]
+        neighbors.sort(key=lambda row: row["x0"])
+        merged = base
+        for row in neighbors:
+            merged = (merged + " " + row["text"]).strip()
+            value = self._validated_name(merged)
+            if value:
+                return value
+        return None
 
     def _validated_name(self, value: str) -> str | None:
         # "." removes the abbreviation mark in "Sig. NOME COGNOME"; the

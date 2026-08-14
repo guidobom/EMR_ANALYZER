@@ -4,7 +4,7 @@ from pathlib import Path
 
 # --- Application paths ---
 APP_NAME = "EMR Analyzer"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.3"
 OFFLINE_MODE = True
 # Verify each document's workspace attribution with the LLM before its
 # clinical text is normalized. The check runs on the pre-anonymization
