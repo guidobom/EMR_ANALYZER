@@ -383,6 +383,10 @@ class WorkspaceMergeService:
                 "UPDATE patient_identities SET patient_id=? WHERE patient_id=?",
                 (target_pid, source_pid),
             )
+            self.db.execute(
+                "UPDATE patient_hospital_ids SET patient_id=? WHERE patient_id=?",
+                (target_pid, source_pid),
+            )
             return
         now = datetime.now().isoformat()
         self.db.execute(
@@ -399,6 +403,19 @@ class WorkspaceMergeService:
              source["birth_date_key"], source["sex"],
              source["hospital_patient_id_key"], source["confidence"],
              now, target_pid),
+        )
+        # Hospital patient IDs are multi-valued per patient: fold the source's
+        # set into the target's before removing the source workspace.
+        self.db.execute(
+            """INSERT OR IGNORE INTO patient_hospital_ids
+               (patient_id, hospital_patient_id_key, created_at, updated_at)
+               SELECT ?, hospital_patient_id_key, created_at, updated_at
+               FROM patient_hospital_ids WHERE patient_id=?""",
+            (target_pid, source_pid),
+        )
+        self.db.execute(
+            "DELETE FROM patient_hospital_ids WHERE patient_id=?",
+            (source_pid,),
         )
         self.db.execute(
             "DELETE FROM patient_identities WHERE patient_id=?",

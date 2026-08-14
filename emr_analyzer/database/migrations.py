@@ -3,7 +3,7 @@
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -189,6 +189,20 @@ CREATE_TABLES_SQL = [
         updated_at TEXT NOT NULL
     )
     """,
+    # Hospital patient IDs are many-to-one: a person legitimately holds
+    # several IDs across the units of a hospital trust (one per referral
+    # path), so a single column cannot represent them.  Only keyed digests
+    # are stored; the raw values stay in the source PDFs.
+    """
+    CREATE TABLE IF NOT EXISTS patient_hospital_ids (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        hospital_patient_id_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(patient_id, hospital_patient_id_key)
+    )
+    """,
     # Schema version tracking
     """
     CREATE TABLE IF NOT EXISTS schema_version (
@@ -221,6 +235,8 @@ INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_timeline_date ON clinical_timeline(date_observed)",
     "CREATE INDEX IF NOT EXISTS idx_timeline_category ON clinical_timeline(category)",
     "CREATE INDEX IF NOT EXISTS idx_timeline_status ON clinical_timeline(status)",
+    "CREATE INDEX IF NOT EXISTS idx_hpid_patient ON patient_hospital_ids(patient_id)",
+    "CREATE INDEX IF NOT EXISTS idx_hpid_key ON patient_hospital_ids(hospital_patient_id_key)",
 ]
 
 
@@ -244,6 +260,16 @@ def init_database(db: DatabaseEngine) -> None:
         _safe_add_column(db, "clinical_timeline", "merged_into_ids", "TEXT")
         # v9: user-confirmed timeline entries for the golden validation set
         _safe_add_column(db, "clinical_timeline", "is_golden", "INTEGER DEFAULT 0")
+
+        # v10: a person may hold several hospital patient IDs (one per unit).
+        # Fold any legacy single-column value into the multi-valued table so
+        # both storage forms are consistent; idempotent (UNIQUE + OR IGNORE).
+        db.execute(
+            """INSERT OR IGNORE INTO patient_hospital_ids
+               (patient_id, hospital_patient_id_key, created_at, updated_at)
+               SELECT patient_id, hospital_patient_id_key, created_at, updated_at
+               FROM patient_identities WHERE hospital_patient_id_key IS NOT NULL"""
+        )
 
         # Set schema version
         cursor = db.execute("SELECT MAX(version) FROM schema_version")
@@ -272,7 +298,8 @@ def drop_all_tables(db: DatabaseEngine) -> None:
         "audit_log", "validation_queue",
         "clinical_state", "lab_values", "clinical_timeline",
         "clinical_evidence", "document_identity_evidence",
-        "patient_identities", "documents", "patients", "schema_version",
+        "patient_hospital_ids", "patient_identities",
+        "documents", "patients", "schema_version",
     ]
     with db:
         for table in tables:

@@ -109,6 +109,14 @@ class PatientIdentityRepository:
                 now,
             ),
         )
+        hospital_id_key = field_keys.get("hospital_patient_id")
+        if hospital_id_key:
+            self.db.execute(
+                """INSERT OR IGNORE INTO patient_hospital_ids
+                   (patient_id, hospital_patient_id_key, created_at, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (patient_id, hospital_id_key, now, now),
+            )
         self.db.commit()
 
     def find_match(self, evidence: PatientIdentityEvidence) -> IdentityMatch:
@@ -125,8 +133,8 @@ class PatientIdentityRepository:
             )
         cf_patient = cf_patients[0] if cf_patients else None
 
-        hp_patients = self._patients_for_key(
-            "hospital_patient_id_key", keys.get("hospital_patient_id")
+        hp_patients = self._patients_for_hospital_id(
+            keys.get("hospital_patient_id")
         )
         if len(hp_patients) > 1:
             return IdentityMatch(
@@ -168,16 +176,28 @@ class PatientIdentityRepository:
             "SELECT * FROM patient_identities WHERE patient_id=?", (patient_id,)
         ).fetchone()
         conflicts = []
-        for column, key_name in (
-            ("fiscal_code_key", "fiscal_code"),
-            ("hospital_patient_id_key", "hospital_patient_id"),
-            ("normalized_name_key", "name"),
-            ("birth_date_key", "birth_date"),
-        ):
-            incoming = keys.get(key_name)
-            stored = row[column] if row else None
-            if incoming and stored and incoming != stored:
-                conflicts.append(key_name)
+        incoming_cf = keys.get("fiscal_code")
+        incoming_hpid = keys.get("hospital_patient_id")
+        incoming_name = keys.get("name")
+        incoming_birth = keys.get("birth_date")
+        if incoming_cf and row and row["fiscal_code_key"] \
+                and incoming_cf != row["fiscal_code_key"]:
+            conflicts.append("fiscal_code")
+        # A patient legitimately holds several hospital patient IDs (one per
+        # hospital unit): only a value absent from the registered set is a
+        # conflict, not a different one of the patient's own IDs.
+        registered_hpids = set(self._hospital_patient_ids(patient_id))
+        if row and row["hospital_patient_id_key"]:
+            registered_hpids.add(row["hospital_patient_id_key"])
+        if incoming_hpid and registered_hpids \
+                and incoming_hpid not in registered_hpids:
+            conflicts.append("hospital_patient_id")
+        if incoming_name and row and row["normalized_name_key"] \
+                and incoming_name != row["normalized_name_key"]:
+            conflicts.append("name")
+        if incoming_birth and row and row["birth_date_key"] \
+                and incoming_birth != row["birth_date_key"]:
+            conflicts.append("birth_date")
         if conflicts:
             return IdentityMatch(
                 patient_id=patient_id,
@@ -240,5 +260,54 @@ class PatientIdentityRepository:
             raise ValueError("Campo identità non consentito")
         rows = self.db.execute(
             f"SELECT patient_id FROM patient_identities WHERE {column}=?", (value,)
+        ).fetchall()
+        return [row["patient_id"] for row in rows]
+
+    def _hospital_patient_ids(self, patient_id: str) -> list[str]:
+        """All hospital-patient-id digests registered for a patient."""
+        rows = self.db.execute(
+            "SELECT hospital_patient_id_key FROM patient_hospital_ids "
+            "WHERE patient_id=?",
+            (patient_id,),
+        ).fetchall()
+        return [row["hospital_patient_id_key"] for row in rows]
+
+    def add_hospital_patient_id(self, patient_id: str, value: str) -> None:
+        """Register one more hospital patient ID for a patient (idempotent).
+
+        A person holds several hospital IDs across the units of a trust, so
+        the registry keeps a set per patient rather than a single column.
+        Only the keyed digest is persisted.
+        """
+        if not value:
+            return
+        now = datetime.now().isoformat()
+        self.db.execute(
+            """INSERT OR IGNORE INTO patient_hospital_ids
+               (patient_id, hospital_patient_id_key, created_at, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (patient_id, self.keys.digest("hospital_patient_id", value),
+             now, now),
+        )
+        self.db.commit()
+
+    def _patients_for_hospital_id(self, value: str | None) -> list[str]:
+        """Patients holding this hospital-patient-id digest.
+
+        The multi-valued table is the source of truth; the legacy single
+        column is still consulted so databases that predate the table match
+        the same way.
+        """
+        if not value:
+            return []
+        rows = self.db.execute(
+            """SELECT DISTINCT patient_id FROM (
+                 SELECT patient_id FROM patient_hospital_ids
+                  WHERE hospital_patient_id_key=?
+                 UNION
+                 SELECT patient_id FROM patient_identities
+                  WHERE hospital_patient_id_key=?
+               )""",
+            (value, value),
         ).fetchall()
         return [row["patient_id"] for row in rows]
