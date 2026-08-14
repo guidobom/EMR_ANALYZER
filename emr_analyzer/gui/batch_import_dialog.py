@@ -12,11 +12,12 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTreeWidget, QTreeWidgetItem, QComboBox, QMessageBox, QHeaderView,
 )
-from PyQt5.QtCore import Qt, QEvent
+from PyQt5.QtCore import Qt
 
 from ..models.document import DocumentType
 from .import_dialog import run_file_checks, import_checked_documents
 from .pdf_viewer import PDFViewerDialog
+from .quick_look import QuickLook
 
 
 class BatchImportDialog(QDialog):
@@ -70,9 +71,11 @@ class BatchImportDialog(QDialog):
         self._tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
         self._tree.setAlternatingRowColors(True)
         self._tree.itemChanged.connect(self._on_item_changed)
-        # Open the PDF on double-click; spacebar quick-view via event filter.
+        # Double-click opens the full viewer; spacebar opens an in-app Quick
+        # Look preview of the current file (Space/Esc again closes it). The
+        # overlay owns the spacebar key via its own event filter on the tree.
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
-        self._tree.installEventFilter(self)
+        self._quick_look = QuickLook(self._tree, self._quick_look_path)
         layout.addWidget(self._tree, stretch=1)
 
         buttons = QHBoxLayout()
@@ -238,17 +241,6 @@ class BatchImportDialog(QDialog):
             return  # column 0 is the checkbox; let it toggle
         self._open_file(item)
 
-    def eventFilter(self, obj, event):
-        """Spacebar quick-view on the tree, without breaking checkbox toggle."""
-        if (
-            obj is self._tree
-            and event.type() == QEvent.KeyPress
-            and event.key() == Qt.Key_Space
-            and self._open_file(self._tree.currentItem())
-        ):
-            return True  # consume: quick-view instead of toggling the checkbox
-        return super().eventFilter(obj, event)
-
     def _open_file(self, item: QTreeWidgetItem | None) -> bool:
         """Open the file of a row in the PDF viewer. False when not a file."""
         if item is None or item.parent() is None:
@@ -256,6 +248,7 @@ class BatchImportDialog(QDialog):
         path = item.data(0, Qt.UserRole + 1)
         if not path or not os.path.exists(str(path)):
             return False
+        self._quick_look.dismiss()
         viewer = PDFViewerDialog(
             {"filename": os.path.basename(str(path)), "original_path": str(path)},
             self._services,
@@ -263,6 +256,16 @@ class BatchImportDialog(QDialog):
         )
         viewer.exec_()
         return True
+
+    def _quick_look_path(self):
+        """Resolve the current tree row to a PDF path for the Quick Look."""
+        item = self._tree.currentItem()
+        if item is None or item.parent() is None:
+            return None  # a patient/unassigned header row, not a file
+        path = item.data(0, Qt.UserRole + 1)
+        if not path or not os.path.exists(str(path)):
+            return None
+        return str(path), os.path.basename(str(path))
 
     def _make_status_callback(self, parent: QTreeWidgetItem):
         def cb(index: int, message: str):

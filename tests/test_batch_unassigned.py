@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import fitz
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QEvent, Qt
@@ -140,7 +142,10 @@ class BatchUnassignedTest(unittest.TestCase):
 
     def _dialog_with_patient(self, name="a.pdf"):
         path = self._root / name
-        path.write_bytes(b"pdf-content")
+        pdf = fitz.open()
+        pdf.new_page().insert_text((72, 72), "test")
+        pdf.save(str(path))
+        pdf.close()
         return BatchImportDialog(
             {"P001": [str(path)]}, self._services,
         )
@@ -188,38 +193,26 @@ class BatchUnassignedTest(unittest.TestCase):
         dialog = self._dialog_with_patient()
         child = self._file_child(dialog)
         dialog._tree.setCurrentItem(child)
-        original = batch_module.PDFViewerDialog
-        seen = []
-        class _Capture(_FakeViewer):
-            def __init__(self, doc_data, services, parent=None):
-                super().__init__(doc_data, services, parent)
-                seen.append(doc_data)
-        batch_module.PDFViewerDialog = _Capture
-        try:
-            event = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier)
-            consumed = dialog.eventFilter(dialog._tree, event)
-        finally:
-            batch_module.PDFViewerDialog = original
+        event = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier)
+        consumed = dialog._quick_look.eventFilter(dialog._tree, event)
         self.assertTrue(consumed)
-        self.assertEqual(len(seen), 1)
+        self.assertFalse(dialog._quick_look.isHidden())  # preview shown
+        self.assertEqual(dialog._quick_look._title_label.text(), "a.pdf")
+        self.assertIsNotNone(dialog._quick_look._doc)
+        # Spacebar again closes the preview and returns to the file list.
+        event2 = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier)
+        consumed2 = dialog._quick_look.eventFilter(dialog._tree, event2)
+        self.assertTrue(consumed2)
+        self.assertTrue(dialog._quick_look.isHidden())
+        self.assertIsNone(dialog._quick_look._doc)
 
     def test_spacebar_on_patient_row_keeps_checkbox_toggle(self):
         dialog = self._dialog_with_patient()
         dialog._tree.setCurrentItem(dialog._tree.topLevelItem(0))
-        original = batch_module.PDFViewerDialog
-        seen = []
-        class _Capture(_FakeViewer):
-            def __init__(self, doc_data, services, parent=None):
-                super().__init__(doc_data, services, parent)
-                seen.append(doc_data)
-        batch_module.PDFViewerDialog = _Capture
-        try:
-            event = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier)
-            consumed = dialog.eventFilter(dialog._tree, event)
-        finally:
-            batch_module.PDFViewerDialog = original
+        event = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier)
+        consumed = dialog._quick_look.eventFilter(dialog._tree, event)
         self.assertFalse(consumed)
-        self.assertEqual(seen, [])
+        self.assertTrue(dialog._quick_look.isHidden())
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from PyQt5.QtCore import Qt, QThread
 from ..utils.file_utils import compute_file_hash, verify_pdf, get_file_info, is_supported_file
 from ..models.document import DocumentType, DocumentRecord, ParsingStatus
 from ..config import active_workspace
+from .quick_look import QuickLook
 
 
 def guess_document_type(filename: str) -> str:
@@ -268,6 +269,10 @@ class ImportDialog(QDialog):
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._table.setAlternatingRowColors(True)
+        # Double-click opens the full viewer; spacebar opens an in-app Quick
+        # Look preview of the current file (Space/Esc again closes it).
+        self._table.doubleClicked.connect(self._on_double_click)
+        self._quick_look = QuickLook(self._table, self._quick_look_path)
         layout.addWidget(self._table, stretch=1)
 
         # Bottom: type override + buttons
@@ -373,6 +378,37 @@ class ImportDialog(QDialog):
             chk = self._table.cellWidget(i, 0)
             if chk and chk.isChecked():
                 self._table.setItem(i, 5, QTableWidgetItem(new_type))
+
+    def _on_double_click(self, index):
+        """Open the full PDF viewer for the double-clicked file."""
+        row = index.row()
+        item = self._table.item(row, 1)
+        if not item:
+            return
+        path = item.data(Qt.UserRole)
+        if not path or not os.path.exists(str(path)):
+            return
+        self._quick_look.dismiss()
+        from .pdf_viewer import PDFViewerDialog
+        viewer = PDFViewerDialog(
+            {"filename": os.path.basename(str(path)), "original_path": str(path)},
+            self._services,
+            self,
+        )
+        viewer.exec_()
+
+    def _quick_look_path(self):
+        """Resolve the current table row to a file path for the Quick Look."""
+        row = self._table.currentRow()
+        if row < 0:
+            return None
+        item = self._table.item(row, 1)
+        if not item:
+            return None
+        path = item.data(Qt.UserRole)
+        if not path or not os.path.exists(str(path)):
+            return None
+        return str(path), os.path.basename(str(path))
 
     def _on_import(self):
         """Copy files to workspace and create DocumentRecords."""

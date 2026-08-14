@@ -19,6 +19,7 @@ from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
 from ..extraction.clinical_text_isolator import ClinicalTextIsolationError
 from ..pipeline.sensitive_data import SensitiveDataSanitizer
 from ..config import ATTRIBUTION_VERIFICATION_ENABLED
+from .quick_look import QuickLook
 
 
 class AttributionMismatchError(RuntimeError):
@@ -186,6 +187,11 @@ class DocumentsTab(QWidget):
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.doubleClicked.connect(self._on_double_click)
         self._table.installEventFilter(self)
+        # Spacebar opens a screen-centered Quick Look preview of the current
+        # document; Space/Esc again closes it. The preview never takes focus,
+        # so the table keeps the keys, and moving to another row swaps the
+        # preview to that document.
+        self._quick_look = QuickLook(self._table, self._quick_look_path)
         layout.addWidget(self._table, stretch=1)
 
     def set_services(self, services: dict):
@@ -1595,9 +1601,26 @@ class DocumentsTab(QWidget):
             self._open_pdf_viewer(doc_data)
 
     def _open_pdf_viewer(self, doc_data: dict):
+        self._quick_look.dismiss()
         from .pdf_viewer import PDFViewerDialog
         viewer = PDFViewerDialog(doc_data, self._services, self)
         viewer.exec_()
+
+    def _quick_look_path(self):
+        """Resolve the current table row to a PDF path for the Quick Look."""
+        row = self._table.currentRow()
+        if row < 0:
+            return None
+        item = self._table.item(row, 0)
+        if not item:
+            return None
+        doc_data = item.data(Qt.UserRole + 1)
+        path = doc_data.get("original_path") or doc_data.get("stored_path")
+        if not path:
+            return None
+        if not os.path.isabs(str(path)) and doc_data.get("workspace_root"):
+            path = os.path.join(doc_data["workspace_root"], str(path))
+        return str(path), doc_data.get("filename") or os.path.basename(str(path))
 
     def _on_context_menu(self, pos):
         row = self._table.currentRow()
