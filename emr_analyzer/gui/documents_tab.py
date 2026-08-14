@@ -1310,7 +1310,13 @@ class DocumentsTab(QWidget):
             fields["birth_date"] = IdentityField(
                 birth, birth, confidence=confidence
             )
-        if cf:
+        # Only a formally valid Italian fiscal code (16 chars + checksum) is
+        # trusted as an identity anchor.  A malformed string read by the LLM
+        # (e.g. a phone number) must neither anchor the identity nor raise a
+        # conflict against the registered one — it is dropped from the
+        # evidence, matching the deterministic extractor (which already gates
+        # on the checksum).
+        if cf and fiscal_code_has_valid_checksum(cf):
             normalized_cf = normalize_fiscal_code(cf)
             fields["fiscal_code"] = IdentityField(
                 normalized_cf, normalized_cf, confidence=confidence

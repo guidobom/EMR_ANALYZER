@@ -261,6 +261,41 @@ class AttributionVerificationTest(unittest.TestCase):
                 None, _Progress(),
             )
 
+    # --- malformed fiscal codes read by the LLM --------------------------
+
+    def test_invalid_cf_read_by_llm_does_not_conflict(self):
+        # The patient has a registered (valid) CF; the LLM misreads a numeric
+        # string (e.g. a phone number) as the fiscal code on one report.  A
+        # malformed code must not raise a conflict against the registered one:
+        # name+birth still identify the workspace, so the extraction proceeds.
+        self._register(
+            "P001", name="Mario Rossi", birth="1980-01-01", cf=CF_MARIO
+        )
+        tab = self._tab({
+            "name": "Mario Rossi", "birth_date": "1980-01-01",
+            "fiscal_code": "8100455504", "confidence": 0.95,
+        })
+        result = tab._verify_document_attribution(
+            self._doc("P001"),
+            self._report(
+                "Paziente: Mario Rossi nato il 1980-01-01. "
+                "Recapito telefonico 8100455504."
+            ),
+            None, _Progress(),
+        )
+        self.assertIsNone(result)
+
+    def test_lone_invalid_cf_is_inconclusive(self):
+        # A malformed code alone carries no identity: it is dropped from the
+        # evidence and the verification stays inconclusive (nothing blocks).
+        tab = self._tab({"fiscal_code": "8100455504", "confidence": 0.9})
+        result = tab._verify_document_attribution(
+            self._doc("P001"),
+            self._report("Referto di controllo. Numero 8100455504."),
+            None, _Progress(),
+        )
+        self.assertIsNone(result)
+
     # --- service / config gating ---------------------------------------
 
     def test_disabled_flag_skips_verification(self):
