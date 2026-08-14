@@ -21,6 +21,18 @@ NAME_LABELS = ("NOME E COGNOME", "COGNOME E NOME", "PAZIENTE", "SIG")
 FISCAL_LABELS = ("CODICE FISCALE",)
 BIRTH_LABELS = ("LUOGO E DATA DI NASCITA", "DATA DI NASCITA", "DATA NASCITA")
 SEX_LABELS = ("SESSO",)
+
+# Sex values accepted after the SESSO label.  Hospital headers spell the
+# value out ("Femmina"/"Maschio") as often as they use the single letter;
+# both are mapped to the canonical M/F used for workspace naming and routing.
+_SEX_TOKEN_MAP = {
+    "M": "M",
+    "MASCHIO": "M",
+    "MASCHILE": "M",
+    "F": "F",
+    "FEMMINA": "F",
+    "FEMMINILE": "F",
+}
 # Ospedale "ID Paziente" header (e.g. ``FE204467``): a strong per-hospital
 # identifier that the coordinate extractor must capture and the matcher use.
 # The shorter label also covers the Radiologia variant ``Id Paz:``; the value
@@ -100,7 +112,21 @@ class PatientIdentityExtractor:
         "QUESITO",
         "CLINICO", "VERSIONE", "PAGINA", "ACC", "NUMBER", "DICOM",
         "PRATICA", "CONSENSO", "DICHIARAZIONE", "RISERVATEZZA",
+        # Contaminants observed on real headers: the registered-mail marker
+        # "RA", a document-type line ("TIPO DOCUMENTO"), and the "CF"
+        # abbreviation printed next to the fiscal code.  None of these is
+        # ever part of a patient name.
+        "RA", "TIPO", "DOCUMENTO", "CF",
     }
+
+    # Tokens that open an address/locality line.  A name continuation never
+    # extends past them (``VIA X``, ``PIAZZA X``, ``STR Y``, a bare "CF"
+    # next to the fiscal code), so the extractor stops the name there
+    # instead of absorbing the address into the surname.
+    _ADDRESS_STOP_WORDS = frozenset({
+        "VIA", "PIAZZA", "P.ZA", "CORSO", "VIALE", "VLE", "STR", "LARGO",
+        "BORGO", "CF",
+    })
 
     def extract(self, file_path: str | Path) -> PatientIdentityEvidence:
         import fitz
@@ -335,6 +361,8 @@ class PatientIdentityExtractor:
                 break
             if abs(nxt["x0"] - start_row["x0"]) > 4.0:
                 continue  # different column — another label/value, not a wrap
+            if self._starts_with_address_stop(nxt["text"]):
+                break  # "VIA ..."/"CF": the name ends before the address
             merged = (base_value + " " + nxt["text"]).strip()
             merged_value = self._validated_name(merged)
             if merged_value:
@@ -370,6 +398,20 @@ class PatientIdentityExtractor:
             return self._extend_same_line(rows, start_row)
         return None
 
+    @staticmethod
+    def _starts_with_address_stop(text: str) -> bool:
+        """True when a row opens with an address/locality marker.
+
+        Used to stop name continuation at ``VIA ...`` / ``CF`` rows, which
+        would otherwise be absorbed into the surname (``VITALI REMO
+        COPPARO``) and make the name discordant across the same person's
+        documents.
+        """
+        words = text.split()
+        if not words:
+            return False
+        return normalize_text(words[0]) in PatientIdentityExtractor._ADDRESS_STOP_WORDS
+
     def _extend_same_line(self, rows: list[dict], start_row: dict) -> str | None:
         """Rebuild a name from side-by-side words on the same baseline.
 
@@ -392,6 +434,8 @@ class PatientIdentityExtractor:
         neighbors.sort(key=lambda row: row["x0"])
         merged = base
         for row in neighbors:
+            if self._starts_with_address_stop(row["text"]):
+                break  # "VIA ..."/"CF": the name ends before the address
             merged = (merged + " " + row["text"]).strip()
             value = self._validated_name(merged)
             if value:
@@ -460,13 +504,25 @@ class PatientIdentityExtractor:
             )
             for row in search_rows:
                 tokens = [normalize_text(word) for word in row["words"]]
+                label_inline = any(
+                    any(label in token for label in SEX_LABELS)
+                    for token in tokens
+                )
                 for token in tokens:
-                    if token in {"M", "F"}:
-                        return IdentityField(
-                            value=token, normalized=token,
-                            bbox=self._bbox(row), method=method,
-                            confidence=confidence - 0.03,
-                        )
+                    mapped = _SEX_TOKEN_MAP.get(token)
+                    if mapped is None:
+                        continue
+                    # "M"/"F" are a single letter that can appear inside a
+                    # longer value (e.g. a measure "15 F"); accept them only
+                    # when the row is the value alone or the SESSO label is
+                    # inline.  The spelled-out forms are unambiguous anywhere.
+                    if token in ("M", "F") and len(tokens) != 1 and not label_inline:
+                        continue
+                    return IdentityField(
+                        value=mapped, normalized=mapped,
+                        bbox=self._bbox(row), method=method,
+                        confidence=confidence - 0.03,
+                    )
         return None
 
     def _extract_hospital_id(

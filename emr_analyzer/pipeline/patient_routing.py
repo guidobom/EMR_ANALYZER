@@ -34,6 +34,17 @@ def _extract_document_text(path: str) -> str:
         document.close()
 
 
+# Tokens that contaminate an extracted patient name but never belong to it:
+# the registered-mail marker "RA", an address/locality suffix, or the "CF"
+# abbreviation printed next to the fiscal code.  They are removed before
+# comparing names so that a minority of such variants does not flag a whole
+# group as discordant.
+_NAME_NOISE_TOKENS = frozenset({
+    "RA", "VIA", "PIAZZA", "P.ZA", "CORSO", "VIALE", "VLE", "STR", "LARGO",
+    "BORGO", "CF",
+})
+
+
 def _birth_date_in_text(text: str, birth_iso: str) -> bool:
     """True if the dd/mm/yyyy form of the birth date appears in the text."""
     parts = birth_iso.split("-")
@@ -319,13 +330,43 @@ class PatientRoutingService:
                     continue
                 value = field.normalized
                 if field_name == "name":
-                    value = " ".join(sorted(value.split()))
+                    value = cls._clean_name(value)
                 values.add(value)
             if len(values) > 1:
                 if field_name == "name" and cls._names_compatible(values):
                     continue
                 conflicts.append(field_name)
+        # A group anchored by one authoritative identifier (all documents
+        # share the same fiscal code or hospital patient ID) names the
+        # person uniquely: the remaining name variants are layout noise, not
+        # a genuine conflict, so they must not send the whole group to
+        # review.  Birth date and sex contradictions still block.
+        if "name" in conflicts and cls._has_single_authoritative_anchor(documents):
+            conflicts.remove("name")
         return conflicts
+
+    @staticmethod
+    def _clean_name(value: str) -> str:
+        """Drop tokens that contaminate an extracted name (RA/address/CF)."""
+        return " ".join(
+            token for token in value.split() if token not in _NAME_NOISE_TOKENS
+        )
+
+    @classmethod
+    def _has_single_authoritative_anchor(
+        cls, documents: list[StagedDocument]
+    ) -> bool:
+        """True when every document shares one fiscal code or hospital ID."""
+        for field_name in ("fiscal_code", "hospital_patient_id"):
+            values = set()
+            for document in documents:
+                field = getattr(document.evidence, field_name)
+                if field is None:
+                    continue
+                values.add(field.normalized)
+            if len(values) == 1:
+                return True
+        return False
 
     # --- best-effort auto-assignment of unresolved groups ------------------
 

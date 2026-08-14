@@ -17,7 +17,7 @@ from emr_analyzer.pipeline.patient_identity import PatientIdentityExtractor
 
 
 def _row(x0: float, y0: float, text: str) -> dict:
-    width = 40.0 + 5.0 * len(text)
+    width = 6.0 * len(text)
     return {
         "key": (int(y0), int(y0 + 12)),
         "x0": float(x0),
@@ -105,6 +105,117 @@ class MergeNameValueTest(unittest.TestCase):
         self.assertIsNone(
             self.extractor._merged_name_value(rows, rows[0])
         )
+
+
+class SexExtractionTest(unittest.TestCase):
+    """Sex values spelled out ("Femmina"/"Maschio") map to F/M.
+
+    Hospital headers often print the sex as a full word next to the SESSO
+    label instead of the bare "M"/"F"; the old extractor only matched the
+    single letter, so those workspaces were created with ``sex=None`` and
+    their folder name lost the sex component.
+    """
+
+    def setUp(self):
+        self.extractor = PatientIdentityExtractor()
+
+    def test_femmina_on_same_line_maps_to_f(self):
+        # CARAVITA-style header: "Sesso:" at x=21, "Femmina" to its right.
+        rows = [
+            _row(21.1, 96.6, "Sesso:"),
+            _row(87.7, 96.6, "Femmina"),
+        ]
+        sex = self.extractor._extract_sex(rows, 842.0, "native_text", 0.97)
+        self.assertIsNotNone(sex)
+        self.assertEqual(sex.normalized, "F")
+
+    def test_maschio_maps_to_m(self):
+        rows = [
+            _row(21.1, 96.6, "Sesso:"),
+            _row(87.7, 96.6, "Maschio"),
+        ]
+        sex = self.extractor._extract_sex(rows, 842.0, "native_text", 0.97)
+        self.assertEqual(sex.normalized, "M")
+
+    def test_label_and_value_on_one_row(self):
+        # "Sesso: M" inline: the label token makes the single letter valid.
+        rows = [
+            _row(21.1, 96.6, "Sesso: M"),
+            _row(300.0, 96.6, "Data:"),
+            _row(400.0, 96.6, "01 08 1985"),
+        ]
+        sex = self.extractor._extract_sex(rows, 842.0, "native_text", 0.97)
+        self.assertEqual(sex.normalized, "M")
+
+    def test_single_letter_value_below_label(self):
+        rows = [
+            _row(21.1, 96.6, "Sesso:"),
+            _row(21.1, 110.0, "F"),
+        ]
+        sex = self.extractor._extract_sex(rows, 842.0, "native_text", 0.97)
+        self.assertEqual(sex.normalized, "F")
+
+    def test_lone_letter_inside_longer_row_is_not_sex(self):
+        # A near row whose "F" is one of many tokens (a measure, not sex):
+        # without an inline SESSO label the bare letter must not be taken.
+        rows = [
+            _row(21.1, 96.6, "Sesso:"),
+            _row(21.1, 110.0, "EF FV 35 F 42"),
+        ]
+        sex = self.extractor._extract_sex(rows, 842.0, "native_text", 0.97)
+        self.assertIsNone(sex)
+
+    def test_missing_sex_label_returns_none(self):
+        rows = [
+            _row(21.1, 96.6, "Paziente"),
+            _row(87.7, 96.6, "CARAVITA CRISTIANA"),
+        ]
+        self.assertIsNone(
+            self.extractor._extract_sex(rows, 842.0, "native_text", 0.97)
+        )
+
+
+class NameContaminationTest(unittest.TestCase):
+    """Name values must not absorb address/locality/type contamination."""
+
+    def setUp(self):
+        self.extractor = PatientIdentityExtractor()
+
+    def test_ra_prefix_rejected_as_name(self):
+        # "RA" (raccomandata) before the name: the value must be rejected.
+        value = self.extractor._validated_name("RA VITALI REMO")
+        self.assertIsNone(value)
+
+    def test_tipo_documento_rejected_as_name(self):
+        # A document-type header line is never a patient name.
+        value = self.extractor._validated_name("TIPO DOCUMENTO")
+        self.assertIsNone(value)
+
+    def test_trailing_cf_token_rejected(self):
+        # "ADIL GUENNANE CF" — the "CF" abbreviation is not a name token.
+        value = self.extractor._validated_name("ADIL GUENNANE CF")
+        self.assertIsNone(value)
+
+    def test_vertical_continuation_stops_at_address(self):
+        # "CAVALLINI ORESTINO" wrapped onto a second line "VIA ACQUEDOTTO":
+        # the address line must not be absorbed into the surname.
+        rows = [
+            _row(72.0, 195.0, "CAVALLINI"),
+            _row(72.0, 210.0, "ORESTINO"),
+            _row(72.0, 225.0, "VIA ACQUEDOTTO"),
+        ]
+        value = self.extractor._merged_name_value(rows, rows[0])
+        self.assertEqual(value, "CAVALLINI ORESTINO")
+
+    def test_same_line_extension_stops_before_cf(self):
+        # A same-baseline "CF" marker must not extend the name.
+        rows = [
+            _row(68.5, 33.0, "ADIL"),
+            _row(164.7, 33.0, "GUENNANE"),
+            _row(300.0, 33.0, "CF"),
+        ]
+        value = self.extractor._merged_name_value(rows, rows[0])
+        self.assertEqual(value, "ADIL GUENNANE")
 
 
 class FullExtractionTest(unittest.TestCase):
