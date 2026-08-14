@@ -137,7 +137,7 @@ class PatientRoutingService:
             grouped[key].append(document)
 
         initial = [
-            RoutingGroup(key=key, documents=members, evidence=members[0].evidence)
+            RoutingGroup(key=key, documents=members, evidence=self._group_evidence(members))
             for key, members in grouped.items()
         ]
         # Documents describing the same person may land in different groups
@@ -251,6 +251,14 @@ class PatientRoutingService:
                 else:
                     other += 1
             index += 1
+
+        # The merge above keeps one of the two representatives; recomputing
+        # from the whole merged set fills name/birth into the identifier-rich
+        # evidence, so the created workspace is named and keeps the
+        # ``name+birth`` fingerprint even when the richest single document
+        # carries only identifiers.
+        for group in merged:
+            group.evidence = cls._group_evidence(group.documents)
         return merged
 
     @staticmethod
@@ -301,6 +309,77 @@ class PatientRoutingService:
         if candidate_score < current_score:
             return current
         return candidate if candidate.confidence > current.confidence else current
+
+    @classmethod
+    def _group_evidence(
+        cls, members: list[StagedDocument]
+    ) -> PatientIdentityEvidence | None:
+        """The most identifying evidence among a group's documents.
+
+        The naive representative (the first document) can be a weak
+        extraction — a scanned page carrying only the fiscal code, or a
+        header where the name row was not recognized.  ``_prefer_evidence``
+        alone is not enough either: it ranks a fiscal-code + hospital-ID
+        document (17) above a fiscal-code + name + birth one (12), so the
+        "strongest" evidence of a group can lack the patient's name.  Without
+        a name the group contributes no ``name+birth`` fingerprint, the
+        workspaces of one person split into two folders (``PIUNNO REMO`` vs
+        ``REMO PIUNNO``), and the second folder is created with no initials.
+        The representative therefore keeps the identifier-rich evidence but
+        fills in name (and birth) from a document that names the patient,
+        whenever the group has one.
+        """
+        strongest = None
+        named = None
+        for document in members:
+            evidence = document.evidence
+            if evidence is None:
+                continue
+            strongest = (
+                evidence
+                if strongest is None
+                else cls._prefer_evidence(strongest, evidence)
+            )
+            if not evidence.name:
+                continue
+            if named is None:
+                named = evidence
+            elif bool(evidence.birth_date) != bool(named.birth_date):
+                if evidence.birth_date:
+                    named = evidence
+            else:
+                named = cls._prefer_evidence(named, evidence)
+        if strongest is None:
+            return None
+        if strongest.name and strongest.birth_date:
+            return strongest
+        if named is not None:
+            return cls._merge_group_evidence(strongest, named)
+        return strongest
+
+    @staticmethod
+    def _merge_group_evidence(
+        primary: PatientIdentityEvidence,
+        donor: PatientIdentityEvidence,
+    ) -> PatientIdentityEvidence:
+        """``primary`` with name/birth/sex filled in from ``donor``.
+
+        Combines the identifier-rich evidence of a group (fiscal code,
+        hospital ID) with the fields only a well-extracted document carries
+        (the patient's name), so the representative keeps every fingerprint
+        and the created workspace is named.  In-memory only: raw values are
+        never persisted, exactly like the source evidence.
+        """
+        return PatientIdentityEvidence(
+            source_path=primary.source_path,
+            name=primary.name or donor.name,
+            fiscal_code=primary.fiscal_code,
+            birth_date=primary.birth_date or donor.birth_date,
+            sex=primary.sex or donor.sex,
+            hospital_patient_id=primary.hospital_patient_id,
+            extraction_method=primary.extraction_method,
+            warnings=list(primary.warnings),
+        )
 
     @staticmethod
     def _names_compatible(values: set[str]) -> bool:
