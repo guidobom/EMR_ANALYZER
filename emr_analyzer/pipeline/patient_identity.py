@@ -17,10 +17,28 @@ import unicodedata
 from ..models.patient_identity import IdentityField, PatientIdentityEvidence
 
 
-NAME_LABELS = ("NOME E COGNOME", "COGNOME E NOME", "PAZIENTE", "SIG")
+NAME_LABELS = (
+    "NOME E COGNOME", "COGNOME E NOME",
+    "NOME COGNOME", "COGNOME NOME",
+    "PAZIENTE", "SIG",
+)
 FISCAL_LABELS = ("CODICE FISCALE",)
 BIRTH_LABELS = ("LUOGO E DATA DI NASCITA", "DATA DI NASCITA", "DATA NASCITA")
 SEX_LABELS = ("SESSO",)
+
+# Table-style forms (pre-op anaesthesia, surgery logs) split the name across
+# two cells: 'Cognome' and 'Nome', each followed by its value on the same
+# baseline or in the column below.  The reassembled name must never absorb a
+# neighbouring label/value that starts another column, so the same-line scan
+# stops at these tokens.
+_TABLE_LABEL_GAP = 20.0
+_TABLE_VALUE_GAP = 40.0
+_TABLE_STOP_WORDS = frozenset({
+    "SESSO", "DATA", "NASCITA", "ETA", "BMI", "PESO", "ALTEZZA",
+    "CODICE", "FISCALE", "LUOGO", "INDIRIZZO", "TELEFONO", "REPARTO",
+    "DIAGNOSI", "INTERVENTO", "ANESTESISTA", "SPECIALITA",
+    "NOME", "COGNOME", "E",
+})
 
 # Sex values accepted after the SESSO label.  Hospital headers spell the
 # value out ("Femmina"/"Maschio") as often as they use the single letter;
@@ -204,6 +222,12 @@ class PatientIdentityExtractor:
                 "y1": max(item[3] for item in items),
                 "words": [str(item[4]).strip() for item in items if str(item[4]).strip()],
                 "text": " ".join(str(item[4]).strip() for item in items if str(item[4]).strip()),
+                # Per-word coordinates let the table-name extractor split a
+                # baseline into cells ('Cognome' vs the value 'RIZZI').
+                "word_data": [
+                    (item[0], item[1], item[2], item[3], str(item[4]).strip())
+                    for item in items
+                ],
             })
         rows.sort(key=lambda row: (round(row["y0"], 1), row["x0"]))
         return rows
@@ -301,6 +325,18 @@ class PatientIdentityExtractor:
     def _extract_name(
         self, rows: list[dict], page_height: float, method: str, confidence: float
     ) -> IdentityField | None:
+        # Table-style forms split the name across 'Cognome'/'Nome' column
+        # cells.  Their values are anchored to the labels themselves, so this
+        # path is tried before the prose-scanning full-name labels: a
+        # reassembled table name can never fall back to a prose sentence.
+        table_name = self._extract_table_name(rows, page_height)
+        if table_name is not None:
+            value, bbox = table_name
+            return IdentityField(
+                value=value, normalized=normalize_name(value),
+                bbox=bbox, method=method, confidence=confidence - 0.02,
+            )
+
         demographic_y0s: set[float] | None = None
         for label_index in self._label_row_indices(
             rows, NAME_LABELS, common=_COMMON_LABELS
@@ -446,6 +482,9 @@ class PatientIdentityExtractor:
         # "." removes the abbreviation mark in "Sig. NOME COGNOME"; the
         # name regex still rejects any word with an internal period.
         value = re.sub(r"\s+", " ", value).strip(" :-|.")
+        # "MARIO - RIZZI" (value printed before the label, dash-separated)
+        # carries a separator that is not part of the name.
+        value = re.sub(r"\s+[-–]\s+", " ", value).strip(" :-|.")
         words = value.split()
         if not 2 <= len(words) <= 6:
             return None
@@ -455,6 +494,197 @@ class PatientIdentityExtractor:
         if {normalize_text(word) for word in words} & self._FORBIDDEN_NAME_WORDS:
             return None
         return value
+
+    # --- table-style 'Cognome'/'Nome' column headers ----------------------
+
+    def _extract_table_name(
+        self, rows: list[dict], page_height: float
+    ) -> tuple[str, tuple[float, float, float, float]] | None:
+        """Reassemble a name from table-style ``Cognome``/``Nome`` cells.
+
+        Some forms (pre-op anaesthesia, surgery logs) split the demographic
+        header into two column cells, ``Cognome`` and ``Nome``, each with its
+        value: ``Cognome ... RIZZI`` on one baseline and ``Nome ... MARIO``
+        on the next (or below in the same column).  The full-name labels
+        (``NOME E COGNOME``, ``COGNOME NOME``) never occur there, so the name
+        must be rebuilt from the two column values.  Returns ``(name, bbox)``
+        or ``None`` when the labels or a valid combination are absent.
+        """
+        surname_value = None
+        surname_bbox = None
+        firstname_value = None
+        firstname_bbox = None
+        for row in rows:
+            surname_label, firstname_label = self._table_name_signal(
+                row, rows
+            )
+            if surname_label and surname_value is None:
+                value = self._name_value_for_label(
+                    rows, surname_label, page_height
+                )
+                if value and self._plausible_name_value(value):
+                    surname_value = value
+                    surname_bbox = self._bbox(row)
+            if firstname_label and firstname_value is None:
+                value = self._name_value_for_label(
+                    rows, firstname_label, page_height
+                )
+                if value and self._plausible_name_value(value):
+                    firstname_value = value
+                    firstname_bbox = self._bbox(row)
+            if surname_value and firstname_value:
+                break
+        if not (surname_value and firstname_value):
+            return None
+        name = f"{surname_value} {firstname_value}".strip()
+        if self._validated_name(name) is None:
+            return None
+        return name, surname_bbox or firstname_bbox
+
+    def _table_name_signal(
+        self, row: dict, rows: list[dict]
+    ) -> tuple[tuple | None, tuple | None]:
+        """Standalone ``COGNOME``/``NOME`` label words in a table row.
+
+        The words must not belong to a full-name phrase (``COGNOME E NOME``,
+        ``NOME COGNOME``) — those are handled by the standard name labels.
+        PyMuPDF splits a printed line into several rows, so phrase membership
+        is decided on the real baselines across all rows.
+        """
+        surname = None
+        firstname = None
+        for word in row.get("word_data", []):
+            normalized = normalize_text(word[4])
+            if normalized not in ("COGNOME", "NOME"):
+                continue
+            if self._in_name_phrase(word, rows):
+                continue
+            if normalized == "COGNOME" and surname is None:
+                surname = word
+            elif normalized == "NOME" and firstname is None:
+                firstname = word
+        return surname, firstname
+
+    def _in_name_phrase(self, word, rows: list[dict]) -> bool:
+        """True when ``word`` belongs to ``NOME E COGNOME``/``COGNOME NOME``.
+
+        The neighbouring word on the same baseline decides: column headers
+        ``Cognome``/``Nome`` are separated by a wide gap, while the phrase
+        words sit a few points apart (``NOME E COGNOME``).
+        """
+        normalized = normalize_text(word[4])
+        same_baseline = sorted(
+            (
+                candidate for candidate in self._all_words(rows)
+                if candidate is not word
+                and abs(candidate[1] - word[1]) <= 3.0
+            ),
+            key=lambda candidate: candidate[0],
+        )
+        before = [
+            candidate for candidate in same_baseline
+            if candidate[0] < word[2] - 2.0
+        ]
+        after = [
+            candidate for candidate in same_baseline
+            if candidate[0] > word[0] + 2.0
+        ]
+        previous = before[-1] if before else None
+        following = after[0] if after else None
+        previous_gap = (word[0] - previous[2]) if previous else float("inf")
+        following_gap = (following[0] - word[2]) if following else float("inf")
+
+        if normalized == "COGNOME":
+            if (previous is not None
+                    and previous_gap <= _TABLE_LABEL_GAP
+                    and normalize_text(previous[4]) in ("NOME", "E")):
+                return True
+            if (following is not None
+                    and following_gap <= _TABLE_LABEL_GAP
+                    and normalize_text(following[4]) in ("NOME", "E")):
+                return True
+        else:  # NOME
+            if (following is not None
+                    and following_gap <= _TABLE_LABEL_GAP
+                    and normalize_text(following[4]) in ("E", "COGNOME")):
+                return True
+            if (previous is not None
+                    and previous_gap <= _TABLE_LABEL_GAP
+                    and normalize_text(previous[4]) == "COGNOME"):
+                return True
+        return False
+
+    def _name_value_for_label(
+        self, rows: list[dict], label_word, page_height: float
+    ) -> str | None:
+        """The value paired with a table label: same baseline, else below."""
+        same_line = self._same_row_value(rows, label_word)
+        if same_line:
+            return same_line
+        return self._below_column_value(rows, label_word, page_height)
+
+    @staticmethod
+    def _all_words(rows: list[dict]) -> list[tuple]:
+        return [
+            word for row in rows for word in row.get("word_data", [])
+        ]
+
+    def _same_row_value(self, rows: list[dict], label_word) -> str | None:
+        """Value words on the label's baseline, right of it, until a gap.
+
+        PyMuPDF often splits a single printed line into several ``(block,
+        line)`` rows, so the comparison uses the real word coordinates across
+        every row: the words sharing the label's baseline are collected until
+        a column gap or the next column label.
+        """
+        label_x1 = label_word[2]
+        collected = []
+        previous_end = label_x1
+        for word in sorted(self._all_words(rows), key=lambda item: item[0]):
+            if word[0] < label_x1 - 2.0:
+                continue  # same column as the label or to its left
+            if abs(word[1] - label_word[1]) > 3.0:
+                continue  # different baseline
+            if word[0] - previous_end > _TABLE_VALUE_GAP:
+                break
+            if normalize_text(word[4]) in _TABLE_STOP_WORDS:
+                break
+            collected.append(word[4])
+            previous_end = word[2]
+        if not collected:
+            return None
+        return " ".join(collected).strip()
+
+    def _below_column_value(
+        self, rows: list[dict], label_word, page_height: float
+    ) -> str | None:
+        """Word on a following line horizontally aligned with the label.
+
+        Column-table forms print the value on the next line in the same
+        column (``Nome`` header above ``MARIO``), so the label's x position
+        selects the value word.
+        """
+        max_vertical = max(35.0, page_height * 0.045)
+        candidates = []
+        for word in self._all_words(rows):
+            vertical = word[1] - label_word[1]
+            if not 0 < vertical <= max_vertical:
+                continue
+            if abs(word[0] - label_word[0]) <= 6.0 and normalize_text(word[4]):
+                candidates.append((word[1], word[0], word[4]))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[:2])
+        return candidates[0][2]
+
+    def _plausible_name_value(self, value: str) -> bool:
+        """A value that may be part of a name (alphabetic, not a label)."""
+        tokens = value.split()
+        if not tokens:
+            return False
+        if any(normalize_text(token) in self._FORBIDDEN_NAME_WORDS for token in tokens):
+            return False
+        return all(self._NAME_WORD.fullmatch(token.rstrip(",")) for token in tokens)
 
     def _extract_fiscal_code(
         self, rows: list[dict], page_height: float, method: str, confidence: float
@@ -529,7 +759,18 @@ class PatientIdentityExtractor:
         self, rows: list[dict], page_height: float, method: str, confidence: float
     ) -> IdentityField | None:
         for label_index in self._label_row_indices(rows, HOSPITAL_ID_LABELS):
-            search_rows = [rows[label_index]] + self._near_label_rows(
+            label_row = rows[label_index]
+            # The row may carry several identifiers ('Id. Dicom: FSA20024
+            # Id.Paz FSA38432'): only the value that follows 'ID PAZ' itself
+            # is the hospital patient ID.
+            value = self._hospital_id_after_label(label_row)
+            if value:
+                return IdentityField(
+                    value=value, normalized=value,
+                    bbox=self._bbox(label_row), method=method,
+                    confidence=confidence,
+                )
+            search_rows = [label_row] + self._near_label_rows(
                 rows, label_index, page_height, exclude_above=True
             )
             for row in search_rows:
@@ -540,6 +781,27 @@ class PatientIdentityExtractor:
                         bbox=self._bbox(row), method=method,
                         confidence=confidence,
                     )
+        return None
+
+    def _hospital_id_after_label(self, row: dict) -> str | None:
+        """The identifier that directly follows the 'ID PAZ' token.
+
+        Radiology footers print ``Id. Dicom``, ``Id.Paz`` and the accession
+        number on one line; the value adjacent to ``ID PAZ``/``ID PAZIENTE``
+        is the hospital patient ID and the others must not be captured.  The
+        label may be one token (``Id.Paz``) or two (``Id Paz``).
+        """
+        words = sorted(row.get("word_data", []), key=lambda item: item[0])
+        for index, word in enumerate(words):
+            tokens = normalize_text(word[4]).split()
+            if "PAZ" not in tokens and "PAZIENTE" not in tokens:
+                continue
+            for following in words[index + 1:]:
+                if not normalize_text(following[4]):
+                    continue  # punctuation like ':' is an empty token
+                value = self._validated_hospital_id(following[4])
+                if value:
+                    return value
         return None
 
     def _validated_hospital_id(self, text: str) -> str | None:
