@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from ..models.patient_identity import PatientIdentityEvidence
@@ -352,10 +352,20 @@ class PatientRoutingService:
         if strongest is None:
             return None
         if strongest.name and strongest.birth_date:
-            return strongest
-        if named is not None:
-            return cls._merge_group_evidence(strongest, named)
-        return strongest
+            result = strongest
+        elif named is not None:
+            result = cls._merge_group_evidence(strongest, named)
+        else:
+            result = strongest
+        # A minority fiscal code (a wrong, yet checksum-valid, code in a few
+        # older records) must not be the one registered for the workspace:
+        # the code held by the majority of the group anchors the identity.
+        dominant_cf = cls._dominant_fiscal_code_field(members)
+        if (dominant_cf is not None
+                and (result.fiscal_code is None
+                     or result.fiscal_code.normalized != dominant_cf.normalized)):
+            result.fiscal_code = dominant_cf
+        return result
 
     @staticmethod
     def _merge_group_evidence(
@@ -414,6 +424,11 @@ class PatientRoutingService:
             if len(values) > 1:
                 if field_name == "name" and cls._names_compatible(values):
                     continue
+                if (field_name == "fiscal_code"
+                        and cls._fiscal_code_discordance_is_noise(
+                            documents, values
+                        )):
+                    continue
                 conflicts.append(field_name)
         # A group anchored by one authoritative identifier (all documents
         # share the same fiscal code or hospital patient ID) names the
@@ -446,6 +461,61 @@ class PatientRoutingService:
             if len(values) == 1:
                 return True
         return False
+
+    @staticmethod
+    def _dominant_fiscal_code_field(
+        documents: list[StagedDocument],
+    ):
+        """The :class:`IdentityField` of the majority fiscal code, or None.
+
+        A group dominated by one checksum-valid fiscal code (``81`` documents
+        with ``SRCMND45C53G916N``) can still carry a stray divergent code —
+        the hospital printed a male-encoded variant of the same person, or a
+        checksum-valid digit typo.  The dominant value is a reliable anchor
+        and must win over the minority when the group otherwise agrees.
+        Returns ``None`` unless one value is a clear majority (>= 3
+        documents and more than twice the runner-up), so a genuine split
+        between two people is never collapsed.
+        """
+        counts: Counter = Counter()
+        fields = {}
+        for document in documents:
+            cf = document.evidence.fiscal_code
+            if cf and cf.normalized:
+                counts[cf.normalized] += 1
+                fields.setdefault(cf.normalized, cf)
+        if not counts:
+            return None
+        top_value, top_count = counts.most_common(1)[0]
+        total = sum(counts.values())
+        if top_count < 3 or top_count <= 2 * (total - top_count):
+            return None
+        return fields[top_value]
+
+    @classmethod
+    def _fiscal_code_discordance_is_noise(
+        cls, documents: list[StagedDocument], distinct_values: set
+    ) -> bool:
+        """True when a split fiscal code is minority noise, not a conflict.
+
+        Mirrors the name logic: a group that agrees on name and birth date
+        but shows two fiscal codes is almost always one patient whose older
+        records carried a wrong — yet checksum-valid — code.  The majority
+        code anchors the identity, so the minority value must not send the
+        whole group to review.  A split birth date still blocks: it would
+        indicate two genuinely different people sharing a name.
+        """
+        if len(distinct_values) < 2:
+            return False
+        if cls._dominant_fiscal_code_field(documents) is None:
+            return False
+        birth_dates = {
+            document.evidence.birth_date.normalized
+            for document in documents
+            if document.evidence.birth_date
+            and document.evidence.birth_date.normalized
+        }
+        return len(birth_dates) <= 1
 
     # --- best-effort auto-assignment of unresolved groups ------------------
 

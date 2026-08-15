@@ -78,6 +78,16 @@ class ImportHelpersTest(unittest.TestCase):
         self.assertTrue(by_path[duplicate]["is_duplicate"])
         self.assertNotEqual(by_path[duplicate]["status"], "Pronto")
 
+    def test_appledouble_sidecar_files_are_rejected(self):
+        # macOS ._* AppleDouble sidecars are metadata, never documents: they
+        # carry no readable text, would always fail identity extraction and
+        # pollute the "Da assegnare" bucket forever.
+        from emr_analyzer.utils.file_utils import is_supported_file
+
+        self.assertFalse(is_supported_file("._10a9b448416DC157.pdf"))
+        self.assertFalse(is_supported_file(self._write("._esami.png", b"x")))
+        self.assertTrue(is_supported_file(self._write("esami.pdf", b"x")))
+
     def test_import_checked_documents_copies_and_creates_record(self):
         src = self._write("esami.png", b"png-content")
         checks = run_file_checks(self._services, [src])

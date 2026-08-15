@@ -19,8 +19,17 @@ def compute_file_hash(file_path: str | Path, algorithm: str = "sha256") -> str:
 
 
 def is_supported_file(file_path: str | Path) -> bool:
-    """Check if the file extension is supported."""
-    return Path(file_path).suffix.lower() in SUPPORTED_EXTENSIONS
+    """Check if the file extension is supported.
+
+    macOS ``._*`` AppleDouble sidecar files are metadata for the real file
+    next to them, never documents themselves: they carry no readable text,
+    would always fail identity extraction and would pollute the "Da
+    assegnare" bucket forever.  They are filtered out here.
+    """
+    path = Path(file_path)
+    if path.name.startswith("._"):
+        return False
+    return path.suffix.lower() in SUPPORTED_EXTENSIONS
 
 
 def is_pdf(file_path: str | Path) -> bool:

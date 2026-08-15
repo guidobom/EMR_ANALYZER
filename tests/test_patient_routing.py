@@ -323,6 +323,69 @@ class PatientRoutingTest(unittest.TestCase):
             # The created identity keeps the richest evidence of the batch.
             self.assertIsNotNone(groups[0].evidence.fiscal_code)
 
+    def test_resolve_minority_fiscal_code_is_noise_not_conflict(self):
+        # A group dominated by one checksum-valid fiscal code can carry a
+        # stray divergent code — the hospital printed a male-encoded variant
+        # of the same person (SRCMND45C13G916J vs SRCMND45C53G916N).  The
+        # minority value must not send all 110 documents to "Da assegnare":
+        # the group routes as one strong identity and the dominant code wins.
+        dominant_cf = "SRCMND45C53G916N"
+        minority_cf = "SRCMND45C13G916J"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = DatabaseEngine(tmp_path / "registry.db")
+            init_database(db)
+            identity_repo = PatientIdentityRepository(
+                db, IdentityKeyService(tmp_path / "identity.key")
+            )
+            router = PatientRoutingService(
+                identity_repo, None, None, None, audit_repo=None
+            )
+
+            documents = [
+                _staged(_evidence("SERACENI MIRANDA", "1945-03-13", dominant_cf), i)
+                for i in range(80)
+            ]
+            documents.append(
+                _staged(_evidence("SERACENI MIRANDA", "1945-03-13", minority_cf), 80)
+            )
+
+            groups = router.resolve(documents)
+            self.assertEqual(len(groups), 1)
+            self.assertTrue(groups[0].create_new)
+            self.assertFalse(groups[0].conflict)
+            self.assertEqual(len(groups[0].documents), len(documents))
+            # The workspace registers the majority code, not the stray one.
+            self.assertEqual(groups[0].evidence.fiscal_code.normalized, dominant_cf)
+
+    def test_resolve_balanced_fiscal_code_split_still_conflicts(self):
+        # A genuine split between two codes (3 vs 3) means two people share
+        # the name; the majority tolerance must not collapse them.
+        dominant_cf = "SRCMND45C53G916N"
+        other_cf = "SRCMND45C13G916J"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = DatabaseEngine(tmp_path / "registry.db")
+            init_database(db)
+            identity_repo = PatientIdentityRepository(
+                db, IdentityKeyService(tmp_path / "identity.key")
+            )
+            router = PatientRoutingService(
+                identity_repo, None, None, None, audit_repo=None
+            )
+
+            documents = (
+                [_staged(_evidence("SERACENI MIRANDA", "1945-03-13", dominant_cf), i)
+                 for i in range(3)]
+                + [_staged(_evidence("SERACENI MIRANDA", "1945-03-13", other_cf), i)
+                   for i in range(3, 6)]
+            )
+
+            groups = router.resolve(documents)
+            self.assertEqual(len(groups), 1)
+            self.assertTrue(groups[0].needs_review)
+            self.assertTrue(groups[0].conflict)
+
     # --- best-effort auto-assignment of unresolved groups -----------------
 
     def test_resolve_auto_assigns_unresolved_by_surname_and_birth(self):
