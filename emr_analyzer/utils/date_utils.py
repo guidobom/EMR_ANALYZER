@@ -18,6 +18,9 @@ DATE_PATTERNS = [
     # tail of a 4-digit year: without them "1929-08-26" matched "29-08-26"
     # and was misread as 26-Aug-2029-08 → "2026-08-29".
     (re.compile(r'(?<!\d)(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})(?!\d)'), "DMY"),
+    # 23 10 2014 (space-separated DMY used by the anatomy-pathology reports:
+    # "Esame 22 10 2014", firma "(23 10 2014)"). Same DMY branch + guards.
+    (re.compile(r'(?<!\d)(\d{1,2})[ ](\d{1,2})[ ](\d{2,4})(?!\d)'), "DMY"),
     # 2026-04-12, 2026/04/12, 2026.04.12
     (re.compile(r'(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})'), "YMD"),
     # 12 aprile 2026, 12 Aprile 2026
