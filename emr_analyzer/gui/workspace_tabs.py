@@ -296,6 +296,47 @@ class WorkspaceTabs(QTabWidget):
         progress.mark_done()
         progress.exec_()
 
+    def run_extraction_for_docs(self, grouped: dict[str, list[str]]):
+        """Run clinical-text extraction for explicit doc_ids, grouped by patient.
+
+        Mirrors :meth:`run_extraction_queue` but passes the selected documents
+        to ``extract_clinical_text``, so only the requested files are parsed
+        and LLM-normalized (other pending documents of the patient are left
+        untouched).
+        """
+        patients = [pid for pid, ids in grouped.items() if ids]
+        if not patients:
+            return
+
+        total = len(patients)
+        progress = ProgressDialog(
+            f"Estrazione documenti selezionati — paziente 1/{total}",
+            parent=self,
+        )
+        progress.show()
+        QApplication.processEvents()
+
+        for idx, pid in enumerate(patients, start=1):
+            if progress.is_cancelled():
+                break
+            progress.reset_for_reuse()
+            progress.setWindowTitle(
+                f"Estrazione documenti selezionati — paziente {idx}/{total}"
+            )
+            progress.add_log(f"\n===== Paziente {idx}/{total}: {pid} =====")
+            self.load_patient(pid)
+            try:
+                self._documents_tab.extract_clinical_text(
+                    doc_ids=grouped[pid],
+                    progress=progress,
+                    patient_label=f"Paziente {idx}/{total}: {pid}",
+                )
+            except Exception as exc:
+                progress.add_log(f"❌ Errore per {pid}: {exc}")
+
+        progress.mark_done()
+        progress.exec_()
+
     def _on_document_selected(self, doc_id: str, doc_data: dict):
         self._current_document_id = doc_id
         doc_data["_patient_id"] = self._current_patient_id

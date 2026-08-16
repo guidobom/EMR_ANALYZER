@@ -261,6 +261,62 @@ class AttributionVerificationTest(unittest.TestCase):
                 None, _Progress(),
             )
 
+    # --- CF-anchored birth override (Fix 3) ------------------------------
+
+    def test_anchored_cf_birth_overrides_transposed_textual_birth(self):
+        # The P015 corruption: the LLM's textual birth is parsed to a wrong
+        # date ("01/08/1980" → 1980-08-01 instead of 1980-01-01).  A
+        # checksum-valid CF that is verbatim in the text encodes the
+        # authoritative birth date, so the wrong textual date must not raise
+        # a false mismatch against the registered one.
+        self._register(
+            "P001", name="Mario Rossi", birth="1980-01-01", cf=CF_MARIO
+        )
+        tab = self._tab({
+            "name": "Mario Rossi", "birth_date": "01/08/1980",
+            "fiscal_code": CF_MARIO, "confidence": 0.97,
+        })
+        result = tab._verify_document_attribution(
+            self._doc("P001"),
+            self._report(
+                f"Paziente: Mario Rossi nato il 01/08/1980. "
+                f"Codice fiscale {CF_MARIO}."
+            ),
+            None, _Progress(),
+        )
+        self.assertIsNone(result)
+
+    def test_anchored_cf_fills_missing_textual_birth(self):
+        # The LLM omits the birth date but the CF is in the text: the decoded
+        # date completes the evidence instead of weakening it.
+        self._register(
+            "P001", name="Mario Rossi", birth="1980-01-01", cf=CF_MARIO
+        )
+        tab = self._tab({
+            "name": "Mario Rossi", "fiscal_code": CF_MARIO,
+            "confidence": 0.97,
+        })
+        result = tab._verify_document_attribution(
+            self._doc("P001"),
+            self._report(f"Paziente: Mario Rossi. Codice fiscale {CF_MARIO}."),
+            None, _Progress(),
+        )
+        self.assertIsNone(result)
+
+    def test_anchored_cf_of_different_patient_still_blocks(self):
+        # A CF pointing at a *different* registered patient must still raise
+        # even now that the decoded birth date joins the evidence.
+        self._register("P001", cf=CF_MARIO)
+        tab = self._tab({
+            "fiscal_code": CF_MARIO, "confidence": 0.97,
+        })
+        with self.assertRaises(AttributionMismatchError):
+            tab._verify_document_attribution(
+                self._doc("P002"),
+                self._report(f"Codice fiscale {CF_MARIO} del paziente."),
+                None, _Progress(),
+            )
+
     # --- malformed fiscal codes read by the LLM --------------------------
 
     def test_invalid_cf_read_by_llm_does_not_conflict(self):
@@ -378,6 +434,59 @@ class AttributionVerificationTest(unittest.TestCase):
         # The most important guarantee: no normalization under the wrong
         # patient.
         self.assertEqual(isolator.calls, [])
+
+
+class BuildAttributionFieldsTest(unittest.TestCase):
+    """Pure tests of ``DocumentsTab._build_attribution_fields`` (Fix 3)."""
+
+    @staticmethod
+    def _build(**kwargs):
+        defaults = {
+            "name": "", "birth": "", "cf": "",
+            "raw_text": "Referto di controllo oncologico.",
+            "confidence": 0.9,
+        }
+        defaults.update(kwargs)
+        return DocumentsTab._build_attribution_fields(**defaults)
+
+    def test_decoded_cf_birth_overrides_textual_birth(self):
+        # Transposed textual birth ("01/08/1980" → 1980-08-01) is replaced by
+        # the date encoded in the anchored CF (1980-01-01).
+        fields = self._build(
+            name="Mario Rossi", birth="01/08/1980", cf=CF_MARIO,
+            raw_text=f"Paziente Mario Rossi. Codice fiscale {CF_MARIO}.",
+            confidence=0.95,
+        )
+        self.assertEqual(fields["birth_date"].normalized, "1980-01-01")
+        self.assertEqual(fields["fiscal_code"].normalized, CF_MARIO)
+        self.assertEqual(fields["name"].normalized, "MARIO ROSSI")
+
+    def test_decoded_cf_birth_fills_missing_textual_birth(self):
+        fields = self._build(
+            name="Mario Rossi", cf=CF_MARIO,
+            raw_text=f"Paziente Mario Rossi. Codice fiscale {CF_MARIO}.",
+            confidence=0.95,
+        )
+        self.assertEqual(fields["birth_date"].normalized, "1980-01-01")
+
+    def test_hallucinated_cf_not_in_text_returns_none(self):
+        self.assertIsNone(self._build(cf=CF_MARIO))
+
+    def test_malformed_cf_without_anchor_returns_none(self):
+        # A malformed code (a phone number read by the LLM) cannot anchor
+        # even when present verbatim.
+        self.assertIsNone(
+            self._build(cf="8100455504", raw_text="Numero 8100455504.")
+        )
+
+    def test_lone_valid_cf_anchored_returns_only_cf_and_birth(self):
+        fields = self._build(
+            cf=CF_MARIO, raw_text=f"Codice fiscale {CF_MARIO}."
+        )
+        self.assertEqual(set(fields), {"fiscal_code", "birth_date"})
+
+    def test_lone_name_without_anchor_returns_none(self):
+        self.assertIsNone(self._build(name="Mario Rossi"))
 
 
 if __name__ == "__main__":

@@ -1269,38 +1269,53 @@ class DocumentsTab(QWidget):
             raw = text or ""
         return (raw or "")[:8000]
 
-    def _attribution_verdict(self, doc, raw_text, extract_identity,
-                             identity_repo) -> dict:
-        """Decide whether the LLM identity confirms the workspace.
+    @staticmethod
+    def _build_attribution_fields(
+        name: str, birth: str, cf: str, raw_text: str, confidence: float
+    ) -> dict | None:
+        """Build the identity evidence fields for the LLM attribution verdict.
 
-        Returns a dict with ``status`` in
-        ``confirmed | mismatch | conflict | inconclusive``; ``mismatch``
-        carries ``suggested_patient_id``.
+        Returns None when the identity is not anchored in the text
+        (anti-hallucination guard).  A checksum-valid fiscal code that appears
+        verbatim in the text is the authoritative source for the birth date:
+        the code encodes it, so a misread, transposed or variant-format
+        textual date never produces a false conflict against the registered
+        birth date.
         """
-        from ..models.patient_identity import (
-            PatientIdentityEvidence, IdentityField,
-        )
+        from ..models.patient_identity import IdentityField
         from ..pipeline.patient_identity import (
             normalize_text, normalize_fiscal_code,
-            fiscal_code_has_valid_checksum,
+            fiscal_code_has_valid_checksum, decode_birth_date_from_cf,
         )
+        from ..utils.date_utils import parse_italian_date
 
-        if not raw_text or len(raw_text.strip()) < 60:
-            return {"status": "inconclusive"}
-        identity = extract_identity(raw_text)
-        if not identity:
-            return {"status": "inconclusive"}
+        name = name or ""
+        birth = birth or ""
+        cf = cf or ""
 
-        name = identity.get("name") or ""
-        birth = identity.get("birth_date") or ""
-        cf = identity.get("fiscal_code") or ""
+        words = set(normalize_text(raw_text).split())
+        anchored_cf = bool(
+            cf
+            and fiscal_code_has_valid_checksum(cf)
+            and normalize_fiscal_code(cf) in words
+        )
+        anchored_name = False
+        if name:
+            tokens = [t for t in normalize_text(name).split() if len(t) >= 4]
+            if tokens and tokens[-1] in words:
+                anchored_name = True
+        if not (anchored_cf or anchored_name):
+            return None
+
+        if anchored_cf:
+            decoded = decode_birth_date_from_cf(normalize_fiscal_code(cf))
+            if decoded:
+                birth = decoded
         if birth:
-            from ..utils.date_utils import parse_italian_date
             iso = parse_italian_date(birth)
             if iso:
                 birth = iso
 
-        confidence = identity.get("confidence", 0.5)
         fields = {}
         if name:
             fields["name"] = IdentityField(
@@ -1316,31 +1331,42 @@ class DocumentsTab(QWidget):
         # conflict against the registered one — it is dropped from the
         # evidence, matching the deterministic extractor (which already gates
         # on the checksum).
-        if cf and fiscal_code_has_valid_checksum(cf):
+        if anchored_cf:
             normalized_cf = normalize_fiscal_code(cf)
             fields["fiscal_code"] = IdentityField(
                 normalized_cf, normalized_cf, confidence=confidence
             )
+        return fields or None
+
+    def _attribution_verdict(self, doc, raw_text, extract_identity,
+                             identity_repo) -> dict:
+        """Decide whether the LLM identity confirms the workspace.
+
+        Returns a dict with ``status`` in
+        ``confirmed | mismatch | conflict | inconclusive``; ``mismatch``
+        carries ``suggested_patient_id``.
+        """
+        from ..models.patient_identity import PatientIdentityEvidence
+
+        if not raw_text or len(raw_text.strip()) < 60:
+            return {"status": "inconclusive"}
+        identity = extract_identity(raw_text)
+        if not identity:
+            return {"status": "inconclusive"}
+
+        confidence = identity.get("confidence", 0.5)
+        fields = self._build_attribution_fields(
+            identity.get("name") or "",
+            identity.get("birth_date") or "",
+            identity.get("fiscal_code") or "",
+            raw_text,
+            confidence,
+        )
         if not fields:
             return {"status": "inconclusive"}
         evidence = PatientIdentityEvidence(
             source_path="llm_attribution", **fields
         )
-
-        # Anti-hallucination anchor: the identity must actually be in the
-        # text before its match is trusted.
-        words = set(normalize_text(raw_text).split())
-        anchored_cf = False
-        if cf and fiscal_code_has_valid_checksum(cf):
-            anchored_cf = normalize_fiscal_code(cf) in words
-        anchored_name = False
-        if name:
-            tokens = [t for t in normalize_text(name).split() if len(t) >= 4]
-            if tokens and tokens[-1] in words:
-                anchored_name = True
-        if not (anchored_cf or anchored_name):
-            return {"status": "inconclusive"}
-
         match = identity_repo.find_match(evidence)
         if match.conflict:
             return {
@@ -1357,7 +1383,9 @@ class DocumentsTab(QWidget):
             # Only a well-anchored identity (valid CF, or name+birth date)
             # blocks the extraction; a lone name may point to a physician
             # or a relative cited in the report.
-            if anchored_cf or (name and birth):
+            if "fiscal_code" in fields or (
+                "name" in fields and "birth_date" in fields
+            ):
                 return {
                     "status": "mismatch",
                     "message": (

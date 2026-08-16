@@ -84,6 +84,14 @@ class DocumentRepository:
         )
         return [self._row_to_doc(r) for r in cursor.fetchall()]
 
+    def list_all(self) -> list[DocumentRecord]:
+        """Return every document in the registry, regardless of patient."""
+        cursor = self.db.execute(
+            """SELECT * FROM documents
+               ORDER BY patient_id, document_date DESC, import_date DESC"""
+        )
+        return [self._row_to_doc(r) for r in cursor.fetchall()]
+
     def update_parsing_status(self, doc_id: str, status: str,
                               error: Optional[str] = None) -> None:
         self.db.execute(

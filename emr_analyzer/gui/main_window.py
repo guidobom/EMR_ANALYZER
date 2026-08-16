@@ -6,7 +6,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QMainWindow, QToolBar, QStatusBar, QAction,
     QSplitter, QMessageBox, QFileDialog, QWidget,
-    QLabel, QApplication, QSizePolicy,
+    QLabel, QApplication, QSizePolicy, QDialog,
 )
 from PyQt5.QtCore import Qt, QSize
 
@@ -144,6 +144,16 @@ class MainWindow(QMainWindow):
         export_btn = QAction("📤 Esporta", self)
         export_btn.triggered.connect(self._on_export)
         toolbar.addAction(export_btn)
+
+        # Workspace-wide view of documents still needing normalization or
+        # carrying an error, with the option to launch the extraction on them.
+        pending_btn = QAction("🧹 Non normalizzati", self)
+        pending_btn.setToolTip(
+            "Mostra tutti i documenti ancora da normalizzare o con errori e "
+            "avvia l'estrazione del testo clinico sui selezionati"
+        )
+        pending_btn.triggered.connect(self._on_show_pending)
+        toolbar.addAction(pending_btn)
 
         # Spacer
         spacer = QWidget()
@@ -313,6 +323,35 @@ class MainWindow(QMainWindow):
             return
         dialog = ExportDialog(self._services, self._current_patient_id, self)
         dialog.exec_()
+
+    def _on_show_pending(self):
+        """List every document needing normalization or with an error.
+
+        The dialog returns the checked documents grouped by patient; the
+        extraction queue is launched only after the dialog closes, so the
+        modal selection window never sits behind the progress dialog.
+        """
+        from .normalization_dialog import (
+            NormalizationDialog, classify_pending_documents,
+        )
+        doc_repo = self._services.get("document_repo")
+        if not doc_repo:
+            QMessageBox.warning(
+                self, "Errore", "Servizio documenti non disponibile."
+            )
+            return
+        classification = classify_pending_documents(doc_repo.list_all())
+        if classification.total == 0:
+            QMessageBox.information(
+                self, "Nessun documento pendente",
+                "Nessun documento da normalizzare o con errori nel workspace.",
+            )
+            return
+        dialog = NormalizationDialog(classification, parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            grouped = dialog.selected_groups()
+            if grouped:
+                self.workspace_tabs.run_extraction_for_docs(grouped)
 
     def _on_about(self):
         QMessageBox.about(

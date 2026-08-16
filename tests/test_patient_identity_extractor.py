@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import unittest
 
-from emr_analyzer.pipeline.patient_identity import PatientIdentityExtractor
+from emr_analyzer.pipeline.patient_identity import (
+    PatientIdentityExtractor,
+    decode_birth_date_from_cf,
+    decode_sex_from_cf,
+)
 
 
 def _row(x0: float, y0: float, text: str) -> dict:
@@ -259,6 +263,81 @@ class FullExtractionTest(unittest.TestCase):
             (200, 240, "01 08 1985"),
         ])
         self.assertEqual(name.value, "MARIO ROSSI")
+
+
+class CfDecodeTest(unittest.TestCase):
+    """Deterministic decoding of birth date and sex from a fiscal code."""
+
+    def test_birth_date_and_sex_from_known_codes(self):
+        cases = [
+            ("CRSMRA29M66D429M", "1929-08-26", "F"),
+            ("MRAMRS44P45C980J", "1944-09-05", "F"),
+            ("GRZDRO46P24G768B", "1946-09-24", "M"),
+            ("PNNRME54D11G916N", "1954-04-11", "M"),
+        ]
+        for cf, birth, sex in cases:
+            with self.subTest(cf=cf):
+                self.assertEqual(decode_birth_date_from_cf(cf), birth)
+                self.assertEqual(decode_sex_from_cf(cf), sex)
+
+    def test_female_day_increment_and_december(self):
+        # 50 → day 10 (female); T is the December month letter.
+        self.assertEqual(decode_sex_from_cf("RSSMRA85T50H501W"), "F")
+        self.assertEqual(
+            decode_birth_date_from_cf("RSSMRA85T50H501W"), "1985-12-10"
+        )
+        self.assertEqual(decode_sex_from_cf("RSSMRA85T10H501U"), "M")
+        self.assertEqual(
+            decode_birth_date_from_cf("RSSMRA85T10H501U"), "1985-12-10"
+        )
+
+    def test_invalid_structure_returns_none(self):
+        self.assertIsNone(decode_birth_date_from_cf("ABC"))
+        self.assertIsNone(decode_birth_date_from_cf(""))
+        self.assertIsNone(decode_sex_from_cf("XYZ"))
+
+
+class BirthDateCfFallbackTest(unittest.TestCase):
+    """_extract_birth_date decodes the birth date from the CF when no
+    dedicated birth-date label is printed on the header."""
+
+    def setUp(self):
+        self.extractor = PatientIdentityExtractor()
+
+    def test_decode_from_fiscal_code_when_no_birth_label(self):
+        rows = [
+            _row(20.0, 100.0, "CODICE FISCALE"),
+            _row(200.0, 100.0, "CRSMRA29M66D429M"),
+        ]
+        field = self.extractor._extract_birth_date(
+            rows, 842.0, "native_text", 0.97
+        )
+        self.assertIsNotNone(field)
+        self.assertEqual(field.normalized, "1929-08-26")
+
+    def test_none_when_no_birth_label_and_no_cf(self):
+        rows = [
+            _row(20.0, 100.0, "NOME E COGNOME"),
+            _row(200.0, 100.0, "MARIO ROSSI"),
+        ]
+        field = self.extractor._extract_birth_date(
+            rows, 842.0, "native_text", 0.97
+        )
+        self.assertIsNone(field)
+
+    def test_labelled_birth_wins_over_cf_decode(self):
+        rows = [
+            _row(20.0, 100.0, "CODICE FISCALE"),
+            _row(200.0, 100.0, "CRSMRA29M66D429M"),
+            _row(20.0, 140.0, "DATA DI NASCITA"),
+            _row(200.0, 140.0, "26.08.1929"),
+        ]
+        field = self.extractor._extract_birth_date(
+            rows, 842.0, "native_text", 0.97
+        )
+        self.assertIsNotNone(field)
+        self.assertEqual(field.value, "26.08.1929")
+        self.assertEqual(field.normalized, "1929-08-26")
 
 
 if __name__ == "__main__":

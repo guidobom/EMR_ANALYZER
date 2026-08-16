@@ -109,6 +109,64 @@ def fiscal_code_has_valid_checksum(value: str) -> bool:
     return value[-1] == chr(ord("A") + total % 26)
 
 
+# Month letters in the Italian fiscal code (index 8 of the CF): the month is
+# encoded as its letter from "Gennaio"…, but J/Feb skipped: A B C D E H L M
+# P R S T → 1..12.
+_CF_MONTH_LETTERS = {
+    "A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "H": 6,
+    "L": 7, "M": 8, "P": 9, "R": 10, "S": 11, "T": 12,
+}
+
+
+def decode_birth_date_from_cf(cf: str) -> str | None:
+    """Decode the birth date encoded in an Italian fiscal code.
+
+    The CF stores it in positions 8–11 (0-based): two-digit year, a month
+    letter, and the day (+40 when the person is female).  Returns the ISO
+    date, or None when the code is not structurally valid.
+    """
+    value = normalize_fiscal_code(cf)
+    if len(value) != 16:
+        return None
+    year_digits = value[6:8]
+    month_letter = value[8]
+    if not year_digits.isdigit():
+        return None
+    month = _CF_MONTH_LETTERS.get(month_letter)
+    if month is None:
+        return None
+    year = int(year_digits)
+    # Rolling window: a 2-digit year ≤ the current one is 2000s, otherwise
+    # 1900s — every person born in this century is at most ~25 today, everyone
+    # older was born in the 1900s.
+    year += 2000 if year <= datetime.now().year % 100 else 1900
+    try:
+        day = int(value[9:11])
+    except ValueError:
+        return None
+    if day > 40:
+        day -= 40
+    try:
+        parsed = datetime(year, month, day)
+    except ValueError:
+        return None
+    if not 1900 <= parsed.year <= 2100:
+        return None
+    return parsed.date().isoformat()
+
+
+def decode_sex_from_cf(cf: str) -> str | None:
+    """Return 'M' or 'F' from the day field of an Italian fiscal code."""
+    value = normalize_fiscal_code(cf)
+    if len(value) != 16:
+        return None
+    try:
+        day = int(value[9:11])
+    except (IndexError, ValueError):
+        return None
+    return "F" if day > 40 else "M"
+
+
 class PatientIdentityExtractor:
     """Extract patient identifiers from labelled first-page header cells."""
 
@@ -723,6 +781,20 @@ class PatientIdentityExtractor:
                         value=match.group(0), normalized=parsed.date().isoformat(),
                         bbox=self._bbox(row), method=method, confidence=confidence,
                     )
+        # Many headers print the fiscal code but no dedicated birth-date row:
+        # the CF always encodes the birth date (positions 8-11), so decode it
+        # as a deterministic fallback when no labelled value was found.
+        fiscal = self._extract_fiscal_code(
+            rows, page_height, method, confidence
+        )
+        if fiscal:
+            iso = decode_birth_date_from_cf(fiscal.normalized)
+            if iso:
+                return IdentityField(
+                    value=iso, normalized=iso,
+                    bbox=fiscal.bbox, method=method,
+                    confidence=confidence - 0.02,
+                )
         return None
 
     def _extract_sex(
