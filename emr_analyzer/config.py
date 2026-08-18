@@ -58,6 +58,11 @@ LLAMA_SERVER_HOST = "127.0.0.1"
 LLAMA_SERVER_BASE_PORT = 11435
 # Deadline for a freshly spawned server to finish loading its model.
 LLAMA_SERVER_LOAD_TIMEOUT = 180
+# Client-side timeout (seconds) for generation requests.  Clinical prompts
+# can reach 10-15K input tokens and the 14B model generates slowly under
+# load: 5 minutes proved too tight, so be generous (the old Ollama client
+# had no practical timeout at all).
+LLAMA_SERVER_HTTP_TIMEOUT = 1800
 # GGUF models directory and its metadata index (see llm_backend/model_store.py).
 LLM_MODELS_DIR = BASE_DIR / "models"
 LLM_MODEL_INDEX_PATH = LLM_MODELS_DIR / "index.json"

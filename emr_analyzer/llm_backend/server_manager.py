@@ -94,7 +94,7 @@ class ServerManager:
     def __init__(self, binary: str | None = None) -> None:
         self._binary = binary or find_server_binary()
         self._instances: dict[ServerKey, _ServerInstance] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._shutdown_hook_registered = False
 
     # -- public API ---------------------------------------------------------
@@ -300,11 +300,15 @@ class ServerManager:
     def _allocate_port(self) -> int:
         """First free port from the configured base upward.
 
-        Ports owned by a stale process of a previous run are reclaimed by
-        terminating that process (the app owns the whole range).
+        Ports owned by one of our live servers are skipped, never reaped.
+        A stale llama-server process of a previous run is terminated so its
+        port can be reused; anything else (including this application and
+        its client sockets) is left alone.
         """
         for offset in range(_PORT_SCAN_COUNT):
             port = LLAMA_SERVER_BASE_PORT + offset
+            if self._port_owned_by_managed(port):
+                continue
             if _port_is_free(port):
                 return port
             self._reap_port(port)
@@ -316,8 +320,24 @@ class ServerManager:
             f"{LLAMA_SERVER_BASE_PORT + _PORT_SCAN_COUNT - 1}"
         )
 
+    def _port_owned_by_managed(self, port: int) -> bool:
+        """True when one of our live servers already listens on *port*."""
+        return any(
+            instance.port == port and instance.proc.poll() is None
+            for instance in self._instances.values()
+        )
+
     def _reap_port(self, port: int) -> None:
-        """Kill the process listening on *port* if it is a leftover server."""
+        """Kill the process on *port* only when it is an ORPHANED llama-server.
+
+        ``lsof`` also lists client sockets (this app's own keep-alive
+        connections), so every candidate PID is verified by name first: the
+        application itself and unrelated processes are never signalled.  A
+        llama-server whose parent is still alive belongs to a running
+        application (possibly another EMR Analyzer process on the same
+        machine) and is left alone: only stale servers left behind by a
+        crashed run — reparented to launchd/init — are reclaimed.
+        """
         try:
             result = subprocess.run(
                 ["lsof", "-ti", f"tcp:{port}"],
@@ -325,11 +345,42 @@ class ServerManager:
             )
         except (OSError, subprocess.TimeoutExpired):
             return
-        for pid in result.stdout.split():
+        for raw_pid in result.stdout.split():
+            if not raw_pid.isdigit():
+                continue
+            pid = int(raw_pid)
+            if pid == os.getpid():
+                continue
+            if not self._is_orphaned_llama_server(pid):
+                continue
             try:
-                os.kill(int(pid), 15)  # SIGTERM
+                os.kill(pid, 15)  # SIGTERM
             except (OSError, ValueError):
                 continue
+
+    @staticmethod
+    def _is_orphaned_llama_server(pid: int) -> bool:
+        """True when *pid* is a llama-server with no living parent.
+
+        Processes are spawned with ``start_new_session=True``: while the
+        owning application is alive the server keeps it as parent; when the
+        app crashes the server is reparented to PID 1 (launchd/init) and is
+        safe to reclaim.
+        """
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "ppid=,comm="],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        parts = result.stdout.split()
+        if len(parts) < 2 or "llama" not in parts[-1].lower():
+            return False
+        try:
+            return int(parts[0]) == 1
+        except ValueError:
+            return False
 
     @staticmethod
     def _wait_early_exit(proc: subprocess.Popen, seconds: float) -> bool:

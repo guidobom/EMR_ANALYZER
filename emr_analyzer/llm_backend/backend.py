@@ -17,7 +17,10 @@ import threading
 
 import httpx
 
-from ..config import LLAMA_SERVER_LOAD_TIMEOUT
+from ..config import (
+    LLAMA_SERVER_HTTP_TIMEOUT,
+    LLAMA_SERVER_LOAD_TIMEOUT,
+)
 from . import model_store
 from .server_manager import ServerKey, ServerManager
 
@@ -42,7 +45,13 @@ class LlamaBackend:
         self._load_timeout = load_timeout
         self._key_cache: dict[tuple, ServerKey] = {}
         self._cache_lock = threading.Lock()
-        self._http = httpx.Client(timeout=httpx.Timeout(300.0, read=300.0))
+        # Generous read timeout: long clinical prompts on the 14B model can
+        # legitimately take many minutes, especially with parallel workers.
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(
+                LLAMA_SERVER_HTTP_TIMEOUT, read=LLAMA_SERVER_HTTP_TIMEOUT
+            )
+        )
 
     # -- model directory ------------------------------------------------------
 

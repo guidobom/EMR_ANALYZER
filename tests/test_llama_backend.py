@@ -1,6 +1,7 @@
 """Unit tests for the llama.cpp backend package (no real server needed)."""
 
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -238,7 +239,7 @@ class TestServerManager(unittest.TestCase):
         self.patches.append(health_patch)
         port_patch = mock.patch(
             "emr_analyzer.llm_backend.server_manager._port_is_free",
-            side_effect=lambda port: port == 11435,
+            side_effect=lambda port: port in (11435, 11436),
         )
         self.fake_port = port_patch.start()
         self.patches.append(port_patch)
@@ -276,6 +277,51 @@ class TestServerManager(unittest.TestCase):
         other = ServerKey(str(self._model_path), 65536, 4)
         self.manager.ensure(other, load_timeout=5)
         self.assertEqual(self.fake_popen.call_count, 2)
+
+    def test_second_server_skips_port_owned_by_first(self):
+        self._patch_spawn_and_health()
+        self.manager.ensure(self.key, load_timeout=5)
+        other = ServerKey(str(self._model_path), 65536, 4)
+        self.manager.ensure(other, load_timeout=5)
+        second_argv = self.fake_popen.call_args_list[1][0][0]
+        self.assertEqual(
+            second_argv[second_argv.index("--port") + 1], "11436",
+            "la seconda istanza non deve riutilizzare la porta 11435",
+        )
+
+    def test_reap_port_only_kills_orphaned_llama_servers(self):
+        app_pid = os.getpid()
+        orphan_pid = 424242      # ppid 1 → stale server of a crashed run
+        live_parent_pid = 424243  # ppid != 1 → another live application
+
+        def fake_run(argv, **kwargs):
+            result = mock.MagicMock()
+            if argv[0] == "lsof":
+                # The port has: this app (client socket), an orphaned
+                # llama-server, a llama-server with a live parent, and an
+                # unrelated process.
+                result.stdout = (
+                    f"{app_pid}\n{orphan_pid}\n{live_parent_pid}\n99999\n"
+                )
+            else:  # ps -p <pid> -o ppid=,comm=
+                pid = int(argv[2])
+                table = {
+                    orphan_pid: "1 llama-server",
+                    live_parent_pid: "999 llama-server",
+                    99999: "4242 python",
+                }
+                result.stdout = table.get(pid, "4242 python") + "\n"
+            return result
+
+        with mock.patch(
+            "emr_analyzer.llm_backend.server_manager.subprocess.run",
+            side_effect=fake_run,
+        ), mock.patch(
+            "emr_analyzer.llm_backend.server_manager.os.kill"
+        ) as fake_kill:
+            self.manager._reap_port(11435)
+
+        fake_kill.assert_called_once_with(orphan_pid, 15)
 
     def test_early_death_with_bad_flag_retries_without_rea(self):
         self._patch_spawn_and_health()
