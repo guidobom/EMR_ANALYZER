@@ -12,7 +12,8 @@ della pratica clinica.
 - una workspace indipendente per ciascun paziente;
 - importazione e attribuzione automatica dei documenti al paziente;
 - estrazione PDF tramite `pdfplumber → PyMuPDF → OCR locale`;
-- normalizzazione conservativa del testo clinico con un modello Ollama locale;
+- normalizzazione conservativa del testo clinico con un modello locale
+  (llama.cpp);
 - pseudonimizzazione deterministica prima e dopo l’elaborazione LLM;
 - estrazione strutturata dei valori di laboratorio con unità, range, flag,
   data e pagina sorgente;
@@ -23,8 +24,9 @@ della pratica clinica.
 ## Principi di sicurezza
 
 L’applicazione è progettata per funzionare senza servizi cloud. PDF, database,
-testi estratti, chiavi di identità e modelli Ollama rimangono sul computer
-locale.
+testi estratti, chiavi di identità e modelli locali rimangono sul computer.
+Il motore LLM è llama.cpp: l’applicazione avvia e ferma da sé il proprio
+processo `llama-server`, senza alcun servizio esterno da tenere in vita.
 
 Il repository non deve contenere dati sanitari reali. La `.gitignore` esclude
 per impostazione predefinita:
@@ -41,8 +43,10 @@ Usare nei test pubblicabili esclusivamente documenti sintetici.
 - macOS o Linux;
 - Python 3.12;
 - ambiente Conda consigliato;
-- [Ollama](https://ollama.com/) installato localmente;
-- almeno un modello documentale e un modello per il Clinical State.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) installato
+  (`brew install llama.cpp` su macOS; build CUDA su Linux, vedi sotto);
+- almeno un modello documentale e un modello per il Clinical State in
+  formato GGUF.
 
 La configurazione dei modelli, della temperatura, del contesto e dell’output
 avviene dall’interfaccia tramite **Configura LLM**.
@@ -53,13 +57,54 @@ avviene dall’interfaccia tramite **Configura LLM**.
 conda create -n emr-analyzer python=3.12
 conda activate emr-analyzer
 pip install -r requirements.txt
+brew install llama.cpp    # solo macOS
 ```
+
+Registrazione dei modelli: se Ollama è (stato) installato, lo script di setup
+copia i GGUF già presenti in `~/.ollama/models/blobs` in
+`~/.emr_analyzer/models/` senza scaricare nulla:
+
+```bash
+python tools/setup_llama_backend.py
+```
+
+In alternativa, scarica un GGUF (ad es. `qwen3-14b`) e registralo
+manualmente in `~/.emr_analyzer/models/` con `index.json`.
 
 Avvio:
 
 ```bash
 python run.py
 ```
+
+### Linux / NVIDIA DGX Spark
+
+Il backend llama.cpp dell’app è indipendente dalla piattaforma: la gestione
+dei processi, le porte, il parallelismo multi-slot e i modelli GGUF sono
+identici su macOS e Linux. Su DGX Spark (DGX OS, arm64, Blackwell Ultra /
+sm_100, 128 GB di memoria unificata):
+
+1. installa una build CUDA di llama.cpp (nessun Homebrew):
+
+   ```bash
+   git clone --depth 1 https://github.com/ggml-org/llama.cpp
+   cd llama.cpp
+   cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON
+   cmake --build build --config Release -j
+   sudo cp build/bin/llama-server /usr/local/bin/
+   ```
+
+   oppure usa un container NGC con llama.cpp già compilato;
+
+2. registra i GGUF in `~/.emr_analyzer/models/` (su DGX Spark non esiste
+   lo storage Ollama: scarica direttamente i file GGUF);
+
+3. `python tools/setup_llama_backend.py` stampa le stesse istruzioni quando
+   il binario manca.
+
+Il dimensionamento dei worker è automatico e basato sulla RAM: con 128 GB
+il numero di slot paralleli cresce fino al massimo configurato (8), il
+limite pratico del pool di estrazione.
 
 I dati runtime vengono salvati fuori dal repository in:
 
@@ -95,7 +140,8 @@ emr_analyzer/
 
 ## Modelli e riproducibilità
 
-I modelli Ollama sono configurabili separatamente per:
+I modelli locali (GGUF serviti da llama-server) sono configurabili
+separatamente per:
 
 1. isolamento del testo clinico dai singoli documenti;
 2. costruzione e interrogazione del Clinical State.

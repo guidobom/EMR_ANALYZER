@@ -1,4 +1,4 @@
-"""Single configuration dialog for the two local Ollama roles."""
+"""Single configuration dialog for the two local llama.cpp roles."""
 
 from __future__ import annotations
 
@@ -58,10 +58,20 @@ class LLMConfigDialog(QDialog):
         self._unload_worker: _ModelUnloadWorker | None = None
 
         layout = QVBoxLayout(self)
-        intro = QLabel(
-            "I parametri sono indipendenti per le due funzioni. Il limite "
-            "massimo del contesto viene letto dai metadati del modello locale."
-        )
+        if self._models:
+            intro = QLabel(
+                "I parametri sono indipendenti per le due funzioni. Il limite "
+                "massimo del contesto viene letto dai metadati del modello "
+                "locale. Il motore è un processo llama.cpp avviato e fermato "
+                "dall'applicazione stessa."
+            )
+        else:
+            intro = QLabel(
+                "⚠️ Nessun modello locale registrato in "
+                "~/.emr_analyzer/models.\n"
+                "Esegui tools/setup_llama_backend.py per copiare i GGUF "
+                "già scaricati da Ollama (nessun download)."
+            )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -72,36 +82,18 @@ class LLMConfigDialog(QDialog):
         gpu_actions.addStretch()
         self._unload_all_button = QPushButton("■ Libera tutta la GPU")
         self._unload_all_button.setToolTip(
-            "Scarica dalla memoria tutti i modelli attualmente residenti "
-            "nel server Ollama locale."
+            "Ferma i processi llama-server avviati dall'applicazione, "
+            "scaricando dalla memoria tutti i modelli residenti."
         )
         self._unload_all_button.clicked.connect(self._unload_all_models)
         gpu_actions.addWidget(self._unload_all_button)
 
-        # Ollama parallel requests setting
+        # Effective llama-server slots: one server per role, spawned with
+        # -np = min(parallel_workers, RAM-safe maximum).
         gpu_actions.addSpacing(20)
-        np_val = self._detect_ollama_parallel()
-        self._ollama_np_label = QLabel(
-            f"Ollama richieste parallele: {np_val}"
-        )
-        if np_val <= 1:
-            self._ollama_np_label.setStyleSheet(
-                "color: #c0392b; font-weight: bold;"
-            )
-            self._ollama_np_label.setToolTip(
-                "⚠️ Ollama processa 1 richiesta alla volta. "
-                "I worker paralleli sono inutili! Imposta un valore >1."
-            )
-        else:
-            self._ollama_np_label.setStyleSheet("color: #27ae60;")
-        gpu_actions.addWidget(self._ollama_np_label)
-
-        self._set_np_btn = QPushButton("Imposta")
-        self._set_np_btn.setToolTip(
-            "Imposta OLLAMA_NUM_PARALLEL e riavvia Ollama"
-        )
-        self._set_np_btn.clicked.connect(self._on_set_ollama_parallel)
-        gpu_actions.addWidget(self._set_np_btn)
+        self._slots_label = QLabel("Slot paralleli (llama-server): —")
+        self._slots_label.setStyleSheet("color: #5d6d7e;")
+        gpu_actions.addWidget(self._slots_label)
         layout.addLayout(gpu_actions)
 
         self._buttons = QDialogButtonBox(
@@ -115,6 +107,8 @@ class LLMConfigDialog(QDialog):
 
         for role in self._widgets:
             self._on_model_changed(role, initial=True)
+
+        self._update_slots_label()
 
         self._runtime_timer = QTimer(self)
         self._runtime_timer.setInterval(5000)
@@ -204,14 +198,6 @@ class LLMConfigDialog(QDialog):
             "Seed fisso per favorire la riproducibilità; -1 usa un seed casuale."
         )
 
-        keep_alive = QSpinBox()
-        keep_alive.setRange(0, 1440)
-        keep_alive.setSuffix(" min")
-        keep_alive.setValue(config.keep_alive_minutes)
-        keep_alive.setToolTip(
-            "Tempo per cui Ollama mantiene il modello in memoria dopo l'uso."
-        )
-
         grid.addWidget(QLabel("Temperatura:"), 3, 0)
         grid.addWidget(temperature, 3, 1)
         grid.addWidget(QLabel("Contesto:"), 3, 3)
@@ -224,8 +210,12 @@ class LLMConfigDialog(QDialog):
         grid.addWidget(top_k, 5, 1)
         grid.addWidget(QLabel("Seed:"), 5, 3)
         grid.addWidget(seed, 5, 4, 1, 2)
-        grid.addWidget(QLabel("Mantieni in memoria:"), 6, 0)
-        grid.addWidget(keep_alive, 6, 1)
+        resident_note = QLabel(
+            "Il modello resta in memoria finché non lo scarichi "
+            "(nessuna scadenza automatica)."
+        )
+        resident_note.setStyleSheet("color: #5d6d7e;")
+        grid.addWidget(resident_note, 6, 0, 1, 3)
         grid.addWidget(unload_button, 6, 4, 1, 2)
 
         # Worker selector — parallel document/text processing
@@ -272,7 +262,6 @@ class LLMConfigDialog(QDialog):
             "top_p": top_p,
             "top_k": top_k,
             "seed": seed,
-            "keep_alive_minutes": keep_alive,
             "workers_combo": workers_combo,
             "workers_info": workers_info,
         }
@@ -296,6 +285,10 @@ class LLMConfigDialog(QDialog):
                 selected_role
             )
         )
+        if workers_combo is not None:
+            workers_combo.currentIndexChanged.connect(
+                lambda _index: self._update_slots_label()
+            )
         return group
 
     def configurations(self) -> dict[str, LLMRoleConfig]:
@@ -317,7 +310,8 @@ class LLMConfigDialog(QDialog):
             top_p=widgets["top_p"].value(),
             top_k=widgets["top_k"].value(),
             seed=widgets["seed"].value(),
-            keep_alive_minutes=widgets["keep_alive_minutes"].value(),
+            # Deprecated with the llama.cpp backend; kept for compatibility.
+            keep_alive_minutes=10,
             parallel_workers=workers,
         )
 
@@ -363,7 +357,7 @@ class LLMConfigDialog(QDialog):
             else:
                 widgets["context_length"].setMaximum(2_000_000)
                 widgets["max_context"].setText(
-                    "Contesto massimo: non dichiarato nei metadati Ollama"
+                    "Contesto massimo: non dichiarato nei metadati del modello"
                 )
         except Exception as exc:
             widgets["context_length"].setMaximum(2_000_000)
@@ -469,7 +463,7 @@ class LLMConfigDialog(QDialog):
                     self,
                     "Ottimizzazione non disponibile",
                     "Impossibile analizzare l'hardware o il modello.\n"
-                    "Verifica che Ollama sia in esecuzione.",
+                    "Verifica che llama.cpp sia installato e il modello sia registrato.",
                 )
             return
 
@@ -479,7 +473,7 @@ class LLMConfigDialog(QDialog):
                     self,
                     "Modello non trovato",
                     f"Impossibile leggere i metadati di {model}.\n"
-                    "Assicurati che il modello sia installato in Ollama.",
+                    "Assicurati che il modello sia registrato in ~/.emr_analyzer/models (tools/setup_llama_backend.py).",
                 )
             return
 
@@ -543,7 +537,11 @@ class LLMConfigDialog(QDialog):
             role not in self._workers and self._unload_worker is None
         )
         try:
-            runtime = LlmClient(model=model).loaded_model_info()
+            # The role config decides the server key (model + ctx + slots):
+            # probing with a bare model name would target the wrong server.
+            runtime = LlmClient(
+                config=self._collect_config(role)
+            ).loaded_model_info()
         except Exception as exc:
             unload_button.setEnabled(False)
             self._set_status(role, "errore", str(exc))
@@ -556,7 +554,7 @@ class LLMConfigDialog(QDialog):
             self._set_status(
                 role,
                 "disponibile",
-                "Modello installato, ma non caricato nella memoria di Ollama",
+                "Modello registrato, ma il suo server llama.cpp non è in esecuzione",
             )
 
     def _test_model(self, role: str) -> None:
@@ -597,11 +595,13 @@ class LLMConfigDialog(QDialog):
 
     def _on_warmup_failure(self, role: str, model: str, error: str) -> None:
         self._set_role_enabled(role, True)
-        # A runner can remain resident even when its warm-up fails (for
+        # A server can remain resident even when its warm-up fails (for
         # example after a Metal out-of-memory error), so keep recovery
         # available directly from the dialog.
         try:
-            resident = LlmClient(model=model).loaded_model_info() is not None
+            resident = LlmClient(
+                config=self._collect_config(role)
+            ).loaded_model_info() is not None
         except Exception:
             resident = False
         self._widgets[role]["unload"].setEnabled(resident)
@@ -625,57 +625,34 @@ class LLMConfigDialog(QDialog):
             return
         self._start_unload(role, [model])
 
-    @staticmethod
-    def _detect_ollama_parallel() -> int:
-        """Check how many parallel requests Ollama currently handles."""
-        import subprocess
-        try:
-            result = subprocess.run(
-                ["launchctl", "getenv", "OLLAMA_NUM_PARALLEL"],
-                capture_output=True, text=True, timeout=5,
-            )
-            val = result.stdout.strip()
-            return int(val) if val.isdigit() else 1
-        except Exception:
-            return 1
+    def _update_slots_label(self) -> None:
+        """Show the effective llama-server slot count for each role.
 
-    def _on_set_ollama_parallel(self):
-        """Prompt for a value and configure OLLAMA_NUM_PARALLEL."""
-        from PyQt5.QtWidgets import QInputDialog
-        current = self._detect_ollama_parallel()
-        value, ok = QInputDialog.getInt(
-            self, "Richieste parallele Ollama",
-            f"Valore attuale: {current}\n"
-            f"Imposta il numero massimo di richieste parallele "
-            f"che Ollama può processare (1-8):",
-            value=max(current, 3), min=1, max=8, step=1,
+        Every role gets its own server process spawned with
+        ``-np = min(parallel_workers, RAM-safe maximum)``; the label makes
+        the real concurrency visible without a server-side setting.
+        """
+        parts = []
+        for role in ("document", "clinical_state"):
+            widgets = self._widgets.get(role)
+            if widgets is None:
+                continue
+            model = str(widgets["model"].currentData() or "")
+            if not model:
+                continue
+            combo = widgets.get("workers_combo")
+            workers = int(combo.currentData() or 1) if combo else 1
+            context = widgets["context_length"].value()
+            try:
+                from ..utils.hardware import get_safe_max_workers
+                slots = min(workers, get_safe_max_workers(model, context))
+            except Exception:
+                slots = workers
+            parts.append(f"{role}: {slots}")
+        text = "Slot paralleli (llama-server): " + (
+            " · ".join(parts) if parts else "—"
         )
-        if not ok:
-            return
-
-        import subprocess
-        try:
-            subprocess.run(
-                ["launchctl", "setenv", "OLLAMA_NUM_PARALLEL", str(value)],
-                check=True, timeout=5,
-            )
-            QMessageBox.information(
-                self, "Riavvio necessario",
-                f"OLLAMA_NUM_PARALLEL impostato a {value}.\n\n"
-                f"Riavvia Ollama per applicare la modifica:\n"
-                f"1. Chiudi questa finestra\n"
-                f"2. Clicca '■ Libera tutta la GPU'\n"
-                f"3. Riavvia Ollama (o killall Ollama && open -a Ollama)\n\n"
-                f"Dopo il riavvio, 'ollama ps' mostrerà -np {value}."
-            )
-            # Update the label
-            self._ollama_np_label.setText(
-                f"Ollama richieste parallele: {value} (riavvia Ollama)"
-            )
-            if value > 1:
-                self._ollama_np_label.setStyleSheet("color: #d68910;")
-        except Exception as e:
-            QMessageBox.warning(self, "Errore", str(e))
+        self._slots_label.setText(text)
 
     def _unload_all_models(self) -> None:
         self._start_unload("__all__", None)
@@ -726,7 +703,7 @@ class LLMConfigDialog(QDialog):
             QMessageBox.information(
                 self,
                 "GPU liberata",
-                "Modelli scaricati dalla memoria Ollama:\n- "
+                "Modelli scaricati dalla memoria:\n- "
                 + "\n- ".join(unloaded),
             )
         else:
@@ -740,7 +717,7 @@ class LLMConfigDialog(QDialog):
         QMessageBox.warning(
             self,
             "Impossibile liberare la GPU",
-            f"Ollama non ha completato lo scaricamento.\n\n{error}",
+            f"llama-server non ha completato lo scaricamento.\n\n{error}",
         )
 
     def _release_unload_worker(self) -> None:
@@ -850,7 +827,7 @@ class LLMConfigDialog(QDialog):
 
     @classmethod
     def _runtime_tooltip(cls, runtime: dict) -> str:
-        lines = ["Modello caricato nella memoria gestita da Ollama"]
+        lines = ["Modello caricato nel server llama.cpp dell'applicazione"]
         memory = cls._format_bytes(runtime.get("size_vram"))
         if memory:
             lines.append(f"Memoria acceleratore/unificata: {memory}")
@@ -860,7 +837,7 @@ class LLMConfigDialog(QDialog):
                 f"{cls._format_integer(runtime['context_length'])} token"
             )
         if runtime.get("expires_at"):
-            lines.append(f"Scadenza Ollama: {runtime['expires_at']}")
+            lines.append(f"Scadenza: {runtime['expires_at']}")
         return "\n".join(lines)
 
 
@@ -884,7 +861,7 @@ class _ModelWarmupWorker(QThread):
 
 
 class _ModelUnloadWorker(QThread):
-    """Unload selected or all resident Ollama models without blocking Qt."""
+    """Unload selected or all resident llama.cpp models without blocking Qt."""
 
     succeeded = pyqtSignal(str, object)
     failed = pyqtSignal(str, str)

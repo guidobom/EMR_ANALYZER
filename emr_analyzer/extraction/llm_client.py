@@ -1,13 +1,18 @@
-"""Client for configurable local Ollama models."""
+"""Client for configurable local models served by llama.cpp.
+
+Generation goes through the app-managed llama-server backend
+(:mod:`emr_analyzer.llm_backend`); no external Ollama service is involved.
+The document-normalization path uses ``generate_text``; the structured
+methods are retained only for the separate Clinical State layer.
+"""
 
 import json
 import re
 import time
 
-from ..config import OLLAMA_BASE_URL, DEFAULT_LLM_MODEL_NAME, OLLAMA_CONTEXT_LENGTH
-from ..config import OFFLINE_MODE
+from ..config import DEFAULT_LLM_MODEL_NAME
+from ..llm_backend import get_backend
 from ..settings import LLMRoleConfig
-from ..security.offline import require_loopback_url
 from .golden_fewshot import (
     DISCHARGE_ALLOWED_CATEGORIES,
     format_examples_section,
@@ -16,20 +21,23 @@ from .golden_fewshot import (
 
 class LlmClient:
     """
-    Client for configurable local models served by Ollama.
+    Client for configurable local models served by llama.cpp.
 
     The document-normalization path uses ``generate_text``; the structured
     methods are retained only for the separate Clinical State layer.
     """
 
-    def __init__(self, base_url: str = OLLAMA_BASE_URL,
+    def __init__(self, base_url: str | None = None,
                  model: str = DEFAULT_LLM_MODEL_NAME,
-                 config: LLMRoleConfig | None = None):
-        self.base_url = require_loopback_url(base_url) if OFFLINE_MODE else base_url.rstrip("/")
+                 config: LLMRoleConfig | None = None,
+                 backend=None):
+        # ``base_url`` is kept for signature compatibility with older
+        # callers; the llama.cpp backend owns its server URLs.
+        self.base_url = str(base_url or "").rstrip("/")
         self.model = config.model if config is not None else model
         self.temperature = config.temperature if config is not None else 0.1
         self.context_length = (
-            config.context_length if config is not None else OLLAMA_CONTEXT_LENGTH
+            config.context_length if config is not None else 32768
         )
         self.max_output_tokens = (
             config.max_output_tokens if config is not None else 4096
@@ -40,6 +48,12 @@ class LlmClient:
         self.keep_alive_minutes = (
             config.keep_alive_minutes if config is not None else 10
         )
+        # Worker slots for this role's server; llama-server is spawned with
+        # -np = this value (capped by available RAM in the backend).
+        self.parallel_workers = (
+            config.parallel_workers if config is not None else 1
+        )
+        self.backend = backend if backend is not None else get_backend()
         self._available = None  # Lazy check
 
     @property
@@ -47,53 +61,17 @@ class LlmClient:
         return f"{self.keep_alive_minutes}m"
 
     @classmethod
-    def list_available_models(cls, base_url: str = OLLAMA_BASE_URL) -> list[str]:
-        """Return locally installed model names without loading them."""
-        import ollama
-
-        host = require_loopback_url(base_url) if OFFLINE_MODE else base_url.rstrip("/")
-        response = ollama.Client(host=host).list()
-        if hasattr(response, "models"):
-            models = response.models
-        elif isinstance(response, dict):
-            models = response.get("models", [])
-        elif isinstance(response, list):
-            models = response
-        else:
-            models = []
-        names = []
-        for item in models:
-            if isinstance(item, dict):
-                name = item.get("model") or item.get("name") or ""
-            else:
-                name = getattr(item, "model", None) or getattr(
-                    item, "name", ""
-                )
-            if name:
-                names.append(str(name))
-        return sorted(set(names))
+    def list_available_models(cls, base_url: str | None = None) -> list[str]:
+        """Return the friendly names of the locally installed GGUF models."""
+        return get_backend().list_models()
 
     @property
     def is_available(self) -> bool:
-        """Check if Ollama server is reachable and model is available."""
+        """Check whether this model exists in the local GGUF index."""
         if self._available is None:
             try:
-                import ollama
-                client = ollama.Client(host=self.base_url)
-                resp = client.list()
-                # Handle both old (dict) and new (ListResponse) API formats
-                if hasattr(resp, 'models'):
-                    model_objs = resp.models
-                    model_names = [m.model for m in model_objs]
-                elif isinstance(resp, dict):
-                    model_names = [m.get("name", "") for m in resp.get("models", [])]
-                else:
-                    model_names = []
-                requested = self.model.removesuffix(":latest")
-                self._available = any(
-                    name.removesuffix(":latest") == requested
-                    or name.startswith(f"{requested}:")
-                    for name in model_names
+                self._available = (
+                    self.backend.model_info(self.model) is not None
                 )
             except Exception:
                 self._available = False
@@ -101,41 +79,47 @@ class LlmClient:
 
     @property
     def server_available(self) -> bool:
-        """Return whether the local Ollama service is reachable."""
+        """Return whether the llama.cpp backend is usable.
+
+        True when the llama-server binary is installed and at least one
+        local model is registered; the server process itself is spawned
+        lazily, so it need not be running yet.
+        """
         try:
-            import ollama
-            ollama.Client(host=self.base_url).list()
-            return True
+            return self.backend.usable()
         except Exception:
             return False
 
     def loaded_model_info(self) -> dict | None:
-        """Return runtime information if this model is loaded by Ollama."""
-        import ollama
-
-        response = ollama.Client(host=self.base_url).ps()
-        return self._find_loaded_model(response, self.model)
+        """Return runtime information if the server for this model is up."""
+        try:
+            slots = self.backend.slots(self)
+        except Exception:
+            slots = []
+        runtime = self._find_loaded_model(slots, self.model)
+        if runtime is None:
+            return None
+        entry = self.backend.model_info(self.model) or {}
+        size = entry.get("size_bytes")
+        runtime["size"] = size
+        runtime["size_vram"] = size
+        runtime["expires_at"] = ""
+        return runtime
 
     @classmethod
     def unload_models(
         cls,
         model_names: list[str] | tuple[str, ...] | None = None,
-        base_url: str = OLLAMA_BASE_URL,
+        base_url: str | None = None,
     ) -> dict:
-        """Unload selected (or all) resident Ollama models.
+        """Stop the servers of selected (or all) local models.
 
-        Ollama unloads a runner when it receives an empty generation request
-        with ``keep_alive=0``.  The current resident list is read first so this
-        method is idempotent and never loads a model merely to unload it.
+        The llama.cpp backend keeps a model resident until its server
+        process is stopped, so unloading means terminating the process.
+        The method is idempotent and never loads a model merely to unload it.
         """
-        import ollama
-
-        host = (
-            require_loopback_url(base_url)
-            if OFFLINE_MODE else base_url.rstrip("/")
-        )
-        client = ollama.Client(host=host)
-        loaded = cls._loaded_model_names(client.ps())
+        backend = get_backend()
+        loaded = backend.running_model_names()
 
         if model_names is None:
             targets = loaded
@@ -153,25 +137,12 @@ class LlmClient:
         errors = {}
         for model_name in targets:
             try:
-                # Use the CLI stop command — it's ~10x faster than the
-                # keep_alive=0 generation trick through the Python client.
-                import subprocess as _sp
-                _sp.run(
-                    ["ollama", "stop", model_name],
-                    capture_output=True,
-                    timeout=10,
-                    check=True,
-                )
-                unloaded.append(model_name)
-            except Exception as exc:
-                # Fallback: keep_alive=0 generation
-                try:
-                    client.generate(
-                        model=model_name, prompt="", keep_alive=0,
-                    )
+                if backend.stop_model(model_name):
                     unloaded.append(model_name)
-                except Exception as exc2:
-                    errors[model_name] = str(exc2)
+                else:
+                    errors[model_name] = "processo già terminato"
+            except Exception as exc:
+                errors[model_name] = str(exc)
 
         return {
             "unloaded": unloaded,
@@ -190,47 +161,33 @@ class LlmClient:
         }
 
     def model_capabilities(self) -> dict:
-        """Read model metadata, including its declared maximum context."""
-        import ollama
-
-        response = ollama.Client(host=self.base_url).show(self.model)
-        if hasattr(response, "modelinfo"):
-            model_info = response.modelinfo or {}
-            capabilities = getattr(response, "capabilities", None) or []
-        elif isinstance(response, dict):
-            model_info = (
-                response.get("model_info")
-                or response.get("modelinfo")
-                or {}
-            )
-            capabilities = response.get("capabilities") or []
-        else:
-            model_info, capabilities = {}, []
-        if not isinstance(model_info, dict):
-            model_info = dict(model_info)
-
-        architecture = str(model_info.get("general.architecture") or "")
-        preferred_key = (
-            f"{architecture}.context_length" if architecture else ""
-        )
-        raw_context = model_info.get(preferred_key) if preferred_key else None
-        if raw_context is None:
-            candidates = [
-                value for key, value in model_info.items()
-                if str(key).endswith(".context_length")
-            ]
-            raw_context = candidates[0] if candidates else None
-        maximum_context = self._as_int(raw_context)
+        """Read model metadata from the local index (GGUF header info)."""
+        entry = self.backend.model_info(self.model) or {}
         return {
             "model": self.model,
-            "architecture": architecture,
-            "max_context_length": maximum_context,
-            "capabilities": [str(item) for item in capabilities],
+            "architecture": str(entry.get("architecture") or ""),
+            "max_context_length": entry.get("max_context_length"),
+            "capabilities": [],
         }
 
     @classmethod
     def _find_loaded_model(cls, response, requested_model: str) -> dict | None:
-        """Normalize both object and legacy-dict responses from ``/api/ps``."""
+        """Normalize llama-server ``/slots`` lists and legacy ``/api/ps`` payloads."""
+        if isinstance(response, list):
+            # llama-server /slots: one entry per parallel slot.  The model
+            # name is not in the payload; the caller supplies it.
+            if not response:
+                return None
+            first = response[0] if isinstance(response[0], dict) else {}
+            return {
+                "model": str(requested_model),
+                "size": None,
+                "size_vram": None,
+                "context_length": cls._as_int(first.get("n_ctx")),
+                "processing": bool(first.get("is_processing")),
+                "slots": len(response),
+                "expires_at": "",
+            }
         if hasattr(response, "models"):
             models = response.models
         elif isinstance(response, dict):
@@ -261,69 +218,39 @@ class LlmClient:
             }
         return None
 
-    @classmethod
-    def _loaded_model_names(cls, response) -> list[str]:
-        """Normalize the resident model names returned by ``/api/ps``."""
-        if hasattr(response, "models"):
-            models = response.models
-        elif isinstance(response, dict):
-            models = response.get("models", [])
-        else:
-            models = []
-
-        names = []
-        for item in models:
-            if isinstance(item, dict):
-                name = item.get("model") or item.get("name")
-            else:
-                name = (
-                    getattr(item, "model", None)
-                    or getattr(item, "name", None)
-                )
-            if name and name not in names:
-                names.append(str(name))
-        return names
-
     def warmup(self, keep_alive: str | None = None) -> dict:
-        """Load and test the model with a tiny, non-clinical request."""
-        import ollama
+        """Load and test the model with a tiny, non-clinical request.
 
-        active_keep_alive = keep_alive or self.keep_alive
+        ``keep_alive`` is accepted for backward compatibility and ignored:
+        llama-server keeps the model resident until its process is stopped.
+        """
         started = time.perf_counter()
-        client = ollama.Client(host=self.base_url)
-        response = client.chat(
-            model=self.model,
+        self.backend.ensure(self)
+        result = self.backend.chat(
+            self,
             messages=[{
                 "role": "user",
                 "content": "Test tecnico di disponibilità. Rispondi soltanto OK.",
             }],
-            think=False,
-            options={
-                "temperature": 0,
-                "num_predict": 8,
-                # Use the same context configured for real processing, so the
-                # first clinical call does not have to reload a different runner.
-                "num_ctx": self.context_length,
-            },
-            keep_alive=active_keep_alive,
+            temperature=0.0,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            seed=self.seed,
+            # Use the same context configured for real processing: the
+            # server was spawned with it, so the first clinical call does
+            # not have to restart a different runner.
+            max_tokens=8,
         )
-        if hasattr(response, "message"):
-            content = response.message.content or ""
-        elif isinstance(response, dict):
-            message = response.get("message", {})
-            content = message.get("content", "") if isinstance(message, dict) else ""
-        else:
-            content = ""
+        content = result.get("content") or ""
         if not str(content).strip():
             raise RuntimeError("Il modello ha restituito una risposta di test vuota")
         runtime = self.loaded_model_info()
         if runtime is None:
             raise RuntimeError(
-                "Il test ha risposto, ma Ollama non segnala il modello in memoria"
+                "Il test ha risposto, ma llama-server non segnala il modello in memoria"
             )
         runtime["elapsed_seconds"] = time.perf_counter() - started
         runtime["test_response"] = str(content).strip()[:100]
-        runtime["keep_alive"] = active_keep_alive
         return runtime
 
     @staticmethod
@@ -337,65 +264,64 @@ class LlmClient:
         except (TypeError, ValueError):
             return None
 
-    def _ollama_generate(self, prompt: str, system: str = "",
-                         stream: bool = False,
-                         format_schema: dict | str | None = None) -> str:
-        """Internal: call Ollama Chat API (disables thinking/reasoning tokens)."""
-        import ollama
-        client = ollama.Client(host=self.base_url)
+    def _generate(self, prompt: str, system: str = "",
+                  stream: bool = False,
+                  response_format: dict | str | None = None) -> str:
+        """Internal: chat completion against the app-managed llama-server.
 
+        The server is spawned with ``-rea off`` and every request also sends
+        ``reasoning_effort: none``: reasoning text is not part of the
+        clinical document and wastes context on models with a thinking
+        channel (qwen3).
+        """
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        request = {
-            "model": self.model,
-            "messages": messages,
-            # Reasoning text is not part of the clinical document and wastes
-            # context on models that support a separate thinking channel.
-            "think": False,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_output_tokens,
-                "num_ctx": self.context_length,
-                "top_p": self.top_p,
-                "top_k": self.top_k,
-                "seed": self.seed,
-            },
-            "keep_alive": self.keep_alive,
-        }
-        if format_schema is not None:
-            request["format"] = format_schema
-        response = client.chat(**request)
-        done_reason = (
-            getattr(response, "done_reason", None)
-            if not isinstance(response, dict)
-            else response.get("done_reason")
-        )
-        if done_reason == "length":
+        try:
+            result = self.backend.chat(
+                self,
+                messages,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                seed=self.seed,
+                max_tokens=self.max_output_tokens,
+                response_format=response_format,
+            )
+        except KeyError as exc:
             raise RuntimeError(
-                "Ollama ha raggiunto il limite di token in output "
+                f"Modello locale non trovato tra i GGUF disponibili: {exc}"
+            ) from exc
+        if result.get("finish_reason") == "length":
+            raise RuntimeError(
+                "Il modello ha raggiunto il limite di token in output "
                 f"(max_output_tokens={self.max_output_tokens}); "
                 "aumentalo in Configura LLM"
             )
-        # Handle both old (dict) and new (ChatResponse) API
-        if hasattr(response, 'message'):
-            return response.message.content or ""
-        if isinstance(response, dict):
-            msg = response.get("message", {})
-            if isinstance(msg, dict):
-                return msg.get("content", "")
-        return ""
+        return str(result.get("content") or "")
 
     def generate_structured(self, prompt: str, system: str,
                             schema: dict) -> dict:
-        """Generate locally with an Ollama-enforced JSON schema."""
+        """Generate locally with a llama.cpp-enforced JSON schema.
 
-        response = self._ollama_generate(
-            prompt, system, format_schema=schema
+        The request uses llama-server's ``json_object`` response format.
+        Some server builds are known to silently ignore the schema, so a
+        fence/brace JSON extraction is attempted before failing.
+        """
+
+        response = self._generate(
+            prompt, system,
+            response_format={"type": "json_object", "schema": schema},
         )
-        return json.loads(response)
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", response, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+            raise
 
     def extract_patient_identity(self, text: str) -> dict:
         """Extract the patient's identity fields from raw document text.
@@ -461,9 +387,11 @@ TESTO:
 
     def generate_text(self, prompt: str, system: str = "") -> str:
         """Generate plain text without JSON/schema constraints."""
-        response = self._ollama_generate(prompt, system, format_schema=None)
+        response = self._generate(prompt, system, response_format=None)
         if not str(response or "").strip():
-            raise ValueError("Ollama ha restituito una risposta vuota")
+            raise ValueError(
+                "Il modello locale ha restituito una risposta vuota"
+            )
         return str(response)
 
     # Clinical Timeline — strictly temporal extraction & deduplication

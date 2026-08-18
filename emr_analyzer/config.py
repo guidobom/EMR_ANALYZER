@@ -47,14 +47,33 @@ IDENTITY_KEY_PATH = BASE_DIR / "identity.key"
 # --- Supported file types ---
 SUPPORTED_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png")
 
-# --- Local models via Ollama ---
-OLLAMA_BASE_URL = "http://localhost:11434"
+# --- Local models via llama.cpp (app-managed llama-server) ---
+# The app spawns its own llama-server child processes; the only external
+# requirement is the binary (brew install llama.cpp) and GGUF model files
+# registered in the local model index.
+LLAMA_SERVER_BINARY = ""  # resolved at runtime: PATH, then brew prefixes
+LLAMA_SERVER_HOST = "127.0.0.1"
+# Base port for the app-owned servers; allocated upward from here, avoiding
+# a possibly still-running Ollama daemon on 11434.
+LLAMA_SERVER_BASE_PORT = 11435
+# Deadline for a freshly spawned server to finish loading its model.
+LLAMA_SERVER_LOAD_TIMEOUT = 180
+# GGUF models directory and its metadata index (see llm_backend/model_store.py).
+LLM_MODELS_DIR = BASE_DIR / "models"
+LLM_MODEL_INDEX_PATH = LLM_MODELS_DIR / "index.json"
+
 # The document model can be smaller/faster; the Clinical State model can be
 # larger because it is used after the evidence has already been normalized.
-DOCUMENT_LLM_MODEL_NAME = "qwen3:14b"
-CLINICAL_STATE_LLM_MODEL_NAME = "qwen3:14b"
+# Names are friendly GGUF-index names (<family>-<tag>, e.g. "qwen3-14b");
+# legacy Ollama names like "qwen3:14b" are resolved at runtime.
+DOCUMENT_LLM_MODEL_NAME = "qwen3-14b"
+CLINICAL_STATE_LLM_MODEL_NAME = "qwen3-14b"
 # Default model for LlmClient when no LLMRoleConfig is provided.
 DEFAULT_LLM_MODEL_NAME = DOCUMENT_LLM_MODEL_NAME
+LLM_DEFAULT_CONTEXT_LENGTH = 32768
+
+# Legacy Ollama constants, kept only for old persisted settings compatibility.
+OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_CONTEXT_LENGTH = 32768
 
 # Lab parameter synonyms (Italian clinical abbreviations -> canonical name)

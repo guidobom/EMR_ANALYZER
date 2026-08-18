@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from emr_analyzer.config import (
     CLINICAL_STATE_LLM_MODEL_NAME,
@@ -18,6 +19,16 @@ from emr_analyzer.settings import (
 
 
 class ModelSettingsTest(unittest.TestCase):
+    def setUp(self):
+        # Isolate from the real ~/.emr_analyzer/models/index.json: legacy
+        # names must round-trip unchanged when no GGUF index exists.
+        patcher = patch(
+            "emr_analyzer.llm_backend.model_store.load_index",
+            return_value={},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_missing_settings_use_function_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             assignments = load_model_assignments(Path(tmp) / "missing.json")

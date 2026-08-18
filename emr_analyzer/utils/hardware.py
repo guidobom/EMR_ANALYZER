@@ -1,6 +1,6 @@
 """Hardware resource detection for dynamic worker pool sizing and auto-config.
 
-Estimates how many concurrent Ollama requests can safely run given
+Estimates how many concurrent llama-server slots can safely run given
 the host's available RAM and the selected model's characteristics.
 Also recommends optimal LLM parameters (context length, output tokens,
 parallel workers) based on hardware profiling.
@@ -9,6 +9,7 @@ parallel workers) based on hardware profiling.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from typing import Optional
@@ -21,9 +22,9 @@ MIN_WORKERS = 1
 MAX_WORKERS = 8
 
 # Empirical KV-cache + working-memory overhead per token of context.
-# KV cache ≈ 2 * layers * kv_heads * head_dim * bytes_per_element
-# For a typical 8B model (Q4_K_M): ~50 KB per context token.
-_BYTES_PER_CONTEXT_TOKEN = 50_000  # ~50 KB per token (KV cache dominant)
+# llama-server runs the KV cache in q8_0: ~80 KB per token for a ~14B
+# model; 100 KB keeps a safety margin (was 50 KB in the f16 Ollama era).
+_BYTES_PER_CONTEXT_TOKEN = 100_000  # ~100 KB per token (KV cache dominant)
 
 # RAM reserved for the OS and non-LLM application processes.
 _OS_RESERVE_GB = 2.0
@@ -60,7 +61,7 @@ class HardwareProfile:
 
 @dataclass
 class ModelProfile:
-    """Key characteristics of a local Ollama model."""
+    """Key characteristics of a local GGUF model."""
 
     model_name: str
     size_gb: float | None
@@ -69,7 +70,7 @@ class ModelProfile:
 
     @classmethod
     def capture(cls, model_name: str) -> "ModelProfile":
-        """Read model metadata from Ollama."""
+        """Read model metadata from the local GGUF index."""
         from ..extraction.llm_client import LlmClient
 
         size = get_model_size_gb(model_name)
@@ -143,48 +144,16 @@ def get_available_ram_gb() -> float:
 
 
 def get_model_size_gb(model_name: str) -> float | None:
-    """Return the on-disk size (GiB) of an Ollama model, or *None*.
-
-    Tries ``ollama list`` first (fast, has size column), then falls back
-    to parameter-count estimation from ``ollama show``.
-    """
+    """Return the on-disk size (GiB) of a local GGUF model, or *None*."""
     try:
-        # Fast path: ollama list has a SIZE column
-        result = subprocess.run(
-            ["ollama", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                # Lines look like: qwen3:8b    500a1f067a9f    5.2 GB    ...
-                if line.startswith(model_name):
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        if i >= 2 and part.upper() in ("GB", "MB", "TB", "KB"):
-                            size_str = parts[i - 1] + " " + parts[i]
-                            parsed = _parse_size(size_str)
-                            if parsed is not None:
-                                return parsed
-        # Fallback: estimate from parameter count in ollama show
-        result2 = subprocess.run(
-            ["ollama", "show", model_name],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result2.returncode == 0:
-            for line in result2.stdout.splitlines():
-                if "parameters" in line.lower():
-                    parts = line.strip().split()
-                    for i, part in enumerate(parts):
-                        if "parameter" in part.lower() and i + 1 < len(parts):
-                            param_str = parts[i + 1].rstrip("B").upper()
-                            return _estimate_params_size(param_str)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return None
+        from ..llm_backend import model_store
+
+        entry = model_store.resolve(model_name)
+        if entry is None or not entry.get("file"):
+            return None
+        return os.path.getsize(entry["file"]) / 1e9
+    except OSError:
+        return None
 
 
 def estimate_per_request_ram_gb(context_length: int) -> float:
@@ -196,7 +165,7 @@ def calculate_max_workers(
     model_name: str,
     context_length: int,
 ) -> int:
-    """Safe number of concurrent Ollama requests for *model_name*.
+    """Safe number of concurrent llama-server slots for *model_name*.
 
     Returns a value clamped to ``[MIN_WORKERS, MAX_WORKERS]``.
     """
@@ -400,39 +369,3 @@ def _fmt_tokens(value: int) -> str:
     return f"{value:,}".replace(",", ".")
 
 
-def _parse_size(raw: str) -> float | None:
-    """Parse a human-readable size string like ``5.2 GB`` or ``986 MB``."""
-    raw = raw.strip().upper()
-    multipliers = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}
-    for unit, mult in sorted(multipliers.items(), key=lambda x: -len(x[0])):
-        if raw.endswith(unit):
-            try:
-                value = float(raw[: -len(unit)].strip())
-                return value * mult / 1e9  # → GiB
-            except ValueError:
-                return None
-    # Try bare number (bytes)
-    try:
-        return float(raw) / 1e9
-    except ValueError:
-        return None
-
-
-def _estimate_params_size(param_str: str) -> float | None:
-    """Estimate model size (GiB) from a parameter-count string like ``8.2B``.
-
-    Assumes Q4_K_M quantization (~0.5 bytes per parameter).
-    """
-    try:
-        raw = param_str.strip().upper()
-        multiplier = 1.0
-        if raw.endswith("B"):
-            multiplier = 1.0
-            raw = raw[:-1]
-        elif raw.endswith("M"):
-            multiplier = 0.001
-            raw = raw[:-1]
-        params = float(raw) * multiplier  # billions
-        return params * 0.6  # Q4_K_M ~0.6 GB per billion params
-    except ValueError:
-        return None

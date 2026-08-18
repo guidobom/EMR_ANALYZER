@@ -1,8 +1,8 @@
 """Process-level offline policy for clinical processing.
 
 The policy blocks network connections initiated by this Python process except
-for loopback connections (for example Ollama on localhost).  It cannot control
-another process such as the Ollama daemon, so model download actions are also
+for loopback connections (for example llama-server on localhost).  It cannot control
+another process such as the llama-server engine, so model download actions are also
 disabled in the clinical UI and models must be installed before the offline
 session starts.
 """

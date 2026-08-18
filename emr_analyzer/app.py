@@ -54,6 +54,7 @@ class EMRAnalyzerApp:
         self._qapp.setApplicationName(APP_NAME)
         self._qapp.setApplicationVersion(APP_VERSION)
         self._qapp.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+        self._qapp.aboutToQuit.connect(self._shutdown_backend)
 
         # Project selection — sets active_workspace.path
         if not self._select_project():
@@ -145,7 +146,7 @@ class EMRAnalyzerApp:
         except Exception:
             self._services["parser_fallback"] = None
 
-        # ---- Function-specific local Ollama models ----
+        # ---- Function-specific local llama.cpp models ----
         ollama_ok = False
         document_config = self._llm_configs["document"]
         state_config = self._llm_configs["clinical_state"]
@@ -182,15 +183,23 @@ class EMRAnalyzerApp:
             })
             if ollama_ok:
                 print(
-                    "  ✓ Ollama: "
+                    "  ✓ LLM locale (llama.cpp): "
                     f"document={active_document_llm.model if active_document_llm else 'off'}, "
                     "clinical-state="
                     f"{active_clinical_state_llm.model if active_clinical_state_llm else 'off'}"
                 )
+                # Eager background start: the model load (seconds on this
+                # hardware) hides behind the normal startup flow.
+                self._eager_start_llm_servers([
+                    active_document_llm, active_clinical_state_llm,
+                ])
             else:
-                print("  ⚠ Ollama non disponibile")
+                print(
+                    "  ⚠ Motore locale non disponibile — esegui "
+                    "tools/setup_llama_backend.py"
+                )
         except Exception as e:
-            print(f"  ⚠ Ollama: {e}")
+            print(f"  ⚠ Motore locale (llama.cpp): {e}")
             self._services.update({
                 "document_llm_client": None,
                 "clinical_state_llm_client": None,
@@ -246,6 +255,40 @@ class EMRAnalyzerApp:
 
         print(f"  ✓ Services initialized")
         return parser_ok, ollama_ok
+
+    @staticmethod
+    def _eager_start_llm_servers(clients: list) -> None:
+        """Spawn the llama-server processes in the background.
+
+        The first clinical request would otherwise pay the model load time;
+        a daemon thread hides it behind the startup flow.  Failures are
+        non-blocking: generation calls retry lazily on demand.
+        """
+        import threading
+
+        from .llm_backend import get_backend
+
+        def _start() -> None:
+            backend = get_backend()
+            for client in clients:
+                if client is None:
+                    continue
+                try:
+                    backend.ensure(client)
+                    print(f"  ✓ server pronto per {client.model}")
+                except Exception as exc:
+                    print(f"  ⚠ avvio server {client.model} rimandato: {exc}")
+
+        threading.Thread(target=_start, daemon=True).start()
+
+    @staticmethod
+    def _shutdown_backend() -> None:
+        """Terminate the app-owned llama-server processes on quit."""
+        try:
+            from .llm_backend import get_backend
+            get_backend().shutdown()
+        except Exception:
+            pass
 
     def _init_gui(self):
         """Initialize and show the main window."""

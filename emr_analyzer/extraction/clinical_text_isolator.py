@@ -97,7 +97,7 @@ class ClinicalTextIsolator:
     ) -> ClinicalTextIsolationResult:
         if not self.llm or not self.llm.is_available:
             raise ClinicalTextIsolationError(
-                "Ollama o il modello documentale non sono disponibili",
+                "Il motore locale o il modello documentale non sono disponibili",
                 systemic=True,
             )
         source = self._prepare_source(text, parsing_result)
@@ -439,6 +439,7 @@ TESTO SORGENTE:
             return False
         message = str(error).lower()
         systemic_signals = (
+            "llama-server",
             "ollama",
             "compute error",
             "server_error",

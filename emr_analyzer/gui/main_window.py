@@ -177,7 +177,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self._configure_llm_action)
 
         self._ollama_label = QLabel(" 🔌")
-        self._ollama_label.setToolTip("Stato connessione Ollama")
+        self._ollama_label.setToolTip("Stato del motore locale (llama.cpp)")
         toolbar.addWidget(self._ollama_label)
 
         # Spacer that pushes the exit button to the right
@@ -387,7 +387,7 @@ class MainWindow(QMainWindow):
             self.context_panel.show_lab_context(data)
 
     def update_model_status(self, ollama_ok: bool = False):
-        """Update the shared Ollama connection indicator."""
+        """Update the shared local-LLM connection indicator."""
         self._model_label.setText("PDF: ⚡ pipeline pronta")
         self._model_label.setStyleSheet("color: #27ae60; font-weight: bold;")
         self._ollama_available = ollama_ok
@@ -454,22 +454,25 @@ class MainWindow(QMainWindow):
                 self,
                 "Modelli non disponibili",
                 "Configurazione salvata, ma questi modelli non risultano "
-                "disponibili in Ollama:\n- " + "\n- ".join(unavailable),
+                "tra i GGUF locali (~/.emr_analyzer/models):\n- "
+                + "\n- ".join(unavailable),
             )
 
     def _update_llm_summary(self) -> None:
         configs = self._services.get("llm_configs")
         if not configs:
             self._ollama_label.setToolTip(
-                "Ollama connesso" if self._ollama_available
-                else "Ollama non disponibile"
+                "Motore locale (llama.cpp) pronto" if self._ollama_available
+                else "Motore locale non disponibile — esegui "
+                     "tools/setup_llama_backend.py"
             )
             return
         document = configs["document"]
         state = configs["clinical_state"]
         connection = (
-            "Ollama connesso" if self._ollama_available
-            else "Ollama non disponibile"
+            "Motore locale (llama.cpp) pronto" if self._ollama_available
+            else "Motore locale non disponibile — esegui "
+                 "tools/setup_llama_backend.py"
         )
         details = (
             f"{connection}\n"

@@ -10,7 +10,7 @@ from .config import (
     BASE_DIR,
     CLINICAL_STATE_LLM_MODEL_NAME,
     DOCUMENT_LLM_MODEL_NAME,
-    OLLAMA_CONTEXT_LENGTH,
+    LLM_DEFAULT_CONTEXT_LENGTH,
 )
 
 
@@ -24,11 +24,13 @@ class LLMRoleConfig:
 
     model: str
     temperature: float = 0.1
-    context_length: int = OLLAMA_CONTEXT_LENGTH
+    context_length: int = LLM_DEFAULT_CONTEXT_LENGTH
     max_output_tokens: int = 4096
     top_p: float = 0.9
     top_k: int = 40
     seed: int = 42
+    # Deprecated with the llama.cpp backend (the model stays resident until
+    # its server process is stopped); kept for settings compatibility.
     keep_alive_minutes: int = 10
     parallel_workers: int = 1
 
@@ -78,6 +80,33 @@ def _auto_workers(model_name: str, context_length: int) -> int:
         return get_safe_max_workers(model_name, context_length)
     except Exception:
         return 1
+
+
+def _resolve_legacy_model_name(model: str) -> str:
+    """Map a legacy ``family:tag`` model name to a GGUF-index name.
+
+    Settings written by older builds store Ollama-style names like
+    ``qwen3:14b``; the llama.cpp backend lists GGUF files under
+    ``family-tag`` names.  When the raw name is not in the index, resolve
+    it through the model store so existing settings keep working.
+    """
+    raw = str(model or "").strip()
+    if not raw:
+        return raw
+    try:
+        from .llm_backend import model_store
+        index = model_store.load_index()
+        candidate = raw.removesuffix(":latest").replace(":", "-")
+        if candidate in index:
+            return candidate
+        entry = model_store.resolve(raw)
+        if entry is not None:
+            for name, data in index.items():
+                if data.get("file") == entry.get("file"):
+                    return name
+        return raw
+    except Exception:
+        return raw
 
 
 def default_llm_configs() -> dict[str, LLMRoleConfig]:
@@ -144,6 +173,9 @@ def load_llm_configs(
                 "model": legacy_models[role],
             }
         config = LLMRoleConfig.from_dict(role_payload, default)
+        config = replace(
+            config, model=_resolve_legacy_model_name(config.model)
+        )
 
         # Auto-detect workers if not explicitly set in the saved payload,
         # using the ACTUAL model and context (not the default values).

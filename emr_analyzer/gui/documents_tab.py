@@ -676,7 +676,7 @@ class DocumentsTab(QWidget):
             QApplication.processEvents()
 
             try:
-                progress.set_progress(pct_base + 2, f"{base_msg} — chiamata Ollama...")
+                progress.set_progress(pct_base + 2, f"{base_msg} — chiamata al modello locale...")
                 QApplication.processEvents()
 
                 self._run_llm_extraction(
@@ -963,7 +963,7 @@ class DocumentsTab(QWidget):
         )
 
     def _abort_llm_batch(self, progress, remaining: int) -> None:
-        """Circuit breaker: avoid repeating the same Ollama failure."""
+        """Circuit breaker: avoid repeating the same model failure."""
         message = (
             "Elaborazione LLM interrotta dopo 3 errori consecutivi: "
             f"{remaining} documenti non elaborati"
@@ -1084,7 +1084,7 @@ class DocumentsTab(QWidget):
         llm_client = self._services.get("document_llm_client")
         if not isolator or not llm_client or not llm_client.is_available:
             raise ClinicalTextIsolationError(
-                "Ollama o il modello documentale non sono disponibili"
+                "Il motore locale o il modello documentale non sono disponibili"
             )
 
         progress.add_log(

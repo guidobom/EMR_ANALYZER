@@ -4,13 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import patch
 
 import fitz
 
 from emr_analyzer.extraction.llm_client import LlmClient
 from emr_analyzer.extraction.clinical_text_isolator import ClinicalTextIsolator
-from emr_analyzer.config import OLLAMA_CONTEXT_LENGTH
 from emr_analyzer.settings import LLMRoleConfig
 from emr_analyzer.pipeline.pdf_extractor import (
     PdfExtractionResult, PdfPage, PdfPlumberExtractor,
@@ -103,6 +101,55 @@ class StubNativeFallbackExtractor(PdfPlumberExtractor):
         raise AssertionError("OCR non deve essere chiamato se PyMuPDF ha testo")
 
 
+class _FakeBackend:
+    """Duck-typed llama.cpp backend recording chat/ensure calls."""
+
+    def __init__(self, chat_result="OK"):
+        self.chat_calls = []
+        self.ensure_calls = []
+        self._chat_result = chat_result
+        self._slots = [
+            {"id": 0, "n_ctx": 32768, "is_processing": False, "state": 0},
+        ]
+        self._models = {
+            "gemma3-12b": {
+                "file": "/models/gemma3-12b.gguf",
+                "size_bytes": 12_000,
+                "architecture": "gemma3",
+                "max_context_length": 131_072,
+            },
+        }
+
+    def list_models(self):
+        return sorted(self._models)
+
+    def model_info(self, name):
+        normalized = str(name).removesuffix(":latest").replace(":", "-")
+        return self._models.get(normalized)
+
+    def usable(self):
+        return True
+
+    def ensure(self, config, progress_cb=None):
+        self.ensure_calls.append(config)
+        return "http://127.0.0.1:11435"
+
+    def chat(self, config, messages, **kwargs):
+        # Mirror the real backend: every generation ensures the server first.
+        self.ensure(config)
+        self.chat_calls.append((config, messages, kwargs))
+        return {"content": self._chat_result, "finish_reason": "stop"}
+
+    def slots(self, config):
+        return self._slots
+
+    def stop_model(self, name):
+        return True
+
+    def running_model_names(self):
+        return []
+
+
 class PdfPipelineTest(unittest.TestCase):
     def test_qwen_runtime_status_parses_object_and_legacy_responses(self):
         object_response = SimpleNamespace(models=[SimpleNamespace(
@@ -127,118 +174,90 @@ class PdfPipelineTest(unittest.TestCase):
             LlmClient._find_loaded_model(legacy_response, "gemma3:12b")
         )
 
-    def test_qwen_warmup_uses_real_context_and_confirms_loaded_model(self):
-        observed = {}
-
-        class FakeOllamaClient:
-            def __init__(self, host):
-                observed["host"] = host
-
-            def chat(self, **request):
-                observed["request"] = request
-                return SimpleNamespace(
-                    message=SimpleNamespace(content="OK")
-                )
-
-            def ps(self):
-                return {"models": [{
-                    "model": "gemma3:12b", "size": 12_000,
-                    "size_vram": 11_000,
-                    "context_length": OLLAMA_CONTEXT_LENGTH,
-                }]}
-
-        fake_ollama = SimpleNamespace(Client=FakeOllamaClient)
-        with patch.dict("sys.modules", {"ollama": fake_ollama}):
-            result = LlmClient(model="gemma3:12b").warmup("10m")
-
-        self.assertEqual(
-            observed["request"]["options"]["num_ctx"],
-            OLLAMA_CONTEXT_LENGTH,
+    def test_qwen_runtime_status_parses_slots_list(self):
+        info = LlmClient._find_loaded_model(
+            [
+                {"id": 0, "n_ctx": 16384, "is_processing": True},
+                {"id": 1, "n_ctx": 16384, "is_processing": False},
+            ],
+            "qwen3:14b",
         )
-        self.assertEqual(observed["request"]["keep_alive"], "10m")
-        self.assertFalse(observed["request"]["think"])
+        self.assertEqual(info["context_length"], 16384)
+        self.assertEqual(info["slots"], 2)
+        self.assertTrue(info["processing"])
+        self.assertIsNone(LlmClient._find_loaded_model([], "qwen3:14b"))
+
+    def test_qwen_warmup_uses_real_context_and_confirms_loaded_model(self):
+        backend = _FakeBackend()
+        result = LlmClient(model="gemma3:12b", backend=backend).warmup("10m")
+
+        config, messages, request = backend.chat_calls[0]
+        self.assertEqual(
+            messages[0]["content"],
+            "Test tecnico di disponibilità. Rispondi soltanto OK.",
+        )
+        self.assertEqual(request["max_tokens"], 8)
+        # The server is spawned with the configured role context so the
+        # first clinical call does not reload a different runner.
+        self.assertEqual(config.context_length, backend.ensure_calls[0].context_length)
         self.assertEqual(result["test_response"], "OK")
-        self.assertEqual(result["size_vram"], 11_000)
+        self.assertEqual(result["context_length"], 32768)
+        self.assertEqual(result["size_vram"], 12_000)
 
     def test_qwen_uses_role_generation_parameters(self):
-        observed = {}
-
-        class FakeOllamaClient:
-            def __init__(self, host):
-                observed["host"] = host
-
-            def chat(self, **request):
-                observed["request"] = request
-                return SimpleNamespace(
-                    message=SimpleNamespace(content="testo normalizzato"),
-                    done_reason="stop",
-                )
-
+        backend = _FakeBackend(chat_result="testo normalizzato")
         config = LLMRoleConfig(
             model="gemma3:12b", temperature=0.0,
             context_length=16_384, max_output_tokens=2_048,
             top_p=0.75, top_k=15, seed=9,
-            keep_alive_minutes=22,
+            keep_alive_minutes=22, parallel_workers=4,
         )
-        fake_ollama = SimpleNamespace(Client=FakeOllamaClient)
-        with patch.dict("sys.modules", {"ollama": fake_ollama}):
-            result = LlmClient(config=config).generate_text("sorgente")
+        result = LlmClient(config=config, backend=backend).generate_text(
+            "sorgente"
+        )
 
         self.assertEqual(result, "testo normalizzato")
-        request = observed["request"]
-        self.assertEqual(request["model"], "gemma3:12b")
-        self.assertEqual(request["options"], {
-            "temperature": 0.0,
-            "num_predict": 2_048,
-            "num_ctx": 16_384,
-            "top_p": 0.75,
-            "top_k": 15,
-            "seed": 9,
-        })
-        self.assertEqual(request["keep_alive"], "22m")
+        _, messages, request = backend.chat_calls[0]
+        self.assertEqual(
+            messages, [{"role": "user", "content": "sorgente"}]
+        )
+        self.assertEqual(request["temperature"], 0.0)
+        self.assertEqual(request["top_p"], 0.75)
+        self.assertEqual(request["top_k"], 15)
+        self.assertEqual(request["seed"], 9)
+        self.assertEqual(request["max_tokens"], 2_048)
+        self.assertIsNone(request["response_format"])
+        # Worker slots flow into the server key/ensure path.
+        self.assertEqual(backend.ensure_calls[0].parallel_workers, 4)
+        self.assertEqual(backend.ensure_calls[0].context_length, 16_384)
 
     def test_qwen_reads_declared_maximum_model_context(self):
-        class FakeOllamaClient:
-            def __init__(self, host):
-                pass
-
-            def show(self, model):
-                return SimpleNamespace(
-                    modelinfo={
-                        "general.architecture": "gemma3",
-                        "gemma3.context_length": 131_072,
-                    },
-                    capabilities=["completion", "vision"],
-                )
-
-        fake_ollama = SimpleNamespace(Client=FakeOllamaClient)
-        with patch.dict("sys.modules", {"ollama": fake_ollama}):
-            capabilities = LlmClient(
-                model="gemma3:12b"
-            ).model_capabilities()
+        capabilities = LlmClient(
+            model="gemma3:12b", backend=_FakeBackend()
+        ).model_capabilities()
 
         self.assertEqual(capabilities["max_context_length"], 131_072)
         self.assertEqual(capabilities["architecture"], "gemma3")
-        self.assertIn("vision", capabilities["capabilities"])
 
     def test_qwen_plain_text_call_does_not_request_json_schema(self):
         client = LlmClient(model="local-test-model")
         observed = {}
 
-        def fake_generate(prompt, system="", stream=False, format_schema=None):
-            observed["format_schema"] = format_schema
+        def fake_generate(prompt, system="", stream=False,
+                          response_format=None):
+            observed["response_format"] = response_format
             return "Testo clinico normalizzato."
 
-        client._ollama_generate = fake_generate
+        client._generate = fake_generate
 
         output = client.generate_text("sorgente")
 
         self.assertEqual(output, "Testo clinico normalizzato.")
-        self.assertIsNone(observed["format_schema"])
+        self.assertIsNone(observed["response_format"])
 
     def test_qwen_plain_text_call_rejects_empty_output(self):
         client = LlmClient(model="local-test-model")
-        client._ollama_generate = lambda *args, **kwargs: "   "
+        client._generate = lambda *args, **kwargs: "   "
 
         with self.assertRaisesRegex(ValueError, "risposta vuota"):
             client.generate_text("sorgente")
