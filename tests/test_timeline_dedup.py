@@ -214,6 +214,116 @@ class TestDeterministicDedup(unittest.TestCase):
         self.assertEqual(len(out), 2)
 
 
+class TestDeterministicDedupExtended(unittest.TestCase):
+    """New pre-filter stages: normalization, lab twins, close dates."""
+
+    def test_exact_normalized_twins_merge(self):
+        # Same fact, different case/punctuation → stage 1.
+        entries = [
+            make_entry("CTL_000001", "2020-05-01", "treatment",
+                       "Inizio Dabrafenib 150 mg."),
+            make_entry("CTL_000002", "2020-05-01", "treatment",
+                       "inizio dabrafenib 150 mg!"),
+        ]
+        out = ClinicalHistoryBuilder._deterministic_dedup(entries)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].entry_id, "CTL_000001")  # longest
+
+    def test_lab_twins_parser_vs_llm_merge(self):
+        # Deterministic parser entry vs LLM extraction of the same value.
+        entries = [
+            make_entry("CTL_000001", "2020-05-01", "laboratory",
+                       "emoglobina: 10.2 g/dL [12.0 - 16.0] (L)",
+                       confidence=1.0),
+            make_entry("CTL_000002", "2020-05-01", "laboratory",
+                       "Emoglobina 10.2 g/dL, valore fuori range",
+                       confidence=0.85),
+        ]
+        out = ClinicalHistoryBuilder._deterministic_dedup(entries)
+        self.assertEqual(len(out), 1)
+        # Survivor rule: longest description wins, then confidence.
+        self.assertEqual(out[0].entry_id, "CTL_000002")
+        self.assertEqual(out[0].merged_into_ids, ["CTL_000001"])
+        self.assertEqual(out[0].confidence, 1.0)  # max confidence folded in
+
+    def test_lab_different_parameters_not_merged(self):
+        entries = [
+            make_entry("CTL_000001", "2020-05-01", "laboratory",
+                       "emoglobina: 10.2 g/dL [12.0 - 16.0] (L)"),
+            make_entry("CTL_000002", "2020-05-01", "laboratory",
+                       "piastrine: 90 x10^3/uL [150 - 450] (L)"),
+        ]
+        out = ClinicalHistoryBuilder._deterministic_dedup(entries)
+        self.assertEqual(len(out), 2)
+
+    def test_close_dates_with_identical_wording_merge(self):
+        entries = [
+            make_entry("CTL_000001", "2020-03-01", "treatment",
+                       "Terapia con pembrolizumab 180 mg ev ogni 3 settimane"),
+            make_entry("CTL_000002", "2020-03-04", "treatment",
+                       "Terapia con pembrolizumab 180 mg ev ogni 3 settimane"),
+        ]
+        out = ClinicalHistoryBuilder._deterministic_dedup(entries)
+        self.assertEqual(len(out), 1)
+
+    def test_close_dates_with_different_wording_not_merged(self):
+        entries = [
+            make_entry("CTL_000001", "2020-03-01", "imaging_finding",
+                       "Controllo radiologico stabile"),
+            make_entry("CTL_000002", "2020-03-04", "imaging_finding",
+                       "Controllo radiologico invariato"),
+        ]
+        out = ClinicalHistoryBuilder._deterministic_dedup(entries)
+        self.assertEqual(len(out), 2)
+
+    def test_dates_beyond_window_not_merged(self):
+        entries = [
+            make_entry("CTL_000001", "2020-03-01", "treatment",
+                       "Terapia con pembrolizumab 180 mg ev ogni 3 settimane"),
+            make_entry("CTL_000002", "2020-03-12", "treatment",
+                       "Terapia con pembrolizumab 180 mg ev ogni 3 settimane"),
+        ]
+        out = ClinicalHistoryBuilder._deterministic_dedup(entries)
+        self.assertEqual(len(out), 2)
+
+    def test_normalize_description(self):
+        self.assertEqual(
+            ClinicalHistoryBuilder._normalize_description(
+                "  Emoglobina  10.2  G/dL.  "
+            ),
+            "emoglobina 10.2 g/dl",
+        )
+
+    def test_lab_parameter_colon_and_free_form(self):
+        self.assertEqual(
+            ClinicalHistoryBuilder._lab_parameter(
+                "emoglobina: 10.2 g/dL [12.0 - 16.0]"
+            ),
+            "emoglobina",
+        )
+        self.assertEqual(
+            ClinicalHistoryBuilder._lab_parameter(
+                "Velocità eritrosedimentazione 45 mm/h"
+            ),
+            "velocità eritrosedimentazione",
+        )
+
+    def test_date_diff_days(self):
+        self.assertEqual(
+            ClinicalHistoryBuilder._date_diff_days(
+                "2020-03-01", "2020-03-04"
+            ),
+            3,
+        )
+        self.assertEqual(
+            ClinicalHistoryBuilder._date_diff_days("2020-03-04", "2020-03-01"),
+            3,
+        )
+        self.assertIsNone(
+            ClinicalHistoryBuilder._date_diff_days("2020-03", "2020-03-01")
+        )
+
+
 class TestApplyDedupGroups(unittest.TestCase):
     """Consumption of the new ``groups`` contract."""
 

@@ -713,101 +713,265 @@ OSSERVAZIONI CLINICHE:
             state.clinical_profile = ""
             self._cs_repo.save(state)
 
-    # Conservative threshold: only near-verbatim entries (same date +
+    # Conservative thresholds: only near-verbatim entries (same date +
     # category, ≥0.75 similarity) are merged deterministically.  The LLM
     # stage handles the semantic duplicates the string matcher misses.
     _DETERMINISTIC_DEDUP_THRESHOLD = 0.75
+    # Laboratory twins (parser entry vs LLM extraction): same parameter +
+    # date with loosely similar value text.
+    _DEDUP_LAB_TWIN_SIMILARITY = 0.6
+    # Close-date merges: same category, dates within ±7 days and
+    # essentially identical wording — very conservative.
+    _DEDUP_CLOSE_DATE_SIMILARITY = 0.95
+    _DEDUP_CLOSE_DATE_DAYS = 7
 
     @staticmethod
     def _deterministic_dedup(
         entries: list[ClinicalTimelineEntry],
     ) -> list[ClinicalTimelineEntry]:
-        """Merge near-verbatim entries with same date + category.
+        """Deterministic dedup pass that runs before the LLM stage.
 
-        Runs before the LLM dedup to reduce the entry count and avoid
-        context-window overflow.  Uses ``SequenceMatcher`` with a
-        conservative threshold (0.75) so only entries that express the
-        same clinical fact with trivial wording differences are merged
-        (e.g. \"Inizio dabrafenib 150 mg\" vs \"inizia dabrafenib 150 mg\").
-        The survivor is the longest / highest-confidence entry of the group;
-        it accumulates the ``merged_into_ids`` (excluding its own id) and
-        the sources of the fused entries.
+        Four conservative stages reduce the entry count (and thus the
+        number of LLM dedup calls) without semantic risk:
+        1. exact normalized matches (same date + category);
+        2. near-verbatim matches (same date + category, SequenceMatcher
+           ≥ threshold on normalized text);
+        3. laboratory twins: same parameter + date, loosely similar value
+           text (deterministic parser entry vs LLM extraction from the
+           document text);
+        4. close dates: same category, |Δdate| ≤ 7 days, similarity ≥ 0.95.
+
+        The survivor is the longest / highest-confidence entry of the
+        group; it accumulates the ``merged_into_ids`` (excluding its own
+        id) and the sources of the fused entries.
         """
         if len(entries) <= 1:
             return entries
 
         threshold = ClinicalHistoryBuilder._DETERMINISTIC_DEDUP_THRESHOLD
-
-        # Sort by (date, category, description) for stable grouping
-        sorted_entries = sorted(
-            entries,
-            key=lambda e: (e.date_observed, e.category, e.description),
-        )
-
-        merged: list[ClinicalTimelineEntry] = []
+        normalized = [
+            ClinicalHistoryBuilder._normalize_description(e.description)
+            for e in entries
+        ]
         used: set[int] = set()
 
-        for i, ei in enumerate(sorted_entries):
-            if i in used:
-                continue
-
-            # Collect the group: same date + category, near-verbatim text.
-            group: list[int] = [i]
-            for j, ej in enumerate(sorted_entries):
-                if j <= i or j in used:
-                    continue
-                if ei.date_observed != ej.date_observed:
-                    break  # sorted — no more same-date entries
-                if ei.category != ej.category:
-                    continue
-                ratio = difflib.SequenceMatcher(
-                    None, ei.description.lower(), ej.description.lower()
-                ).ratio()
-                if ratio >= threshold:
-                    group.append(j)
-                    used.add(j)
-
-            # Survivor: longest description, then highest confidence.
+        def fold(group: list[int]) -> None:
+            """Merge *group* into its survivor (mutates it in place)."""
             best_idx = max(
                 group,
                 key=lambda idx: (
-                    len(sorted_entries[idx].description),
-                    sorted_entries[idx].confidence,
+                    len(entries[idx].description),
+                    entries[idx].confidence,
                 ),
             )
-            survivor = sorted_entries[best_idx]
+            survivor = entries[best_idx]
+            merged_ids = [
+                entries[idx].entry_id
+                for idx in group if idx != best_idx
+            ]
+            all_doc_ids = list(survivor.source_document_ids)
+            all_texts = list(survivor.source_texts)
+            for idx in group:
+                if idx == best_idx:
+                    continue
+                me = entries[idx]
+                for did in me.source_document_ids:
+                    if did not in all_doc_ids:
+                        all_doc_ids.append(did)
+                for txt in me.source_texts:
+                    if txt not in all_texts:
+                        all_texts.append(txt)
+            survivor.source_document_ids = all_doc_ids
+            survivor.source_texts = all_texts[:5]  # Cap at 5
+            survivor.confidence = max(
+                survivor.confidence,
+                max(entries[idx].confidence for idx in group),
+            )
+            survivor.merged_into_ids = list(dict.fromkeys(
+                survivor.merged_into_ids + merged_ids
+            ))
+            # Mark only the merged-away entries: the survivor stays eligible
+            # so a later stage can merge it transitively into another group.
+            for idx in group:
+                if idx != best_idx:
+                    used.add(idx)
 
+        # --- stage 1: exact normalized matches (same date + category) ----
+        exact_groups: dict[tuple, list[int]] = {}
+        for i, entry in enumerate(entries):
+            exact_groups.setdefault(
+                (entry.date_observed, entry.category, normalized[i]), []
+            ).append(i)
+        for group in exact_groups.values():
             if len(group) > 1:
-                merged_ids = [
-                    sorted_entries[idx].entry_id
-                    for idx in group if idx != best_idx
-                ]
-                all_doc_ids = list(survivor.source_document_ids)
-                all_texts = list(survivor.source_texts)
-                for idx in group:
-                    if idx == best_idx:
+                fold(group)
+
+        # --- stage 2: near-verbatim (same date + category) ---------------
+        by_key: dict[tuple, list[int]] = {}
+        for i, entry in enumerate(entries):
+            by_key.setdefault(
+                (entry.date_observed, entry.category), []
+            ).append(i)
+        for idxs in by_key.values():
+            available = [idx for idx in idxs if idx not in used]
+            for a, ia in enumerate(available):
+                if ia in used:
+                    continue
+                group = [ia]
+                for ib in available[a + 1:]:
+                    if ib in used:
                         continue
-                    me = sorted_entries[idx]
-                    for did in me.source_document_ids:
-                        if did not in all_doc_ids:
-                            all_doc_ids.append(did)
-                    for txt in me.source_texts:
-                        if txt not in all_texts:
-                            all_texts.append(txt)
-                survivor.source_document_ids = all_doc_ids
-                survivor.source_texts = all_texts[:5]  # Cap at 5
-                survivor.confidence = max(
-                    survivor.confidence,
-                    max(sorted_entries[idx].confidence for idx in group),
+                    ratio = difflib.SequenceMatcher(
+                        None, normalized[ia], normalized[ib]
+                    ).ratio()
+                    if ratio >= threshold:
+                        group.append(ib)
+                if len(group) > 1:
+                    fold(group)
+
+        # --- stage 3: laboratory twins (same parameter + date) -----------
+        for (date_obs, category), idxs in by_key.items():
+            if category != "laboratory":
+                continue
+            available = [idx for idx in idxs if idx not in used]
+            by_param: dict[str, list[int]] = {}
+            for idx in available:
+                param = ClinicalHistoryBuilder._lab_parameter(
+                    entries[idx].description
                 )
-                survivor.merged_into_ids = list(dict.fromkeys(
-                    survivor.merged_into_ids + merged_ids
-                ))
+                by_param.setdefault(param, []).append(idx)
+            for group_idxs in by_param.values():
+                for a, ia in enumerate(group_idxs):
+                    if ia in used:
+                        continue
+                    group = [ia]
+                    value_a = ClinicalHistoryBuilder._lab_numeric_value(
+                        entries[ia].description
+                    )
+                    for ib in group_idxs[a + 1:]:
+                        if ib in used:
+                            continue
+                        value_b = ClinicalHistoryBuilder._lab_numeric_value(
+                            entries[ib].description
+                        )
+                        if value_a is not None and value_a == value_b:
+                            twin = True  # same parameter + same value
+                        else:
+                            ratio = difflib.SequenceMatcher(
+                                None, normalized[ia], normalized[ib]
+                            ).ratio()
+                            twin = ratio >= (
+                                ClinicalHistoryBuilder
+                                ._DEDUP_LAB_TWIN_SIMILARITY
+                            )
+                        if twin:
+                            group.append(ib)
+                    if len(group) > 1:
+                        fold(group)
 
-            merged.append(survivor)
-            used.add(i)
+        # --- stage 4: close dates (same category, ±7 days, ≥0.95) --------
+        remaining = [idx for idx in range(len(entries)) if idx not in used]
+        remaining.sort(key=lambda idx: (
+            entries[idx].category, entries[idx].date_observed,
+        ))
+        for a, ia in enumerate(remaining):
+            if ia in used:
+                continue
+            group = [ia]
+            for ib in remaining[a + 1:]:
+                if ib in used:
+                    continue
+                if entries[ib].category != entries[ia].category:
+                    break  # sorted by category — no more candidates
+                days = ClinicalHistoryBuilder._date_diff_days(
+                    entries[ia].date_observed, entries[ib].date_observed
+                )
+                if days is None:
+                    continue
+                if days > ClinicalHistoryBuilder._DEDUP_CLOSE_DATE_DAYS:
+                    break  # sorted by date — later ones are even farther
+                ratio = difflib.SequenceMatcher(
+                    None, normalized[ia], normalized[ib]
+                ).ratio()
+                if ratio >= (
+                    ClinicalHistoryBuilder._DEDUP_CLOSE_DATE_SIMILARITY
+                ):
+                    group.append(ib)
+            if len(group) > 1:
+                fold(group)
 
-        return merged
+        # Same stable output order as before: (date, category, description);
+        # survivors have already been mutated in place.
+        ordered = sorted(
+            range(len(entries)),
+            key=lambda idx: (
+                entries[idx].date_observed,
+                entries[idx].category,
+                entries[idx].description,
+            ),
+        )
+        return [entries[idx] for idx in ordered if idx not in used]
+
+    @staticmethod
+    def _normalize_description(text: str) -> str:
+        """Case-fold and strip punctuation/whitespace for comparisons."""
+        import re
+
+        lowered = str(text or "").lower()
+        lowered = re.sub(r"\s+", " ", lowered)
+        lowered = re.sub(r"[^\w\s%./,:+-]", "", lowered)
+        return lowered.strip(" .,:")
+
+    @staticmethod
+    def _lab_parameter(description: str) -> str:
+        """Parameter-name prefix of a laboratory entry description.
+
+        Parser entries are ``parametro: valore ...``; LLM entries are free
+        form (``Emoglobina 10.2 g/dL ...``).  For the free form the second
+        word is included only when it is part of the name (non-numeric),
+        so ``Emoglobina 10.2`` resolves to ``emoglobina`` while
+        ``Velocità eritrosedimentazione 45`` keeps both words.
+        """
+        text = str(description or "").strip()
+        if ":" in text[:40]:
+            return text.split(":", 1)[0].strip().lower()
+        words = text.split()
+        if not words:
+            return ""
+        first = words[0].lower()
+        if len(words) > 1 and not (
+            words[1][0].isdigit() or words[1][0] in "<>="
+        ):
+            return f"{first} {words[1].lower()}"
+        return first
+
+    @staticmethod
+    def _lab_numeric_value(description: str) -> str | None:
+        """First numeric token (operator + number) of a lab value."""
+        import re
+
+        match = re.search(
+            r"([<>≤≥]?\s*\d+(?:[.,]\d+)?)", str(description or "")
+        )
+        if match is None:
+            return None
+        return match.group(1).replace(" ", "")
+
+    @staticmethod
+    def _date_diff_days(date_a: str, date_b: str) -> int | None:
+        """Absolute day distance between two ISO dates; None if unparseable."""
+        from datetime import datetime
+
+        def parse(value: str):
+            try:
+                return datetime.strptime(str(value or "")[:10], "%Y-%m-%d")
+            except ValueError:
+                return None
+
+        first, second = parse(date_a), parse(date_b)
+        if first is None or second is None:
+            return None
+        return abs((second - first).days)
 
     def _apply_dedup_groups(
         self,

@@ -825,17 +825,44 @@ TESTO DA ANALIZZARE:
 
         return []
 
-    _DEDUP_BATCH_SIZE = 40
-    _DEDUP_OVERLAP = 10
+    _DEDUP_BATCH_SIZE_MIN = 20
+    _DEDUP_BATCH_SIZE_MAX = 120
+    _DEDUP_OVERLAP = 5
+    # Estimated token footprint of one compact dedup entry (~250 chars).
+    _DEDUP_TOKENS_PER_ENTRY = 125
+    # Instruction block + response reserve (tokens) per dedup call.
+    _DEDUP_OVERHEAD_TOKENS = 2500
+
+    def _dedup_batch_size(self) -> int:
+        """Entries per LLM dedup call, sized to the configured context.
+
+        The fixed 40-entry batches under-used the context window and turned
+        large registries into many serial calls; a compact entry is ~125
+        tokens, so a 32K context comfortably compares ~100+ entries at once.
+        """
+        output_reserve = max(2048, int(self.max_output_tokens * 0.5))
+        budget = max(
+            8000,
+            self.context_length
+            - self._DEDUP_OVERHEAD_TOKENS
+            - output_reserve,
+        )
+        size = budget // self._DEDUP_TOKENS_PER_ENTRY
+        return max(
+            self._DEDUP_BATCH_SIZE_MIN,
+            min(self._DEDUP_BATCH_SIZE_MAX, size),
+        )
 
     def deduplicate_timeline(self, entries: list[dict]) -> dict:
-        """Semantic dedup with sliding window for large registries.
+        """Semantic dedup with context-sized batches processed in parallel.
 
-        Sends ALL entries to the LLM using a compact format so the full
-        registry fits in the context window (32K tokens ≈ 64K chars).
-        The LLM groups semantically equivalent clinical events and, for
-        each group, synthesises a single **canonical description** with the
-        earliest/most precise date.  The result is a list of groups:
+        Sends ALL entries to the LLM using a compact format.  Entries are
+        ordered by (date, category) so semantic duplicates cluster near
+        each other; the registry is then split into overlapping batches
+        sized to the context window and each batch is deduplicated with an
+        independent LLM call — run in parallel across the server slots.
+        The per-batch groups are finally merged with transitivity
+        resolution.  The result is a list of groups:
 
         ``{"groups": [{"kept_id": ..., "merged_into_ids": [...],
                         "canonical_description": ...,
@@ -848,35 +875,51 @@ TESTO DA ANALIZZARE:
         if not entries:
             return {"groups": []}
 
-        if len(entries) <= self._DEDUP_BATCH_SIZE:
+        batch_size = self._dedup_batch_size()
+        if len(entries) <= batch_size:
             return self._dedup_batch(entries)
 
-        # Sliding-window dedup for large registries.
-        # Each batch reuses the deduplicated output of the previous batch
-        # so the LLM never sees entries that have already been removed.
+        ordered = sorted(
+            entries,
+            key=lambda e: (e.get("date_observed") or "",
+                           e.get("category") or ""),
+        )
+
+        overlap = min(self._DEDUP_OVERLAP, batch_size - 1)
+        step = batch_size - overlap
+        slices = []
+        start = 0
+        while start < len(ordered):
+            end = min(start + batch_size, len(ordered))
+            slices.append(ordered[start:end])
+            if end == len(ordered):
+                break
+            start += step
+
+        max_workers = max(1, min(
+            int(getattr(self, "parallel_workers", 1) or 1),
+            len(slices),
+        ))
+        if max_workers == 1 or len(slices) == 1:
+            batch_results = [self._dedup_batch(s) for s in slices]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                batch_results = list(pool.map(self._dedup_batch, slices))
+
+        # Global merge with transitivity resolution across parallel
+        # batches: a survivor kept by one batch can be merged by another.
         survivor_groups: dict[str, dict] = {}
-        working = list(entries)  # mutable copy — updated after each batch
-        cursor = 0  # first entry that still needs dedup
-
-        while cursor < len(working):
-            batch_end = min(cursor + self._DEDUP_BATCH_SIZE, len(working))
-            batch = working[cursor:batch_end]
-            result = self._dedup_batch(batch)
-            batch_groups = result.get("groups", [])
-
-            batch_removed: set[str] = set()
-            for g in batch_groups:
-                for mid in g.get("merged_into_ids", []):
-                    batch_removed.add(mid)
-
-            # Absorb batch groups into the global survivor registry,
-            # resolving transitivity (an earlier survivor may itself be
-            # merged by a later batch).
-            for g in batch_groups:
+        for result in batch_results:
+            for g in result.get("groups", []):
                 kid = g.get("kept_id")
                 if not kid:
                     continue
-                merged = [m for m in g.get("merged_into_ids", []) if m]
+                merged = [
+                    m for m in g.get("merged_into_ids", [])
+                    if m and m != kid
+                ]
                 if kid in survivor_groups:
                     cur = survivor_groups[kid]
                     cur["merged_into_ids"] = list(dict.fromkeys(
@@ -897,43 +940,29 @@ TESTO DA ANALIZZARE:
                         "category": g.get("category") or "",
                         "status": g.get("status") or "",
                     }
-                # Any prior survivor that is now merged into this group's
-                # kept entry: fold its merged ids into the new survivor.
+                # A prior survivor now merged into this group's kept entry:
+                # fold its merged ids into the new survivor.  When two
+                # batches keep different ends of the same pair, the group
+                # processed later wins and absorbs the earlier one; the
+                # self-reference filter below keeps merged lists clean.
                 for mid in merged:
-                    if mid in survivor_groups:
+                    if mid in survivor_groups and mid != kid:
                         absorbed = survivor_groups.pop(mid)
                         survivor_groups[kid]["merged_into_ids"] = (
                             list(dict.fromkeys(
-                                survivor_groups[kid]["merged_into_ids"]
-                                + absorbed.get("merged_into_ids", [])
+                                [
+                                    m for m in (
+                                        survivor_groups[kid][
+                                            "merged_into_ids"
+                                        ]
+                                        + absorbed.get(
+                                            "merged_into_ids", []
+                                        )
+                                    )
+                                    if m != kid
+                                ]
                             ))
                         )
-
-            # Rebuild working list: drop merged entries, apply canonical
-            # descriptions to survivors of this batch.
-            kept = []
-            for e in working[:batch_end]:
-                eid = e.get("entry_id")
-                if eid in batch_removed:
-                    continue
-                g = next(
-                    (x for x in batch_groups if x.get("kept_id") == eid),
-                    None,
-                )
-                if g and g.get("canonical_description"):
-                    e = dict(e)
-                    e["description"] = g["canonical_description"]
-                kept.append(e)
-            kept.extend(working[batch_end:])
-            working = kept
-
-            # Advance cursor: skip the first (batch_size - overlap) kept
-            # entries, which are now considered fully deduplicated.
-            new_done = max(1, len(batch) - self._DEDUP_OVERLAP)
-            removed_in_batch = len(batch_removed)
-            cursor += max(1, new_done - removed_in_batch)
-            if cursor >= len(working):
-                break
 
         return {"groups": list(survivor_groups.values())}
 
