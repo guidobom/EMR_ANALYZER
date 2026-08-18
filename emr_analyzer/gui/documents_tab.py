@@ -19,6 +19,7 @@ from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
 from ..extraction.clinical_text_isolator import ClinicalTextIsolationError
 from ..pipeline.sensitive_data import SensitiveDataSanitizer
 from ..config import ATTRIBUTION_VERIFICATION_ENABLED
+from ..utils.document_paths import resolve_document_path
 from .quick_look import QuickLook
 
 
@@ -223,8 +224,9 @@ class DocumentsTab(QWidget):
             self._table.setItem(i, 3, QTableWidgetItem(str(doc.page_count)))
             # Size from original path
             size_mb = ""
-            if os.path.exists(doc.original_path):
-                size_mb = f"{os.path.getsize(doc.original_path) / (1024*1024):.1f} MB"
+            resolved_path = resolve_document_path(doc)
+            if os.path.exists(resolved_path):
+                size_mb = f"{os.path.getsize(resolved_path) / (1024*1024):.1f} MB"
             self._table.setItem(i, 4, QTableWidgetItem(size_mb))
             self._table.setItem(i, 5, QTableWidgetItem(doc.import_date[:10]))
             if doc.extraction_status == ExtractionStatus.DONE.value:
@@ -618,7 +620,7 @@ class DocumentsTab(QWidget):
                                         parse_only, llm_only)
             return
 
-        file_path = doc.original_path
+        file_path = resolve_document_path(doc)
         base_msg = f"[{index + 1}/{len(doc_ids)}] {doc.filename}"
 
         # ============================================================
@@ -1181,9 +1183,10 @@ class DocumentsTab(QWidget):
         """Read direct identifiers transiently; never persist their values."""
         values = {}
         identity_extractor = self._services.get("identity_extractor")
-        if identity_extractor and doc.original_path:
+        resolved_path = resolve_document_path(doc)
+        if identity_extractor and resolved_path:
             try:
-                evidence = identity_extractor.extract(doc.original_path)
+                evidence = identity_extractor.extract(resolved_path)
                 for field_name in (
                     "name",
                     "fiscal_code",
@@ -1254,7 +1257,7 @@ class DocumentsTab(QWidget):
         if not raw or len(raw.strip()) < 60:
             try:
                 import fitz
-                pdf = fitz.open(doc.original_path)
+                pdf = fitz.open(resolve_document_path(doc))
                 try:
                     chunks = [
                         pdf[i].get_text()
@@ -1649,12 +1652,10 @@ class DocumentsTab(QWidget):
         if not item:
             return None
         doc_data = item.data(Qt.UserRole + 1)
-        path = doc_data.get("original_path") or doc_data.get("stored_path")
+        path = resolve_document_path(doc_data) if doc_data else ""
         if not path:
             return None
-        if not os.path.isabs(str(path)) and doc_data.get("workspace_root"):
-            path = os.path.join(doc_data["workspace_root"], str(path))
-        return str(path), doc_data.get("filename") or os.path.basename(str(path))
+        return path, doc_data.get("filename") or os.path.basename(path)
 
     def _on_context_menu(self, pos):
         row = self._table.currentRow()

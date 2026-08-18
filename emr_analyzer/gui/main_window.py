@@ -347,7 +347,9 @@ class MainWindow(QMainWindow):
                 "Nessun documento da normalizzare o con errori nel workspace.",
             )
             return
-        dialog = NormalizationDialog(classification, parent=self)
+        dialog = NormalizationDialog(
+            classification, parent=self, services=self._services
+        )
         if dialog.exec_() == QDialog.Accepted:
             grouped = dialog.selected_groups()
             if grouped:

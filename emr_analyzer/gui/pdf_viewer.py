@@ -79,11 +79,9 @@ class PDFViewerDialog(QDialog):
 
     def _load_pdf(self):
         """Load the PDF document."""
-        path = self._doc_data.get("original_path") or self._doc_data.get("stored_path", "")
-        if path and not os.path.isabs(path):
-            workspace_root = self._doc_data.get("workspace_root")
-            if workspace_root:
-                path = os.path.join(workspace_root, path)
+        from ..utils.document_paths import resolve_document_path
+
+        path = resolve_document_path(self._doc_data)
         if not path:
             self._page_label.setText("❌ File non trovato")
             return

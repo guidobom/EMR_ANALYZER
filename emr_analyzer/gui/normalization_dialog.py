@@ -5,11 +5,15 @@ it shows every document that (a) is not yet normalized (non-laboratory type
 and no ``clinical_text`` in its metadata) or (b) carries a parsing or
 extraction error, and lets the user launch the extraction pipeline on the
 selected files (grouped by patient).
+
+Double-click opens the full PDF viewer; the spacebar opens an in-app Quick
+Look preview of the current file, like the other document lists.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
 from PyQt5.QtCore import Qt
@@ -21,6 +25,9 @@ from PyQt5.QtWidgets import (
 from ..models.document import (
     DocumentRecord, DocumentType, ExtractionStatus, ParsingStatus,
 )
+from ..utils.document_paths import resolve_document_path
+from .pdf_viewer import PDFViewerDialog
+from .quick_look import QuickLook
 
 
 @dataclass
@@ -97,9 +104,11 @@ def _pending_status_text(p: PendingDoc) -> str:
 class NormalizationDialog(QDialog):
     """Table of pending documents with per-row checkboxes and an extract action."""
 
-    def __init__(self, classification: PendingClassification, parent=None):
+    def __init__(self, classification: PendingClassification, parent=None,
+                 services: dict | None = None):
         super().__init__(parent)
         self._classification = classification
+        self._services = services or {}
         self._grouped: dict[str, list[str]] = {}
         self.setWindowTitle("Documenti da normalizzare / con errori")
         self.resize(1000, 540)
@@ -127,7 +136,12 @@ class NormalizationDialog(QDialog):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.itemChanged.connect(self._on_item_changed)
+        self._table.doubleClicked.connect(self._on_double_click)
         layout.addWidget(self._table, stretch=1)
+
+        # Double-click opens the full viewer; the spacebar opens an in-app
+        # Quick Look preview (Space/Esc again closes it).
+        self._quick_look = QuickLook(self._table, self._quick_look_path)
 
         self._notes_label = QLabel()
         self._notes_label.setWordWrap(True)
@@ -166,6 +180,7 @@ class NormalizationDialog(QDialog):
             )
             check.setCheckState(Qt.Checked)
             check.setData(Qt.UserRole, p)
+            check.setData(Qt.UserRole + 1, doc.to_dict())
             table.setItem(row, 0, check)
 
             table.setItem(row, 1, QTableWidgetItem(doc.patient_id or ""))
@@ -205,6 +220,46 @@ class NormalizationDialog(QDialog):
     def selected_groups(self) -> dict[str, list[str]]:
         """Map patient_id → [doc_ids] for the currently checked rows."""
         return dict(self._grouped)
+
+    # ------------------------------------------------------------------
+    # PDF viewing (double-click + spacebar Quick Look)
+    # ------------------------------------------------------------------
+    def _current_doc_data(self) -> dict | None:
+        row = self._table.currentRow()
+        if row < 0:
+            return None
+        item = self._table.item(row, 0)
+        if not item:
+            return None
+        return item.data(Qt.UserRole + 1)
+
+    def _on_double_click(self, index) -> None:
+        if index.column() == 0:
+            return  # column 0 is the checkbox; let it toggle
+        self._open_file()
+
+    def _open_file(self) -> bool:
+        """Open the current row's PDF in the full viewer."""
+        doc_data = self._current_doc_data()
+        if not doc_data:
+            return False
+        path = resolve_document_path(doc_data)
+        if not path or not os.path.isfile(path):
+            return False
+        self._quick_look.dismiss()
+        viewer = PDFViewerDialog(doc_data, self._services, self)
+        viewer.exec_()
+        return True
+
+    def _quick_look_path(self):
+        """Resolve the current row to a PDF path for the Quick Look."""
+        doc_data = self._current_doc_data()
+        if not doc_data:
+            return None
+        path = resolve_document_path(doc_data)
+        if not path or not os.path.isfile(path):
+            return None
+        return path, doc_data.get("filename") or os.path.basename(path)
 
     def _update_extract_button(self):
         n = sum(len(ids) for ids in self._grouped.values())
