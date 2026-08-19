@@ -192,6 +192,60 @@ class ClinicalHistoryQueryWorker(QThread):
             self.error.emit(f"Errore query: {str(e)}")
 
 
+class IraeQueueWorker(QThread):
+    """Run the irAE protocol over several patient registries, in order.
+
+    ``patient_plans`` is a list of ``(patient_id, prompts)`` where the
+    prompts are pre-built on the main thread (SQLite is not used
+    cross-thread).  Cancellation is honored BETWEEN patients; the LLM
+    call in flight cannot be interrupted.
+    """
+    patient_started = pyqtSignal(int, int, str)  # index, total, patient_id
+    chunk_progress = pyqtSignal(int, int)        # chunk_index, chunk_total
+    patient_finished = pyqtSignal(str, str)      # patient_id, markdown
+    patient_error = pyqtSignal(str, str)         # patient_id, error
+    finished = pyqtSignal()
+
+    def __init__(self, llm_client, patient_plans, parent=None):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.patient_plans = patient_plans
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        from emr_analyzer.clinical.irae_analysis import SYSTEM_PROMPT
+
+        total = len(self.patient_plans)
+        for index, (patient_id, prompts) in enumerate(
+            self.patient_plans, start=1
+        ):
+            if self._cancelled:
+                break
+            self.patient_started.emit(index, total, patient_id)
+            try:
+                parts = []
+                for chunk_index, prompt in enumerate(prompts, start=1):
+                    self.chunk_progress.emit(chunk_index, len(prompts))
+                    answer = self.llm_client.generate_text(
+                        prompt, SYSTEM_PROMPT
+                    )
+                    parts.append(
+                        f"### Parte {chunk_index}/{len(prompts)}\n\n"
+                        f"{answer}"
+                    )
+                self.patient_finished.emit(
+                    patient_id, "\n\n".join(parts)
+                )
+            except Exception as exc:
+                self.patient_error.emit(
+                    patient_id, f"Errore analisi irAE: {str(exc)}"
+                )
+        self.finished.emit()
+
+
 class IraeAnalysisWorker(QThread):
     """Run the irAE protocol over the whole registry, chunk by chunk."""
     progress = pyqtSignal(int, int)  # chunk_index, chunk_total

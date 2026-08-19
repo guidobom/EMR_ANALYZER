@@ -155,6 +155,14 @@ class MainWindow(QMainWindow):
         pending_btn.triggered.connect(self._on_show_pending)
         toolbar.addAction(pending_btn)
 
+        irae_btn = QAction("⚡ Analisi irAE", self)
+        irae_btn.setToolTip(
+            "Lancia una coda di analisi con il protocollo irAE sui registri "
+            "cronologici dei pazienti selezionati"
+        )
+        irae_btn.triggered.connect(self._on_show_irae_queue)
+        toolbar.addAction(irae_btn)
+
         # Spacer
         spacer = QWidget()
         spacer.setMinimumWidth(20)
@@ -354,6 +362,36 @@ class MainWindow(QMainWindow):
             grouped = dialog.selected_groups()
             if grouped:
                 self.workspace_tabs.run_extraction_for_docs(grouped)
+
+    def _on_show_irae_queue(self):
+        """Launch the multi-patient irAE analysis queue.
+
+        Only patients that HAVE a chronological registry are listed; the
+        queue runs after the selection dialog closes.
+        """
+        timeline_repo = self._services.get("timeline_repo")
+        if not timeline_repo:
+            QMessageBox.warning(
+                self, "Errore", "Servizio del registro non disponibile."
+            )
+            return
+        summaries = timeline_repo.patients_with_entries()
+        if not summaries:
+            QMessageBox.information(
+                self, "Nessun registro",
+                "Nessun paziente ha ancora un registro cronologico "
+                "generato.",
+            )
+            return
+
+        from .irae_queue_dialog import IraeQueueDialog
+
+        dialog = IraeQueueDialog(summaries, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected = dialog.selected_patient_ids()
+        if selected:
+            self.workspace_tabs.run_irae_queue(selected)
 
     def _on_about(self):
         QMessageBox.about(

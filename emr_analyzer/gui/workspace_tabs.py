@@ -30,6 +30,7 @@ class WorkspaceTabs(QTabWidget):
         self._services = {}
         self._current_patient_id = None
         self._current_document_id = None
+        self._irae_queue_worker = None
 
         # Create tabs
         self._documents_tab = DocumentsTab()
@@ -75,6 +76,10 @@ class WorkspaceTabs(QTabWidget):
             self._clinical_history_tab.shutdown()
         except Exception:
             pass
+        worker = self._irae_queue_worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait(5000)
 
     def _on_document_reattributed(self, source_pid: str,
                                   target_pid: str) -> None:
@@ -321,6 +326,135 @@ class WorkspaceTabs(QTabWidget):
 
         progress.mark_done()
         progress.exec_()
+
+    # ------------------------------------------------------------------
+    # Multi-patient irAE analysis queue
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_irae_plans(
+        services: dict, patient_ids: list[str], protocol: str
+    ) -> list[tuple[str, list[str]]]:
+        """Pre-build the analysis prompts of every patient (main thread:
+        SQLite must not be touched from the worker)."""
+        from ..clinical.irae_analysis import build_analysis_plan
+
+        timeline_repo = services.get("timeline_repo")
+        cs_repo = services.get("cs_repo")
+        plans = []
+        for pid in patient_ids:
+            entries = timeline_repo.get_by_patient(pid) if timeline_repo else []
+            profile = ""
+            if cs_repo:
+                state = cs_repo.load(pid)
+                profile = state.clinical_profile if state else ""
+            prompts = build_analysis_plan(
+                [e.to_dict() for e in entries], profile, protocol
+            )
+            plans.append((pid, prompts))
+        return plans
+
+    def run_irae_queue(self, patient_ids: list[str]):
+        """Run the irAE protocol over several registries, in order.
+
+        Plans are built on the main thread; the LLM calls run in a
+        background worker so the UI stays responsive.  A summary dialog
+        with one tab per patient opens at the end.
+        """
+        if not patient_ids:
+            return
+
+        llm = self._services.get("clinical_state_llm_client")
+        if not llm or not llm.is_available:
+            QMessageBox.warning(
+                self, "LLM non disponibile",
+                "Il modello Clinical State non è disponibile.",
+            )
+            return
+
+        from ..clinical import irae_analysis
+
+        try:
+            prompt_path = irae_analysis.ensure_prompt()
+            protocol = irae_analysis.load_prompt(prompt_path)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Protocollo non disponibile", str(exc)
+            )
+            return
+        if not protocol:
+            QMessageBox.warning(
+                self, "Protocollo non disponibile",
+                f"Il file del protocollo irAE è vuoto: {prompt_path}",
+            )
+            return
+
+        plans = self._build_irae_plans(self._services, patient_ids, protocol)
+
+        from .workers import IraeQueueWorker
+
+        self._irae_queue_worker = IraeQueueWorker(llm, plans)
+        worker = self._irae_queue_worker
+        results: list[dict] = []
+
+        total = len(plans)
+        progress = ProgressDialog(
+            f"Coda analisi irAE — paziente 1/{total}", parent=self,
+        )
+        progress.show()
+        QApplication.processEvents()
+
+        worker.patient_started.connect(
+            lambda idx, n, pid, progress=progress: (
+                progress.setWindowTitle(
+                    f"Coda analisi irAE — paziente {idx}/{n}"
+                ),
+                progress.add_log(f"\n===== Paziente {idx}/{n}: {pid} ====="),
+            )
+        )
+        worker.chunk_progress.connect(
+            lambda chunk, n, progress=progress: progress.set_progress(
+                int(chunk * 100 / n),
+                f"Analisi parte {chunk}/{n}...",
+            )
+        )
+        worker.patient_finished.connect(
+            lambda pid, markdown, results=results: (
+                results.append({
+                    "patient_id": pid, "label": pid, "markdown": markdown,
+                    "error": None,
+                }),
+                progress.add_log(f"✓ {pid}: analisi completata"),
+            )
+        )
+        worker.patient_error.connect(
+            lambda pid, error, results=results: (
+                results.append({
+                    "patient_id": pid, "label": pid, "markdown": "",
+                    "error": error,
+                }),
+                progress.add_log(f"❌ {pid}: {error}"),
+            )
+        )
+        progress.cancelled.connect(worker.cancel)
+
+        def _on_queue_finished():
+            worker.deleteLater()
+            self._irae_queue_worker = None
+            progress.mark_done()
+            progress.accept()
+            if results:
+                from .irae_queue_result_dialog import IraeQueueResultDialog
+                dialog = IraeQueueResultDialog(results, parent=self)
+                dialog.exec_()
+            else:
+                QMessageBox.information(
+                    self, "Nessun risultato",
+                    "Nessuna analisi completata.",
+                )
+
+        worker.finished.connect(_on_queue_finished)
+        worker.start()
 
     def run_extraction_for_docs(self, grouped: dict[str, list[str]]):
         """Run clinical-text extraction for explicit doc_ids, grouped by patient.

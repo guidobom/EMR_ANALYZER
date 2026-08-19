@@ -89,6 +89,23 @@ class TimelineRepository:
                     ],
                 )
 
+    def patients_with_entries(self) -> list[dict]:
+        """Summaries of every patient that HAS timeline entries.
+
+        Each dict carries ``id``, ``pseudonym``, ``initials``, ``sex``,
+        ``birth_year`` and ``timeline_count``; ordered most recently
+        created first.
+        """
+        rows = self.db.execute(
+            """SELECT p.id, p.pseudonym, p.initials, p.sex, p.birth_year,
+                      COUNT(t.entry_id) AS timeline_count
+               FROM patients p
+               JOIN clinical_timeline t ON t.patient_id = p.id
+               GROUP BY p.id
+               ORDER BY p.created_at DESC, p.id"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def count_by_patient(self, patient_id: str) -> int:
         """Return the number of timeline entries for a patient."""
         cursor = self.db.execute(
