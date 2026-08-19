@@ -159,6 +159,7 @@ OUTPUT
 Restituisci ESCLUSIVAMENTE una tabella Markdown, senza testo prima o dopo.
 Ogni riga è un irAE distinto; usa "—" per i dati non disponibili.
 La colonna Fonti riporta gli id delle voci del registro su cui si basa l'evento (es. "#12, #27, #33").
+La tabella principale deve avere ESATTAMENTE 13 colonne, come nell'intestazione riportata sotto: non aggiungere né togliere colonne.
 
 | ID | Organo | Evento (termine CTCAE) | Certezza | Prob. immuno-relata | Grado esordio | Grado max | Prima evidenza | Diagnosi | Trattamenti principali | Gestione IO | Risposta | Stato ultimo FU | Fonti |
 
