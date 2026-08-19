@@ -19,6 +19,7 @@ from ..settings import (
     load_chat_preferences,
     save_chat_preferences,
 )
+from ..utils.markdown_tables import render_markdown_to_html
 
 
 # Predefined query templates for the clinical history
@@ -56,6 +57,7 @@ class ClinicalHistoryTab(QWidget):
         self._narrative_worker = None
         self._query_worker = None
         self._dedup_worker = None
+        self._irae_worker = None
         # Per-patient chat trace: every prompt and response is persisted and
         # rendered as a timeline; switching patient replaces it entirely.
         self._chat_messages: list[ChatMessage] = []
@@ -138,6 +140,16 @@ class ClinicalHistoryTab(QWidget):
         self._query_btn.clicked.connect(self._run_query)
         self._query_btn.setEnabled(False)
         query_layout.addWidget(self._query_btn)
+
+        self._irae_btn = QPushButton("⚡ Analisi irAE")
+        self._irae_btn.setToolTip(
+            "Analizza l'INTERO registro cronologico con il protocollo "
+            "irAE (a chunk, senza limite delle ultime 100 voci) e mostra "
+            "le tabelle degli eventi avversi immuno-correlati."
+        )
+        self._irae_btn.clicked.connect(self._on_irae_analysis)
+        self._irae_btn.setEnabled(False)
+        query_layout.addWidget(self._irae_btn)
 
         layout.addLayout(query_layout)
 
@@ -276,6 +288,7 @@ class ClinicalHistoryTab(QWidget):
 
     _WORKER_ATTRS = (
         "_worker", "_narrative_worker", "_dedup_worker", "_query_worker",
+        "_irae_worker",
     )
 
     def _worker_running(self) -> bool:
@@ -360,6 +373,7 @@ class ClinicalHistoryTab(QWidget):
         self._query_btn.setEnabled(has_entries)
         self._narrative_btn.setEnabled(has_entries)
         self._dedup_btn.setEnabled(has_entries)
+        self._irae_btn.setEnabled(has_entries)
         self._count_label.setText(
             f"{len(self._timeline_entries)} voci nel registro cronologico"
         )
@@ -981,6 +995,83 @@ class ClinicalHistoryTab(QWidget):
             self._chat_transient_error = f"Errore: {error}"
             self._render_chat()
 
+    def _on_irae_analysis(self) -> None:
+        """Run the irAE protocol over the WHOLE registry, chunk by chunk."""
+        if self._guard_busy():
+            return
+        if not self._timeline_entries:
+            return
+
+        llm = self._services.get("clinical_state_llm_client")
+        if not llm or not llm.is_available:
+            QMessageBox.warning(
+                self, "LLM non disponibile",
+                "Il modello Clinical State non è disponibile.",
+            )
+            return
+
+        from ..clinical import irae_analysis
+
+        try:
+            prompt_path = irae_analysis.ensure_prompt()
+            protocol = irae_analysis.load_prompt(prompt_path)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Protocollo non disponibile", str(exc)
+            )
+            return
+        if not protocol:
+            QMessageBox.warning(
+                self, "Protocollo non disponibile",
+                f"Il file del protocollo irAE è vuoto: {prompt_path}",
+            )
+            return
+
+        entries_data = [e.to_dict() for e in self._timeline_entries]
+        prompts = irae_analysis.build_analysis_plan(
+            entries_data, self._clinical_profile, protocol
+        )
+
+        from .workers import IraeAnalysisWorker
+
+        self._irae_worker = IraeAnalysisWorker(llm, prompts)
+        self._irae_worker.progress.connect(self._on_irae_progress)
+        self._irae_worker.finished.connect(self._on_irae_finished)
+        self._irae_worker.error.connect(self._on_irae_error)
+        self._irae_worker.finished.connect(
+            lambda _result, attr="_irae_worker": self._release_worker(attr)
+        )
+        self._irae_btn.setEnabled(False)
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setMaximum(len(prompts))
+        self._progress_bar.setValue(0)
+        self._status_label.setText("Analisi irAE del registro completo...")
+        self._irae_worker.start()
+
+    def _on_irae_progress(self, chunk_index: int, chunk_total: int) -> None:
+        self._progress_bar.setValue(chunk_index)
+        self._status_label.setText(
+            f"Analisi irAE: parte {chunk_index}/{chunk_total}..."
+        )
+
+    def _on_irae_finished(self, combined_markdown: str) -> None:
+        self._progress_bar.setVisible(False)
+        self._status_label.setText("")
+        self._irae_btn.setEnabled(bool(self._timeline_entries))
+        from .irae_result_dialog import IraeResultDialog
+
+        dialog = IraeResultDialog(
+            combined_markdown, patient_id=self._current_patient_id or "",
+            parent=self,
+        )
+        dialog.exec_()
+
+    def _on_irae_error(self, error: str) -> None:
+        self._progress_bar.setVisible(False)
+        self._status_label.setText("")
+        self._irae_btn.setEnabled(bool(self._timeline_entries))
+        QMessageBox.critical(self, "Analisi irAE non riuscita", error)
+
     def _on_context_check_changed(self, state: int) -> None:
         self._use_conversation_context = bool(state)
         try:
@@ -1086,9 +1177,10 @@ class ClinicalHistoryTab(QWidget):
             except (TypeError, ValueError):
                 when = message.created_at or ""
             if message.role == "user":
+                rendered = render_markdown_to_html(message.content)
                 lines.append(
                     f"**🗨️ Tu** · {when}"
-                    f"<br>> {message.content.replace(chr(10), '<br>> ')}"
+                    f"<br>&gt; {rendered}"
                 )
             else:
                 meta = []
@@ -1097,9 +1189,10 @@ class ClinicalHistoryTab(QWidget):
                 if message.context_mode:
                     meta.append("contesto conversazionale")
                 suffix = f" · {' · '.join(meta)}" if meta else ""
+                rendered = render_markdown_to_html(message.content)
                 lines.append(
                     f"**🤖 Assistente** · {when}{suffix}"
-                    f"<br>{message.content.replace(chr(10), '<br>')}"
+                    f"<br>{rendered}"
                 )
             lines.append("---")
         if self._chat_transient_error:

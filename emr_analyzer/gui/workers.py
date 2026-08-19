@@ -95,6 +95,19 @@ _MAX_CONVERSATION_MESSAGES = 20   # 10 Q&A exchanges
 _MAX_CONVERSATION_CHARS_PER_MESSAGE = 300
 
 
+def format_registry_context(entries: list[dict], limit: int = 100) -> str:
+    """Compact registry lines with citable entry ids.
+
+    Each line carries ``[#id]`` so prompts can ask the model to cite the
+    exact registry entries behind every claim (traceability).
+    """
+    return "\n".join(
+        f"[#{e.get('entry_id', '?')}] [{e.get('date_observed', '?')}] "
+        f"[{e.get('category', '?')}] {e.get('description', '')}"
+        for e in entries[-limit:]
+    )
+
+
 def build_query_prompt(
     clinical_profile: str,
     entries_text: str,
@@ -163,11 +176,7 @@ class ClinicalHistoryQueryWorker(QThread):
             )
 
             # Merge profile + timeline as compact context
-            entries_text = "\n".join(
-                f"[{e.get('date_observed', '?')}] [{e.get('category', '?')}] "
-                f"{e.get('description', '')}"
-                for e in self.entries[-100:]
-            )
+            entries_text = format_registry_context(self.entries, limit=100)
 
             user_prompt = build_query_prompt(
                 self.clinical_profile,
@@ -181,3 +190,33 @@ class ClinicalHistoryQueryWorker(QThread):
             self.finished.emit(answer)
         except Exception as e:
             self.error.emit(f"Errore query: {str(e)}")
+
+
+class IraeAnalysisWorker(QThread):
+    """Run the irAE protocol over the whole registry, chunk by chunk."""
+    progress = pyqtSignal(int, int)  # chunk_index, chunk_total
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, llm_client, prompts: list[str], parent=None):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.prompts = prompts
+
+    def run(self):
+        from emr_analyzer.clinical.irae_analysis import SYSTEM_PROMPT
+
+        try:
+            parts = []
+            total = len(self.prompts)
+            for index, prompt in enumerate(self.prompts, start=1):
+                self.progress.emit(index, total)
+                answer = self.llm_client.generate_text(
+                    prompt, SYSTEM_PROMPT
+                )
+                parts.append(
+                    f"### Parte {index}/{total}\n\n{answer}"
+                )
+            self.finished.emit("\n\n".join(parts))
+        except Exception as exc:
+            self.error.emit(f"Errore analisi irAE: {str(exc)}")
