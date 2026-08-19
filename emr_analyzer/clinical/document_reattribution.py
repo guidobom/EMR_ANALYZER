@@ -212,6 +212,77 @@ class DocumentReattributionService:
 
     # ------------------------------------------------------------------
 
+    def confirm_attribution(
+        self,
+        doc_id: str,
+        queue_item_id=None,
+        resolution_status: str = "accepted",
+    ) -> ReattributionResult:
+        """Confirm that the document already belongs to the right patient.
+
+        Used for ambiguous identities (conflict verdicts): after human
+        inspection the reviewer can decide the current workspace IS the
+        correct one.  Nothing moves; the document is unlocked
+        (extraction_status → pending, error cleared), the queue row is
+        resolved and the narrative invalidated for rebuild.
+        """
+        doc = self.db.execute(
+            "SELECT * FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+        if doc is None:
+            return ReattributionResult(
+                document_id=doc_id, error="Documento non trovato nel database"
+            )
+        source = doc["patient_id"]
+        result = ReattributionResult(
+            document_id=doc_id,
+            source_patient_id=source,
+            target_patient_id=source,
+        )
+
+        try:
+            with self.db:
+                self.db.execute(
+                    """UPDATE documents
+                       SET extraction_status='pending', error_message=NULL
+                       WHERE id=?""",
+                    (doc_id,),
+                )
+                if queue_item_id is not None:
+                    cursor = self.db.execute(
+                        """UPDATE validation_queue
+                           SET status=?, corrected_value=NULL, resolved_at=?
+                           WHERE id=?""",
+                        (
+                            resolution_status,
+                            datetime.now().isoformat(),
+                            queue_item_id,
+                        ),
+                    )
+                    result.queue_resolved = cursor.rowcount > 0
+                    if cursor.rowcount == 0:
+                        result.warnings.append(
+                            "Elemento della coda non trovato"
+                        )
+                self.db.execute(
+                    "DELETE FROM clinical_state WHERE patient_id=?",
+                    (source,),
+                )
+        except Exception as exc:
+            result.error = (
+                f"Errore durante la conferma dell'attribuzione: {exc}"
+            )
+            return result
+
+        try:
+            self.audit_repo.log(
+                source, "attribution_confirmed", "document", doc_id,
+                {"resolution": resolution_status},
+            )
+        except Exception:
+            pass
+        return result
+
     def _repoint_timeline(self, source: str, target: str, doc_id: str,
                           result: ReattributionResult) -> None:
         """Repoint timeline rows owned exclusively by the moved document.

@@ -327,3 +327,54 @@ class DocumentReattributionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfirmAttributionTest(DocumentReattributionTest):
+    """In-place confirmation: nothing moves, the document is unlocked."""
+
+    def test_confirm_unlocks_and_resolves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture(Path(tmp))
+            service = self._service(fixture)
+            result = service.confirm_attribution(
+                "DOC_000001", queue_item_id=1, resolution_status="accepted"
+            )
+            self.assertTrue(result.ok, result.error)
+
+            doc = fixture["doc_repo"].get_by_id("DOC_000001")
+            self.assertEqual(doc.patient_id, "P001")  # non spostato
+            self.assertEqual(doc.extraction_status, "pending")
+            self.assertIsNone(doc.error_message)
+
+            qrow = fixture["db"].execute(
+                "SELECT * FROM validation_queue WHERE id=1"
+            ).fetchone()
+            self.assertEqual(qrow["status"], "accepted")
+            self.assertIsNotNone(qrow["resolved_at"])
+            self.assertEqual(qrow["patient_id"], "P001")
+
+            # Files untouched.
+            self.assertTrue(fixture["original"].exists())
+
+            # Narrative invalidated for the source patient only.
+            self.assertIsNone(fixture["db"].execute(
+                "SELECT 1 FROM clinical_state WHERE patient_id='P001'"
+            ).fetchone())
+            self.assertIsNotNone(fixture["db"].execute(
+                "SELECT 1 FROM clinical_state WHERE patient_id='P002'"
+            ).fetchone())
+
+            audit = fixture["db"].execute(
+                "SELECT action FROM audit_log "
+                "WHERE action='attribution_confirmed'"
+            ).fetchone()
+            self.assertIsNotNone(audit)
+
+    def test_confirm_missing_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture(Path(tmp))
+            result = self._service(fixture).confirm_attribution(
+                "DOC_999999", queue_item_id=1
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("non trovato", result.error or "")

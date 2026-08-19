@@ -47,6 +47,7 @@ class FakeReattribution:
     def __init__(self, db, ok=True):
         self.db = db
         self.calls: list[tuple] = []
+        self.confirms: list[tuple] = []
         self.ok = ok
 
     def move_document(self, doc_id, target, queue_item_id=None,
@@ -63,6 +64,24 @@ class FakeReattribution:
             document_id=doc_id,
             source_patient_id="P001",
             target_patient_id=target,
+            queue_resolved=self.ok and queue_item_id is not None,
+            error=None if self.ok else "errore simulato",
+        )
+
+    def confirm_attribution(self, doc_id, queue_item_id=None,
+                            resolution_status="accepted"):
+        self.confirms.append((doc_id, queue_item_id, resolution_status))
+        if self.ok and queue_item_id is not None:
+            self.db.execute(
+                "UPDATE validation_queue SET status=?, "
+                "resolved_at='2026-08-19T11:00:00' WHERE id=?",
+                (resolution_status, queue_item_id),
+            )
+            self.db.commit()
+        return ReattributionResult(
+            document_id=doc_id,
+            source_patient_id="P001",
+            target_patient_id="P001",
             queue_resolved=self.ok and queue_item_id is not None,
             error=None if self.ok else "errore simulato",
         )
@@ -310,6 +329,80 @@ class ValidationTabViewerTest(ValidationTabTest):
         )
         self._select_first_row()
         self.assertIsNone(self.tab._quick_look_path())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ValidationTabConfirmTest(ValidationTabTest):
+    """In-place confirmation for ambiguous (conflict) attribution items."""
+
+    def _conflict_row(self):
+        return self._insert_queue_row(
+            "attribution", "DOC_000001",
+            original_value=json.dumps({"suggested_patient_id": "ignoto"}),
+        )
+
+    def test_accept_conflict_with_current_patient_confirms_in_place(self):
+        queue_id = self._conflict_row()
+        self._select_first_row()
+
+        with mock.patch(
+            "emr_analyzer.gui.validation_tab.QInputDialog.getItem",
+            return_value=(
+                "P001 — 001 (paziente corrente — conferma "
+                "l'attribuzione attuale)", True,
+            ),
+        ):
+            self.tab._resolve("accepted")
+
+        self.assertEqual(self.reattribution.calls, [])
+        self.assertEqual(self.reattribution.confirms, [
+            ("DOC_000001", queue_id, "accepted"),
+        ])
+        self.assertEqual(self.emitted, [("P001", "P001")])
+        self.assertEqual(self.tab._table.rowCount(), 0)
+
+    def test_correct_conflict_with_current_patient_confirms_in_place(self):
+        queue_id = self._conflict_row()
+        self._select_first_row()
+
+        with mock.patch(
+            "emr_analyzer.gui.validation_tab.QInputDialog.getItem",
+            return_value=("P001 — 001 (paziente corrente — conferma "
+                          "l'attribuzione attuale)", True),
+        ):
+            self.tab._on_correct()
+
+        self.assertEqual(self.reattribution.confirms, [
+            ("DOC_000001", queue_id, "corrected"),
+        ])
+
+    def test_chooser_includes_current_patient_first(self):
+        self._conflict_row()
+        self._select_first_row()
+
+        with mock.patch(
+            "emr_analyzer.gui.validation_tab.QInputDialog.getItem",
+            return_value=("P002 — 002", True),
+        ) as get_item:
+            self.tab._on_correct()
+
+        labels = get_item.call_args[0][3]
+        self.assertIn("paziente corrente", labels[0])
+
+    def test_accept_with_valid_suggested_still_moves(self):
+        queue_id = self._insert_queue_row(
+            "attribution", "DOC_000001",
+            original_value=json.dumps({"suggested_patient_id": "P002"}),
+        )
+        self._select_first_row()
+        self.tab._resolve("accepted")
+        self.assertEqual(self.reattribution.calls, [
+            ("DOC_000001", "P002", queue_id, "accepted"),
+        ])
+        self.assertEqual(self.reattribution.confirms, [])
 
 
 if __name__ == "__main__":

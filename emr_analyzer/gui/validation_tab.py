@@ -179,7 +179,12 @@ class ValidationTab(QWidget):
                 if row_data.get("item_type") == "attribution":
                     suggested = self._suggested_patient(row_data)
                     if suggested:
-                        detail += f"\nPaziente suggerito: {suggested}"
+                        detail += (
+                            f"\nPaziente suggerito: {suggested}"
+                            if suggested != "ignoto"
+                            else "\nPaziente suggerito: nessuno "
+                                 "(identità ambigua tra più pazienti)"
+                        )
                 if row_data.get("original_value"):
                     detail += f"\nValore originale:\n{row_data['original_value']}"
                 self._detail_text.setPlainText(detail)
@@ -260,26 +265,34 @@ class ValidationTab(QWidget):
 
     def _accept_attribution(self, row_data: dict) -> None:
         """Accept an attribution item: move the document to the suggested
-        patient (or a chosen one) and unlock its extraction."""
+        patient (or a chosen one) and unlock its extraction.  When no
+        valid suggestion exists (conflict verdicts), the reviewer chooses
+        the destination — including the current patient, which confirms
+        the attribution in place."""
         doc_id = str(row_data.get("item_id") or "")
-        suggested = self._suggested_patient(row_data)
         patient_repo = self._services.get("patient_repo")
 
-        target = None
-        if suggested:
-            patient = patient_repo.get_by_id(suggested) if patient_repo else None
-            if patient is not None and suggested != self._current_patient_id:
-                target = suggested
+        suggested = self._suggested_patient(row_data)
+        suggested_patient = (
+            patient_repo.get_by_id(suggested) if patient_repo and suggested else None
+        )
+        target = (
+            suggested
+            if suggested_patient is not None
+            and suggested != self._current_patient_id
+            else None
+        )
 
         if target is None:
-            # Suggested patient invalid or the document already belongs to
-            # the current workspace: fall back to an explicit choice.
-            if suggested is None:
-                QMessageBox.information(
-                    self, "Paziente suggerito non disponibile",
-                    "Il paziente suggerito non è disponibile. "
-                    "Scegli una destinazione.",
-                )
+            # No usable suggestion: explain, then let the reviewer pick
+            # (this is the conflict-verdict case).
+            QMessageBox.information(
+                self, "Paziente suggerito non disponibile",
+                "Il documento non ha un paziente suggerito valido "
+                "(identità ambigua tra più pazienti).\n"
+                "Scegli la destinazione corretta, oppure conferma il "
+                "paziente corrente se l'attribuzione attuale è giusta.",
+            )
             target = self._choose_target_patient(row_data)
             if target is None:
                 return
@@ -338,24 +351,35 @@ class ValidationTab(QWidget):
             self._refresh()
 
     def _choose_target_patient(self, row_data: dict) -> str | None:
-        """Let the user pick the destination patient for a document."""
+        """Let the user pick the destination patient for a document.
+
+        The current patient is offered first as an explicit option: for
+        conflict verdicts the reviewer may conclude the existing
+        attribution is already correct.
+        """
         patient_repo = self._services.get("patient_repo")
-        patients = [
-            p for p in (patient_repo.list_all() if patient_repo else [])
-            if p.id != self._current_patient_id
-        ]
-        if not patients:
+        all_patients = patient_repo.list_all() if patient_repo else []
+        current = next(
+            (p for p in all_patients if p.id == self._current_patient_id),
+            None,
+        )
+        others = [p for p in all_patients if p.id != self._current_patient_id]
+        if not others and current is None:
             QMessageBox.warning(
                 self, "Nessuna destinazione",
-                "Non esistono altri pazienti a cui assegnare il documento.",
+                "Non esistono pazienti a cui assegnare il documento.",
             )
             return None
 
         labels = []
         ids = []
-        suggested = self._suggested_patient(row_data)
-        suggested_index = 0
-        for index, patient in enumerate(patients):
+        if current is not None:
+            labels.append(
+                f"{current.id} — {current.pseudonym} "
+                "(paziente corrente — conferma l'attribuzione attuale)"
+            )
+            ids.append(current.id)
+        for patient in others:
             extras = " • ".join(
                 part for part in (
                     patient.initials, patient.sex,
@@ -367,8 +391,9 @@ class ValidationTab(QWidget):
                 + (f" • {extras}" if extras else "")
             )
             ids.append(patient.id)
-            if patient.id == suggested:
-                suggested_index = index
+
+        suggested = self._suggested_patient(row_data)
+        suggested_index = ids.index(suggested) if suggested in ids else 0
 
         chosen, ok = QInputDialog.getItem(
             self, "Correggi attribuzione",
@@ -378,7 +403,7 @@ class ValidationTab(QWidget):
         )
         if not ok:
             return None
-        # The label is "P001 — pseudonym • extras": the id is the prefix.
+        # The label is "P001 — pseudonym ...": the id is the prefix.
         chosen_id = str(chosen).split(" — ")[0].strip()
         return chosen_id if chosen_id in ids else None
 
@@ -436,7 +461,7 @@ class ValidationTab(QWidget):
     def _perform_reattribution(
         self, row_data: dict, target: str, resolution_status: str
     ) -> None:
-        """Run the move and surface the outcome."""
+        """Run the move (or in-place confirmation) and surface the outcome."""
         service = self._services.get("document_reattribution")
         if not service:
             QMessageBox.critical(
@@ -446,18 +471,33 @@ class ValidationTab(QWidget):
             return
 
         doc_id = str(row_data.get("item_id") or "")
-        result = service.move_document(
-            doc_id, target,
-            queue_item_id=row_data.get("id"),
-            resolution_status=resolution_status,
-        )
-        if result.ok:
-            QMessageBox.information(
-                self, "Documento spostato",
-                f"Documento {doc_id} spostato al paziente {target}.\n"
-                "L'estrazione è stata sbloccata: rielaboralo dalla scheda "
-                "Documenti del paziente.",
+        if target == self._current_patient_id:
+            result = service.confirm_attribution(
+                doc_id,
+                queue_item_id=row_data.get("id"),
+                resolution_status=resolution_status,
             )
+        else:
+            result = service.move_document(
+                doc_id, target,
+                queue_item_id=row_data.get("id"),
+                resolution_status=resolution_status,
+            )
+        if result.ok:
+            if target == self._current_patient_id:
+                QMessageBox.information(
+                    self, "Attribuzione confermata",
+                    f"Documento {doc_id} confermato per il paziente "
+                    f"{target}.\nL'estrazione è stata sbloccata: "
+                    "rielaboralo dalla scheda Documenti del paziente.",
+                )
+            else:
+                QMessageBox.information(
+                    self, "Documento spostato",
+                    f"Documento {doc_id} spostato al paziente {target}.\n"
+                    "L'estrazione è stata sbloccata: rielaboralo dalla "
+                    "scheda Documenti del paziente.",
+                )
             self.document_reattributed.emit(
                 result.source_patient_id, result.target_patient_id
             )
