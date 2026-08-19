@@ -341,3 +341,30 @@ class BusyGuardTest(ClinicalHistoryChatTabTest):
             self.tab._query_preset.model().item(index).isEnabled()
         )
         self.assertTrue(self.tab._irae_btn.isEnabled())
+
+
+class IraeNoRegistryTest(ClinicalHistoryChatTabTest):
+    """The irAE entry points need a registry: no silent no-ops."""
+
+    def _without_registry(self):
+        with mock.patch.object(
+            FakeTimelineRepo, "get_by_patient", return_value=[]
+        ):
+            self.tab.load_patient("P001")
+
+    def test_preset_and_button_disabled_without_registry(self):
+        self._without_registry()
+        index = self.tab._query_preset.findData("__IRAE_ANALYSIS__")
+        self.assertFalse(
+            self.tab._query_preset.model().item(index).isEnabled()
+        )
+        self.assertFalse(self.tab._irae_btn.isEnabled())
+
+    def test_direct_call_without_registry_shows_message(self):
+        self._without_registry()
+        with mock.patch.object(
+            QMessageBox, "information", return_value=None
+        ) as info:
+            self.tab._on_irae_analysis()
+        self.assertIn("Nessun registro", info.call_args[0][1])
+        self.assertIsNone(self.tab._irae_worker)

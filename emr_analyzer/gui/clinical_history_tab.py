@@ -329,13 +329,16 @@ class ClinicalHistoryTab(QWidget):
         return False
 
     def _update_busy_ui(self) -> None:
-        """Grey out the irAE entry points while any worker is running."""
+        """Grey out the irAE entry points while a worker runs or when the
+        patient has no registry (silent no-ops are never acceptable)."""
         busy = self._worker_running()
         has_entries = bool(self._timeline_entries)
         self._irae_btn.setEnabled(has_entries and not busy)
         index = self._query_preset.findData("__IRAE_ANALYSIS__")
         if index >= 0:
-            self._query_preset.model().item(index).setEnabled(not busy)
+            self._query_preset.model().item(index).setEnabled(
+                has_entries and not busy
+            )
 
     def _release_worker(self, attr: str) -> None:
         """Drop a finished worker safely (thread already ended).
@@ -1040,6 +1043,11 @@ class ClinicalHistoryTab(QWidget):
         if self._guard_busy():
             return
         if not self._timeline_entries:
+            QMessageBox.information(
+                self, "Nessun registro",
+                "Nessuna storia clinica disponibile per questo paziente. "
+                "Genera prima il registro cronologico.",
+            )
             return
 
         llm = self._services.get("clinical_state_llm_client")
@@ -1055,9 +1063,19 @@ class ClinicalHistoryTab(QWidget):
         try:
             prompt_path = irae_analysis.ensure_prompt()
             protocol = irae_analysis.load_prompt(prompt_path)
+            entries_data = [e.to_dict() for e in self._timeline_entries]
+            prompts = irae_analysis.build_analysis_plan(
+                entries_data, self._clinical_profile, protocol
+            )
         except OSError as exc:
             QMessageBox.warning(
                 self, "Protocollo non disponibile", str(exc)
+            )
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Analisi irAE non riuscita",
+                f"Errore durante la preparazione dell'analisi: {exc}",
             )
             return
         if not protocol:
@@ -1066,11 +1084,6 @@ class ClinicalHistoryTab(QWidget):
                 f"Il file del protocollo irAE è vuoto: {prompt_path}",
             )
             return
-
-        entries_data = [e.to_dict() for e in self._timeline_entries]
-        prompts = irae_analysis.build_analysis_plan(
-            entries_data, self._clinical_profile, protocol
-        )
 
         from .workers import IraeAnalysisWorker
 
