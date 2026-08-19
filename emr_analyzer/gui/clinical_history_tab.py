@@ -301,16 +301,41 @@ class ClinicalHistoryTab(QWidget):
             for attr in self._WORKER_ATTRS
         )
 
+    def _running_operation_name(self) -> str | None:
+        """Label of the operation currently running, if any."""
+        running = (
+            ("_irae_worker", "l'analisi irAE"),
+            ("_query_worker", "l'interrogazione"),
+            ("_worker", "la generazione del registro"),
+            ("_dedup_worker", "la deduplicazione"),
+            ("_narrative_worker", "la generazione del profilo narrativo"),
+        )
+        for attr, label in running:
+            worker = getattr(self, attr, None)
+            if worker is not None and worker.isRunning():
+                return label
+        return None
+
     def _guard_busy(self) -> bool:
         """Block an action while a worker is running (returns True)."""
-        if self._worker_running():
+        operation = self._running_operation_name()
+        if operation is not None:
             QMessageBox.information(
                 self, "Operazione in corso",
-                "Attendi il completamento dell'operazione corrente "
-                "prima di avviarne un'altra.",
+                f"Attendi il completamento di {operation} prima di "
+                "avviarne un'altra.",
             )
             return True
         return False
+
+    def _update_busy_ui(self) -> None:
+        """Grey out the irAE entry points while any worker is running."""
+        busy = self._worker_running()
+        has_entries = bool(self._timeline_entries)
+        self._irae_btn.setEnabled(has_entries and not busy)
+        index = self._query_preset.findData("__IRAE_ANALYSIS__")
+        if index >= 0:
+            self._query_preset.model().item(index).setEnabled(not busy)
 
     def _release_worker(self, attr: str) -> None:
         """Drop a finished worker safely (thread already ended).
@@ -324,6 +349,7 @@ class ClinicalHistoryTab(QWidget):
         setattr(self, attr, None)
         if worker is not None:
             worker.deleteLater()
+        self._update_busy_ui()
 
     def shutdown(self) -> None:
         """Wait for running workers (application quit path)."""
@@ -375,7 +401,7 @@ class ClinicalHistoryTab(QWidget):
         self._query_btn.setEnabled(has_entries)
         self._narrative_btn.setEnabled(has_entries)
         self._dedup_btn.setEnabled(has_entries)
-        self._irae_btn.setEnabled(has_entries)
+        self._update_busy_ui()
         self._count_label.setText(
             f"{len(self._timeline_entries)} voci nel registro cronologico"
         )
@@ -640,6 +666,7 @@ class ClinicalHistoryTab(QWidget):
         self._dedup_btn.setEnabled(False)
         self._dedup_btn.setText("⏳ Deduplica in corso...")
         self._dedup_worker.start()
+        self._update_busy_ui()
 
     def _on_dedup_finished(self, removed: int):
         self._dedup_btn.setEnabled(True)
@@ -745,6 +772,7 @@ class ClinicalHistoryTab(QWidget):
         self._progress_bar.setValue(0)
         self._status_label.setText("Estrazione osservazioni cliniche...")
         self._worker.start()
+        self._update_busy_ui()
 
     def _on_generation_progress(self, percent: int, message: str):
         self._progress_bar.setValue(percent)
@@ -863,6 +891,7 @@ class ClinicalHistoryTab(QWidget):
         self._narrative_btn.setEnabled(False)
         self._narrative_btn.setText("⏳ Generazione in corso...")
         self._narrative_worker.start()
+        self._update_busy_ui()
 
     def _on_narrative_finished(self, narrative: str):
         self._clinical_profile = narrative
@@ -970,6 +999,7 @@ class ClinicalHistoryTab(QWidget):
         self._query_btn.setEnabled(False)
         self._query_btn.setText("⏳ Interrogazione in corso...")
         self._query_worker.start()
+        self._update_busy_ui()
 
     def _on_query_result(self, answer: str):
         pending = self._pending_query
@@ -1057,6 +1087,7 @@ class ClinicalHistoryTab(QWidget):
         self._progress_bar.setValue(0)
         self._status_label.setText("Analisi irAE del registro completo...")
         self._irae_worker.start()
+        self._update_busy_ui()
 
     def _on_irae_progress(self, chunk_index: int, chunk_total: int) -> None:
         self._progress_bar.setValue(chunk_index)

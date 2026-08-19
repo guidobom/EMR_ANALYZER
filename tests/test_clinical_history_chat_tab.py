@@ -298,3 +298,46 @@ class IraePresetTest(ClinicalHistoryChatTabTest):
         with mock.patch.object(self.tab, "_on_irae_analysis"):
             self.tab._query_preset.setCurrentIndex(index)
         self.assertEqual(self.tab._query_text.toPlainText(), "")
+
+
+class BusyGuardTest(ClinicalHistoryChatTabTest):
+    """The busy guard names the running operation and greys the entry."""
+
+    def _fake_running_worker(self):
+        worker = mock.MagicMock()
+        worker.isRunning.return_value = True
+        self.tab._query_worker = worker
+        self.tab._update_busy_ui()
+        return worker
+
+    def test_busy_state_disables_preset_and_button(self):
+        self.tab.load_patient("P001")
+        self._fake_running_worker()
+        index = self.tab._query_preset.findData("__IRAE_ANALYSIS__")
+        self.assertFalse(
+            self.tab._query_preset.model().item(index).isEnabled()
+        )
+        self.assertFalse(self.tab._irae_btn.isEnabled())
+
+    def test_guard_message_names_the_operation(self):
+        self.tab.load_patient("P001")
+        self._fake_running_worker()
+        self.assertEqual(
+            self.tab._running_operation_name(), "l'interrogazione"
+        )
+        with mock.patch.object(
+            QMessageBox, "information", return_value=None
+        ) as info:
+            self.assertTrue(self.tab._guard_busy())
+        self.assertIn("l'interrogazione", info.call_args[0][2])
+
+    def test_release_reenables_entry_points(self):
+        self.tab.load_patient("P001")
+        worker = self._fake_running_worker()
+        worker.isRunning.return_value = False
+        self.tab._release_worker("_query_worker")
+        index = self.tab._query_preset.findData("__IRAE_ANALYSIS__")
+        self.assertTrue(
+            self.tab._query_preset.model().item(index).isEnabled()
+        )
+        self.assertTrue(self.tab._irae_btn.isEnabled())
