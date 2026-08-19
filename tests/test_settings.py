@@ -11,8 +11,10 @@ from emr_analyzer.config import (
 )
 from emr_analyzer.settings import (
     LLMRoleConfig,
+    load_chat_preferences,
     load_llm_configs,
     load_model_assignments,
+    save_chat_preferences,
     save_llm_configs,
     save_model_assignment,
 )
@@ -93,6 +95,63 @@ class ModelSettingsTest(unittest.TestCase):
             self.assertEqual(configs["document"].model, "legacy-doc")
             self.assertEqual(configs["clinical_state"].model, "legacy-state")
             self.assertGreater(configs["document"].context_length, 0)
+
+
+class ChatPreferencesTest(unittest.TestCase):
+    """Per-patient chat panel preferences (payload["chat"])."""
+
+    def test_default_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            self.assertEqual(
+                load_chat_preferences(path),
+                {"use_conversation_context": False},
+            )
+
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            save_chat_preferences({"use_conversation_context": True}, path)
+            self.assertEqual(
+                load_chat_preferences(path),
+                {"use_conversation_context": True},
+            )
+            save_chat_preferences({"use_conversation_context": False}, path)
+            self.assertEqual(
+                load_chat_preferences(path),
+                {"use_conversation_context": False},
+            )
+
+    def test_preserves_llm_keys_and_vice_versa(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            save_chat_preferences({"use_conversation_context": True}, path)
+            save_model_assignment("document", "qwen3-14b", path)
+            self.assertEqual(
+                load_chat_preferences(path),
+                {"use_conversation_context": True},
+            )
+            self.assertEqual(
+                load_model_assignments(path)["document"], "qwen3-14b"
+            )
+
+    def test_non_dict_prefs_coerced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            save_chat_preferences({"use_conversation_context": "si"}, path)
+            self.assertEqual(
+                load_chat_preferences(path),
+                {"use_conversation_context": True},
+            )
+
+    def test_corrupt_payload_tolerated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text("{not-json", encoding="utf-8")
+            self.assertEqual(
+                load_chat_preferences(path),
+                {"use_conversation_context": False},
+            )
 
 
 if __name__ == "__main__":

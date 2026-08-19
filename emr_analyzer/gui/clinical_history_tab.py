@@ -7,12 +7,18 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
     QTreeWidget, QTreeWidgetItem, QComboBox, QLabel, QSplitter,
     QMessageBox, QProgressBar, QFileDialog, QMenu, QAction,
-    QInputDialog,
+    QInputDialog, QCheckBox, QTextBrowser,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
+from ..models.chat_message import ChatMessage
 from ..models.clinical_timeline import CATEGORY_LABELS
+from ..settings import (
+    SETTINGS_PATH,
+    load_chat_preferences,
+    save_chat_preferences,
+)
 
 
 # Predefined query templates for the clinical history
@@ -40,7 +46,7 @@ HISTORY_QUERIES = [
 class ClinicalHistoryTab(QWidget):
     """Chronological clinical history view with generation and query."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, settings_path=None):
         super().__init__(parent)
         self._services = {}
         self._current_patient_id = None
@@ -49,6 +55,16 @@ class ClinicalHistoryTab(QWidget):
         self._worker = None
         self._narrative_worker = None
         self._query_worker = None
+        # Per-patient chat trace: every prompt and response is persisted and
+        # rendered as a timeline; switching patient replaces it entirely.
+        self._chat_messages: list[ChatMessage] = []
+        self._chat_transient_error = ""
+        self._pending_query: dict | None = None
+        self._chat_settings_path = settings_path or SETTINGS_PATH
+        preferences = load_chat_preferences(self._chat_settings_path)
+        self._use_conversation_context = bool(
+            preferences.get("use_conversation_context", False)
+        )
         self._setup_ui()
 
     # ------------------------------------------------------------------
@@ -124,6 +140,25 @@ class ClinicalHistoryTab(QWidget):
 
         layout.addLayout(query_layout)
 
+        # ---- Chat options --------------------------------------------------
+        chat_options_layout = QHBoxLayout()
+        self._use_context_check = QCheckBox(
+            "Ricorda la conversazione (usa le risposte precedenti come "
+            "contesto)"
+        )
+        self._use_context_check.setChecked(self._use_conversation_context)
+        self._use_context_check.setToolTip(
+            "Se attivo, ogni nuova risposta tiene conto delle domande e "
+            "risposte precedenti per questo paziente. La preferenza è "
+            "salvata globalmente."
+        )
+        self._use_context_check.stateChanged.connect(
+            self._on_context_check_changed
+        )
+        chat_options_layout.addWidget(self._use_context_check)
+        chat_options_layout.addStretch()
+        layout.addLayout(chat_options_layout)
+
         # ---- Main content: splitter timeline | profile + answer --------
         splitter = QSplitter(Qt.Horizontal)
 
@@ -153,14 +188,12 @@ class ClinicalHistoryTab(QWidget):
         )
         right_layout.addWidget(self._profile_text, stretch=1)
 
-        right_layout.addWidget(QLabel("<b>Risposta Query</b>"))
-        self._answer_text = QTextEdit()
-        self._answer_text.setReadOnly(True)
-        self._answer_text.setPlaceholderText(
-            "Seleziona un prompt predefinito o scrivi una domanda e "
-            "clicca 'Interroga'."
-        )
-        right_layout.addWidget(self._answer_text, stretch=1)
+        right_layout.addWidget(QLabel("<b>Cronologia Domande & Risposte</b>"))
+        self._chat_view = QTextBrowser()
+        self._chat_view.setReadOnly(True)
+        self._chat_view.setOpenExternalLinks(False)
+        right_layout.addWidget(self._chat_view, stretch=1)
+        self._render_chat()
 
         splitter.addWidget(right_widget)
         splitter.setSizes([500, 500])
@@ -232,7 +265,9 @@ class ClinicalHistoryTab(QWidget):
         if not self._current_patient_id:
             self._tree.clear()
             self._profile_text.clear()
-            self._answer_text.clear()
+            self._chat_messages = []
+            self._chat_transient_error = ""
+            self._render_chat()
             return
 
         # Load timeline entries
@@ -267,6 +302,13 @@ class ClinicalHistoryTab(QWidget):
         self._count_label.setText(
             f"{len(self._timeline_entries)} voci nel registro cronologico"
         )
+
+        # Load the chat trace of THIS patient only — the single reload
+        # funnel guarantees that switching patients never shows another
+        # patient's conversation.
+        self._chat_messages = self._load_chat_messages()
+        self._chat_transient_error = ""
+        self._render_chat()
 
     # ------------------------------------------------------------------
     # Tree building — flat chronological list
@@ -757,23 +799,64 @@ class ClinicalHistoryTab(QWidget):
             return
 
         if not self._timeline_entries:
-            self._answer_text.setPlainText(
-                "Nessuna storia clinica disponibile. "
-                "Generala prima con il pulsante 'Genera Registro Cronologico'."
+            self._chat_transient_error = (
+                "Nessuna storia clinica disponibile. Generala prima con il "
+                "pulsante 'Genera Registro Cronologico'."
             )
+            self._render_chat()
             return
 
+        # The conversation slice must NOT include the question being asked
+        # now: build it BEFORE appending the user message.
+        use_context = (
+            self._use_context_check.isChecked()
+            and len(self._chat_messages) >= 2
+        )
+        conversation = (
+            self._conversation_slice() if use_context else None
+        )
+
+        patient_id = self._current_patient_id
         llm = self._services.get("clinical_state_llm_client")
+        model_used = getattr(llm, "model", "") if llm is not None else ""
+
+        # Persist + render the user prompt (the trace survives restarts).
+        user_message = self._make_message(
+            "user", question, model_used=model_used, context_mode=0
+        )
+        self._persist_message(user_message)
+        self._chat_messages.append(user_message)
+        self._chat_transient_error = ""
+        self._render_chat()
+
         if not llm or not llm.is_available:
-            # Fallback to local keyword search
-            self._answer_text.setMarkdown(self._local_search(question))
+            # Fallback to local keyword search — recorded like an answer.
+            answer = self._local_search(question)
+            assistant_message = self._make_message(
+                "assistant", answer,
+                model_used="local_search", context_mode=0,
+            )
+            self._persist_message(assistant_message)
+            self._chat_messages.append(assistant_message)
+            self._render_chat()
             return
 
         entries_data = [e.to_dict() for e in self._timeline_entries]
 
+        # Capture the patient at query time: if the user switches patients
+        # while the worker runs, the answer is persisted to the RIGHT
+        # patient and never rendered on the wrong panel.
+        self._pending_query = {
+            "patient_id": patient_id,
+            "model_used": model_used,
+            "context_mode": int(use_context),
+        }
+
         from .workers import ClinicalHistoryQueryWorker
         self._query_worker = ClinicalHistoryQueryWorker(
-            llm, entries_data, self._clinical_profile, question
+            llm, entries_data, self._clinical_profile, question,
+            conversation=conversation,
+            use_conversation_context=use_context,
         )
         self._query_worker.finished.connect(self._on_query_result)
         self._query_worker.error.connect(self._on_query_error)
@@ -782,14 +865,137 @@ class ClinicalHistoryTab(QWidget):
         self._query_worker.start()
 
     def _on_query_result(self, answer: str):
-        self._answer_text.setMarkdown(answer)
-        self._query_btn.setEnabled(True)
+        pending = self._pending_query
+        self._pending_query = None
+        self._query_btn.setEnabled(bool(self._timeline_entries))
         self._query_btn.setText("🔍 Interroga")
 
+        if pending is None:
+            return
+        assistant_message = self._make_message(
+            "assistant", answer,
+            model_used=pending["model_used"],
+            context_mode=pending["context_mode"],
+            patient_id=pending["patient_id"],
+        )
+        self._persist_message(assistant_message)
+        # Render only when the tab still shows the patient who asked.
+        if self._current_patient_id == pending["patient_id"]:
+            self._chat_messages.append(assistant_message)
+            self._render_chat()
+
     def _on_query_error(self, error: str):
-        self._answer_text.setPlainText(f"Errore: {error}")
-        self._query_btn.setEnabled(True)
+        pending = self._pending_query
+        self._pending_query = None
+        self._query_btn.setEnabled(bool(self._timeline_entries))
         self._query_btn.setText("🔍 Interroga")
+
+        # Transient, never persisted; only for the patient who asked.
+        if (
+            pending is not None
+            and self._current_patient_id == pending["patient_id"]
+        ):
+            self._chat_transient_error = f"Errore: {error}"
+            self._render_chat()
+
+    def _on_context_check_changed(self, state: int) -> None:
+        self._use_conversation_context = bool(state)
+        try:
+            save_chat_preferences(
+                {"use_conversation_context": bool(state)},
+                self._chat_settings_path,
+            )
+        except OSError:
+            pass  # preference persistence is best-effort
+
+    # ------------------------------------------------------------------
+    # Chat trace helpers
+    # ------------------------------------------------------------------
+
+    def _load_chat_messages(self) -> list[ChatMessage]:
+        """Messages of the current patient, newest last."""
+        chat_repo = self._services.get("chat_repo")
+        if not chat_repo:
+            return []
+        try:
+            return chat_repo.get_by_patient(self._current_patient_id)
+        except Exception:
+            return []
+
+    def _make_message(
+        self, role: str, content: str, *, model_used: str, context_mode: int,
+        patient_id: str | None = None,
+    ) -> ChatMessage:
+        from ..database.chat_repo import ChatRepository
+
+        return ChatMessage(
+            id=ChatRepository.new_id(),
+            patient_id=patient_id or self._current_patient_id or "",
+            role=role,
+            content=content,
+            model_used=model_used,
+            context_mode=int(context_mode),
+            created_at=datetime.now().isoformat(),
+        )
+
+    def _persist_message(self, message: ChatMessage) -> None:
+        chat_repo = self._services.get("chat_repo")
+        if not chat_repo or not message.patient_id:
+            return
+        try:
+            chat_repo.add_message(message)
+        except Exception:
+            pass  # the trace is best-effort; the UI keeps working
+
+    def _conversation_slice(self) -> list[dict]:
+        """Prior Q&A of the current patient, newest last (capped upstream)."""
+        return [
+            {"role": m.role, "content": m.content}
+            for m in self._chat_messages
+        ]
+
+    def _render_chat(self) -> None:
+        """Render the per-patient prompt/response timeline."""
+        if not self._chat_messages and not self._chat_transient_error:
+            self._chat_view.setHtml(
+                "<i>La cronologia delle domande e risposte per questo "
+                "paziente apparirà qui.</i>"
+            )
+            return
+
+        lines = []
+        for message in self._chat_messages:
+            try:
+                when = datetime.fromisoformat(
+                    message.created_at
+                ).strftime("%d/%m/%Y %H:%M")
+            except (TypeError, ValueError):
+                when = message.created_at or ""
+            if message.role == "user":
+                lines.append(
+                    f"**🗨️ Tu** · {when}"
+                    f"<br>> {message.content.replace(chr(10), '<br>> ')}"
+                )
+            else:
+                meta = []
+                if message.model_used:
+                    meta.append(f"modello `{message.model_used}`")
+                if message.context_mode:
+                    meta.append("contesto conversazionale")
+                suffix = f" · {' · '.join(meta)}" if meta else ""
+                lines.append(
+                    f"**🤖 Assistente** · {when}{suffix}"
+                    f"<br>{message.content.replace(chr(10), '<br>')}"
+                )
+            lines.append("---")
+        if self._chat_transient_error:
+            lines.append(
+                f"<span style='color:#c0392b;'>⚠️ "
+                f"{self._chat_transient_error}</span>"
+            )
+        self._chat_view.setHtml("<br>".join(lines))
+        scrollbar = self._chat_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _local_search(self, question: str) -> str:
         """Simple keyword-based search when LLM is unavailable."""

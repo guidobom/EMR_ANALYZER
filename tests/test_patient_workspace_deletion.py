@@ -92,6 +92,11 @@ class PatientWorkspaceDeletionTest(unittest.TestCase):
             ("""INSERT INTO audit_log
                 (patient_id, action, target_type, target_id, timestamp)
                 VALUES (?, 'test', 'patient', ?, ?)""", ("P002", "P002", now)),
+            ("""INSERT INTO clinical_chat
+                (id, patient_id, role, content, model_used, context_mode,
+                 created_at)
+                VALUES (?, ?, 'user', 'domanda', '', 0, ?)""",
+             ("CHAT_1", "P001", now)),
         ]
         with db:
             for sql, params in statements:

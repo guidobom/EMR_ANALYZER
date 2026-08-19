@@ -88,18 +88,70 @@ class NarrativeWorker(QThread):
             self.error.emit(str(e))
 
 
+# Conversational context cap: last N messages, truncated per message, so
+# the embedded history never crowds out the clinical registry in the
+# context window (default LLM context is 32K tokens).
+_MAX_CONVERSATION_MESSAGES = 20   # 10 Q&A exchanges
+_MAX_CONVERSATION_CHARS_PER_MESSAGE = 300
+
+
+def build_query_prompt(
+    clinical_profile: str,
+    entries_text: str,
+    question: str,
+    conversation: list[dict] | None = None,
+    use_conversation_context: bool = False,
+) -> str:
+    """Build the user prompt of a clinical query.
+
+    When *use_conversation_context* is True and prior messages exist, a
+    ``CONVERSAZIONE PRECEDENTE`` section is embedded before the question so
+    follow-up questions can reference earlier answers (capped: last 20
+    messages, 300 chars each).  Otherwise the prompt is identical to the
+    classic single-shot form.
+    """
+    conversation_text = ""
+    if use_conversation_context and conversation:
+        lines = []
+        for message in conversation[-_MAX_CONVERSATION_MESSAGES:]:
+            speaker = (
+                "UTENTE" if message.get("role") == "user" else "ASSISTENTE"
+            )
+            content = str(message.get("content") or "")
+            if len(content) > _MAX_CONVERSATION_CHARS_PER_MESSAGE:
+                content = content[:_MAX_CONVERSATION_CHARS_PER_MESSAGE] + "…"
+            lines.append(f"[{speaker}] {content}")
+        if lines:
+            conversation_text = (
+                "CONVERSAZIONE PRECEDENTE:\n" + "\n".join(lines) + "\n\n"
+            )
+
+    return (
+        f"PROFILO CLINICO:\n{clinical_profile}\n\n"
+        f"REGISTRO CRONOLOGICO:\n{entries_text}\n\n"
+        f"{conversation_text}"
+        f"DOMANDA: {question}\n\n"
+        f"Rispondi in modo chiaro e conciso, citando date e fonti "
+        f"quando disponibili."
+    )
+
+
 class ClinicalHistoryQueryWorker(QThread):
     """Run a clinical query against the timeline history."""
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
     def __init__(self, llm_client, entries: list[dict],
-                 clinical_profile: str, question: str, parent=None):
+                 clinical_profile: str, question: str,
+                 conversation: list[dict] | None = None,
+                 use_conversation_context: bool = False, parent=None):
         super().__init__(parent)
         self.llm_client = llm_client
         self.entries = entries
         self.clinical_profile = clinical_profile
         self.question = question
+        self.conversation = conversation
+        self.use_conversation_context = use_conversation_context
 
     def run(self):
         try:
@@ -117,12 +169,12 @@ class ClinicalHistoryQueryWorker(QThread):
                 for e in self.entries[-100:]
             )
 
-            user_prompt = (
-                f"PROFILO CLINICO:\n{self.clinical_profile}\n\n"
-                f"REGISTRO CRONOLOGICO:\n{entries_text}\n\n"
-                f"DOMANDA: {self.question}\n\n"
-                f"Rispondi in modo chiaro e conciso, citando date e fonti "
-                f"quando disponibili."
+            user_prompt = build_query_prompt(
+                self.clinical_profile,
+                entries_text,
+                self.question,
+                conversation=self.conversation,
+                use_conversation_context=self.use_conversation_context,
             )
 
             answer = self.llm_client.generate_text(user_prompt, system_prompt)

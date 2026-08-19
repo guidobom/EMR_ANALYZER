@@ -36,6 +36,7 @@ from .clinical.document_deletion import DocumentDeletionService
 from .clinical.patient_deletion import PatientWorkspaceDeletionService
 from .gui.main_window import MainWindow
 from .database.timeline_repo import TimelineRepository
+from .database.chat_repo import ChatRepository
 from .settings import load_llm_configs
 
 
@@ -108,6 +109,7 @@ class EMRAnalyzerApp:
         audit_repo = AuditRepository(db)
         evidence_repo = EvidenceRepository(db)
         timeline_repo = TimelineRepository(db)
+        chat_repo = ChatRepository(db)
         self._services.update({
             "patient_repo": patient_repo,
             "identity_repo": identity_repo,
@@ -117,6 +119,7 @@ class EMRAnalyzerApp:
             "audit_repo": audit_repo,
             "evidence_repo": evidence_repo,
             "timeline_repo": timeline_repo,
+            "chat_repo": chat_repo,
         })
         print(f"  ✓ Repositories initialized")
 

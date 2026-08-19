@@ -224,6 +224,43 @@ def load_model_assignments(path: str | Path = SETTINGS_PATH) -> dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Clinical query chat preferences (UI-only; never clinical data)
+# ---------------------------------------------------------------------------
+
+
+def load_chat_preferences(path: str | Path = SETTINGS_PATH) -> dict:
+    """Persisted preferences of the clinical query chat panel."""
+    payload = _read_payload(Path(path))
+    chat = payload.get("chat", {})
+    if not isinstance(chat, dict):
+        chat = {}
+    return {
+        "use_conversation_context": bool(
+            chat.get("use_conversation_context", False)
+        ),
+    }
+
+
+def save_chat_preferences(
+    prefs: dict, path: str | Path = SETTINGS_PATH
+) -> None:
+    """Persist chat preferences, preserving the LLM configuration."""
+    settings_path = Path(path)
+    payload = _read_payload(settings_path)
+    payload["chat"] = {
+        "use_conversation_context": bool(
+            prefs.get("use_conversation_context", False)
+        ),
+    }
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(settings_path)
+
+
 def save_model_assignment(
     role: str,
     model_name: str,

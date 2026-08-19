@@ -3,7 +3,7 @@
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -210,6 +210,21 @@ CREATE_TABLES_SQL = [
         applied_at TEXT NOT NULL
     )
     """,
+    # Clinical query chat — per-patient trace of prompts and responses,
+    # like a ChatGPT-style conversation history.  role is 'user' or
+    # 'assistant'; context_mode marks answers generated with the previous
+    # Q&A embedded as conversational context (1) or not (0).
+    """
+    CREATE TABLE IF NOT EXISTS clinical_chat (
+        id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        model_used TEXT,
+        context_mode INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """,
 ]
 
 INDEXES_SQL = [
@@ -237,6 +252,8 @@ INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_timeline_status ON clinical_timeline(status)",
     "CREATE INDEX IF NOT EXISTS idx_hpid_patient ON patient_hospital_ids(patient_id)",
     "CREATE INDEX IF NOT EXISTS idx_hpid_key ON patient_hospital_ids(hospital_patient_id_key)",
+    "CREATE INDEX IF NOT EXISTS idx_chat_patient ON clinical_chat(patient_id)",
+    "CREATE INDEX IF NOT EXISTS idx_chat_patient_created ON clinical_chat(patient_id, created_at)",
 ]
 
 
@@ -295,7 +312,7 @@ def _safe_add_column(db: DatabaseEngine, table: str, column: str,
 def drop_all_tables(db: DatabaseEngine) -> None:
     """Drop all tables (for testing/reset). Use with caution."""
     tables = [
-        "audit_log", "validation_queue",
+        "audit_log", "validation_queue", "clinical_chat",
         "clinical_state", "lab_values", "clinical_timeline",
         "clinical_evidence", "document_identity_evidence",
         "patient_hospital_ids", "patient_identities",
