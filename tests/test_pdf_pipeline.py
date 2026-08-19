@@ -436,9 +436,19 @@ Via Orale, 5 mg/die.
             any(character.isdigit() for character in protected)
         )
 
+        # A duplicated insertion is removed deterministically: the first
+        # occurrence wins, the repeated one disappears.
+        repaired = ClinicalTextIsolator._restore_numeric_literals(
+            "[[PAGINA_A]] [[VALORE_B]] [[VALORE_B]]",
+            replacements,
+        )
+        self.assertIn(replacements["[[PAGINA_A]]"], repaired)
+        self.assertEqual(repaired.count(replacements["[[VALORE_B]]"]), 1)
+        self.assertNotIn(replacements["[[VALORE_C]]"], repaired)
+        # A duplication whose removal breaks the source order is rejected.
         with self.assertRaisesRegex(ValueError, "duplicati"):
             ClinicalTextIsolator._restore_numeric_literals(
-                "[[PAGINA_A]] [[VALORE_B]] [[VALORE_B]]",
+                "[[VALORE_B]] [[PAGINA_A]] [[VALORE_B]]",
                 replacements,
             )
         with self.assertRaisesRegex(ValueError, "riordinato"):

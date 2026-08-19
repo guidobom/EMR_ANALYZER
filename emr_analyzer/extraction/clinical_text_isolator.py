@@ -27,6 +27,10 @@ _PAGE_COMMENT_RE = re.compile(
     r"<!--\s*page\s*:\s*(\d+)\s*-->", re.IGNORECASE
 )
 _PAGE_MARKER_RE = re.compile(r"\[PAGINA\s+\d+\]", re.IGNORECASE)
+# Beyond this many literals per chunk the placeholder alphabet is
+# permuted deterministically (see _protect_numeric_literals).
+_PLACEHOLDER_SHUFFLE_THRESHOLD = 8
+
 _PLACEHOLDER_RE = re.compile(r"\[\[(?:VALORE|PAGINA)_[A-Z]+\]\]")
 _MALFORMED_PLACEHOLDER_RE = re.compile(
     r"\[\[?\s*(?:VALORE|PAGINA)[\s_-]+[A-Z]+", re.IGNORECASE
@@ -339,9 +343,10 @@ TESTO SORGENTE:
                 "eventi cronologicamente e non spostare alcuna osservazione."
             ),
             "segnaposti duplicati": (
-                "Hai duplicato uno o più segnaposti. Ogni segnaposto può "
-                "comparire al massimo una volta; non ripetere paragrafi o "
-                "valori già riportati."
+                "Hai usato un segnaposto due volte: ogni segnaposto "
+                "corrisponde a UN SOLO valore della sorgente. Riproduci "
+                "ogni valore con il suo token, esattamente una volta; non "
+                "ripetere paragrafi o valori già riportati."
             ),
             "segnaposti alterati": (
                 "Hai modificato la sintassi di uno o più segnaposti. Copia "
@@ -531,11 +536,22 @@ TESTO SORGENTE:
     def _protect_numeric_literals(
         cls, source: str
     ) -> tuple[str, dict[str, str]]:
-        """Replace page markers and numeric literals with alphabetic tokens."""
+        """Replace page markers and numeric literals with alphabetic tokens.
+
+        Sequential A, B, C… ids become confusable for the model when the
+        chunk carries many literals: it ends up reusing ONE token for TWO
+        different values (a duplicated-placeholder validation failure that
+        sampling variation cannot escape).  Beyond a small threshold the
+        alphabet is permuted deterministically (seeded by the source) so
+        adjacent tokens look nothing alike; small chunks keep the
+        human-readable sequential ids.
+        """
         combined = re.compile(
             rf"{_PAGE_MARKER_RE.pattern}|{_NUMERIC_LITERAL_RE.pattern}",
             re.IGNORECASE,
         )
+        literal_count = len(combined.findall(source))
+        alphabet = cls._placeholder_alphabet(source, literal_count)
         replacements: dict[str, str] = {}
         position = 0
 
@@ -547,13 +563,27 @@ TESTO SORGENTE:
                 else "VALORE"
             )
             placeholder = (
-                f"[[{kind}_{cls._alphabetic_id(position)}]]"
+                f"[[{kind}_{cls._alphabetic_id(position, alphabet)}]]"
             )
             position += 1
             replacements[placeholder] = match.group(0)
             return placeholder
 
         return combined.sub(replace, source), replacements
+
+    @staticmethod
+    def _placeholder_alphabet(source: str, literal_count: int) -> str:
+        """Alphabet for the placeholder ids of one protected chunk."""
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        if literal_count <= _PLACEHOLDER_SHUFFLE_THRESHOLD:
+            return alphabet
+        import hashlib
+        import random
+
+        seed = int(hashlib.sha256(source.encode("utf-8")).hexdigest()[:8], 16)
+        shuffled = list(alphabet)
+        random.Random(seed).shuffle(shuffled)
+        return "".join(shuffled)
 
     @classmethod
     def _restore_numeric_literals(
@@ -578,10 +608,22 @@ TESTO SORGENTE:
             if count > 1
         )
         if duplicated:
-            raise ValueError(
-                "segnaposto duplicati dal modello: "
-                + ", ".join(duplicated[:4])
+            # The model sometimes writes ONE source token in place of
+            # another (a duplicated token where a different one belonged).
+            # When the order is preserved and every source token is
+            # accounted for, the divergent position is unambiguous and can
+            # be repaired deterministically from the source sequence;
+            # anything less certain still fails validation.
+            repaired_output = cls._repair_duplicated_placeholders(
+                output, replacements
             )
+            if repaired_output is None:
+                raise ValueError(
+                    "segnaposto duplicati dal modello: "
+                    + ", ".join(duplicated[:4])
+                )
+            output = repaired_output
+            placeholders = _PLACEHOLDER_RE.findall(output)
         source_order = {
             placeholder: index
             for index, placeholder in enumerate(replacements)
@@ -605,14 +647,117 @@ TESTO SORGENTE:
             raise ValueError("il modello ha alterato uno o più segnaposto")
         return restored
 
+    @classmethod
+    def _repair_duplicated_placeholders(
+        cls, output: str, replacements: dict[str, str]
+    ) -> str | None:
+        """Repair a single token-substitution error by the model.
+
+        The model sometimes reuses one placeholder for a different value
+        of the source (e.g. the date of a visit AND a temperature both
+        written with the same token) even though order and wording are
+        correct.  The output tokens are aligned to the source sequence
+        as a subsequence (the model legitimately filters non-clinical
+        values away); gaps that SKIP a source token are accepted, while
+        a repeated EARLIER token identifies the substitution position
+        unambiguously.  At most ONE substitution is repaired; anything
+        else returns ``None`` and validation fails as before.
+        """
+        matches = list(_PLACEHOLDER_RE.finditer(output))
+        tokens = [match.group(0) for match in matches]
+        source_seq = list(replacements)
+        order_map = {token: index for index, token in enumerate(source_seq)}
+        if any(token not in order_map for token in tokens):
+            return None
+        indices = [order_map[token] for token in tokens]
+        if indices != sorted(indices):
+            return None  # order is broken — the reorder check will fail
+
+        # ---- Insertion model (the common failure shape) ----------------
+        # The model INSERTED the duplicated token once more; dropping every
+        # repeated occurrence must leave a perfect subsequence of the
+        # source.  (Observed on real discharge letters: the output is
+        # "... C, C, L, Z ..." where the source reads "... C, L, Z ...".)
+        kept_positions: list[int] = []
+        removed_positions: list[int] = []
+        seen: set[str] = set()
+        for position, token in enumerate(tokens):
+            if token in seen:
+                removed_positions.append(position)
+            else:
+                seen.add(token)
+                kept_positions.append(position)
+        if removed_positions:
+            candidate = [tokens[p] for p in kept_positions]
+            if cls._is_subsequence(candidate, source_seq):
+                rebuilt = output
+                for position in reversed(removed_positions):
+                    match = matches[position]
+                    rebuilt = (
+                        rebuilt[: match.start()] + rebuilt[match.end():]
+                    )
+                return rebuilt
+
+        # ---- Substitution model ----------------------------------------
+        # One token written in place of another, order preserved: align
+        # the output as a subsequence of the source; gaps that SKIP a
+        # source token are filtering, a repeated EARLIER token identifies
+        # the substitution position.  At most one substitution.
+        fixed: tuple[int, str] | None = None  # (output position, correct)
+        i = 0  # output index
+        j = 0  # source index
+        while i < len(tokens):
+            if j < len(source_seq) and tokens[i] == source_seq[j]:
+                i += 1
+                j += 1
+            elif order_map[tokens[i]] < j:
+                if fixed is not None or j >= len(source_seq):
+                    return None
+                fixed = (i, source_seq[j])
+                i += 1
+                j += 1
+            else:
+                # The model filtered this source value away entirely.
+                j += 1
+        if fixed is None:
+            return None
+
+        position, correct_token = fixed
+        repaired_tokens = list(tokens)
+        repaired_tokens[position] = correct_token
+
+        rebuilt = output
+        for match, new_token in zip(
+            reversed(matches), reversed(repaired_tokens)
+        ):
+            rebuilt = (
+                rebuilt[: match.start()] + new_token + rebuilt[match.end():]
+            )
+        return rebuilt
+
     @staticmethod
-    def _alphabetic_id(index: int) -> str:
-        """Return A..Z, AA..AZ... without introducing digits."""
+    def _is_subsequence(candidate: list[str], source_seq: list[str]) -> bool:
+        """True when *candidate* is a subsequence of *source_seq*."""
+        j = 0
+        for token in candidate:
+            while j < len(source_seq) and source_seq[j] != token:
+                j += 1
+            if j >= len(source_seq):
+                return False
+            j += 1
+        return True
+
+    @staticmethod
+    def _alphabetic_id(
+        index: int, alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ) -> str:
+        """Return A..Z, AA..AZ... over *alphabet*, without digits."""
+        base = len(alphabet)
         value = index + 1
         letters = []
         while value:
-            value, remainder = divmod(value - 1, 26)
-            letters.append(chr(ord("A") + remainder))
+            value, remainder = divmod(value - 1, base)
+            letters.append(alphabet[remainder])
         return "".join(reversed(letters))
 
     @staticmethod
