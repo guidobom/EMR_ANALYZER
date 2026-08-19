@@ -244,7 +244,8 @@ class PdfPipelineTest(unittest.TestCase):
         observed = {}
 
         def fake_generate(prompt, system="", stream=False,
-                          response_format=None):
+                          response_format=None, seed=None,
+                          temperature=None):
             observed["response_format"] = response_format
             return "Testo clinico normalizzato."
 

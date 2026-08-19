@@ -193,6 +193,17 @@ class ClinicalTextIsolator:
                 self._corrective_instruction(validation_categories[-1])
                 if validation_categories else None
             )
+            # Corrective retries vary the sampling slightly so a
+            # deterministic model failure (fixed seed + low temperature)
+            # does not repeat identically forever.  The FIRST attempt
+            # always uses the configured parameters untouched.
+            overrides = {}
+            if attempt > 0 and getattr(self.llm, "seed", None) is not None:
+                overrides["seed"] = self.llm.seed + attempt
+                overrides["temperature"] = max(
+                    0.4,
+                    float(getattr(self.llm, "temperature", 0.1) or 0.1),
+                )
             try:
                 response = self.llm.generate_text(
                     self._prompt(
@@ -201,6 +212,7 @@ class ClinicalTextIsolator:
                         corrective_instruction=correction,
                     ),
                     _SYSTEM_PROMPT,
+                    **overrides,
                 )
             except RuntimeError as exc:
                 # Output-length errors are transient — treat as a validation
@@ -280,7 +292,8 @@ REGOLE OBBLIGATORIE:
   le espressioni temporali originali;
 - ogni token [[VALORE_X]] rappresenta una data o un numero: copialo
   esattamente, senza modificarlo, duplicarlo o sostituirlo e senza scrivere
-  cifre direttamente;
+  cifre direttamente; ogni segnaposto [[VALORE_X]] deve comparire
+  ESATTAMENTE UNA VOLTA nella risposta;
 - ogni token [[PAGINA_X]] delimita internamente una pagina della sorgente:
   non riportarlo nella risposta;
 - conserva l'ordine originale dei segnaposto [[VALORE_X]];

@@ -266,13 +266,20 @@ class LlmClient:
 
     def _generate(self, prompt: str, system: str = "",
                   stream: bool = False,
-                  response_format: dict | str | None = None) -> str:
+                  response_format: dict | str | None = None,
+                  seed: int | None = None,
+                  temperature: float | None = None) -> str:
         """Internal: chat completion against the app-managed llama-server.
 
         The server is spawned with ``-rea off`` and every request also sends
         ``reasoning_effort: none``: reasoning text is not part of the
         clinical document and wastes context on models with a thinking
         channel (qwen3).
+
+        ``seed``/``temperature`` override the configured generation
+        parameters for this single call when given (used by corrective
+        retries to escape deterministic failures); the client's configured
+        values are never modified.
         """
         messages = []
         if system:
@@ -283,10 +290,12 @@ class LlmClient:
             result = self.backend.chat(
                 self,
                 messages,
-                temperature=self.temperature,
+                temperature=(
+                    self.temperature if temperature is None else temperature
+                ),
                 top_p=self.top_p,
                 top_k=self.top_k,
-                seed=self.seed,
+                seed=self.seed if seed is None else seed,
                 max_tokens=self.max_output_tokens,
                 response_format=response_format,
             )
@@ -385,9 +394,18 @@ TESTO:
             "confidence": confidence,
         }
 
-    def generate_text(self, prompt: str, system: str = "") -> str:
-        """Generate plain text without JSON/schema constraints."""
-        response = self._generate(prompt, system, response_format=None)
+    def generate_text(self, prompt: str, system: str = "",
+                      seed: int | None = None,
+                      temperature: float | None = None) -> str:
+        """Generate plain text without JSON/schema constraints.
+
+        ``seed``/``temperature`` override the configured parameters for
+        this single call when given (keyword-only, backward compatible).
+        """
+        response = self._generate(
+            prompt, system, response_format=None,
+            seed=seed, temperature=temperature,
+        )
         if not str(response or "").strip():
             raise ValueError(
                 "Il modello locale ha restituito una risposta vuota"
