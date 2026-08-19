@@ -11,7 +11,7 @@ from .config import (
 )
 from .security.offline import OfflinePolicy
 from .database.engine import DatabaseEngine
-from .database.migrations import init_database
+from .database.migrations import init_database, reset_stale_processing
 from .database.patient_repo import PatientRepository
 from .database.patient_identity_repo import PatientIdentityRepository
 from .database.evidence_repo import EvidenceRepository
@@ -98,6 +98,11 @@ class EMRAnalyzerApp:
         global_db_path = active_workspace.path / "emr_registry.db"
         db = DatabaseEngine(global_db_path)
         init_database(db)
+        # Self-healing: a document left in 'processing' status by an
+        # interrupted run (crash, forced quit) would be skipped by the
+        # extraction queue forever.  At startup no queue is running, so
+        # every 'processing' flag is stale by definition.
+        reset_stale_processing(db)
         self._services["db"] = db
         print(f"  ✓ Database: {global_db_path}")
 

@@ -309,6 +309,24 @@ def _safe_add_column(db: DatabaseEngine, table: str, column: str,
         pass  # Column already exists
 
 
+def reset_stale_processing(db: DatabaseEngine) -> None:
+    """Reset 'processing' document statuses left by an interrupted run.
+
+    Called at application startup, when no extraction queue can be
+    running: every 'processing' flag is stale by definition and would
+    otherwise block those documents in the queue forever.
+    """
+    with db:
+        db.execute(
+            "UPDATE documents SET parsing_status='pending' "
+            "WHERE parsing_status='processing'"
+        )
+        db.execute(
+            "UPDATE documents SET extraction_status='pending' "
+            "WHERE extraction_status='processing'"
+        )
+
+
 def drop_all_tables(db: DatabaseEngine) -> None:
     """Drop all tables (for testing/reset). Use with caution."""
     tables = [

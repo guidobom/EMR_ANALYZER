@@ -107,3 +107,45 @@ class ChatRepositoryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleProcessingResetTest(unittest.TestCase):
+    """Startup self-healing of 'processing' statuses."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.db = DatabaseEngine(root / "registry.db")
+        init_database(self.db)
+        patient_repo = PatientRepository(self.db)
+        patient_repo.insert(Patient(id="P", pseudonym="test", sex="M"))
+        self.db.execute(
+            """INSERT INTO documents
+               (id, patient_id, filename, original_path, file_hash,
+                document_type, import_date, parsing_status,
+                extraction_status)
+               VALUES
+               ('D1', 'P', 'a.pdf', '/x/a.pdf', 'h', 'type', 'now',
+                'processing', 'pending'),
+               ('D2', 'P', 'b.pdf', '/x/b.pdf', 'h', 'type', 'now',
+                'completed', 'processing'),
+               ('D3', 'P', 'c.pdf', '/x/c.pdf', 'h', 'type', 'now',
+                'completed', 'done')"""
+        )
+        self.db.commit()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_resets_only_processing_flags(self):
+        from emr_analyzer.database.migrations import reset_stale_processing
+        reset_stale_processing(self.db)
+        rows = {
+            r["id"]: (r["parsing_status"], r["extraction_status"])
+            for r in self.db.execute(
+                "SELECT id, parsing_status, extraction_status FROM documents"
+            ).fetchall()
+        }
+        self.assertEqual(rows["D1"], ("pending", "pending"))
+        self.assertEqual(rows["D2"], ("completed", "pending"))
+        self.assertEqual(rows["D3"], ("completed", "done"))

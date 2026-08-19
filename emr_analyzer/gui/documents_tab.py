@@ -351,7 +351,23 @@ class DocumentsTab(QWidget):
                 doc.parsing_status == ParsingStatus.PROCESSING.value
                 or doc.extraction_status == ExtractionStatus.PROCESSING.value
             ):
-                continue
+                if requested is None:
+                    # Automatic queue: a document being processed by
+                    # another running queue is left alone.
+                    continue
+                # Explicitly requested: the user is asking for THIS file.
+                # A stale 'processing' flag left by an interrupted run
+                # must not block it forever — reset and include it.
+                doc_repo.update_parsing_status(
+                    doc.id,
+                    "completed"
+                    if doc.parsing_status
+                    in (ParsingStatus.COMPLETED.value,
+                        ParsingStatus.COMPLETED_WITH_WARNINGS.value)
+                    else "pending",
+                )
+                doc_repo.update_extraction_status(doc.id, "pending")
+                doc = doc_repo.get_by_id(doc.id)
             if doc.parsing_status in (
                 ParsingStatus.COMPLETED.value,
                 ParsingStatus.COMPLETED_WITH_WARNINGS.value,
