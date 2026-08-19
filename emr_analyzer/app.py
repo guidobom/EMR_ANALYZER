@@ -34,6 +34,7 @@ from .extraction.clinical_text_isolator import ClinicalTextIsolator
 from .clinical.clinical_history_builder import ClinicalHistoryBuilder
 from .clinical.document_deletion import DocumentDeletionService
 from .clinical.patient_deletion import PatientWorkspaceDeletionService
+from .clinical.document_reattribution import DocumentReattributionService
 from .gui.main_window import MainWindow
 from .database.timeline_repo import TimelineRepository
 from .database.chat_repo import ChatRepository
@@ -254,6 +255,11 @@ class EMRAnalyzerApp:
         )
         self._services["patient_workspace_deletion"] = (
             PatientWorkspaceDeletionService(db, patient_repo)
+        )
+        self._services["document_reattribution"] = (
+            DocumentReattributionService(
+                db, doc_repo, patient_repo, audit_repo
+            )
         )
 
         print(f"  ✓ Services initialized")

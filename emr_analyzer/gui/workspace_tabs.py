@@ -47,6 +47,9 @@ class WorkspaceTabs(QTabWidget):
         self._documents_tab.document_selected.connect(self._on_document_selected)
         self._documents_tab.import_requested.connect(self._on_import_requested)
         self._documents_tab.processing_complete.connect(self._on_processing_complete)
+        self._validation_tab.document_reattributed.connect(
+            self._on_document_reattributed
+        )
 
         # Forward tab selections to context panel
         self._laboratory_tab.lab_selected.connect(self._on_lab_selected)
@@ -65,6 +68,29 @@ class WorkspaceTabs(QTabWidget):
         self._laboratory_tab.load_patient(patient_id)
         self._clinical_history_tab.load_patient(patient_id)
         self._validation_tab.load_patient(patient_id)
+
+    def shutdown(self) -> None:
+        """Stop background workers of the tabs (application quit path)."""
+        try:
+            self._clinical_history_tab.shutdown()
+        except Exception:
+            pass
+
+    def _on_document_reattributed(self, source_pid: str,
+                                  target_pid: str) -> None:
+        """Refresh the visible workspace after a document re-attribution.
+
+        The reviewer is looking at the source patient: reload its tabs
+        (the document just left this workspace).  The target refreshes
+        lazily the next time it is selected.
+        """
+        pid = self._current_patient_id
+        if not pid:
+            return
+        self._documents_tab.load_patient(pid)
+        self._laboratory_tab.load_patient(pid)
+        self._clinical_history_tab.load_patient(pid)
+        self._validation_tab.load_patient(pid)
 
     def show_import_dialog(self, files: list[str]):
         """Import documents — routes to existing/new patient workspaces."""

@@ -1,11 +1,12 @@
 """Validation tab — review queue for human validation of extractions."""
 
+import json
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QLabel, QAbstractItemView, QMessageBox,
-    QTextEdit, QSplitter,
+    QTextEdit, QSplitter, QInputDialog,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
@@ -14,6 +15,9 @@ from ..models.validation import ValidationStatus, Severity
 
 class ValidationTab(QWidget):
     """Tab for reviewing and validating extracted data."""
+
+    # (source_patient_id, target_patient_id) after a document re-attribution.
+    document_reattributed = pyqtSignal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -163,6 +167,10 @@ class ValidationTab(QWidget):
                     f"Problema: {row_data.get('issue')}\n"
                     f"Gravità: {row_data.get('severity')}\n"
                 )
+                if row_data.get("item_type") == "attribution":
+                    suggested = self._suggested_patient(row_data)
+                    if suggested:
+                        detail += f"\nPaziente suggerito: {suggested}"
                 if row_data.get("original_value"):
                     detail += f"\nValore originale:\n{row_data['original_value']}"
                 self._detail_text.setPlainText(detail)
@@ -178,6 +186,14 @@ class ValidationTab(QWidget):
             return
 
         row_data = item.data(Qt.UserRole)
+
+        # Attribution rows follow a different flow: the document moves to
+        # the target patient and the queue row is resolved atomically by
+        # the re-attribution service (never a bare status update).
+        if row_data.get("item_type") == "attribution" and new_status == "accepted":
+            self._accept_attribution(row_data)
+            return
+
         item_id = row_data.get("id")
         db = self._services.get("db")
 
@@ -217,8 +233,67 @@ class ValidationTab(QWidget):
             if lab_repo and item_ref_id.isdigit():
                 lab_repo.update_validation(int(item_ref_id), True)
 
+    # ------------------------------------------------------------------
+    # Attribution re-assignment (human-confirmed document move)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _suggested_patient(row_data: dict) -> str | None:
+        """Suggested patient from the attribution queue item JSON."""
+        try:
+            payload = json.loads(str(row_data.get("original_value") or ""))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        suggested = payload.get("suggested_patient_id")
+        return str(suggested) if suggested else None
+
+    def _accept_attribution(self, row_data: dict) -> None:
+        """Accept an attribution item: move the document to the suggested
+        patient (or a chosen one) and unlock its extraction."""
+        doc_id = str(row_data.get("item_id") or "")
+        suggested = self._suggested_patient(row_data)
+        patient_repo = self._services.get("patient_repo")
+
+        target = None
+        if suggested:
+            patient = patient_repo.get_by_id(suggested) if patient_repo else None
+            if patient is not None and suggested != self._current_patient_id:
+                target = suggested
+
+        if target is None:
+            # Suggested patient invalid or the document already belongs to
+            # the current workspace: fall back to an explicit choice.
+            if suggested is None:
+                QMessageBox.information(
+                    self, "Paziente suggerito non disponibile",
+                    "Il paziente suggerito non è disponibile. "
+                    "Scegli una destinazione.",
+                )
+            target = self._choose_target_patient(row_data)
+            if target is None:
+                return
+        else:
+            patient = patient_repo.get_by_id(target)
+            label = (
+                f"{target} ({patient.pseudonym})" if patient else target
+            )
+            reply = QMessageBox.question(
+                self, "Conferma spostamento",
+                f"Spostare il documento {doc_id} al paziente {label}?\n\n"
+                "Il documento verrà spostato fisicamente e l'estrazione "
+                "verrà sbloccata.\nQuesta azione è irreversibile.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._perform_reattribution(row_data, target, "accepted")
+
     def _on_correct(self):
-        """Open a dialog to correct the value."""
+        """Correct the value; for attribution items, choose the patient."""
         row = self._table.currentRow()
         if row < 0:
             return
@@ -228,7 +303,12 @@ class ValidationTab(QWidget):
             return
 
         row_data = item.data(Qt.UserRole)
-        from PyQt5.QtWidgets import QInputDialog
+        if row_data.get("item_type") == "attribution":
+            target = self._choose_target_patient(row_data)
+            if target is None:
+                return
+            self._perform_reattribution(row_data, target, "corrected")
+            return
 
         new_value, ok = QInputDialog.getText(
             self, "Correggi Valore",
@@ -247,6 +327,85 @@ class ValidationTab(QWidget):
                 )
                 db.commit()
             self._refresh()
+
+    def _choose_target_patient(self, row_data: dict) -> str | None:
+        """Let the user pick the destination patient for a document."""
+        patient_repo = self._services.get("patient_repo")
+        patients = [
+            p for p in (patient_repo.list_all() if patient_repo else [])
+            if p.id != self._current_patient_id
+        ]
+        if not patients:
+            QMessageBox.warning(
+                self, "Nessuna destinazione",
+                "Non esistono altri pazienti a cui assegnare il documento.",
+            )
+            return None
+
+        labels = []
+        ids = []
+        suggested = self._suggested_patient(row_data)
+        suggested_index = 0
+        for index, patient in enumerate(patients):
+            extras = " • ".join(
+                part for part in (
+                    patient.initials, patient.sex,
+                    str(patient.birth_year) if patient.birth_year else "",
+                ) if part
+            )
+            labels.append(
+                f"{patient.id} — {patient.pseudonym}"
+                + (f" • {extras}" if extras else "")
+            )
+            ids.append(patient.id)
+            if patient.id == suggested:
+                suggested_index = index
+
+        chosen, ok = QInputDialog.getItem(
+            self, "Correggi attribuzione",
+            f"Scegli il paziente a cui assegnare il documento "
+            f"{row_data.get('item_id')}:",
+            labels, suggested_index, editable=False,
+        )
+        if not ok:
+            return None
+        # The label is "P001 — pseudonym • extras": the id is the prefix.
+        chosen_id = str(chosen).split(" — ")[0].strip()
+        return chosen_id if chosen_id in ids else None
+
+    def _perform_reattribution(
+        self, row_data: dict, target: str, resolution_status: str
+    ) -> None:
+        """Run the move and surface the outcome."""
+        service = self._services.get("document_reattribution")
+        if not service:
+            QMessageBox.critical(
+                self, "Errore",
+                "Servizio di riassegnazione non disponibile.",
+            )
+            return
+
+        doc_id = str(row_data.get("item_id") or "")
+        result = service.move_document(
+            doc_id, target,
+            queue_item_id=row_data.get("id"),
+            resolution_status=resolution_status,
+        )
+        if result.ok:
+            QMessageBox.information(
+                self, "Documento spostato",
+                f"Documento {doc_id} spostato al paziente {target}.\n"
+                "L'estrazione è stata sbloccata: rielaboralo dalla scheda "
+                "Documenti del paziente.",
+            )
+            self.document_reattributed.emit(
+                result.source_patient_id, result.target_patient_id
+            )
+        else:
+            QMessageBox.critical(
+                self, "Spostamento non riuscito", result.error or "Errore"
+            )
+        self._refresh()
 
     def _on_accept_all_low_risk(self):
         """Accept all low-severity items automatically."""

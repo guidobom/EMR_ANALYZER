@@ -20,6 +20,59 @@ from ..config import active_workspace
 from ..utils.file_utils import compute_file_hash
 
 
+def move_document_files(workspaces_dir: Path, source_pid: str,
+                        target_pid: str, doc, moved: list,
+                        new_original_paths: dict) -> int:
+    """Move a document's original file and its extraction/docling
+    artifacts.  Returns the number of files moved.
+
+    Module-level so it can be reused by single-document operations
+    (document re-attribution); *doc* is a dict-like row with
+    ``original_path``, ``file_hash`` and ``id`` keys.  *moved* collects
+    ``(src, dst)`` pairs for rollback via
+    :meth:`WorkspaceMergeService._restore_files`.
+    """
+    source_root = workspaces_dir / source_pid
+    target_root = workspaces_dir / target_pid
+    files_moved = 0
+    new_original = None
+
+    original = Path(doc["original_path"])
+    if original.is_file():
+        if WorkspaceMergeService._is_within(original, source_root):
+            destination = target_root / original.relative_to(source_root)
+        else:
+            destination = (
+                target_root / "documents" / "original" / original.name
+            )
+        destination, skipped = WorkspaceMergeService._unique_target_path(
+            destination, doc["file_hash"]
+        )
+        if not skipped:
+            WorkspaceMergeService._move(original, destination, moved)
+            files_moved += 1
+        new_original = str(destination)
+
+    # Extraction / docling artifacts share the (globally unique) doc id,
+    # so they can never collide in the target.
+    doc_id = doc["id"]
+    for subdir in ("extraction", "docling"):
+        source_dir = source_root / subdir
+        if not source_dir.is_dir():
+            continue
+        for candidate in sorted(source_dir.glob(f"{doc_id}*")):
+            if not candidate.is_file():
+                continue
+            WorkspaceMergeService._move(
+                candidate, target_root / subdir / candidate.name, moved
+            )
+            files_moved += 1
+
+    if new_original is not None:
+        new_original_paths[doc_id] = new_original
+    return files_moved
+
+
 @dataclass
 class MergeResult:
     source_patient_id: str
@@ -326,45 +379,10 @@ class WorkspaceMergeService:
                              doc, moved, new_original_paths) -> int:
         """Move a document's original file and its extraction/docling
         artifacts.  Returns the number of files moved."""
-        source_root = self.workspaces_dir / source_pid
-        target_root = self.workspaces_dir / target_pid
-        files_moved = 0
-        new_original = None
-
-        original = Path(doc["original_path"])
-        if original.is_file():
-            if self._is_within(original, source_root):
-                destination = target_root / original.relative_to(source_root)
-            else:
-                destination = (
-                    target_root / "documents" / "original" / original.name
-                )
-            destination, skipped = self._unique_target_path(
-                destination, doc["file_hash"]
-            )
-            if not skipped:
-                self._move(original, destination, moved)
-                files_moved += 1
-            new_original = str(destination)
-
-        # Extraction / docling artifacts share the (globally unique) doc id,
-        # so they can never collide in the target.
-        doc_id = doc["id"]
-        for subdir in ("extraction", "docling"):
-            source_dir = source_root / subdir
-            if not source_dir.is_dir():
-                continue
-            for candidate in sorted(source_dir.glob(f"{doc_id}*")):
-                if not candidate.is_file():
-                    continue
-                self._move(
-                    candidate, target_root / subdir / candidate.name, moved
-                )
-                files_moved += 1
-
-        if new_original is not None:
-            new_original_paths[doc_id] = new_original
-        return files_moved
+        return move_document_files(
+            self.workspaces_dir, source_pid, target_pid, doc,
+            moved, new_original_paths,
+        )
 
     def _merge_identity_rows(self, source_pid: str, target_pid: str) -> None:
         """Fold the source identity into the target's (patient_id is UNIQUE)."""
