@@ -55,6 +55,7 @@ class ClinicalHistoryTab(QWidget):
         self._worker = None
         self._narrative_worker = None
         self._query_worker = None
+        self._dedup_worker = None
         # Per-patient chat trace: every prompt and response is persisted and
         # rendered as a timeline; switching patient replaces it entirely.
         self._chat_messages: list[ChatMessage] = []
@@ -255,6 +256,53 @@ class ClinicalHistoryTab(QWidget):
         """Refresh all data for the given patient."""
         self._current_patient_id = patient_id
         self._refresh()
+
+    # ------------------------------------------------------------------
+    # Background worker lifecycle
+    # ------------------------------------------------------------------
+
+    _WORKER_ATTRS = (
+        "_worker", "_narrative_worker", "_dedup_worker", "_query_worker",
+    )
+
+    def _worker_running(self) -> bool:
+        """True when any background worker of this tab is still running."""
+        return any(
+            getattr(self, attr, None) is not None
+            and getattr(self, attr).isRunning()
+            for attr in self._WORKER_ATTRS
+        )
+
+    def _guard_busy(self) -> bool:
+        """Block an action while a worker is running (returns True)."""
+        if self._worker_running():
+            QMessageBox.information(
+                self, "Operazione in corso",
+                "Attendi il completamento dell'operazione corrente "
+                "prima di avviarne un'altra.",
+            )
+            return True
+        return False
+
+    def _release_worker(self, attr: str) -> None:
+        """Drop a finished worker safely (thread already ended).
+
+        QThread objects must never be garbage-collected while their run()
+        is executing: Qt aborts the process ("Destroyed while thread is
+        still running").  This slot is connected to the ``finished``
+        signal, which fires only after the thread has stopped.
+        """
+        worker = getattr(self, attr, None)
+        setattr(self, attr, None)
+        if worker is not None:
+            worker.deleteLater()
+
+    def shutdown(self) -> None:
+        """Wait for running workers (application quit path)."""
+        for attr in self._WORKER_ATTRS:
+            worker = getattr(self, attr, None)
+            if worker is not None and worker.isRunning():
+                worker.wait(5000)
 
     # ------------------------------------------------------------------
     # Data loading
@@ -534,6 +582,8 @@ class ClinicalHistoryTab(QWidget):
 
     def _on_dedup(self):
         """Deduplicate the existing registry without re-extracting."""
+        if self._guard_busy():
+            return
         if not self._timeline_entries:
             return
 
@@ -555,6 +605,9 @@ class ClinicalHistoryTab(QWidget):
         )
         self._dedup_worker.finished.connect(self._on_dedup_finished)
         self._dedup_worker.error.connect(self._on_dedup_error)
+        self._dedup_worker.finished.connect(
+            lambda _result, attr="_dedup_worker": self._release_worker(attr)
+        )
         self._dedup_btn.setEnabled(False)
         self._dedup_btn.setText("⏳ Deduplica in corso...")
         self._dedup_worker.start()
@@ -609,6 +662,8 @@ class ClinicalHistoryTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_generate(self):
+        if self._guard_busy():
+            return
         if not self._current_patient_id:
             QMessageBox.warning(
                 self, "Nessun paziente",
@@ -651,6 +706,9 @@ class ClinicalHistoryTab(QWidget):
         self._worker.progress.connect(self._on_generation_progress)
         self._worker.finished.connect(self._on_generation_finished)
         self._worker.error.connect(self._on_generation_error)
+        self._worker.finished.connect(
+            lambda _result, attr="_worker": self._release_worker(attr)
+        )
         self._gen_btn.setEnabled(False)
         self._narrative_btn.setEnabled(False)
         self._dedup_btn.setEnabled(False)
@@ -726,6 +784,8 @@ class ClinicalHistoryTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_generate_narrative(self):
+        if self._guard_busy():
+            return
         if not self._timeline_entries:
             QMessageBox.warning(
                 self, "Nessun registro",
@@ -766,6 +826,11 @@ class ClinicalHistoryTab(QWidget):
         )
         self._narrative_worker.finished.connect(self._on_narrative_finished)
         self._narrative_worker.error.connect(self._on_narrative_error)
+        self._narrative_worker.finished.connect(
+            lambda _result, attr="_narrative_worker": (
+                self._release_worker(attr)
+            )
+        )
         self._narrative_btn.setEnabled(False)
         self._narrative_btn.setText("⏳ Generazione in corso...")
         self._narrative_worker.start()
@@ -794,6 +859,8 @@ class ClinicalHistoryTab(QWidget):
             self._query_text.setPlainText(query)
 
     def _run_query(self):
+        if self._guard_busy():
+            return
         question = self._query_text.toPlainText().strip()
         if not question:
             return
@@ -860,6 +927,9 @@ class ClinicalHistoryTab(QWidget):
         )
         self._query_worker.finished.connect(self._on_query_result)
         self._query_worker.error.connect(self._on_query_error)
+        self._query_worker.finished.connect(
+            lambda _result, attr="_query_worker": self._release_worker(attr)
+        )
         self._query_btn.setEnabled(False)
         self._query_btn.setText("⏳ Interrogazione in corso...")
         self._query_worker.start()

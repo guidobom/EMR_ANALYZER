@@ -499,7 +499,13 @@ class MainWindow(QMainWindow):
             history_builder._llm = client
 
     def closeEvent(self, event):
-        """Close the database connection before exiting."""
+        """Stop background workers and close the database before exiting."""
+        # QThread objects must not be destroyed while running: wait for the
+        # Clinical History workers, then close the DB.
+        try:
+            self.workspace_tabs.shutdown()
+        except Exception:
+            pass
         if "db" in self._services and self._services["db"]:
             self._services["db"].close()
         event.accept()
