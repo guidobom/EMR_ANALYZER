@@ -25,6 +25,8 @@ from ..utils.markdown_tables import render_markdown_to_html
 # Predefined query templates for the clinical history
 HISTORY_QUERIES = [
     ("— Prompt predefiniti —", ""),
+    ("⚡ Analisi irAE (registro completo)",
+     "__IRAE_ANALYSIS__"),
     ("Qual e' la diagnosi principale?",
      "Qual e' la diagnosi oncologica principale del paziente e quando e' stata formulata?"),
     ("Quali terapie ha ricevuto il paziente?",
@@ -882,6 +884,14 @@ class ClinicalHistoryTab(QWidget):
 
     def _on_preset_changed(self, index: int):
         query = self._query_preset.currentData()
+        if query == "__IRAE_ANALYSIS__":
+            # Sentinel entry: launch the full-registry analysis instead of
+            # dumping the 23K-char protocol into the query box.
+            self._query_preset.blockSignals(True)
+            self._query_preset.setCurrentIndex(0)
+            self._query_preset.blockSignals(False)
+            self._on_irae_analysis()
+            return
         if query:
             self._query_text.setPlainText(query)
 

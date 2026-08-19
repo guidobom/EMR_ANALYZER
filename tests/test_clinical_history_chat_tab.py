@@ -276,3 +276,25 @@ class ChatClearTest(ClinicalHistoryChatTabTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IraePresetTest(ClinicalHistoryChatTabTest):
+    """The dropdown preset launches the full-registry irAE analysis."""
+
+    def test_preset_triggers_analysis_and_resets_combo(self):
+        index = self.tab._query_preset.findData("__IRAE_ANALYSIS__")
+        self.assertGreaterEqual(index, 0)
+        with mock.patch.object(
+            self.tab, "_on_irae_analysis"
+        ) as analysis:
+            self.tab._query_preset.setCurrentIndex(index)
+            analysis.assert_called_once()
+            # The combo returns to the placeholder entry.
+            self.assertEqual(self.tab._query_preset.currentIndex(), 0)
+            self.assertEqual(self.tab._query_preset.currentData(), "")
+
+    def test_preset_does_not_fill_query_box(self):
+        index = self.tab._query_preset.findData("__IRAE_ANALYSIS__")
+        with mock.patch.object(self.tab, "_on_irae_analysis"):
+            self.tab._query_preset.setCurrentIndex(index)
+        self.assertEqual(self.tab._query_text.toPlainText(), "")
