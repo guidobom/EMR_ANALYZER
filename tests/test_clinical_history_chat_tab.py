@@ -14,6 +14,9 @@ from PyQt5.QtWidgets import QApplication
 from emr_analyzer.gui.clinical_history_tab import ClinicalHistoryTab
 from emr_analyzer.models.chat_message import ChatMessage
 
+from unittest import mock
+from PyQt5.QtWidgets import QMessageBox
+
 
 class FakeChatRepo:
     """In-memory chat repository keyed by patient."""
@@ -33,6 +36,9 @@ class FakeChatRepo:
 
     def count_by_patient(self, patient_id: str) -> int:
         return len(self._store.get(patient_id, []))
+
+    def clear_for_patient(self, patient_id: str) -> None:
+        self._store.pop(patient_id, None)
 
 
 class FakeTimelineRepo:
@@ -106,6 +112,17 @@ class ClinicalHistoryChatTabTest(unittest.TestCase):
             "cs_repo": FakeCSRepo(),
             "chat_repo": self.chat_repo,
         })
+        # Silence every modal dialog.
+        for patch in (
+            mock.patch.object(QMessageBox, "question",
+                              return_value=QMessageBox.Yes),
+            mock.patch.object(QMessageBox, "information",
+                              return_value=None),
+            mock.patch.object(QMessageBox, "warning", return_value=None),
+            mock.patch.object(QMessageBox, "critical", return_value=None),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def _wait_query_worker(self):
         worker = self.tab._query_worker
@@ -208,6 +225,53 @@ class ClinicalHistoryChatTabTest(unittest.TestCase):
                          self.tab._chat_view.toHtml())
         self.assertNotIn("risposta per P001",
                          [m.content for m in self.chat_repo.get_by_patient("P002")])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ChatClearTest(ClinicalHistoryChatTabTest):
+    """Deleting the per-patient chat history."""
+
+    def _seed_history(self):
+        self.chat_repo._store = {
+            "P001": [make_message("P001", "user", "domanda A"),
+                     make_message("P001", "assistant", "risposta A")],
+            "P002": [make_message("P002", "user", "domanda B")],
+        }
+        self.tab.load_patient("P001")
+
+    def test_clear_removes_only_current_patient(self):
+        self._seed_history()
+        self.assertTrue(self.tab._clear_chat_btn.isEnabled())
+
+        self.tab._on_clear_chat()  # QMessageBox.question → Yes (patched)
+
+        self.assertEqual(self.tab._chat_messages, [])
+        self.assertNotIn("domanda A", self.tab._chat_view.toHtml())
+        self.assertFalse(self.tab._clear_chat_btn.isEnabled())
+        # The other patient's history is untouched.
+        self.assertEqual(len(self.chat_repo.get_by_patient("P002")), 1)
+
+    def test_clear_works_with_context_toggle_on(self):
+        self._seed_history()
+        self.tab._use_context_check.setChecked(True)
+        self.tab._on_clear_chat()
+        self.assertEqual(self.tab._chat_messages, [])
+        self.assertEqual(self.chat_repo.count_by_patient("P001"), 0)
+
+    def test_clear_works_with_context_toggle_off(self):
+        self._seed_history()
+        self.tab._use_context_check.setChecked(False)
+        self.tab._on_clear_chat()
+        self.assertEqual(self.chat_repo.count_by_patient("P001"), 0)
+
+    def test_clear_without_history_is_noop(self):
+        self.tab.load_patient("P001")
+        self.assertFalse(self.tab._clear_chat_btn.isEnabled())
+        self.tab._on_clear_chat()
+        self.assertEqual(self.chat_repo.count_by_patient("P001"), 0)
 
 
 if __name__ == "__main__":

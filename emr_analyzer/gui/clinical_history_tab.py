@@ -189,7 +189,20 @@ class ClinicalHistoryTab(QWidget):
         )
         right_layout.addWidget(self._profile_text, stretch=1)
 
-        right_layout.addWidget(QLabel("<b>Cronologia Domande & Risposte</b>"))
+        chat_header = QHBoxLayout()
+        chat_header.addWidget(QLabel("<b>Cronologia Domande & Risposte</b>"))
+        chat_header.addStretch()
+        self._clear_chat_btn = QPushButton("🗑️ Elimina cronologia")
+        self._clear_chat_btn.setToolTip(
+            "Cancella tutte le domande e risposte registrate per questo "
+            "paziente. Il registro cronologico e il profilo restano "
+            "invariati."
+        )
+        self._clear_chat_btn.clicked.connect(self._on_clear_chat)
+        self._clear_chat_btn.setEnabled(False)
+        chat_header.addWidget(self._clear_chat_btn)
+        right_layout.addLayout(chat_header)
+
         self._chat_view = QTextBrowser()
         self._chat_view.setReadOnly(True)
         self._chat_view.setOpenExternalLinks(False)
@@ -1024,8 +1037,39 @@ class ClinicalHistoryTab(QWidget):
             for m in self._chat_messages
         ]
 
+    def _on_clear_chat(self) -> None:
+        """Delete the whole chat history of the current patient.
+
+        Works regardless of the conversational-context checkbox (the
+        toggle only affects how answers are generated, never the stored
+        trace).
+        """
+        if not self._chat_messages:
+            return
+        reply = QMessageBox.question(
+            self, "Conferma eliminazione",
+            "Eliminare tutta la cronologia di domande e risposte "
+            "per questo paziente?\nIl registro cronologico e il profilo "
+            "narrativo restano invariati.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        chat_repo = self._services.get("chat_repo")
+        if chat_repo and self._current_patient_id:
+            try:
+                chat_repo.clear_for_patient(self._current_patient_id)
+            except Exception:
+                pass  # the in-memory panel clears regardless
+        self._chat_messages = []
+        self._chat_transient_error = ""
+        self._render_chat()
+
     def _render_chat(self) -> None:
         """Render the per-patient prompt/response timeline."""
+        self._clear_chat_btn.setEnabled(bool(self._chat_messages))
         if not self._chat_messages and not self._chat_transient_error:
             self._chat_view.setHtml(
                 "<i>La cronologia delle domande e risposte per questo "
