@@ -20,6 +20,17 @@ from emr_analyzer.database.migrations import init_database
 from emr_analyzer.database.patient_repo import PatientRepository
 from emr_analyzer.gui.validation_tab import ValidationTab
 from emr_analyzer.models import Patient
+from emr_analyzer.models.document import DocumentRecord
+
+
+class FakeDocRepo:
+    """Serves a single DocumentRecord by id."""
+
+    def __init__(self, doc):
+        self.doc = doc
+
+    def get_by_id(self, doc_id: str):
+        return self.doc if doc_id == self.doc.id else None
 
 
 class FakeLabRepo:
@@ -75,12 +86,23 @@ class ValidationTabTest(unittest.TestCase):
         self.reattribution = FakeReattribution(self.db)
         self.audit_repo = AuditRepository(self.db)
 
+        self.doc_file = root / "doc.pdf"
+        self.doc_file.write_bytes(b"%PDF-fake")
+        self.doc = DocumentRecord(
+            id="DOC_000001", patient_id="P001", filename="doc.pdf",
+            original_path=str(self.doc_file), file_hash="h",
+            document_type="lettera_dimissione",
+            import_date="2026-08-19T00:00:00",
+        )
+        self.doc_repo = FakeDocRepo(self.doc)
+
         self.tab = ValidationTab()
         self.tab.set_services({
             "db": self.db,
             "patient_repo": patient_repo,
             "lab_repo": self.lab_repo,
             "audit_repo": self.audit_repo,
+            "document_repo": self.doc_repo,
             "document_reattribution": self.reattribution,
         })
         self.emitted: list[tuple] = []
@@ -239,6 +261,55 @@ class ValidationTabTest(unittest.TestCase):
             self.tab._resolve("accepted")
 
         self.assertEqual(self.reattribution.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ValidationTabViewerTest(ValidationTabTest):
+    """PDF inspection of attribution rows (double-click + Quick Look)."""
+
+    def _attribution_row(self):
+        self._insert_queue_row(
+            "attribution", "DOC_000001",
+            original_value=json.dumps({"suggested_patient_id": "P002"}),
+        )
+        self._select_first_row()
+
+    def test_quick_look_resolves_attribution_document(self):
+        self._attribution_row()
+        resolved = self.tab._quick_look_path()
+        self.assertIsNotNone(resolved)
+        path, filename = resolved
+        self.assertEqual(filename, "doc.pdf")
+        self.assertTrue(os.path.isfile(path))
+
+    def test_double_click_opens_pdf_viewer(self):
+        self._attribution_row()
+        with mock.patch(
+            "emr_analyzer.gui.validation_tab.PDFViewerDialog"
+        ) as viewer_cls:
+            index = mock.MagicMock(column=lambda: 1)
+            self.tab._on_double_click(index)
+        viewer_cls.assert_called_once()
+        doc_data = viewer_cls.call_args[0][0]
+        self.assertEqual(doc_data["id"], "DOC_000001")
+        self.assertEqual(doc_data["filename"], "doc.pdf")
+
+    def test_lab_value_row_has_no_document_view(self):
+        self._insert_queue_row("lab_value", "42")
+        self._select_first_row()
+        self.assertIsNone(self.tab._quick_look_path())
+        self.assertFalse(self.tab._open_file())
+
+    def test_missing_document_returns_nothing(self):
+        self._insert_queue_row(
+            "attribution", "DOC_999999",
+            original_value=json.dumps({"suggested_patient_id": "P002"}),
+        )
+        self._select_first_row()
+        self.assertIsNone(self.tab._quick_look_path())
 
 
 if __name__ == "__main__":

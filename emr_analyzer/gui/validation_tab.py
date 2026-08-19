@@ -1,6 +1,7 @@
 """Validation tab — review queue for human validation of extractions."""
 
 import json
+import os
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -11,6 +12,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal
 
 from ..models.validation import ValidationStatus, Severity
+from ..utils.document_paths import resolve_document_path
+from .pdf_viewer import PDFViewerDialog
+from .quick_look import QuickLook
 
 
 class ValidationTab(QWidget):
@@ -56,7 +60,12 @@ class ValidationTab(QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._table.doubleClicked.connect(self._on_double_click)
         splitter.addWidget(self._table)
+
+        # Double-click opens the full PDF viewer; the spacebar opens an
+        # in-app Quick Look preview of the current attribution document.
+        self._quick_look = QuickLook(self._table, self._quick_look_path)
 
         # Detail panel
         detail_widget = QWidget()
@@ -372,6 +381,57 @@ class ValidationTab(QWidget):
         # The label is "P001 — pseudonym • extras": the id is the prefix.
         chosen_id = str(chosen).split(" — ")[0].strip()
         return chosen_id if chosen_id in ids else None
+
+    # ------------------------------------------------------------------
+    # Document inspection (double-click + spacebar Quick Look)
+    # ------------------------------------------------------------------
+
+    def _current_doc_data(self) -> dict | None:
+        """DocumentRecord dict of the selected attribution row, if any."""
+        row = self._table.currentRow()
+        if row < 0:
+            return None
+        item = self._table.item(row, 0)
+        if not item:
+            return None
+        row_data = item.data(Qt.UserRole)
+        if row_data.get("item_type") != "attribution":
+            return None
+        doc_repo = self._services.get("document_repo")
+        if not doc_repo:
+            return None
+        doc = doc_repo.get_by_id(str(row_data.get("item_id") or ""))
+        if doc is None:
+            return None
+        return doc.to_dict()
+
+    def _on_double_click(self, index) -> None:
+        if index.column() == 0:
+            return  # column 0 carries the row data; open from any other
+        self._open_file()
+
+    def _open_file(self) -> bool:
+        """Open the current attribution row's PDF in the full viewer."""
+        doc_data = self._current_doc_data()
+        if not doc_data:
+            return False
+        path = resolve_document_path(doc_data)
+        if not path or not os.path.isfile(path):
+            return False
+        self._quick_look.dismiss()
+        viewer = PDFViewerDialog(doc_data, self._services, self)
+        viewer.exec_()
+        return True
+
+    def _quick_look_path(self):
+        """Resolve the current attribution row to a PDF path."""
+        doc_data = self._current_doc_data()
+        if not doc_data:
+            return None
+        path = resolve_document_path(doc_data)
+        if not path or not os.path.isfile(path):
+            return None
+        return path, doc_data.get("filename") or os.path.basename(path)
 
     def _perform_reattribution(
         self, row_data: dict, target: str, resolution_status: str
