@@ -261,6 +261,88 @@ class AttributionVerificationTest(unittest.TestCase):
                 None, _Progress(),
             )
 
+    # --- same-patient conflict with a confirming CF (Fix 4) --------------
+
+    # Anna Serra, born 1929-08-26 — a second checksum-valid code, used for a
+    # patient whose *registered* CF differs from the one the LLM reads.
+    CF_ANNA = "CRSMRA29M66D429M"
+
+    # Bianchi Mario, born 1980-01-01 — a valid CF that is *not* registered
+    # anywhere: it encodes the same birth date as CF_MARIO, so name+birth
+    # still identify the assigned patient when the LLM reads this code.
+    CF_BIANCHI = "BNCMRA80A01H501A"
+
+    def test_same_patient_name_conflict_with_confirming_cf_is_confirmed(self):
+        # The P066/P080/P031 pattern: the LLM misreads a birth-place town as
+        # the patient's name ("JOLANDA DI SAVOIA") while the checksum-valid,
+        # text-anchored CF still confirms the assigned patient.  The name
+        # conflict is a misread, not a wrong attribution: the extraction must
+        # proceed (confirmed with a warning) instead of blocking.
+        self._register(
+            "P001", name="Mario Rossi", birth="1980-01-01", cf=CF_MARIO
+        )
+        tab = self._tab({
+            "name": "JOLANDA DI SAVOIA", "birth_date": "1980-01-01",
+            "fiscal_code": CF_MARIO, "confidence": 0.97,
+        })
+        result = tab._verify_document_attribution(
+            self._doc("P001"),
+            self._report(
+                f"Paziente: JOLANDA DI SAVOIA. Codice fiscale {CF_MARIO}."
+            ),
+            None, _Progress(),
+        )
+        self.assertIsNone(result)
+
+    def test_same_patient_cf_conflict_with_matching_name_birth_is_confirmed(self):
+        # The RENE P023 / LUNG P026 pattern: name and birth exactly match the
+        # assigned patient, but the checksum-valid CF read from the document
+        # differs from the registered one (a source-form artifact).  The
+        # (name, birth) pair independently confirms the patient, so the CF
+        # conflict is downgraded to a warning and the extraction proceeds.
+        self._register(
+            "P001", name="Mario Rossi", birth="1980-01-01", cf=CF_MARIO
+        )
+        tab = self._tab({
+            "name": "Mario Rossi", "birth_date": "1980-01-01",
+            # A valid CF that encodes the same birth date but is not
+            # registered to anyone: name+birth still identify P001.
+            "fiscal_code": self.CF_BIANCHI, "confidence": 0.97,
+        })
+        result = tab._verify_document_attribution(
+            self._doc("P001"),
+            self._report(
+                f"Paziente: Mario Rossi nato il 1980-01-01. "
+                f"Codice fiscale {self.CF_BIANCHI}."
+            ),
+            None, _Progress(),
+        )
+        self.assertIsNone(result)
+
+    def test_cf_pointing_to_other_patient_still_blocks(self):
+        # A checksum-valid CF that resolves to a *different* registered
+        # patient must still raise even when name+birth match the assigned
+        # one: the cross-field conflict is a genuine attribution mismatch.
+        self._register(
+            "P001", name="Mario Rossi", birth="1980-01-01", cf=CF_MARIO
+        )
+        self._register(
+            "P002", name="Anna Serra", birth="1929-08-26", cf=self.CF_ANNA
+        )
+        tab = self._tab({
+            "name": "Mario Rossi", "birth_date": "1980-01-01",
+            "fiscal_code": self.CF_ANNA, "confidence": 0.97,
+        })
+        with self.assertRaises(AttributionMismatchError):
+            tab._verify_document_attribution(
+                self._doc("P001"),
+                self._report(
+                    f"Paziente: Mario Rossi nato il 1980-01-01. "
+                    f"Codice fiscale {self.CF_ANNA}."
+                ),
+                None, _Progress(),
+            )
+
     # --- CF-anchored birth override (Fix 3) ------------------------------
 
     def test_anchored_cf_birth_overrides_transposed_textual_birth(self):

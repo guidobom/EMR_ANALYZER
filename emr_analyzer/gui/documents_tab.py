@@ -1235,6 +1235,45 @@ class DocumentsTab(QWidget):
                     pass
         return values
 
+    # --- deterministic (non-LLM) attribution confirmation ---------------
+
+    def _deterministic_attribution_confirmed(
+        self, doc, identity_repo
+    ) -> bool:
+        """Whether the document's own evidence deterministically confirms it.
+
+        Extracts identity evidence from the PDF (header extractor first,
+        then a full-text scan for a checksum-valid fiscal code), persists it
+        to ``document_identity_evidence`` and registers any hospital patient
+        id, then checks that a strong identifier uniquely resolves to the
+        assigned patient.  A confirmed document skips the LLM identity call;
+        anything inconclusive falls through to the LLM verification.
+        """
+        from ..pipeline.deterministic_attribution import (
+            deterministic_verdict, strong_evidence_confirms,
+        )
+
+        extractor = self._services.get("identity_extractor")
+        status, evidence = deterministic_verdict(
+            extractor, doc.original_path
+        )
+        if status != "confirmed" or evidence is None:
+            return False
+        try:
+            identity_repo.add_document_evidence(
+                doc.id, doc.patient_id, evidence
+            )
+            if evidence.hospital_patient_id:
+                identity_repo.add_hospital_patient_id(
+                    doc.patient_id,
+                    evidence.hospital_patient_id.normalized,
+                )
+        except Exception:
+            pass
+        return strong_evidence_confirms(
+            identity_repo, evidence, doc.patient_id
+        )
+
     # --- LLM attribution verification ------------------------------------
 
     def _verify_document_attribution(self, doc, text, parsing_result,
@@ -1251,10 +1290,19 @@ class DocumentsTab(QWidget):
         """
         if not ATTRIBUTION_VERIFICATION_ENABLED:
             return
-        llm_client = self._services.get("document_llm_client")
         identity_repo = self._services.get("identity_repo")
+        if not identity_repo:
+            return
+        # Deterministic pre-check (no LLM): strong evidence on the document
+        # itself — its PDF header, or a checksum-valid fiscal code anywhere in
+        # the text — confirms the assigned patient, so the LLM identity call
+        # is skipped entirely.  Only an inconclusive deterministic result
+        # falls through to the LLM check below.
+        if self._deterministic_attribution_confirmed(doc, identity_repo):
+            return
+        llm_client = self._services.get("document_llm_client")
         extract_identity = getattr(llm_client, "extract_patient_identity", None)
-        if not callable(extract_identity) or not identity_repo:
+        if not callable(extract_identity):
             return
         raw_text = self._attribution_raw_text(doc, text, parsing_result)
         verdict = self._attribution_verdict(
@@ -1263,6 +1311,24 @@ class DocumentsTab(QWidget):
         if verdict["status"] in ("mismatch", "conflict"):
             self._flag_attribution_mismatch(doc, verdict, progress)
             raise AttributionMismatchError(verdict["message"])
+        if verdict["status"] == "confirmed" and verdict.get("warning"):
+            # Confirmed with a non-blocking warning: the attribution is
+            # trusted (strong CF or name+birth evidence), but a registered
+            # identity field disagrees with the document.  Audit it for a
+            # later data-quality review (e.g. a registered CF to fix) without
+            # blocking or queuing the document.
+            audit_repo = self._services.get("audit_repo")
+            if audit_repo:
+                try:
+                    audit_repo.log(
+                        doc.patient_id, "attribution_warning", "document",
+                        doc.id, {
+                            "warning": verdict["warning"],
+                            "llm_identity": verdict.get("identity") or {},
+                        },
+                    )
+                except Exception:
+                    pass
 
     @staticmethod
     def _attribution_raw_text(doc, text, parsing_result) -> str:
@@ -1388,6 +1454,29 @@ class DocumentsTab(QWidget):
         )
         match = identity_repo.find_match(evidence)
         if match.conflict:
+            # A same-patient conflict (the matched patient is the assigned
+            # one, but some field differs from the registered value) is
+            # usually an LLM misread — e.g. a birth-place town read as a
+            # name, or a variant first-name spelling — NOT a wrong
+            # attribution.  The attribution is trustworthy when the
+            # evidence carries at least one strong identifier that
+            # independently confirms the assigned patient: a
+            # checksum-valid, text-anchored fiscal code, or the exact
+            # (name, birth date) pair.  In those cases the conflicting
+            # field is downgraded to a warning instead of blocking the
+            # extraction.  A conflict where no strong sub-evidence
+            # confirms the assigned patient still blocks.
+            if (
+                match.patient_id == doc.patient_id
+                and self._strong_identity_confirms(
+                    identity_repo, fields, doc.patient_id
+                )
+            ):
+                return {
+                    "status": "confirmed",
+                    "identity": identity,
+                    "warning": match.reason,
+                }
             return {
                 "status": "conflict",
                 "message": (
@@ -1416,6 +1505,37 @@ class DocumentsTab(QWidget):
                     "identity": identity,
                 }
         return {"status": "inconclusive", "identity": identity}
+
+    @staticmethod
+    def _strong_identity_confirms(
+        identity_repo, fields: dict, patient_id: str
+    ) -> bool:
+        """Whether a strong identifier in ``fields`` confirms ``patient_id``.
+
+        The evidence is matched again on each single strong identifier — a
+        checksum-valid fiscal code, or the exact (name, birth date) pair —
+        using ``find_match`` on a reduced evidence.  Either one uniquely
+        resolving to ``patient_id`` (without a new conflict) makes the
+        attribution trustworthy despite a conflicting secondary field.
+        """
+        from ..models.patient_identity import PatientIdentityEvidence
+
+        strong_subsets = []
+        fiscal_code = fields.get("fiscal_code")
+        if fiscal_code is not None:
+            strong_subsets.append({"fiscal_code": fiscal_code})
+        name = fields.get("name")
+        birth = fields.get("birth_date")
+        if name is not None and birth is not None:
+            strong_subsets.append({"name": name, "birth_date": birth})
+        for subset in strong_subsets:
+            reduced = PatientIdentityEvidence(
+                source_path="llm_attribution", **subset
+            )
+            match = identity_repo.find_match(reduced)
+            if match.patient_id == patient_id and not match.conflict:
+                return True
+        return False
 
     def _flag_attribution_mismatch(self, doc, verdict, progress) -> None:
         """Audit + review-queue the mismatch and surface it in the log."""
