@@ -70,6 +70,7 @@ class ModelSettingsTest(unittest.TestCase):
                     context_length=65536, max_output_tokens=8192,
                     top_p=0.95, top_k=50, seed=42,
                     keep_alive_minutes=30,
+                    speculative_decoding=True,
                 ),
             }
 

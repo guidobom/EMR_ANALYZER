@@ -264,6 +264,16 @@ class TestServerManager(unittest.TestCase):
         self.assertEqual(argv[argv.index("-ctk") + 1], "q8_0")
         self.assertIn("-rea", argv)
 
+    def test_ngram_speculation_is_explicit_and_target_verified(self):
+        self._patch_spawn_and_health()
+        key = ServerKey(
+            str(self._model_path), 32768, 1,
+            speculative_mode="ngram-cache",
+        )
+        self.manager.ensure(key, load_timeout=5)
+        argv = self.fake_popen.call_args[0][0]
+        self.assertEqual(argv[argv.index("--spec-type") + 1], "ngram-cache")
+
     def test_ensure_is_idempotent(self):
         self._patch_spawn_and_health()
         first = self.manager.ensure(self.key, load_timeout=5)

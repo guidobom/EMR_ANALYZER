@@ -220,6 +220,25 @@ class ValidationTab(QWidget):
             )
             db.commit()
 
+            if row_data.get("item_type") == "clinical_event_v2":
+                review_repo = self._services.get("review_repo")
+                if review_repo:
+                    review_repo.decide_event(
+                        self._current_patient_id,
+                        str(row_data.get("item_id") or ""),
+                        new_status,
+                        reason=str(row_data.get("issue") or "Revisione clinica"),
+                    )
+                timeline_repo = self._services.get("timeline_repo")
+                if timeline_repo:
+                    if new_status == "rejected":
+                        timeline_repo.delete_entry(str(row_data.get("item_id") or ""))
+                    else:
+                        timeline_repo.set_golden(
+                            str(row_data.get("item_id") or ""),
+                            new_status == "accepted",
+                        )
+
             # If accepted, also update the underlying item
             if new_status == "accepted":
                 self._accept_underlying_item(row_data)
@@ -348,6 +367,30 @@ class ValidationTab(QWidget):
                     (new_value, datetime.now().isoformat(), row_data.get("id")),
                 )
                 db.commit()
+            if row_data.get("item_type") == "clinical_event_v2":
+                review_repo = self._services.get("review_repo")
+                if review_repo:
+                    review_repo.decide_event(
+                        self._current_patient_id,
+                        str(row_data.get("item_id") or ""),
+                        "corrected",
+                        corrected_value={"summary_short": new_value.strip()},
+                        reason=str(row_data.get("issue") or "Correzione clinica"),
+                    )
+                timeline_repo = self._services.get("timeline_repo")
+                if timeline_repo:
+                    timeline_repo.update_description(
+                        str(row_data.get("item_id") or ""), new_value.strip()
+                    )
+            audit_repo = self._services.get("audit_repo")
+            if audit_repo:
+                audit_repo.log(
+                    self._current_patient_id,
+                    "validate",
+                    row_data.get("item_type"),
+                    row_data.get("item_id"),
+                    {"action": "corrected", "issue": row_data.get("issue")},
+                )
             self._refresh()
 
     def _choose_target_patient(self, row_data: dict) -> str | None:

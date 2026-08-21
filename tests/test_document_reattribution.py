@@ -189,13 +189,14 @@ class DocumentReattributionTest(unittest.TestCase):
             self.assertIsNone(qrow["corrected_value"])
             self.assertTrue(result.queue_resolved)
 
-            # Audit: mismatch row repointed + new reattribution row.
+            # Audit is append-only: the mismatch remains in its historical
+            # patient context; a new target-side reattribution row links it.
             audit_rows = fixture["db"].execute(
                 "SELECT patient_id, action FROM audit_log "
                 "WHERE target_id='DOC_000001' ORDER BY id"
             ).fetchall()
             actions = {r["action"]: r["patient_id"] for r in audit_rows}
-            self.assertEqual(actions.get("attribution_mismatch"), "P002")
+            self.assertEqual(actions.get("attribution_mismatch"), "P001")
             self.assertEqual(actions.get("document_reattributed"), "P002")
 
             # Timeline: single-doc row repointed, mixed row stays.

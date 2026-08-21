@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PyQt5.QtWidgets import (
-    QTabWidget, QWidget, QVBoxLayout, QLabel, QMessageBox, QApplication,
+    QTabWidget, QWidget, QVBoxLayout, QLabel, QMessageBox,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
@@ -13,9 +13,11 @@ from .documents_tab import DocumentsTab
 from .laboratory_tab import LaboratoryTab
 from .clinical_history_tab import ClinicalHistoryTab
 from .validation_tab import ValidationTab
+from .gold_set_tab import GoldSetTab
 from .import_dialog import ImportDialog
 from .batch_import_dialog import BatchImportDialog
 from .progress_dialog import ProgressDialog
+from .qt_utils import process_gui_events
 from ..models import Patient
 
 
@@ -31,18 +33,21 @@ class WorkspaceTabs(QTabWidget):
         self._current_patient_id = None
         self._current_document_id = None
         self._irae_queue_worker = None
+        self._registry_queue_worker = None
 
         # Create tabs
         self._documents_tab = DocumentsTab()
         self._laboratory_tab = LaboratoryTab()
         self._clinical_history_tab = ClinicalHistoryTab()
         self._validation_tab = ValidationTab()
+        self._gold_set_tab = GoldSetTab()
 
         # Add tabs
         self.addTab(self._documents_tab, "📄 Documenti")
         self.addTab(self._laboratory_tab, "🔬 Laboratorio")
         self.addTab(self._clinical_history_tab, "📋 Storia Clinica")
         self.addTab(self._validation_tab, "✓ Validazione")
+        self.addTab(self._gold_set_tab, "🧪 Gold Set")
 
         # Connect signals
         self._documents_tab.document_selected.connect(self._on_document_selected)
@@ -61,6 +66,7 @@ class WorkspaceTabs(QTabWidget):
         self._laboratory_tab.set_services(services)
         self._clinical_history_tab.set_services(services)
         self._validation_tab.set_services(services)
+        self._gold_set_tab.set_services(services)
 
     def load_patient(self, patient_id: str):
         """Load all tabs with data for the given patient."""
@@ -69,6 +75,7 @@ class WorkspaceTabs(QTabWidget):
         self._laboratory_tab.load_patient(patient_id)
         self._clinical_history_tab.load_patient(patient_id)
         self._validation_tab.load_patient(patient_id)
+        self._gold_set_tab.load_patient(patient_id)
 
     def shutdown(self) -> None:
         """Stop background workers of the tabs (application quit path)."""
@@ -76,10 +83,25 @@ class WorkspaceTabs(QTabWidget):
             self._clinical_history_tab.shutdown()
         except Exception:
             pass
-        worker = self._irae_queue_worker
-        if worker is not None and worker.isRunning():
-            worker.cancel()
-            worker.wait(5000)
+        for worker in (
+            self._irae_queue_worker, self._registry_queue_worker,
+        ):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                worker.wait(5000)
+
+    def llm_operation_running(self) -> bool:
+        """True while any workspace operation is using an LLM runtime."""
+        if self._documents_tab.llm_operation_running():
+            return True
+        if self._clinical_history_tab._worker_running():
+            return True
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (
+                self._irae_queue_worker, self._registry_queue_worker,
+            )
+        )
 
     def _on_document_reattributed(self, source_pid: str,
                                   target_pid: str) -> None:
@@ -96,6 +118,7 @@ class WorkspaceTabs(QTabWidget):
         self._laboratory_tab.load_patient(pid)
         self._clinical_history_tab.load_patient(pid)
         self._validation_tab.load_patient(pid)
+        self._gold_set_tab.load_patient(pid)
 
     def show_import_dialog(self, files: list[str]):
         """Import documents — routes to existing/new patient workspaces."""
@@ -305,7 +328,7 @@ class WorkspaceTabs(QTabWidget):
             f"Coda di estrazione — paziente 1/{total}", parent=self,
         )
         progress.show()
-        QApplication.processEvents()
+        process_gui_events()
 
         for idx, pid in enumerate(patient_ids, start=1):
             if progress.is_cancelled():
@@ -326,6 +349,126 @@ class WorkspaceTabs(QTabWidget):
 
         progress.mark_done()
         progress.exec_()
+
+    # ------------------------------------------------------------------
+    # Multi-patient chronological-registry queue
+    # ------------------------------------------------------------------
+
+    def run_registry_queue(
+        self, patient_ids: list[str], *, force_rebuild: bool = False
+    ) -> None:
+        """Build registries sequentially while each patient uses all slots."""
+        if not patient_ids:
+            return
+        if self.llm_operation_running():
+            QMessageBox.information(
+                self, "Operazione LLM in corso",
+                "Attendi il completamento dell'operazione corrente prima "
+                "di avviare la coda dei registri.",
+            )
+            return
+
+        builder = self._services.get("clinical_history_builder")
+        llm = self._services.get("clinical_state_llm_client")
+        if builder is None or llm is None or not llm.is_available:
+            QMessageBox.warning(
+                self, "LLM non disponibile",
+                "Il modello Clinical State o il generatore dei registri "
+                "non è disponibile.",
+            )
+            return
+
+        configs = self._services.get("llm_configs") or {}
+        state_config = configs.get("clinical_state")
+        num_workers = max(
+            1, int(getattr(state_config, "parallel_workers", 1) or 1)
+        )
+
+        from .workers import RegistryQueueWorker
+
+        worker = RegistryQueueWorker(
+            builder, patient_ids, num_workers=num_workers,
+            force_rebuild=force_rebuild,
+        )
+        self._registry_queue_worker = worker
+        results: list[dict] = []
+        state = {"index": 0, "total": len(patient_ids), "patient": ""}
+        progress = ProgressDialog(
+            f"Coda registri — paziente 1/{len(patient_ids)}", parent=self,
+        )
+        progress.show()
+        process_gui_events()
+
+        def on_started(index: int, total: int, patient_id: str) -> None:
+            state.update(index=index, total=total, patient=patient_id)
+            progress.setWindowTitle(
+                f"Coda registri — paziente {index}/{total}"
+            )
+            progress.add_log(
+                f"\n===== Paziente {index}/{total}: {patient_id} ====="
+            )
+            progress.set_progress(
+                int((index - 1) * 100 / total),
+                f"Avvio registro di {patient_id}...",
+            )
+
+        def on_progress(patient_id: str, percent: int, message: str) -> None:
+            index = state["index"]
+            total = max(state["total"], 1)
+            overall = int(((index - 1) + percent / 100) * 100 / total)
+            progress.set_progress(
+                overall,
+                f"{patient_id} ({percent}%): {message}",
+            )
+
+        def on_finished(patient_id: str, result: dict) -> None:
+            results.append({
+                "patient_id": patient_id, "result": result, "error": None,
+            })
+            processed = int(result.get("documents_processed", 0) or 0)
+            skipped = int(result.get("documents_skipped", 0) or 0)
+            label = (
+                "già aggiornato"
+                if processed == 0 and skipped else
+                f"completato ({processed} documenti elaborati)"
+            )
+            progress.add_log(f"✓ {patient_id}: {label}")
+            progress.set_progress(
+                int(state["index"] * 100 / max(state["total"], 1)),
+                f"{patient_id}: {label}",
+            )
+
+        def on_error(patient_id: str, error: str) -> None:
+            results.append({
+                "patient_id": patient_id, "result": {}, "error": error,
+            })
+            progress.add_log(f"❌ {patient_id}: {error}")
+
+        worker.patient_started.connect(on_started)
+        worker.patient_progress.connect(on_progress)
+        worker.patient_finished.connect(on_finished)
+        worker.patient_error.connect(on_error)
+        progress.cancelled.connect(worker.cancel)
+
+        def on_queue_finished() -> None:
+            cancelled = progress.is_cancelled()
+            worker.deleteLater()
+            self._registry_queue_worker = None
+            progress.mark_done()
+            progress.accept()
+            if self._current_patient_id:
+                self._clinical_history_tab.load_patient(
+                    self._current_patient_id
+                )
+            from .registry_queue_result_dialog import (
+                RegistryQueueResultDialog,
+            )
+            RegistryQueueResultDialog(
+                results, cancelled=cancelled, parent=self,
+            ).exec_()
+
+        worker.finished.connect(on_queue_finished)
+        worker.start()
 
     # ------------------------------------------------------------------
     # Multi-patient irAE analysis queue
@@ -402,7 +545,7 @@ class WorkspaceTabs(QTabWidget):
             f"Coda analisi irAE — paziente 1/{total}", parent=self,
         )
         progress.show()
-        QApplication.processEvents()
+        process_gui_events()
 
         worker.patient_started.connect(
             lambda idx, n, pid, progress=progress: (
@@ -474,7 +617,7 @@ class WorkspaceTabs(QTabWidget):
             parent=self,
         )
         progress.show()
-        QApplication.processEvents()
+        process_gui_events()
 
         for idx, pid in enumerate(patients, start=1):
             if progress.is_cancelled():

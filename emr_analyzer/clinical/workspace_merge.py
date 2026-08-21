@@ -12,8 +12,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+import hashlib
 import json
+from pathlib import Path
 import shutil
 
 from ..config import active_workspace
@@ -105,7 +106,6 @@ _DOCUMENT_BOUND_TABLES = {
 # NULL via ON DELETE SET NULL when a skipped duplicate is deleted.
 _WHOLESALE_TABLES = (
     "validation_queue",
-    "audit_log",
 )
 
 
@@ -223,6 +223,18 @@ class WorkspaceMergeService:
             raise ValueError(
                 f"Paziente destinazione {target_pid} non trovato"
             )
+        protected = self.db.execute(
+            """SELECT patient_id, status FROM gold_set_cases
+               WHERE patient_id IN (?, ?) AND included=1 LIMIT 1""",
+            (source_pid, target_pid),
+        ).fetchone()
+        if protected:
+            raise ValueError(
+                "Merge bloccato: il paziente "
+                f"{protected['patient_id']} appartiene al gold set "
+                f"({protected['status']}). Escludere o ricostruire il caso "
+                "prima del merge."
+            )
         self._emit(progress_callback, 5, "Verifica workspace...")
 
         # ---- 1. Classify documents --------------------------------------
@@ -322,11 +334,14 @@ class WorkspaceMergeService:
         # ---- 4. Audit (after commit) --------------------------------------
         try:
             if self.audit_repo:
+                source_audit = self._audit_summary(source_pid)
                 self.audit_repo.log(
                     target_pid, "merge", "patient", source_pid,
                     {
                         "moved_documents": result.moved_documents,
                         "already_present": result.already_present,
+                        "source_audit_count": source_audit["count"],
+                        "source_audit_sha256": source_audit["sha256"],
                     },
                 )
         except Exception as exc:
@@ -350,6 +365,21 @@ class WorkspaceMergeService:
 
         self._emit(progress_callback, 100, "Completato")
         return result
+
+    def _audit_summary(self, patient_id: str) -> dict:
+        """Hash immutable source audit rows before right-to-erasure cleanup."""
+        rows = self.db.execute(
+            """SELECT action, target_type, target_id, details_json,
+                      model_used, model_version, timestamp, entry_hash
+               FROM audit_log WHERE patient_id=? ORDER BY id""",
+            (patient_id,),
+        ).fetchall()
+        payload = [dict(row) for row in rows]
+        digest = hashlib.sha256(json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return {"count": len(rows), "sha256": digest}
 
     def merge_many(self, pairs: list[tuple[str, str]],
                    progress_callback=None) -> list[MergeResult]:

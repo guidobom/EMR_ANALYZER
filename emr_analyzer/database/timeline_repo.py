@@ -168,12 +168,17 @@ class TimelineRepository:
     def get_next_entry_id(self) -> str:
         """Generate the next sequential timeline entry ID."""
         cursor = self.db.execute(
-            "SELECT entry_id FROM clinical_timeline ORDER BY entry_id DESC LIMIT 1"
+            """SELECT entry_id FROM clinical_timeline
+               WHERE entry_id GLOB 'CTL_[0-9]*'
+               ORDER BY CAST(SUBSTR(entry_id, 5) AS INTEGER) DESC LIMIT 1"""
         )
         row = cursor.fetchone()
         if row:
             last_id = row["entry_id"]
-            last_num = int(last_id.split("_")[1])
+            try:
+                last_num = int(last_id.split("_", 1)[1])
+            except (TypeError, ValueError, IndexError):
+                last_num = 0
             return f"CTL_{last_num + 1:06d}"
         return "CTL_000001"
 

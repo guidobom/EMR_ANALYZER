@@ -1,6 +1,7 @@
 """Right panel showing context/details of the selected item."""
 
 import json
+import hashlib
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QGroupBox,
@@ -14,6 +15,7 @@ class ContextPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._services = {}
         self.setMinimumWidth(220)
         self.setMaximumWidth(350)
         self._setup_ui()
@@ -72,7 +74,7 @@ class ContextPanel(QWidget):
         self._text_edit = QTextEdit()
         self._text_edit.setMinimumHeight(150)
         self._text_edit.setMaximumHeight(400)
-        self._text_edit.setReadOnly(False)  # EDITABLE for manual correction
+        self._text_edit.setReadOnly(False)  # edits create a versioned overlay
         self._text_edit.setPlaceholderText("Seleziona un documento per visualizzare il testo...")
         text_layout.addWidget(self._text_edit)
 
@@ -95,6 +97,7 @@ class ContextPanel(QWidget):
         self._current_doc_id = None
         self._current_patient_id = None
         self._original_text = ""
+        self._base_text = ""
 
         # Notes group
         self._notes_group = QGroupBox("Note utente")
@@ -108,6 +111,9 @@ class ContextPanel(QWidget):
 
         # Stretch at bottom
         self._scroll_layout.addStretch()
+
+    def set_services(self, services: dict) -> None:
+        self._services = services
 
     def show_event_context(self, event: dict):
         """Show details for a clinical event."""
@@ -188,7 +194,14 @@ class ContextPanel(QWidget):
             if not md_path.exists():
                 md_path = active_workspace.path / patient_id / "docling" / f"{doc_id}.md"
             if md_path.exists():
-                self._original_text = md_path.read_text(encoding="utf-8")
+                self._base_text = md_path.read_text(encoding="utf-8")
+                overlay_repo = self._services.get("overlay_repo")
+                overlay = (
+                    overlay_repo.get_active(doc_id) if overlay_repo else None
+                )
+                self._original_text = (
+                    overlay.corrected_text if overlay else self._base_text
+                )
                 self._text_edit.setPlainText(self._original_text)
                 self._save_btn.setEnabled(True)
                 self._cancel_btn.setEnabled(True)
@@ -268,28 +281,50 @@ class ContextPanel(QWidget):
                     )
 
     def _on_save_text(self):
-        """Save edited text back to the markdown file."""
+        """Save an overlay while leaving the normalized Markdown immutable."""
         if not self._current_doc_id or not self._current_patient_id:
             return
 
         reply = QMessageBox.question(
             self, "Conferma salvataggio",
-            "Salvare le modifiche al testo clinico attivo?\n"
-            "Il testo grezzo e la sorgente PDF resteranno conservati "
-            "separatamente.",
+            "Salvare la correzione come nuovo overlay versionato?\n"
+            "Il testo normalizzato e la sorgente PDF non saranno modificati.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
         )
         if reply != QMessageBox.Yes:
             return
 
-        from pathlib import Path
-        from ..config import active_workspace
-        md_path = active_workspace.path / self._current_patient_id / "extraction" / f"{self._current_doc_id}.md"
-        if not md_path.exists():
-            md_path = active_workspace.path / self._current_patient_id / "docling" / f"{self._current_doc_id}.md"
+        from ..models.clinical_registry import DocumentTextOverlay
+
+        overlay_repo = self._services.get("overlay_repo")
+        if overlay_repo is None:
+            QMessageBox.critical(
+                self, "Overlay non disponibile",
+                "Il repository delle correzioni non è inizializzato. "
+                "Il testo normalizzato non è stato modificato.",
+            )
+            return
         new_text = self._text_edit.toPlainText()
-        md_path.write_text(new_text, encoding="utf-8")
+        overlay_repo.save(DocumentTextOverlay(
+            patient_id=self._current_patient_id,
+            document_id=self._current_doc_id,
+            corrected_text=new_text,
+            base_text_hash=hashlib.sha256(
+                self._base_text.encode("utf-8")
+            ).hexdigest(),
+        ))
         self._original_text = new_text
+
+        audit_repo = self._services.get("audit_repo")
+        if audit_repo:
+            audit_repo.log(
+                self._current_patient_id, "document_text_overlay_created",
+                "document", self._current_doc_id,
+                {"base_text_hash": hashlib.sha256(
+                    self._base_text.encode("utf-8")
+                ).hexdigest()},
+                actor_id="local_user", actor_role="clinician",
+            )
 
         self._save_btn.setText("✓ Salvato")
         self._save_btn.setStyleSheet("background-color: #2ecc71; color: white;")
@@ -314,6 +349,7 @@ class ContextPanel(QWidget):
         self._save_btn.setText("💾 Salva correzioni")
         self._save_btn.setStyleSheet("")
         self._original_text = ""
+        self._base_text = ""
 
     def _add_meta_field(self, label: str, value: str):
         """Add a read-only field to the metadata panel."""

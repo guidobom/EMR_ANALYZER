@@ -184,7 +184,17 @@ class PdfPipelineTest(unittest.TestCase):
         )
         self.assertEqual(info["context_length"], 16384)
         self.assertEqual(info["slots"], 2)
+        self.assertEqual(info["active_slots"], 1)
         self.assertTrue(info["processing"])
+        second_active = LlmClient._find_loaded_model(
+            [
+                {"id": 0, "n_ctx": 16384, "is_processing": False},
+                {"id": 1, "n_ctx": 16384, "is_processing": True},
+            ],
+            "qwen3:14b",
+        )
+        self.assertTrue(second_active["processing"])
+        self.assertEqual(second_active["active_slots"], 1)
         self.assertIsNone(LlmClient._find_loaded_model([], "qwen3:14b"))
 
     def test_qwen_warmup_uses_real_context_and_confirms_loaded_model(self):

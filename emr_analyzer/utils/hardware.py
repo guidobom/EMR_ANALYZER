@@ -107,8 +107,9 @@ class RecommendedParams:
     ) -> "RecommendedParams":
         """Compute recommended parameters for *model* running on *hw*.
 
-        *role* is ``"document"`` (needs larger output for text filtering) or
-        ``"clinical_state"`` (structured output is more compact).
+        *role* is ``"document"`` (text normalization) or
+        ``"clinical_state"`` (structured extraction plus potentially long
+        registry and irAE reports).
         """
         # ---- context_length ------------------------------------------------
         context, context_rationale = _recommend_context(hw, model)
@@ -143,6 +144,11 @@ def get_available_ram_gb() -> float:
     return psutil.virtual_memory().available / (1024 ** 3)
 
 
+def get_total_ram_gb() -> float:
+    """Physical/unified RAM capacity in GiB."""
+    return psutil.virtual_memory().total / (1024 ** 3)
+
+
 def get_model_size_gb(model_name: str) -> float | None:
     """Return the on-disk size (GiB) of a local GGUF model, or *None*."""
     try:
@@ -151,7 +157,7 @@ def get_model_size_gb(model_name: str) -> float | None:
         entry = model_store.resolve(model_name)
         if entry is None or not entry.get("file"):
             return None
-        return os.path.getsize(entry["file"]) / 1e9
+        return os.path.getsize(entry["file"]) / (1024 ** 3)
     except OSError:
         return None
 
@@ -159,6 +165,32 @@ def get_model_size_gb(model_name: str) -> float | None:
 def estimate_per_request_ram_gb(context_length: int) -> float:
     """Estimate additional RAM (GiB) consumed by one concurrent request."""
     return (context_length * _BYTES_PER_CONTEXT_TOKEN) / (1024 ** 3)
+
+
+def estimate_server_ram_gb(
+    model_name: str, context_length: int, workers: int
+) -> float:
+    """Conservative machine requirement for one llama-server runtime."""
+    return (
+        estimate_runtime_ram_gb(model_name, context_length, workers)
+        + _OS_RESERVE_GB
+    )
+
+
+def estimate_runtime_ram_gb(
+    model_name: str, context_length: int, workers: int
+) -> float:
+    """Estimated weights + KV cache for one physical runtime, in GiB."""
+    model_size = get_model_size_gb(model_name) or 4.0
+    return (
+        model_size
+        + estimate_per_request_ram_gb(context_length) * max(1, int(workers))
+    )
+
+
+def get_system_ram_reserve_gb() -> float:
+    """RAM excluded from LLM sizing for the OS and the application."""
+    return _OS_RESERVE_GB
 
 
 def calculate_max_workers(
@@ -169,7 +201,10 @@ def calculate_max_workers(
 
     Returns a value clamped to ``[MIN_WORKERS, MAX_WORKERS]``.
     """
-    available = get_available_ram_gb()
+    # Size a cold runtime against machine capacity.  ``available`` RAM is
+    # misleading while this same model is resident because subtracting its
+    # weights again double-counts memory already in use.
+    capacity = get_total_ram_gb()
     model_size = get_model_size_gb(model_name)
 
     if model_size is None:
@@ -180,7 +215,7 @@ def calculate_max_workers(
     if per_request <= 0:
         return MAX_WORKERS
 
-    headroom = available - model_size - _OS_RESERVE_GB
+    headroom = capacity - model_size - _OS_RESERVE_GB
     if headroom <= 0:
         return MIN_WORKERS
 
@@ -231,6 +266,15 @@ def recommend_all(
     return RecommendedParams.compute(hw, model, role)
 
 
+def recommend_output_tokens(context_length: int, role: str) -> tuple[int, str]:
+    """Public request-scoped output recommendation for an existing runtime."""
+    return _recommend_output(
+        int(context_length),
+        ModelProfile("runtime", None, int(context_length)),
+        role,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal
 # ---------------------------------------------------------------------------
@@ -274,8 +318,9 @@ def _recommend_context(
     model_max = model.max_context_length or 131_072  # Conservative fallback
     model_size = model.size_gb or 4.0
 
-    # Estimate how much context fits in available RAM
-    available_for_llm = hw.available_ram_gb - _OS_RESERVE_GB
+    # Configuration describes a cold server. Use total capacity rather than
+    # a volatile post-load snapshot that already excludes resident weights.
+    available_for_llm = hw.total_ram_gb - _OS_RESERVE_GB
     kv_per_token_gb = _BYTES_PER_CONTEXT_TOKEN / (1024**3)
     ram_budget_tokens = max(
         2048,
@@ -284,7 +329,9 @@ def _recommend_context(
 
     # Pick the largest round value that fits both constraints.
     candidates = [
-        c for c in (131_072, 65_536, 49_152, 32_768, 16_384, 8_192)
+        c for c in sorted({
+            model_max, 131_072, 65_536, 49_152, 32_768, 16_384, 8_192,
+        }, reverse=True)
         if c <= model_max and c <= ram_budget_tokens
     ]
     chosen = candidates[0] if candidates else 8_192
@@ -298,8 +345,8 @@ def _recommend_context(
             f"a {_fmt_tokens(chosen)} per rispettare la RAM"
         )
     parts.append(
-        f"RAM disponibile: {hw.available_ram_gb:.1f} GB "
-        f"(modello ~{model_size:.1f} GB)"
+        f"RAM totale: {hw.total_ram_gb:.1f} GiB "
+        f"(modello ~{model_size:.1f} GiB)"
     )
     return chosen, "; ".join(parts)
 
@@ -310,15 +357,16 @@ def _recommend_output(
     """Recommend max_output_tokens.
 
     The document model filters full text → needs larger output.
-    The clinical-state model produces structured JSON → compact output.
+    Clinical State also produces long narrative/irAE reports.
     """
     # Base ratio: output gets a fraction of the context.
     if role == "document":
         # Document filtering can produce output up to ~50 % of source
         ratio = 0.30
     else:
-        # Structured JSON is compact
-        ratio = 0.20
+        # Structured extraction is compact, but full-registry and irAE
+        # reports need more headroom than the former 20% recommendation.
+        ratio = 0.25
 
     recommended = max(4096, int(context * ratio))
     # Round to the nearest nice boundary
@@ -327,7 +375,7 @@ def _recommend_output(
     chosen = max(4096, chosen)
 
     rationale = (
-        f"{'Filtraggio testo' if role == 'document' else 'Output strutturato'}: "
+        f"{'Filtraggio testo' if role == 'document' else 'Registro/analisi clinica'}: "
         f"{int(ratio * 100)}% del contesto di {_fmt_tokens(context)} "
         f"→ {_fmt_tokens(chosen)} token"
     )
@@ -338,28 +386,42 @@ def _recommend_workers(
     hw: HardwareProfile, model: ModelProfile, context: int
 ) -> tuple[int, str]:
     """Recommend parallel workers based on RAM headroom."""
-    available = hw.available_ram_gb
+    capacity = hw.total_ram_gb
     model_size = model.size_gb or 4.0
     per_request = estimate_per_request_ram_gb(context)
-    headroom = available - model_size - _OS_RESERVE_GB
+    headroom = capacity - model_size - _OS_RESERVE_GB
 
     if headroom <= 0:
         workers = 1
         rationale = (
-            f"RAM insufficiente ({available:.1f} GB disp., "
-            f"modello {model_size:.1f} GB) — 1 worker forzato"
+            f"Capacità RAM insufficiente ({capacity:.1f} GiB totali, "
+            f"modello {model_size:.1f} GiB) — 1 slot forzato"
         )
     else:
         theoretical = int(headroom / per_request) if per_request > 0 else MAX_WORKERS
-        workers = max(MIN_WORKERS, min(MAX_WORKERS, theoretical))
-        hw_desc = f"Apple Silicon ({hw.gpu_name})" if hw.has_apple_silicon else f"{hw.cpu_cores_physical} core CPU"
+        # Large models rarely gain useful throughput from very high
+        # concurrency on a workstation even when the KV cache technically
+        # fits. Keep automatic recommendations conservative; advanced users
+        # can still select any capacity-safe value manually.
+        performance_cap = 3 if model_size >= 8 else 4 if model_size >= 4 else 6
+        workers = max(
+            MIN_WORKERS,
+            min(MAX_WORKERS, theoretical, performance_cap),
+        )
+        hw_desc = (
+            f"Apple Silicon ({hw.gpu_name})"
+            if hw.has_apple_silicon and hw.gpu_name
+            else "Apple Silicon"
+            if hw.has_apple_silicon
+            else f"{hw.cpu_cores_physical} core CPU"
+        )
         est_total = model_size + (per_request * workers) + _OS_RESERVE_GB
         rationale = (
             f"{hw_desc} — "
-            f"RAM: {available:.1f} GB disp., "
-            f"~{est_total:.1f} GB stimati per {workers} worker "
-            f"(modello {model_size:.1f} GB + "
-            f"{per_request * workers:.1f} GB KV-cache)"
+            f"RAM: {capacity:.1f} GiB totali, "
+            f"~{est_total:.1f} GiB stimati per {workers} slot "
+            f"(modello {model_size:.1f} GiB + "
+            f"{per_request * workers:.1f} GiB KV-cache)"
         )
     return workers, rationale
 
@@ -367,5 +429,3 @@ def _recommend_workers(
 def _fmt_tokens(value: int) -> str:
     """Format a token count for display (e.g. 32768 → '32.768')."""
     return f"{value:,}".replace(",", ".")
-
-

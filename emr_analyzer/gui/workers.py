@@ -24,11 +24,19 @@ class ClinicalHistoryWorker(QThread):
 
     def run(self):
         try:
-            # Use incremental mode when entries already exist
+            # A crash can leave no final timeline rows even though many
+            # document-level checkpoints are already durable.  Prefer the
+            # incremental builder in that case; it validates hashes, prompt
+            # and model before deciding which documents can really be skipped.
             existing_count = self.builder._timeline_repo.count_by_patient(
                 self.patient_id
             )
-            if existing_count > 0:
+            registry_builder = getattr(self.builder, "_registry_builder", None)
+            has_checkpoint = bool(
+                registry_builder is not None
+                and registry_builder.has_atomic_checkpoint(self.patient_id)
+            )
+            if existing_count > 0 or has_checkpoint:
                 result = self.builder.build_incremental(
                     self.patient_id,
                     progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
@@ -50,6 +58,74 @@ class ClinicalHistoryWorker(QThread):
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class RegistryQueueWorker(QThread):
+    """Build chronological registries for several patients sequentially.
+
+    One patient already consumes all configured llama-server slots through
+    the registry builder's document pool.  Running patients concurrently
+    would only make them compete for the same slots, so this worker advances
+    to the next patient only after the current registry is durably saved.
+    Cancellation is intentionally honoured between patients.
+    """
+
+    patient_started = pyqtSignal(int, int, str)
+    patient_progress = pyqtSignal(str, int, str)
+    patient_finished = pyqtSignal(str, dict)
+    patient_error = pyqtSignal(str, str)
+
+    def __init__(
+        self,
+        builder,
+        patient_ids: list[str],
+        *,
+        num_workers: int = 1,
+        force_rebuild: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.builder = builder
+        self.patient_ids = list(patient_ids)
+        self.num_workers = max(1, int(num_workers or 1))
+        self.force_rebuild = bool(force_rebuild)
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Request a safe stop after the patient currently being saved."""
+        self._cancelled = True
+
+    def run(self) -> None:
+        total = len(self.patient_ids)
+        for index, patient_id in enumerate(self.patient_ids, start=1):
+            if self._cancelled:
+                break
+            self.patient_started.emit(index, total, patient_id)
+
+            def progress(percent: int, message: str, pid=patient_id) -> None:
+                self.patient_progress.emit(pid, int(percent), str(message))
+
+            try:
+                if self.force_rebuild:
+                    result = self.builder.build_from_documents_parallel(
+                        patient_id,
+                        num_workers=self.num_workers,
+                        progress_callback=progress,
+                        generate_narrative=False,
+                    )
+                else:
+                    # The evidence-first builder verifies input hashes,
+                    # prompt/model versions and manifests; a patient whose
+                    # registry is current therefore completes without LLM
+                    # calls and is reported as already up to date.
+                    result = self.builder.build_incremental(
+                        patient_id,
+                        progress_callback=progress,
+                        generate_narrative=False,
+                    )
+                self.patient_finished.emit(patient_id, dict(result or {}))
+            except Exception as exc:
+                self.patient_error.emit(patient_id, str(exc))
 
 
 class DedupWorker(QThread):
@@ -157,7 +233,8 @@ class ClinicalHistoryQueryWorker(QThread):
     def __init__(self, llm_client, entries: list[dict],
                  clinical_profile: str, question: str,
                  conversation: list[dict] | None = None,
-                 use_conversation_context: bool = False, parent=None):
+                 use_conversation_context: bool = False,
+                 registry_repo=None, patient_id: str = "", parent=None):
         super().__init__(parent)
         self.llm_client = llm_client
         self.entries = entries
@@ -165,6 +242,8 @@ class ClinicalHistoryQueryWorker(QThread):
         self.question = question
         self.conversation = conversation
         self.use_conversation_context = use_conversation_context
+        self.registry_repo = registry_repo
+        self.patient_id = patient_id
 
     def run(self):
         try:
@@ -175,21 +254,156 @@ class ClinicalHistoryQueryWorker(QThread):
                 "Cita le date quando disponibili. Non inventare informazioni."
             )
 
-            # Merge profile + timeline as compact context
-            entries_text = format_registry_context(self.entries, limit=100)
-
-            user_prompt = build_query_prompt(
-                self.clinical_profile,
-                entries_text,
-                self.question,
-                conversation=self.conversation,
-                use_conversation_context=self.use_conversation_context,
-            )
-
-            answer = self.llm_client.generate_text(user_prompt, system_prompt)
+            if self.registry_repo is not None and self.patient_id:
+                answer = self._run_registry_query(system_prompt)
+            else:
+                # Compatibility path for legacy workspaces/tests.
+                entries_text = format_registry_context(self.entries, limit=100)
+                user_prompt = build_query_prompt(
+                    self.clinical_profile,
+                    entries_text,
+                    self.question,
+                    conversation=self.conversation,
+                    use_conversation_context=self.use_conversation_context,
+                )
+                answer = self.llm_client.generate_text(
+                    user_prompt, system_prompt
+                )
             self.finished.emit(answer)
         except Exception as e:
             self.error.emit(f"Errore query: {str(e)}")
+
+    def _run_registry_query(self, system_prompt: str) -> str:
+        from ..clinical.query_service import (
+            ClinicalQueryService, answer_has_valid_citations,
+        )
+
+        service = ClinicalQueryService(self.registry_repo)
+        details = service.retrieve(self.patient_id, self.question)
+        valid_ids = {
+            detail["event"]["event_id"] for detail in details
+        }
+        valid_pairs = {
+            (detail["event"]["event_id"], str(evidence.get("document_id")))
+            for detail in details for evidence in detail.get("evidence", [])
+            if evidence.get("document_id")
+        }
+        context_length = int(
+            getattr(self.llm_client, "context_length", 32768) or 32768
+        )
+        output_tokens = int(
+            getattr(self.llm_client, "max_output_tokens", 4096) or 4096
+        )
+        context_chars = max(
+            12_000,
+            int(max(4000, context_length - output_tokens - 2500) * 2.3),
+        )
+        chunks = service.format_chunks(details, max_chars=context_chars)
+        partials = []
+        for index, chunk in enumerate(chunks, start=1):
+            prompt = build_query_prompt(
+                self.clinical_profile if index == 1 else "",
+                chunk,
+                self.question,
+                conversation=self.conversation if index == 1 else None,
+                use_conversation_context=(
+                    self.use_conversation_context and index == 1
+                ),
+            ) + (
+                "\nUsa citazioni nel formato [#EVT_...; DOC_...:p.N]. "
+                "Ogni affermazione clinica deve essere sostenuta da almeno "
+                "un evento e da una fonte originale elencata. Non usare "
+                "identificativi non presenti nel contesto."
+            )
+            partials.append(self.llm_client.generate_text(
+                prompt,
+                system_prompt + (
+                    " Il contesto deriva dal registro evidence-based completo, "
+                    "non dalle sole voci più recenti."
+                ),
+            ))
+        if len(partials) == 1:
+            answer = partials[0]
+        else:
+            answer = _reconcile_query_partials(
+                self.llm_client, partials, self.question, system_prompt,
+                max_chars=context_chars,
+            )
+        if valid_ids and not answer_has_valid_citations(
+            answer, valid_ids, valid_pairs
+        ):
+            retry = (
+                "La risposta seguente non contiene citazioni di registro "
+                "verificabili. Riformulala senza aggiungere contenuto e cita "
+                "ogni affermazione con uno degli ID validi nel formato "
+                "[#EVT_...; DOC_...:p.N].\n\n"
+                f"RISPOSTA DA CORREGGERE:\n{answer}\n\n"
+                "CONTESTO VERIFICABILE:\n" + "\n\n".join(chunks)
+            )
+            corrected = self.llm_client.generate_text(retry, system_prompt)
+            if answer_has_valid_citations(corrected, valid_ids, valid_pairs):
+                answer = corrected
+            else:
+                answer = (
+                    "La risposta generativa non ha superato il controllo delle "
+                    "citazioni. Eventi pertinenti recuperati:\n\n"
+                    + "\n".join(_deterministic_cited_event(detail)
+                                for detail in details)
+                )
+        return answer
+
+
+def _deterministic_cited_event(detail: dict) -> str:
+    event = detail["event"]
+    evidence = (detail.get("evidence") or [{}])[0]
+    document_id = evidence.get("document_id") or "documento_n.d."
+    page = evidence.get("source_page") or "n.d."
+    return (
+        f"- [#{event['event_id']}; {document_id}:p.{page}] "
+        f"{event.get('first_evidence_date') or 'data n.d.'}: "
+        f"{event.get('summary_short') or ''}"
+    )
+
+
+def _reconcile_query_partials(
+    llm_client, partials: list[str], question: str, system_prompt: str,
+    *, max_chars: int,
+) -> str:
+    """Hierarchically reconcile arbitrarily many complete registry chunks."""
+    current = list(partials)
+    while len(current) > 1:
+        groups, group, size = [], [], 0
+        for part in current:
+            added = len(part) + 20
+            if group and size + added > max_chars:
+                groups.append(group)
+                group, size = [], 0
+            group.append(part)
+            size += added
+        if group:
+            groups.append(group)
+        # Ensure progress even when every partial nearly fills the budget.
+        if len(groups) == len(current):
+            groups = [current[index:index + 2] for index in range(0, len(current), 2)]
+        reduced = []
+        for group in groups:
+            if len(group) == 1:
+                reduced.append(group[0])
+                continue
+            prompt = (
+                f"DOMANDA: {question}\n\n"
+                "SINTESI PARZIALI DA RICONCILIARE:\n"
+                + "\n\n".join(
+                    f"PARTE {index}:\n{part}"
+                    for index, part in enumerate(group, start=1)
+                )
+                + "\n\nProduci una risposta unica, elimina ripetizioni, "
+                  "conserva discordanze e tutte le citazioni verificabili. "
+                  "Non introdurre affermazioni nuove."
+            )
+            reduced.append(llm_client.generate_text(prompt, system_prompt))
+        current = reduced
+    return current[0]
 
 
 class IraeQueueWorker(QThread):
@@ -237,7 +451,10 @@ class IraeQueueWorker(QThread):
                         f"{answer}"
                     )
                 self.patient_finished.emit(
-                    patient_id, "\n\n".join(parts)
+                    patient_id,
+                    reconcile_irae_parts(
+                        self.llm_client, parts, prompts, SYSTEM_PROMPT
+                    ),
                 )
             except Exception as exc:
                 self.patient_error.emit(
@@ -271,6 +488,50 @@ class IraeAnalysisWorker(QThread):
                 parts.append(
                     f"### Parte {index}/{total}\n\n{answer}"
                 )
-            self.finished.emit("\n\n".join(parts))
+            self.finished.emit(reconcile_irae_parts(
+                self.llm_client, parts, self.prompts, SYSTEM_PROMPT
+            ))
         except Exception as exc:
             self.error.emit(f"Errore analisi irAE: {str(exc)}")
+
+
+def reconcile_irae_parts(
+    llm_client, parts: list[str], source_prompts: list[str], system_prompt: str
+) -> str:
+    """Create one deduplicated irAE report while retaining valid source IDs."""
+    if len(parts) <= 1:
+        return "\n\n".join(parts)
+    import re
+
+    allowed_ids = set(re.findall(
+        r"\[#([^\];\s]+)", "\n".join(source_prompts)
+    ))
+    reconciliation_prompt = (
+        "RICONCILIAZIONE FINALE DI ANALISI irAE\n\n"
+        "Le sezioni seguenti sono analisi parziali di blocchi dello stesso "
+        "registro. Produci un unico rapporto clinico finale secondo il "
+        "protocollo: elimina duplicati e sovrapposizioni, unifica lo stesso "
+        "episodio, conserva cronologia e discordanze, non aggiungere eventi "
+        "nuovi. Mantieni le tabelle richieste e cita solo ID [#...] già "
+        "presenti. Distingui sospetto, confermato ed escluso; non affermare "
+        "causalità non documentate.\n\n"
+        + "\n\n".join(parts)
+    )
+    answer = llm_client.generate_text(reconciliation_prompt, system_prompt)
+    cited = set(re.findall(r"\[#([^\];\s]+)", str(answer)))
+    if cited - allowed_ids or (allowed_ids and not cited):
+        retry = (
+            "Riformula il rapporto riconciliato senza cambiare i contenuti. "
+            "Usa esclusivamente questi ID di registro: "
+            + ", ".join(f"[#{item}]" for item in sorted(allowed_ids))
+            + "\n\nRAPPORTO DA CORREGGERE:\n" + str(answer)
+        )
+        corrected = llm_client.generate_text(retry, system_prompt)
+        corrected_ids = set(re.findall(r"\[#([^\];\s]+)", str(corrected)))
+        if not (corrected_ids - allowed_ids) and (
+            corrected_ids or not allowed_ids
+        ):
+            return corrected
+        # The partial reports are safer than an uncited reconciliation.
+        return "\n\n".join(parts)
+    return answer

@@ -97,6 +97,19 @@ class DocumentReattributionService:
                 f"Il documento appartiene già al paziente {source}"
             )
             return result
+        gold_reference = self.db.execute(
+            """SELECT a.annotation_id FROM gold_annotation_sources s
+               JOIN gold_annotations a ON a.annotation_id=s.annotation_id
+               WHERE s.document_id=? LIMIT 1""",
+            (doc_id,),
+        ).fetchone()
+        if gold_reference:
+            result.error = (
+                "Il documento è citato dal gold set clinico "
+                f"({gold_reference['annotation_id']}); rimuovere o riaprire "
+                "l'annotazione prima di cambiarne paziente."
+            )
+            return result
 
         # ---- Files first (reversible bookkeeping, no transaction) -----
         moved_paths: list[tuple[Path, Path]] = []
@@ -157,12 +170,9 @@ class DocumentReattributionService:
                         )
                     else:
                         result.queue_resolved = True
-                # The audit trail follows the document.
-                self.db.execute(
-                    """UPDATE audit_log SET patient_id=?
-                       WHERE target_type='document' AND target_id=?""",
-                    (target_patient_id, doc_id),
-                )
+                # Historical audit rows remain immutable under the patient
+                # context in which the action occurred. The post-commit
+                # reattribution entry below links source and destination.
                 self._repoint_timeline(
                     source, target_patient_id, doc_id, result
                 )

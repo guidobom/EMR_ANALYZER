@@ -223,8 +223,18 @@ class PatientIdentityExtractor:
             words = page.get_text("words", sort=False)
             method = "native_text"
             if len(words) < 5:
-                words = self._ocr_words(page)
-                method = "ocr" if words else "unavailable"
+                # A short native header can still carry a complete labelled
+                # field (e.g. only "Data Nascita: 31/12/1950").  Prefer OCR
+                # when it yields content, but never discard valid native text
+                # merely because OCR is unavailable.
+                ocr_words = self._ocr_words(page)
+                if ocr_words:
+                    words = ocr_words
+                    method = "ocr"
+                elif words:
+                    method = "native_text"
+                else:
+                    method = "unavailable"
             evidence.extraction_method = method
             if not words:
                 evidence.warnings.append("Testo anagrafico non disponibile")

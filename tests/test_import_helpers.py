@@ -53,7 +53,7 @@ class ImportHelpersTest(unittest.TestCase):
 
     def test_run_file_checks_flags_unsupported_and_duplicate(self):
         supported = self._write("esami.png", b"png-content")
-        unsupported = self._write("note.txt", b"not-supported")
+        unsupported = self._write("note.exe", b"not-supported")
         duplicate = self._write("tac.png", b"dup-content")
         dup_hash = compute_file_hash(duplicate)
         self._doc_repo.insert(DocumentRecord(

@@ -38,6 +38,17 @@ class DocumentDeletionService:
         if document is None:
             result.error = "Documento non trovato nel database"
             return result
+        gold_reference = self.db.execute(
+            """SELECT annotation_id FROM gold_annotation_sources
+               WHERE document_id=? LIMIT 1""",
+            (document_id,),
+        ).fetchone()
+        if gold_reference:
+            result.error = (
+                "Documento citato dal gold set clinico "
+                f"({gold_reference['annotation_id']}): eliminazione bloccata"
+            )
+            return result
 
         trash_dir = (
             self.workspaces_dir / "_trash" /

@@ -104,6 +104,18 @@ class IraeQueueWorkerTest(unittest.TestCase):
         self.assertEqual(finished_ok, ["P001"])
         self.assertEqual(errors, ["P002"])
 
+    def test_multi_chunk_report_is_finally_reconciled(self):
+        llm = FakeLlm()
+        worker = IraeQueueWorker(llm, [(
+            "P001",
+            ["paziente P001 [#T1] parte 1", "paziente P001 [#T2] parte 2"],
+        )])
+        finished = []
+        worker.patient_finished.connect(lambda patient, report: finished.append(report))
+        worker.run()
+        self.assertEqual(len(llm.calls), 4)
+        self.assertIn("RICONCILIAZIONE FINALE", llm.calls[-2])
+
     def test_cancel_stops_between_patients(self):
         class CancellingLlm(FakeLlm):
             def __init__(self, worker):

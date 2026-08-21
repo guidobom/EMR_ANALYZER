@@ -32,12 +32,18 @@ from .extraction.normalizer import LabNormalizer
 from .extraction.llm_client import LlmClient
 from .extraction.clinical_text_isolator import ClinicalTextIsolator
 from .clinical.clinical_history_builder import ClinicalHistoryBuilder
+from .clinical.registry_builder import ClinicalRegistryBuilder
 from .clinical.document_deletion import DocumentDeletionService
 from .clinical.patient_deletion import PatientWorkspaceDeletionService
 from .clinical.document_reattribution import DocumentReattributionService
 from .gui.main_window import MainWindow
 from .database.timeline_repo import TimelineRepository
 from .database.chat_repo import ChatRepository
+from .database.registry_repo import ClinicalRegistryRepository
+from .database.processing_repo import ProcessingRepository
+from .database.overlay_repo import DocumentTextOverlayRepository
+from .database.review_repo import ReviewDecisionRepository
+from .database.gold_set_repo import GoldSetRepository
 from .settings import load_llm_configs
 
 
@@ -116,6 +122,13 @@ class EMRAnalyzerApp:
         evidence_repo = EvidenceRepository(db)
         timeline_repo = TimelineRepository(db)
         chat_repo = ChatRepository(db)
+        registry_repo = ClinicalRegistryRepository(db)
+        processing_repo = ProcessingRepository(db)
+        overlay_repo = DocumentTextOverlayRepository(db)
+        review_repo = ReviewDecisionRepository(db)
+        gold_set_repo = GoldSetRepository(
+            db, registry_repo=registry_repo, audit_repo=audit_repo
+        )
         self._services.update({
             "patient_repo": patient_repo,
             "identity_repo": identity_repo,
@@ -126,6 +139,11 @@ class EMRAnalyzerApp:
             "evidence_repo": evidence_repo,
             "timeline_repo": timeline_repo,
             "chat_repo": chat_repo,
+            "registry_repo": registry_repo,
+            "processing_repo": processing_repo,
+            "overlay_repo": overlay_repo,
+            "review_repo": review_repo,
+            "gold_set_repo": gold_set_repo,
         })
         print(f"  ✓ Repositories initialized")
 
@@ -245,15 +263,29 @@ class EMRAnalyzerApp:
         })
 
         # ---- Clinical components ----
+        registry_builder = ClinicalRegistryBuilder(
+            registry_repo=registry_repo,
+            evidence_repo=evidence_repo,
+            processing_repo=processing_repo,
+            timeline_repo=timeline_repo,
+            document_repo=doc_repo,
+            lab_repo=lab_repo,
+            overlay_repo=overlay_repo,
+            llm_client=self._services.get("clinical_state_llm_client"),
+            audit_repo=audit_repo,
+            db=db,
+        )
         clinical_history_builder = ClinicalHistoryBuilder(
             timeline_repo=timeline_repo,
             document_repo=doc_repo,
             cs_repo=cs_repo,
             clinical_state_llm_client=self._services.get("clinical_state_llm_client"),
             audit_repo=audit_repo,
+            registry_builder=registry_builder,
         )
         self._services.update({
             "clinical_history_builder": clinical_history_builder,
+            "registry_builder": registry_builder,
         })
         self._services["document_deletion"] = DocumentDeletionService(
             db, doc_repo, audit_repo=audit_repo

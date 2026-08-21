@@ -9,6 +9,12 @@ from typing import Optional
 from ..config import SUPPORTED_EXTENSIONS
 
 
+def supported_file_dialog_filter() -> str:
+    """Qt file-dialog filter kept in sync with the ingestion whitelist."""
+    patterns = " ".join(f"*{extension}" for extension in SUPPORTED_EXTENSIONS)
+    return f"Documenti supportati ({patterns});;Tutti i file (*)"
+
+
 def compute_file_hash(file_path: str | Path, algorithm: str = "sha256") -> str:
     """Compute hash of a file."""
     h = hashlib.new(algorithm)
@@ -37,16 +43,30 @@ def is_pdf(file_path: str | Path) -> bool:
 
 
 def is_image(file_path: str | Path) -> bool:
-    return Path(file_path).suffix.lower() in (".jpg", ".jpeg", ".png")
+    return Path(file_path).suffix.lower() in (
+        ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp",
+    )
 
 
 def detect_file_type(file_path: str | Path) -> str:
-    """Returns 'pdf', 'image', or 'unsupported'."""
+    """Return the deterministic extraction family for a supported file."""
     ext = Path(file_path).suffix.lower()
     if ext == ".pdf":
         return "pdf"
-    elif ext in (".jpg", ".jpeg", ".png"):
+    if ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"):
         return "image"
+    if ext in (".txt", ".md", ".hl7"):
+        return "text"
+    if ext == ".csv":
+        return "csv"
+    if ext in (".xml", ".cda"):
+        return "xml"
+    if ext == ".json":
+        return "json"
+    if ext in (".doc", ".docx"):
+        return "word"
+    if ext == ".xlsx":
+        return "spreadsheet"
     return "unsupported"
 
 

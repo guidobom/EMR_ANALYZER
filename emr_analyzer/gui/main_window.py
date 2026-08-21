@@ -15,9 +15,11 @@ from .workspace_tabs import WorkspaceTabs
 from .context_panel import ContextPanel
 from .llm_config_dialog import LLMConfigDialog
 from .styles import MAIN_STYLESHEET
+from ..clinical.atomic_evidence import AtomicEvidenceExtractor
 from ..config import APP_NAME, APP_VERSION, active_workspace
 from ..extraction.llm_client import LlmClient
 from ..settings import load_llm_configs, save_llm_configs
+from ..utils.file_utils import supported_file_dialog_filter
 
 
 class MainWindow(QMainWindow):
@@ -46,6 +48,7 @@ class MainWindow(QMainWindow):
         self._services = services
         self.patient_panel.set_services(services)
         self.workspace_tabs.set_services(services)
+        self.context_panel.set_services(services)
         # Connect context panel
         self.workspace_tabs.context_requested.connect(self._on_context_requested)
         self.workspace_tabs.patient_created.connect(
@@ -108,11 +111,21 @@ class MainWindow(QMainWindow):
         reprocess_action.triggered.connect(self._on_reprocess)
         tools_menu.addAction(reprocess_action)
 
+        registry_queue_action = QAction(
+            "Genera registri &multi-paziente...", self
+        )
+        registry_queue_action.triggered.connect(self._on_show_registry_queue)
+        tools_menu.addAction(registry_queue_action)
+
         tools_menu.addSeparator()
 
         validate_action = QAction("&Validazione", self)
         validate_action.setShortcut("Ctrl+V")
-        validate_action.triggered.connect(lambda: self.workspace_tabs.setCurrentIndex(6))
+        validate_action.triggered.connect(
+            lambda: self.workspace_tabs.setCurrentWidget(
+                self.workspace_tabs._validation_tab
+            )
+        )
         tools_menu.addAction(validate_action)
 
         # Help menu
@@ -154,6 +167,14 @@ class MainWindow(QMainWindow):
         )
         pending_btn.triggered.connect(self._on_show_pending)
         toolbar.addAction(pending_btn)
+
+        registry_queue_btn = QAction("📚 Coda registri", self)
+        registry_queue_btn.setToolTip(
+            "Genera o aggiorna in sequenza i registri cronologici di più "
+            "pazienti"
+        )
+        registry_queue_btn.triggered.connect(self._on_show_registry_queue)
+        toolbar.addAction(registry_queue_btn)
 
         irae_btn = QAction("⚡ Analisi irAE", self)
         irae_btn.setToolTip(
@@ -298,8 +319,8 @@ class MainWindow(QMainWindow):
                                 "Seleziona prima un paziente.")
             return
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Seleziona Documenti PDF",
-            "", "Documenti (*.pdf *.jpg *.jpeg *.png);;Tutti i file (*)"
+            self, "Seleziona documenti clinici",
+            "", supported_file_dialog_filter()
         )
         if files:
             self.workspace_tabs.show_import_dialog(files)
@@ -393,6 +414,53 @@ class MainWindow(QMainWindow):
         if selected:
             self.workspace_tabs.run_irae_queue(selected)
 
+    def _on_show_registry_queue(self):
+        """Select patients and launch sequential registry generation."""
+        if self.workspace_tabs.llm_operation_running():
+            QMessageBox.information(
+                self, "LLM occupato",
+                "Attendi il completamento o annulla l'elaborazione LLM "
+                "attualmente in corso.",
+            )
+            return
+
+        if self._services.get("clinical_state_llm_client") is None:
+            QMessageBox.warning(
+                self, "LLM non configurato",
+                "Configura e carica il modello LLM per il Clinical State.",
+            )
+            return
+
+        from .registry_queue_dialog import (
+            RegistryQueueDialog,
+            build_registry_queue_summaries,
+        )
+
+        summaries = build_registry_queue_summaries(self._services)
+        if not summaries:
+            QMessageBox.information(
+                self, "Nessun documento",
+                "Nessun paziente del workspace contiene documenti clinici.",
+            )
+            return
+        if not any(summary.get("eligible") for summary in summaries):
+            QMessageBox.information(
+                self, "Nessun documento normalizzato",
+                "Prima di creare i registri occorre normalizzare almeno un "
+                "documento clinico.",
+            )
+            return
+
+        dialog = RegistryQueueDialog(summaries, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        selected = dialog.selected_patient_ids()
+        if selected:
+            self.workspace_tabs.run_registry_queue(
+                selected,
+                force_rebuild=dialog.force_rebuild(),
+            )
+
     def _on_about(self):
         QMessageBox.about(
             self, f"Informazioni su {APP_NAME}",
@@ -441,6 +509,15 @@ class MainWindow(QMainWindow):
 
     def _open_llm_config(self) -> None:
         """Open the single configuration surface for both local LLMs."""
+        if self.workspace_tabs.llm_operation_running():
+            QMessageBox.information(
+                self,
+                "Elaborazione LLM in corso",
+                "Attendi il completamento dell'elaborazione dei documenti, "
+                "del registro clinico o dell'analisi irAE prima di modificare "
+                "i runtime LLM.",
+            )
+            return
         configs = self._services.get("llm_configs") or load_llm_configs()
         try:
             available_models = LlmClient.list_available_models()
@@ -464,7 +541,43 @@ class MainWindow(QMainWindow):
 
     def _apply_llm_configs(self, configs) -> None:
         """Persist settings and replace both live clients atomically."""
+        old_configs = self._services.get("llm_configs") or {}
         save_llm_configs(configs)
+
+        # A server is keyed by GGUF path, context and slot count. Stop only
+        # old shapes no longer referenced by either role. Request-scoped
+        # changes such as temperature and output length keep the shared
+        # process alive.
+        new_runtime_ids = set()
+        for config in configs.values():
+            if not config.model:
+                continue
+            try:
+                new_runtime_ids.add(
+                    LlmClient(config=config).runtime_identity()
+                )
+            except Exception:
+                pass
+        obsolete_configs = []
+        obsolete_seen = set()
+        for config in old_configs.values():
+            if not config.model:
+                continue
+            try:
+                identity = LlmClient(config=config).runtime_identity()
+            except Exception:
+                continue
+            if (
+                identity not in new_runtime_ids
+                and identity not in obsolete_seen
+            ):
+                obsolete_seen.add(identity)
+                obsolete_configs.append(config)
+        cleanup_result = (
+            LlmClient.unload_runtimes(obsolete_configs)
+            if obsolete_configs else {"errors": {}}
+        )
+
         clients = {}
         unavailable = []
         for role in ("document", "clinical_state"):
@@ -488,6 +601,19 @@ class MainWindow(QMainWindow):
         self._services["ollama_available"] = self._ollama_available
         self.update_model_status(self._ollama_available)
         self.statusbar.showMessage("Configurazione LLM salvata e applicata", 6000)
+
+        cleanup_errors = cleanup_result.get("errors") or {}
+        if cleanup_errors:
+            QMessageBox.warning(
+                self,
+                "Runtime precedente non scaricato",
+                "La configurazione è stata applicata, ma non è stato possibile "
+                "fermare uno o più server precedenti:\n- "
+                + "\n- ".join(
+                    f"{name}: {error}"
+                    for name, error in cleanup_errors.items()
+                ),
+            )
 
         if unavailable:
             QMessageBox.warning(
@@ -514,12 +640,32 @@ class MainWindow(QMainWindow):
             else "Motore locale non disponibile — esegui "
                  "tools/setup_llama_backend.py"
         )
+        try:
+            document_runtime = (
+                LlmClient(config=document).runtime_identity()
+                if document.model else None
+            )
+            state_runtime = (
+                LlmClient(config=state).runtime_identity()
+                if state.model else None
+            )
+        except Exception:
+            document_runtime = state_runtime = None
+        if document_runtime is not None and document_runtime == state_runtime:
+            runtime_note = "Un solo server fisico condiviso"
+        elif document_runtime is not None or state_runtime is not None:
+            runtime_note = "Server fisici distinti"
+        else:
+            runtime_note = "Nessun server configurato"
         details = (
             f"{connection}\n"
+            f"{runtime_note}\n"
             f"Documenti: {document.model or 'off'} — "
-            f"ctx {document.context_length}, T {document.temperature:g}\n"
+            f"ctx {document.context_length}, {document.parallel_workers} slot, "
+            f"T {document.temperature:g}\n"
             f"Clinical State: {state.model or 'off'} — "
-            f"ctx {state.context_length}, T {state.temperature:g}"
+            f"ctx {state.context_length}, {state.parallel_workers} slot, "
+            f"T {state.temperature:g}"
         )
         self._ollama_label.setToolTip(details)
         self._configure_llm_action.setToolTip(details)
@@ -535,11 +681,26 @@ class MainWindow(QMainWindow):
         history_builder = self._services.get("clinical_history_builder")
         if history_builder is not None:
             history_builder._llm = client
+        registry_builder = self._services.get("registry_builder")
+        if registry_builder is not None:
+            registry_builder.llm = client
+            registry_builder.atomic_extractor = (
+                AtomicEvidenceExtractor(client) if client is not None else None
+            )
 
     def closeEvent(self, event):
-        """Stop background workers and close the database before exiting."""
-        # QThread objects must not be destroyed while running: wait for the
-        # Clinical History workers, then close the DB.
+        """Never tear down the LLM client while clinical work is running."""
+        if self.workspace_tabs.llm_operation_running():
+            QMessageBox.warning(
+                self,
+                "Elaborazione in corso",
+                "Non è possibile chiudere EMR Analyzer mentre è in corso "
+                "un'elaborazione. Attendi il completamento: i risultati "
+                "vengono salvati progressivamente e il programma potrà poi "
+                "essere chiuso in sicurezza.",
+            )
+            event.ignore()
+            return
         try:
             self.workspace_tabs.shutdown()
         except Exception:

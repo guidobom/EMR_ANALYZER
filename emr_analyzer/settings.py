@@ -33,6 +33,9 @@ class LLMRoleConfig:
     # its server process is stopped); kept for settings compatibility.
     keep_alive_minutes: int = 10
     parallel_workers: int = 1
+    # Target-verified n-gram speculative decoding in llama.cpp. Disabled by
+    # default until benchmarked on the local machine.
+    speculative_decoding: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -57,6 +60,12 @@ class LLMRoleConfig:
                 return getattr(default, name)
             return min(maximum, max(minimum, value))
 
+        def boolean(name: str) -> bool:
+            value = payload.get(name, getattr(default, name))
+            if isinstance(value, str):
+                return value.strip().casefold() in {"1", "true", "yes", "on"}
+            return bool(value)
+
         model = payload.get("model", default.model)
         if not isinstance(model, str):
             model = default.model
@@ -70,6 +79,7 @@ class LLMRoleConfig:
             seed=integer("seed", -1, 2_147_483_647),
             keep_alive_minutes=integer("keep_alive_minutes", 0, 1440),
             parallel_workers=integer("parallel_workers", 1, 8),
+            speculative_decoding=boolean("speculative_decoding"),
         )
 
 

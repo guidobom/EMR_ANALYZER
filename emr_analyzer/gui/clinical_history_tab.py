@@ -1,6 +1,5 @@
 """Clinical History tab — chronological timeline view with query capability."""
 
-import json
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -181,7 +180,8 @@ class ClinicalHistoryTab(QWidget):
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["Data", "Cat.", "Descrizione"])
         self._tree.setAlternatingRowColors(True)
-        self._tree.setRootIsDecorated(False)
+        self._tree.setRootIsDecorated(True)
+        self._tree.itemExpanded.connect(self._on_event_expanded)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(
             self._on_tree_context_menu
@@ -486,7 +486,72 @@ class ClinicalHistoryTab(QWidget):
                 child.setForeground(1, Qt.darkYellow)
                 child.setForeground(2, Qt.darkYellow)
 
+            if str(e.entry_id).startswith("EVT_"):
+                placeholder = QTreeWidgetItem(["", "", "Caricamento evidenze…"])
+                placeholder.setData(0, Qt.UserRole + 2, "placeholder")
+                child.addChild(placeholder)
+
             self._tree.addTopLevelItem(child)
+
+    def _on_event_expanded(self, item):
+        """Load every fused, excluded and conflicting source only on demand."""
+        event_id = item.data(0, Qt.UserRole)
+        if not str(event_id or "").startswith("EVT_"):
+            return
+        if item.childCount() != 1 or (
+            item.child(0).data(0, Qt.UserRole + 2) != "placeholder"
+        ):
+            return
+        item.takeChildren()
+        registry_repo = self._services.get("registry_repo")
+        detail = registry_repo.get_event_detail(event_id) if registry_repo else None
+        if not detail:
+            item.addChild(QTreeWidgetItem(["", "", "Dettaglio non disponibile"])); return
+
+        event = detail["event"]
+        item.addChild(QTreeWidgetItem([
+            "Prima evidenza",
+            event.get("date_precision") or "data n.d.",
+            event.get("first_evidence_date") or "non determinabile",
+        ]))
+        evidence_root = QTreeWidgetItem([
+            "", "Evidenze", f"{len(detail.get('evidence', []))} fonti collegate",
+        ])
+        for evidence in detail.get("evidence", []):
+            relation = evidence.get("relation") or "supports"
+            date = evidence.get("observed_date") or evidence.get("source_document_date") or "data n.d."
+            source = evidence.get("source_text") or "(passaggio non disponibile)"
+            citation = f"doc {evidence.get('document_id') or '?'}"
+            if evidence.get("source_page"):
+                citation += f", p. {evidence['source_page']}"
+            included = "in sintesi" if evidence.get("included_in_summary") else "esclusa dalla sintesi"
+            evidence_root.addChild(QTreeWidgetItem([
+                str(date), relation,
+                f"[{citation}; {included}] {source}",
+            ]))
+        item.addChild(evidence_root)
+
+        updates = detail.get("updates", [])
+        if updates:
+            update_root = QTreeWidgetItem(["", "Aggiornamenti", str(len(updates))])
+            for update in updates:
+                update_root.addChild(QTreeWidgetItem([
+                    update.get("update_date") or "data n.d.",
+                    update.get("status_after") or "aggiornamento",
+                    update.get("summary") or "",
+                ]))
+            item.addChild(update_root)
+
+        reviews = detail.get("reviews", [])
+        if reviews:
+            review_root = QTreeWidgetItem(["", "Revisioni", str(len(reviews))])
+            for review in reviews:
+                review_root.addChild(QTreeWidgetItem([
+                    str(review.get("created_at") or "")[:10],
+                    review.get("decision") or "",
+                    review.get("reason") or "Decisione del revisore",
+                ]))
+            item.addChild(review_root)
 
     @staticmethod
     def _category_icon(category: str) -> str:
@@ -562,6 +627,17 @@ class ClinicalHistoryTab(QWidget):
         if not entry_id:
             return
         new_state = not bool(item.data(0, Qt.UserRole + 1))
+        review_repo = self._services.get("review_repo")
+        if review_repo and str(entry_id).startswith("EVT_"):
+            review_repo.decide_event(
+                self._current_patient_id,
+                entry_id,
+                "accepted" if new_state else "deferred",
+                reason=(
+                    "Evento confermato dal clinico"
+                    if new_state else "Conferma rimossa: richiede nuova revisione"
+                ),
+            )
         timeline_repo = self._services.get("timeline_repo")
         if timeline_repo:
             timeline_repo.set_golden(entry_id, new_state)
@@ -584,6 +660,15 @@ class ClinicalHistoryTab(QWidget):
             return
 
         timeline_repo = self._services.get("timeline_repo")
+        review_repo = self._services.get("review_repo")
+        if review_repo and str(entry_id).startswith("EVT_"):
+            review_repo.decide_event(
+                self._current_patient_id,
+                entry_id,
+                "corrected",
+                corrected_value={"summary_short": text.strip()},
+                reason="Descrizione canonica corretta manualmente",
+            )
         if timeline_repo:
             timeline_repo.update_description(entry_id, text.strip())
         self._refresh()
@@ -612,6 +697,14 @@ class ClinicalHistoryTab(QWidget):
             return
 
         timeline_repo = self._services.get("timeline_repo")
+        review_repo = self._services.get("review_repo")
+        if review_repo and str(entry_id).startswith("EVT_"):
+            review_repo.decide_event(
+                self._current_patient_id,
+                entry_id,
+                "rejected",
+                reason="Evento escluso manualmente dal registro clinico",
+            )
         if timeline_repo:
             timeline_repo.delete_entry(entry_id)
         self._refresh()
@@ -625,13 +718,24 @@ class ClinicalHistoryTab(QWidget):
             self, "Conferma eliminazione",
             f"Eliminare TUTTE le {len(self._timeline_entries)} voci del "
             f"registro cronologico e il profilo narrativo?\n\n"
-            f"Questa operazione non e' reversibile.",
+            f"Le evidenze originali resteranno conservate e ogni esclusione "
+            f"sarà registrata nella revisione clinica.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
 
+        registry_repo = self._services.get("registry_repo")
+        review_repo = self._services.get("review_repo")
+        if registry_repo and review_repo:
+            for event in registry_repo.get_events(self._current_patient_id):
+                review_repo.decide_event(
+                    self._current_patient_id,
+                    event.event_id,
+                    "rejected",
+                    reason="Esclusione richiesta con azzeramento del registro",
+                )
         builder = self._services.get("clinical_history_builder")
         if builder:
             builder.clear_timeline(self._current_patient_id)
@@ -795,6 +899,17 @@ class ClinicalHistoryTab(QWidget):
         skipped = result.get('documents_skipped', 0)
         elapsed = result.get('elapsed_seconds')
         incremental = result.get('incremental', False)
+        newly_extracted = result.get('atomic_evidence_extracted', 0)
+        reused_blocks = result.get('exact_blocks_reused', 0)
+        reused_evidence = result.get('reused_evidence', 0)
+        verified_reuse_blocks = result.get(
+            'unique_reuse_blocks_verified', 0
+        )
+        targeted_reuse = result.get('targeted_reuse_verifications', 0)
+        full_fallbacks = result.get('full_document_fallbacks', 0)
+        llm_calls = result.get('llm_calls', 0)
+        source_chunks = result.get('source_chunks', 0)
+        output_retries = result.get('output_limit_retries', 0)
 
         status_text = f"Completato: {final} voci (deduplicate: {dedup})"
         if elapsed is not None:
@@ -806,7 +921,8 @@ class ClinicalHistoryTab(QWidget):
                 f"Registro aggiornato incrementalmente:\n\n"
                 f"• {skipped} documenti già presenti (saltati)\n"
                 f"• {processed} nuovi documenti analizzati\n"
-                f"• {total} nuove osservazioni estratte\n"
+                f"• {newly_extracted} nuove evidenze atomiche\n"
+                f"• {total} evidenze complessive disponibili\n"
                 f"• {dedup} duplicati rimossi\n"
                 f"• {final} voci totali nel registro"
             )
@@ -814,17 +930,31 @@ class ClinicalHistoryTab(QWidget):
             msg = (
                 f"Registro cronologico generato:\n\n"
                 f"• {processed} documenti analizzati\n"
-                f"• {total} osservazioni estratte\n"
+                f"• {newly_extracted} evidenze atomiche estratte\n"
+                f"• {total} evidenze complessive disponibili\n"
                 f"• {dedup} duplicati rimossi\n"
                 f"• {final} voci finali nel registro"
+            )
+        if llm_calls or reused_blocks:
+            msg += (
+                f"\n\nOttimizzazione:\n"
+                f"• {llm_calls} chiamate LLM\n"
+                f"• {source_chunks} segmenti clinici elaborati\n"
+                f"• {output_retries} risposte scartate per limite output\n"
+                f"• {reused_blocks} blocchi identici riutilizzati"
+                f" ({reused_evidence} evidenze replicate con nuova fonte)\n"
+                f"• {verified_reuse_blocks} blocchi unici verificati una volta\n"
+                f"• {targeted_reuse} verifiche mirate sul documento\n"
+                f"• {full_fallbacks} fallback completi di sicurezza"
             )
         if failed > 0:
             failed_ids = result.get('failed_doc_ids', [])
             msg += (
-                f"\n\n⚠️ {failed} documenti non hanno prodotto voci: "
+                f"\n\n⚠️ {failed} documenti non completati: "
                 f"{', '.join(failed_ids[:5])}"
                 f"{'...' if len(failed_ids) > 5 else ''}"
-                f"\n\nControlla il terminale per i dettagli sugli errori."
+                f"\n\nUna nuova esecuzione riprenderà i soli documenti "
+                f"mancanti; le evidenze già salvate non verranno ricalcolate."
             )
 
         self._refresh()
@@ -993,6 +1123,8 @@ class ClinicalHistoryTab(QWidget):
             llm, entries_data, self._clinical_profile, question,
             conversation=conversation,
             use_conversation_context=use_context,
+            registry_repo=self._services.get("registry_repo"),
+            patient_id=patient_id,
         )
         self._query_worker.finished.connect(self._on_query_result)
         self._query_worker.error.connect(self._on_query_error)
@@ -1259,7 +1391,28 @@ class ClinicalHistoryTab(QWidget):
         scrollbar.setValue(scrollbar.maximum())
 
     def _local_search(self, question: str) -> str:
-        """Simple keyword-based search when LLM is unavailable."""
+        """Structured/FTS local search when the generation model is offline."""
+        registry_repo = self._services.get("registry_repo")
+        if registry_repo and self._current_patient_id:
+            from ..clinical.query_service import ClinicalQueryService
+            details = ClinicalQueryService(registry_repo).retrieve(
+                self._current_patient_id, question, limit=50
+            )
+            if details:
+                results = []
+                for detail in details:
+                    event = detail["event"]
+                    sources = detail.get("evidence", [])
+                    citations = " ".join(
+                        f"[#{event['event_id']}; {source['document_id']}:"
+                        f"p.{source.get('source_page') or 'n.d.'}]"
+                        for source in sources
+                    ) or f"[#{event['event_id']}]"
+                    results.append(
+                        f"- **{event.get('first_evidence_date') or 'data n.d.'}** "
+                        f"{event['summary_short']} {citations}"
+                    )
+                return "### Risultati\n\n" + "\n".join(results)
         q_lower = question.lower()
         results = []
         for e in self._timeline_entries:
@@ -1289,53 +1442,43 @@ class ClinicalHistoryTab(QWidget):
             )
             return
 
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected_filter = QFileDialog.getSaveFileName(
             self, "Esporta Registro Cronologico", "",
-            "File Markdown (*.md);;File JSON (*.json);;File di testo (*.txt)"
+            "Markdown completo (*.md);;JSON completo (*.json);;"
+            "Excel multi-foglio (*.xlsx);;CSV eventi (*.csv);;"
+            "Documento Word (*.docx);;Documento PDF (*.pdf);;"
+            "File di testo (*.txt)"
         )
         if not path:
             return
-
-        if path.endswith(".json"):
-            data = {
-                "patient_id": self._current_patient_id,
-                "generated_at": datetime.now().isoformat(),
-                "clinical_profile": self._clinical_profile,
-                "entries": [e.to_dict() for e in self._timeline_entries],
+        if not any(path.lower().endswith(ext) for ext in (
+            ".md", ".json", ".xlsx", ".csv", ".docx", ".pdf", ".txt",
+        )):
+            ext_by_filter = {
+                "Markdown": ".md", "JSON": ".json", "Excel": ".xlsx",
+                "CSV": ".csv", "Documento Word": ".docx",
+                "Documento PDF": ".pdf", "File di testo": ".txt",
             }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        else:
-            lines = [
-                f"# Registro Cronologico — {self._current_patient_id}",
-                "",
-                f"*Generato il {datetime.now().strftime('%d/%m/%Y %H:%M')}*",
-                "",
-            ]
-            if self._clinical_profile:
-                lines += [
-                    "## Profilo Clinico Narrativo",
-                    "",
-                    self._clinical_profile,
-                    "",
-                ]
-            lines += [
-                "## Elenco Cronologico",
-                "",
-            ]
-            for e in sorted(
-                self._timeline_entries, key=lambda x: x.date_observed
-            ):
-                resolved = ""
-                if e.date_resolved:
-                    resolved = f" → risolto: {e.date_resolved}"
-                cat_label = CATEGORY_LABELS.get(e.category, e.category)
-                lines.append(
-                    f"- **{e.date_observed}** [{cat_label}] "
-                    f"{e.description}{resolved}"
-                )
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
+            path += next(
+                (extension for label, extension in ext_by_filter.items()
+                 if selected_filter.startswith(label)),
+                ".md",
+            )
+        try:
+            from ..export.registry_export import ClinicalRegistryExporter
+            ClinicalRegistryExporter(self._services).export(
+                self._current_patient_id, path, include_sources=True,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Errore esportazione",
+                f"Impossibile esportare il registro completo:\n\n{exc}",
+            )
+            return
+        QMessageBox.information(
+            self, "Esportazione completata",
+            f"Registro clinico completo esportato in:\n{path}",
+        )
 
     def _on_export_golden_set(self):
         """Export the user-confirmed golden set for prompt evaluation."""

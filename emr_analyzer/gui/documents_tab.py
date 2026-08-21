@@ -12,15 +12,17 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView, QLabel,
     QFileDialog, QMessageBox, QMenu, QAction,
 )
-from PyQt5.QtCore import pyqtSignal, Qt, QMimeData, QTimer
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+from PyQt5.QtCore import pyqtSignal, Qt, QTimer, QUrl
+from PyQt5.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 
 from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
 from ..extraction.clinical_text_isolator import ClinicalTextIsolationError
 from ..pipeline.sensitive_data import SensitiveDataSanitizer
 from ..config import ATTRIBUTION_VERIFICATION_ENABLED
 from ..utils.document_paths import resolve_document_path
+from ..utils.file_utils import is_supported_file, supported_file_dialog_filter
 from .quick_look import QuickLook
+from .qt_utils import process_gui_events
 
 
 class AttributionMismatchError(RuntimeError):
@@ -46,7 +48,7 @@ class _NullProgressLogger:
 
 
 class DropZoneWidget(QWidget):
-    """Widget that accepts drag-and-drop of PDF/image files."""
+    """Widget that accepts every document type supported by ingestion."""
 
     files_dropped = pyqtSignal(list)
 
@@ -59,7 +61,7 @@ class DropZoneWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
         label = QLabel(
-            "📂 Trascina qui i PDF o clicca per importare\n"
+            "📂 Trascina qui i documenti clinici o clicca per importare\n"
             "I pazienti vengono rilevati automaticamente"
         )
         label.setAlignment(Qt.AlignCenter)
@@ -100,7 +102,7 @@ class DropZoneWidget(QWidget):
                 for root, _, filenames in os.walk(path):
                     for f in filenames:
                         fp = os.path.join(root, f)
-                        if f.lower().endswith(('.pdf', '.jpg', '.jpeg', '.png')):
+                        if is_supported_file(fp):
                             files.append(fp)
         if files:
             QTimer.singleShot(0, lambda: self.files_dropped.emit(files))
@@ -108,8 +110,8 @@ class DropZoneWidget(QWidget):
     def mousePressEvent(self, event):
         """Click to open file dialog."""
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Seleziona Documenti PDF",
-            "", "Documenti (*.pdf *.jpg *.jpeg *.png);;Tutti i file (*)"
+            self, "Seleziona documenti clinici",
+            "", supported_file_dialog_filter()
         )
         if files:
             self.files_dropped.emit(files)
@@ -129,7 +131,22 @@ class DocumentsTab(QWidget):
         self._consecutive_llm_errors = 0
         self._batch_success_count = 0
         self._batch_error_count = 0
+        self._llm_processing_depth = 0
         self._setup_ui()
+
+    def llm_operation_running(self) -> bool:
+        """Whether this tab is currently issuing document-LLM requests."""
+        return self._llm_processing_depth > 0
+
+    def _process_documents_with_busy_state(self, *args, **kwargs):
+        """Run a document batch while runtime changes are blocked."""
+        self._llm_processing_depth += 1
+        try:
+            return self._process_documents(*args, **kwargs)
+        finally:
+            self._llm_processing_depth = max(
+                0, self._llm_processing_depth - 1
+            )
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -154,7 +171,7 @@ class DocumentsTab(QWidget):
         )
         self._extract_clinical_text_btn.setEnabled(False)
 
-        self._view_pdf_btn = QPushButton("📖 Apri PDF")
+        self._view_pdf_btn = QPushButton("📖 Apri documento")
         self._view_pdf_btn.clicked.connect(self._on_view_pdf)
         self._view_pdf_btn.setEnabled(False)
 
@@ -311,8 +328,8 @@ class DocumentsTab(QWidget):
 
     def _on_import_click(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Seleziona Documenti PDF",
-            "", "Documenti (*.pdf *.jpg *.jpeg *.png);;Tutti i file (*)"
+            self, "Seleziona documenti clinici",
+            "", supported_file_dialog_filter()
         )
         if files:
             self.import_requested.emit(files)
@@ -333,7 +350,6 @@ class DocumentsTab(QWidget):
              (CPU-bound, sequential, fast);
           2. LLM isolation over every parsed document, in parallel.
         """
-        from PyQt5.QtWidgets import QApplication
         from .progress_dialog import ProgressDialog
 
         doc_repo = self._services.get("document_repo")
@@ -379,7 +395,6 @@ class DocumentsTab(QWidget):
         if progress is None:
             progress = ProgressDialog("Estrazione testo clinico", self.window())
             progress.show()
-            QApplication.processEvents()
         if patient_label:
             progress.setWindowTitle(patient_label)
 
@@ -388,8 +403,10 @@ class DocumentsTab(QWidget):
             self._process_documents(to_parse, parse_only=True, progress=progress)
         llm_ids = parsed + to_parse
         if llm_ids:
-            # Phase 2 (GPU): parallel LLM isolation over every parsed document.
-            self._process_documents(llm_ids, llm_only=True, progress=progress)
+            # Phase 2 (LLM): parallel isolation over every parsed document.
+            self._process_documents_with_busy_state(
+                llm_ids, llm_only=True, progress=progress
+            )
 
     def _get_selected_doc_ids(self) -> list[str]:
         rows = set()
@@ -413,7 +430,6 @@ class DocumentsTab(QWidget):
         queue).  When given it is reset and reused; when None a fresh dialog is
         created for the phase.
         """
-        from PyQt5.QtWidgets import QApplication
         from .progress_dialog import ProgressDialog
 
         self._consecutive_llm_errors = 0
@@ -458,7 +474,7 @@ class DocumentsTab(QWidget):
                     "Isolamento testo clinico", self.window()
                 )
                 progress.show()
-                QApplication.processEvents()
+                process_gui_events()
             else:
                 progress.reset_for_reuse()
             progress.set_progress(
@@ -480,7 +496,7 @@ class DocumentsTab(QWidget):
         if progress is None:
             progress = ProgressDialog(title, self.window())
             progress.show()
-            QApplication.processEvents()
+            process_gui_events()
         else:
             progress.reset_for_reuse()
         progress.set_progress(
@@ -507,6 +523,7 @@ class DocumentsTab(QWidget):
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from .progress_dialog import ProgressDialog
         from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtCore import QThread
 
         doc_repo = self._services.get("document_repo")
         total = len(doc_ids)
@@ -540,7 +557,9 @@ class DocumentsTab(QWidget):
             50 if not llm_only else 0,
             f"LLM su {total} documenti con {actual_workers} worker...",
         )
-        QApplication.processEvents()
+        app = QApplication.instance()
+        if app is not None and QThread.currentThread() is app.thread():
+            process_gui_events()
 
         completed = 0
 
@@ -594,7 +613,7 @@ class DocumentsTab(QWidget):
                 progress.set_progress(
                     pct, f"Completati {completed}/{total} ({elapsed:.0f}s)",
                 )
-                QApplication.processEvents()
+                process_gui_events()
 
         progress.set_progress(
             100,
@@ -690,12 +709,11 @@ class DocumentsTab(QWidget):
             # Run LLM extraction with granular progress
             pct_base = int((index / len(doc_ids)) * 100)
             progress.set_progress(pct_base, f"{base_msg} — estrazione LLM...")
-            from PyQt5.QtWidgets import QApplication
-            QApplication.processEvents()
+            process_gui_events()
 
             try:
                 progress.set_progress(pct_base + 2, f"{base_msg} — chiamata al modello locale...")
-                QApplication.processEvents()
+                process_gui_events()
 
                 self._run_llm_extraction(
                     doc, source_text, progress, parsing_result=parsing_result
@@ -704,7 +722,7 @@ class DocumentsTab(QWidget):
                     min(99, pct_base + 8),
                     f"{base_msg} — salvataggio testo clinico...",
                 )
-                QApplication.processEvents()
+                process_gui_events()
 
                 doc.extraction_status = ExtractionStatus.DONE.value
                 doc.event_count = 0
@@ -734,8 +752,7 @@ class DocumentsTab(QWidget):
                 return
 
             self._refresh_table()
-            from PyQt5.QtWidgets import QApplication
-            QApplication.processEvents()
+            process_gui_events()
             self._process_next_document(doc_ids, index + 1, progress, converter,
                                         parse_only, llm_only)
             return
@@ -817,6 +834,11 @@ class DocumentsTab(QWidget):
             )
 
             extraction_dict = active_parser.export_dict(result)
+            if isinstance(extraction_dict, dict):
+                extraction_dict["source_path"] = f"{doc_id}{file_path.suffix.lower()}"
+            extraction_dict = sanitizer.sanitize_payload(
+                extraction_dict, sensitive_identity
+            )
             json_path = extraction_dir / f"{doc_id}.json"
             json_path.write_text(
                 json.dumps(extraction_dict, ensure_ascii=False, indent=2),
@@ -962,8 +984,7 @@ class DocumentsTab(QWidget):
             return
 
         self._refresh_table()
-        from PyQt5.QtWidgets import QApplication
-        QApplication.processEvents()
+        process_gui_events()
 
         self._process_next_document(doc_ids, index + 1, progress, converter,
                                     parse_only=parse_only)
@@ -1088,10 +1109,9 @@ class DocumentsTab(QWidget):
         return {"events": events, "lab_values": lab_values}
 
     def _run_llm_extraction(self, doc, text: str, progress,
-                            parsing_result=None) -> list:
+        parsing_result=None) -> list:
         """Replace the active parser text with normalized clinical prose."""
         doc_id = doc.id
-        from PyQt5.QtWidgets import QApplication
 
         # Parallel LLM workers pass progress=None: the widget is not
         # thread-safe, so swallow the internal log lines there.
@@ -1111,7 +1131,6 @@ class DocumentsTab(QWidget):
         progress.add_log(
             "  🔒 Controllo deterministico dei dati sensibili..."
         )
-        QApplication.processEvents()
         sensitive_identity = self._sensitive_identity_for_document(
             doc, text, parsing_result
         )
@@ -1539,8 +1558,11 @@ class DocumentsTab(QWidget):
 
     def _flag_attribution_mismatch(self, doc, verdict, progress) -> None:
         """Audit + review-queue the mismatch and surface it in the log."""
+        from ..security.privacy import identity_metadata
+
         suggested = verdict.get("suggested_patient_id") or "ignoto"
         identity = verdict.get("identity") or {}
+        safe_identity = identity_metadata(identity)
         audit_repo = self._services.get("audit_repo")
         if audit_repo:
             try:
@@ -1549,7 +1571,7 @@ class DocumentsTab(QWidget):
                     {
                         "status": verdict["status"],
                         "suggested_patient_id": suggested,
-                        "llm_identity": identity,
+                        "llm_identity": safe_identity,
                     },
                 )
             except Exception:
@@ -1566,7 +1588,7 @@ class DocumentsTab(QWidget):
                         doc.patient_id, doc.id, verdict["message"],
                         json.dumps({
                             "suggested_patient_id": suggested,
-                            "llm_identity": identity,
+                            "llm_identity": safe_identity,
                         }, ensure_ascii=False),
                         datetime.now().isoformat(),
                     ),
@@ -1654,7 +1676,11 @@ class DocumentsTab(QWidget):
                 temporality="current",
                 clinical_status=clinical_status,
                 observed_date=lab.sample_date or doc.document_date,
-                value_text=lab.value_text or str(lab.value) if lab.value is not None else "",
+                value_text=(
+                    lab.value_text
+                    if lab.value_text is not None
+                    else (str(lab.value) if lab.value is not None else "")
+                ),
                 numeric_value=lab.value,
                 unit=lab.unit,
                 source_page=page,
@@ -1662,8 +1688,17 @@ class DocumentsTab(QWidget):
                 bbox=bbox,
                 confidence=lab.confidence,
                 extraction_method="deterministic_lab",
+                document_date=doc.document_date,
+                date_precision=(
+                    "day" if len(str(lab.sample_date or doc.document_date or "")) == 10
+                    else "month" if len(str(lab.sample_date or doc.document_date or "")) == 7
+                    else "unknown"
+                ),
+                date_source=(
+                    "sample_date" if lab.sample_date else "document_date"
+                ),
                 prompt_version=None,
-                schema_version="1.0",
+                schema_version="2.0",
                 status="auto",
                 data={
                     "reference_low": lab.reference_low,
@@ -1775,6 +1810,19 @@ class DocumentsTab(QWidget):
 
     def _open_pdf_viewer(self, doc_data: dict):
         self._quick_look.dismiss()
+        path = resolve_document_path(doc_data)
+        if not path:
+            QMessageBox.warning(self, "Documento non disponibile", "File non trovato.")
+            return
+        if os.path.splitext(path)[1].lower() not in {
+            ".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp",
+        }:
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+                QMessageBox.warning(
+                    self, "Apertura non riuscita",
+                    "Nessuna applicazione di sistema può aprire il documento.",
+                )
+            return
         from .pdf_viewer import PDFViewerDialog
         viewer = PDFViewerDialog(doc_data, self._services, self)
         viewer.exec_()
@@ -1811,7 +1859,7 @@ class DocumentsTab(QWidget):
             "🧠 Riestrai testo clinico" if extraction_done
             else "🧠 Estrai testo clinico"
         )
-        open_action = menu.addAction("📖 Apri PDF")
+        open_action = menu.addAction("📖 Apri documento")
         view_text_action = menu.addAction("📝 Visualizza testo clinico")
         menu.addSeparator()
         edit_action = menu.addAction("✏️ Modifica tipo/metadati")
@@ -1820,7 +1868,7 @@ class DocumentsTab(QWidget):
 
         action = menu.exec_(self._table.viewport().mapToGlobal(pos))
         if action == extract_action:
-            self._process_documents([doc_id])
+            self._process_documents_with_busy_state([doc_id])
         elif action == open_action:
             self._open_pdf_viewer(doc_data)
         elif action == view_text_action:
@@ -1893,7 +1941,6 @@ class DocumentsTab(QWidget):
     def eventFilter(self, obj, event):
         """Handle key press events on the table."""
         from PyQt5.QtCore import QEvent
-        from PyQt5.QtWidgets import QApplication
         if obj == self._table and event.type() == QEvent.KeyPress:
             if event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace:
                 doc_ids = self._get_selected_doc_ids()
@@ -1967,4 +2014,4 @@ class DocumentsTab(QWidget):
 
     def reprocess_document(self, doc_id: str):
         """Re-run the complete clinical-text pipeline for one document."""
-        self._process_documents([doc_id])
+        self._process_documents_with_busy_state([doc_id])
