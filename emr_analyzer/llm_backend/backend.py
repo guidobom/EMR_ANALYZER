@@ -73,6 +73,7 @@ class LlamaBackend:
             str(getattr(config, "model", "")),
             int(getattr(config, "context_length", 32768) or 32768),
             int(getattr(config, "parallel_workers", 1) or 1),
+            bool(getattr(config, "speculative_decoding", False)),
         )
         with self._cache_lock:
             cached = self._key_cache.get(cache_key)
@@ -105,6 +106,11 @@ class LlamaBackend:
             gguf_path=entry["file"],
             ctx_size=ctx,
             np=max(1, np),
+            speculative_mode=(
+                "ngram-cache"
+                if bool(getattr(config, "speculative_decoding", False))
+                else "none"
+            ),
         )
 
     @staticmethod
@@ -133,6 +139,28 @@ class LlamaBackend:
         except KeyError:
             return None
         return self._manager.status(key)
+
+    def runtime_identity(self, config) -> tuple[str, int, int, str]:
+        """Stable identity of the physical server used by *config*.
+
+        Generation parameters such as temperature and output length are
+        request-scoped.  Only the GGUF file, per-slot context and slot count
+        decide whether two logical roles can share one llama-server process.
+        """
+        key = self.key_for(config)
+        return key.gguf_path, key.ctx_size, key.np, key.speculative_mode
+
+    def stop_config(self, config) -> bool:
+        """Stop only the exact runtime selected by *config*.
+
+        Unlike :meth:`stop_model`, this does not terminate other servers
+        using the same GGUF with a different context or slot count.
+        """
+        try:
+            key = self.key_for(config)
+        except KeyError:
+            return False
+        return self._manager.stop(key)
 
     def stop_model(self, name: str) -> bool:
         """Stop every server running the model *name*; True if any stopped."""
@@ -219,6 +247,8 @@ class LlamaBackend:
         return {
             "content": str(message.get("content") or ""),
             "finish_reason": choice.get("finish_reason") or "stop",
+            "usage": dict(data.get("usage") or {}),
+            "timings": dict(data.get("timings") or {}),
         }
 
     def slots(self, config) -> list[dict]:
@@ -227,7 +257,10 @@ class LlamaBackend:
         if base_url is None:
             return []
         try:
-            response = self._http.get(f"{base_url}/slots", timeout=5.0)
+            # /slots is a local, lightweight status endpoint.  A short
+            # timeout keeps periodic GUI refreshes from freezing the dialog
+            # when a child process is unhealthy.
+            response = self._http.get(f"{base_url}/slots", timeout=1.0)
         except httpx.HTTPError:
             return []
         if response.status_code != 200:
@@ -240,7 +273,7 @@ class LlamaBackend:
         if base_url is None:
             return {}
         try:
-            response = self._http.get(f"{base_url}/props", timeout=5.0)
+            response = self._http.get(f"{base_url}/props", timeout=1.0)
         except httpx.HTTPError:
             return {}
         if response.status_code != 200:

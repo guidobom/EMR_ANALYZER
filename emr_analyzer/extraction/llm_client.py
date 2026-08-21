@@ -8,6 +8,7 @@ methods are retained only for the separate Clinical State layer.
 
 import json
 import re
+import threading
 import time
 
 from ..config import DEFAULT_LLM_MODEL_NAME
@@ -17,6 +18,17 @@ from .golden_fewshot import (
     DISCHARGE_ALLOWED_CATEGORIES,
     format_examples_section,
 )
+
+
+class OutputLimitError(RuntimeError):
+    """The server stopped because the request-specific output cap was hit."""
+
+    def __init__(self, max_tokens: int):
+        self.max_tokens = int(max_tokens)
+        super().__init__(
+            "Il modello ha raggiunto il limite di token in output "
+            f"(max_output_tokens={self.max_tokens})"
+        )
 
 
 class LlmClient:
@@ -53,8 +65,14 @@ class LlmClient:
         self.parallel_workers = (
             config.parallel_workers if config is not None else 1
         )
+        self.speculative_decoding = bool(
+            config.speculative_decoding if config is not None else False
+        )
         self.backend = backend if backend is not None else get_backend()
         self._available = None  # Lazy check
+        # Generation metadata is request-local: one LlmClient is deliberately
+        # shared by the parallel registry workers.
+        self._generation_local = threading.local()
 
     @property
     def keep_alive(self) -> str:
@@ -105,6 +123,47 @@ class LlmClient:
         runtime["size_vram"] = size
         runtime["expires_at"] = ""
         return runtime
+
+    def runtime_identity(self) -> tuple[str, int, int, str]:
+        """Return ``(GGUF path, context, slots, speculation)``."""
+        return self.backend.runtime_identity(self)
+
+    @classmethod
+    def unload_runtimes(
+        cls, configs: list[LLMRoleConfig] | tuple[LLMRoleConfig, ...]
+    ) -> dict:
+        """Stop exact configured runtimes without loading them first."""
+        backend = get_backend()
+        unique: dict[tuple[str, int, int], LLMRoleConfig] = {}
+        errors: dict[str, str] = {}
+        for config in configs:
+            if not config.model:
+                continue
+            try:
+                identity = backend.runtime_identity(config)
+            except Exception as exc:
+                errors[config.model] = str(exc)
+                continue
+            unique.setdefault(identity, config)
+
+        unloaded = []
+        not_loaded = []
+        for identity, config in unique.items():
+            label = (
+                f"{config.model} · ctx {identity[1]} · {identity[2]} slot"
+            )
+            try:
+                if backend.stop_config(config):
+                    unloaded.append(label)
+                else:
+                    not_loaded.append(label)
+            except Exception as exc:
+                errors[label] = str(exc)
+        return {
+            "unloaded": unloaded,
+            "not_loaded": not_loaded,
+            "errors": errors,
+        }
 
     @classmethod
     def unload_models(
@@ -178,14 +237,17 @@ class LlmClient:
             # name is not in the payload; the caller supplies it.
             if not response:
                 return None
-            first = response[0] if isinstance(response[0], dict) else {}
+            rows = [item for item in response if isinstance(item, dict)]
+            first = rows[0] if rows else {}
+            active_slots = sum(bool(item.get("is_processing")) for item in rows)
             return {
                 "model": str(requested_model),
                 "size": None,
                 "size_vram": None,
                 "context_length": cls._as_int(first.get("n_ctx")),
-                "processing": bool(first.get("is_processing")),
-                "slots": len(response),
+                "processing": active_slots > 0,
+                "active_slots": active_slots,
+                "slots": len(rows),
                 "expires_at": "",
             }
         if hasattr(response, "models"):
@@ -268,7 +330,8 @@ class LlmClient:
                   stream: bool = False,
                   response_format: dict | str | None = None,
                   seed: int | None = None,
-                  temperature: float | None = None) -> str:
+                  temperature: float | None = None,
+                  max_tokens: int | None = None) -> str:
         """Internal: chat completion against the app-managed llama-server.
 
         The server is spawned with ``-rea off`` and every request also sends
@@ -286,6 +349,11 @@ class LlmClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        request_max_tokens = max(
+            1, int(
+                self.max_output_tokens if max_tokens is None else max_tokens
+            )
+        )
         try:
             result = self.backend.chat(
                 self,
@@ -296,23 +364,26 @@ class LlmClient:
                 top_p=self.top_p,
                 top_k=self.top_k,
                 seed=self.seed if seed is None else seed,
-                max_tokens=self.max_output_tokens,
+                max_tokens=request_max_tokens,
                 response_format=response_format,
             )
         except KeyError as exc:
             raise RuntimeError(
                 f"Modello locale non trovato tra i GGUF disponibili: {exc}"
             ) from exc
+        self._generation_local.metadata = {
+            "finish_reason": result.get("finish_reason") or "stop",
+            "max_tokens": request_max_tokens,
+            **dict(result.get("usage") or {}),
+            **dict(result.get("timings") or {}),
+        }
         if result.get("finish_reason") == "length":
-            raise RuntimeError(
-                "Il modello ha raggiunto il limite di token in output "
-                f"(max_output_tokens={self.max_output_tokens}); "
-                "aumentalo in Configura LLM"
-            )
+            raise OutputLimitError(request_max_tokens)
         return str(result.get("content") or "")
 
     def generate_structured(self, prompt: str, system: str,
-                            schema: dict) -> dict:
+                            schema: dict,
+                            *, max_tokens: int | None = None) -> dict:
         """Generate locally with a llama.cpp-enforced JSON schema.
 
         The request uses llama-server's ``json_object`` response format.
@@ -323,6 +394,7 @@ class LlmClient:
         response = self._generate(
             prompt, system,
             response_format={"type": "json_object", "schema": schema},
+            max_tokens=max_tokens,
         )
         try:
             return json.loads(response)
@@ -331,6 +403,10 @@ class LlmClient:
             if match:
                 return json.loads(match.group(0))
             raise
+
+    def last_generation_metadata(self) -> dict:
+        """Return metrics for the last request made by the current thread."""
+        return dict(getattr(self._generation_local, "metadata", {}) or {})
 
     def extract_patient_identity(self, text: str) -> dict:
         """Extract the patient's identity fields from raw document text.

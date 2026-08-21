@@ -50,6 +50,7 @@ class ServerKey:
     gguf_path: str
     ctx_size: int
     np: int
+    speculative_mode: str = "none"
 
 
 @dataclass
@@ -246,6 +247,11 @@ class ServerManager:
             "-ctv", "q8_0",
             "-rea", "off",
         ]
+        if key.speculative_mode == "ngram-cache":
+            # Draft tokens are always checked by the target model.  This can
+            # accelerate repetitive structured JSON without replacing the
+            # clinical model or accepting an unverified token.
+            argv.extend(["--spec-type", "ngram-cache"])
         try:
             proc = subprocess.Popen(
                 argv,

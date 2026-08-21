@@ -183,6 +183,46 @@ class SensitiveDataSanitizer:
             },
         )
 
+    def sanitize_payload(self, payload, identity=None):
+        """Recursively de-identify parser JSON while preserving geometry.
+
+        Word-level geometry stores names as separate tokens, where a normal
+        full-name regex cannot match. Exact identity-name tokens are therefore
+        removed in addition to ordinary string sanitization.
+        """
+        identity_values = self._identity_values(identity)
+        name_tokens = {
+            token.casefold()
+            for token in re.findall(
+                r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’\-][A-Za-zÀ-ÖØ-öø-ÿ]+)?",
+                identity_values.get("name", ""),
+            )
+            if len(token) >= 3
+        }
+        direct_values = {
+            re.sub(r"\W", "", value).casefold()
+            for key, value in identity_values.items()
+            if key != "name" and value
+        }
+
+        def walk(value):
+            if isinstance(value, Mapping):
+                return {str(key): walk(child) for key, child in value.items()}
+            if isinstance(value, list):
+                return [walk(child) for child in value]
+            if isinstance(value, tuple):
+                return [walk(child) for child in value]
+            if isinstance(value, str):
+                compact = re.sub(r"\W", "", value).casefold()
+                if value.strip().casefold() in name_tokens or (
+                    compact and compact in direct_values
+                ):
+                    return "[IDENTIFICATIVO RIMOSSO]"
+                return self.sanitize(value, identity).text
+            return value
+
+        return walk(payload)
+
     @classmethod
     def _redact_patient_name(
         cls, text: str, patient_name: str

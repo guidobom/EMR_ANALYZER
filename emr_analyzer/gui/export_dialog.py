@@ -112,151 +112,18 @@ class ExportDialog(QDialog):
             return
 
         try:
-            if self._csv_radio.isChecked():
-                self._export_csv(file_path)
-            elif self._json_radio.isChecked():
-                self._export_json(file_path)
-            elif self._xlsx_radio.isChecked():
-                self._export_xlsx(file_path)
+            from ..export.registry_export import ClinicalRegistryExporter
+            ClinicalRegistryExporter(self._services).export(
+                self._patient_id,
+                file_path,
+                include_sources=self._sources_check.isChecked(),
+                include_events=self._events_check.isChecked(),
+                include_labs=self._lab_check.isChecked(),
+                include_profile=self._state_check.isChecked(),
+            )
 
             QMessageBox.information(self, "Esportazione completata",
                                     f"File salvato con successo:\n{file_path}")
             self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Errore esportazione", str(e))
-
-    def _export_csv(self, file_path: str):
-        import csv
-        with open(file_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            # Lab values
-            if self._lab_check.isChecked():
-                lab_repo = self._services.get("lab_repo")
-                if lab_repo:
-                    values = lab_repo.get_by_patient(self._patient_id)
-                    writer.writerow([
-                        "Data", "Parametro", "Valore", "Unità", "Range",
-                        "Anomalo", "Flag", "Confidenza", "Documento", "Pagina"
-                    ])
-                    for lv in values:
-                        display_value = (
-                            lv.value_text if lv.value_text
-                            else f"{lv.operator or ''}{lv.value}".strip()
-                            if lv.value is not None else ""
-                        )
-                        writer.writerow([
-                            lv.sample_date, lv.parameter_name, display_value,
-                            lv.unit, lv.reference_text,
-                            "Sì" if lv.is_abnormal else "No",
-                            lv.flag, f"{lv.confidence:.2f}",
-                            lv.document_id, lv.page,
-                        ])
-                        if not self._sources_check.isChecked():
-                            pass  # source_text column skipped
-
-            # Registro Cronologico
-            if self._events_check.isChecked():
-                writer.writerow([])
-                timeline_repo = self._services.get("timeline_repo")
-                if timeline_repo:
-                    entries = timeline_repo.get_by_patient(self._patient_id)
-                    writer.writerow([
-                        "Data", "Categoria", "Descrizione", "Stato",
-                        "Confidenza", "Documenti",
-                    ])
-                    for e in entries:
-                        row = [
-                            e.date_observed, e.category, e.description,
-                            e.status, f"{e.confidence:.2f}",
-                            ", ".join(e.source_document_ids),
-                        ]
-                        if self._sources_check.isChecked():
-                            row.append("\n".join(e.source_texts[:3]))
-                        writer.writerow(row)
-
-    def _export_json(self, file_path: str):
-        import json
-        result = {"patient_id": self._patient_id}
-
-        if self._lab_check.isChecked():
-            lab_repo = self._services.get("lab_repo")
-            if lab_repo:
-                result["lab_values"] = [lv.to_dict()
-                                        for lv in lab_repo.get_by_patient(self._patient_id)]
-
-        if self._events_check.isChecked():
-            timeline_repo = self._services.get("timeline_repo")
-            if timeline_repo:
-                result["clinical_timeline"] = [e.to_dict()
-                    for e in timeline_repo.get_by_patient(self._patient_id)]
-
-        if self._state_check.isChecked():
-            cs_repo = self._services.get("cs_repo")
-            if cs_repo:
-                cs = cs_repo.load(self._patient_id)
-                if cs and cs.clinical_profile:
-                    result["clinical_profile"] = cs.clinical_profile
-
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-
-    def _export_xlsx(self, file_path: str):
-        from openpyxl import Workbook
-        wb = Workbook()
-
-        # Lab values sheet
-        if self._lab_check.isChecked():
-            ws = wb.active
-            ws.title = "Laboratorio"
-            ws.append([
-                "Data", "Parametro", "Valore", "Unità", "Range",
-                "Anomalo", "Flag", "Confidenza", "Documento", "Pagina", "Fonte"
-            ])
-            lab_repo = self._services.get("lab_repo")
-            if lab_repo:
-                for lv in lab_repo.get_by_patient(self._patient_id):
-                    display_value = (
-                        lv.value_text if lv.value_text
-                        else f"{lv.operator or ''}{lv.value}".strip()
-                        if lv.value is not None else ""
-                    )
-                    row = [
-                        lv.sample_date, lv.parameter_name, display_value,
-                        lv.unit, lv.reference_text,
-                        "Sì" if lv.is_abnormal else "No",
-                        lv.flag, lv.confidence,
-                        lv.document_id, lv.page,
-                        lv.source_text if self._sources_check.isChecked() else "",
-                    ]
-                    ws.append(row)
-
-        # Registro Cronologico sheet
-        if self._events_check.isChecked():
-            ws = wb.create_sheet("Registro Cronologico")
-            ws.append([
-                "Data", "Categoria", "Descrizione", "Stato",
-                "Confidenza", "Documenti", "Fonti"
-            ])
-            timeline_repo = self._services.get("timeline_repo")
-            if timeline_repo:
-                for e in timeline_repo.get_by_patient(self._patient_id):
-                    row = [
-                        e.date_observed, e.category, e.description,
-                        e.status, e.confidence,
-                        ", ".join(e.source_document_ids),
-                        "\n---\n".join(e.source_texts[:3])
-                        if self._sources_check.isChecked() else "",
-                    ]
-                    ws.append(row)
-
-        # Profilo Clinico sheet
-        if self._state_check.isChecked():
-            ws = wb.create_sheet("Profilo Clinico")
-            cs_repo = self._services.get("cs_repo")
-            if cs_repo:
-                cs = cs_repo.load(self._patient_id)
-                if cs and cs.clinical_profile:
-                    ws.append(["Profilo Clinico Narrativo"])
-                    ws.append([cs.clinical_profile])
-
-        wb.save(file_path)

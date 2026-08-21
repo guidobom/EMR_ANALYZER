@@ -1,0 +1,1676 @@
+"""Independent per-document extraction of atomic clinical evidence."""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+import hashlib
+import inspect
+import json
+from pathlib import Path
+import re
+import threading
+from typing import Any, Iterable
+import uuid
+
+from .temporal import normalize_clinical_date
+from ..extraction.llm_client import OutputLimitError
+from ..models.clinical_evidence import ClinicalEvidence
+from ..models.clinical_registry import (
+    ASSERTION_TYPES,
+    CERTAINTY_LEVELS,
+    EVENT_CATEGORIES,
+)
+
+
+ATOMIC_PIPELINE_VERSION = "registry_pipeline_v4"
+# v3 and v4 share the same v5 clinical prompt, output schema and immutable
+# evidence identifiers.  v4 changes scheduling/chunk recovery only, so a run
+# interrupted under v3 can safely retain its completed per-document evidence.
+ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS = ("registry_pipeline_v3",)
+
+_ATOMIC_TASK = """Includi diagnosi/stati, sintomi-segni-vitali e negazioni utili,
+laboratorio-imaging-istologia-biomarcatori, farmaci/oncologia/tossicità,
+procedure, ricoveri, allergie, rischi e follow-up.
+
+Ogni item è esattamente [c,e,r,a,q,g,k]: c=category, e=entity, r=refs,
+a=assertion, q=certainty, g=significance; k è un oggetto per i soli dettagli
+documentati: s=status, d=date, de=date_end, p=precision, i=site, l=side,
+v=severity, x=value, n=number, u=unit, m=drug, o=oncology, z=extra.
+
+Vincoli:
+- 1 item=1 concetto; separa reperti distinti;
+- r: 1-6 ID S consecutivi che contengono la prova e il referente esplicito;
+  includi anche l'ID con la data-intestazione se governa le frasi successive;
+  e: concetto base (dispnea, SpO2, farmaco), senza valore/stato/data;
+- non duplicare lo stesso concetto su frasi adiacenti: usa un item con più refs;
+- copia in k.d la data/durata riferita all'item, senza convertirla;
+  per misure compila k.n e k.u;
+- diagnosis solo se esplicita; symptom=patient_reported salvo prova obiettiva;
+  clinical_sign=obiettivo; toxicity=attribuita a terapia, altrimenti adverse_event;
+- a descrive presenza/negazione del fatto, non il ciclo del farmaco:
+  sospendere è present + k.s/k.m.l=suspended;
+- un valore numerico misurato è present; se la stessa frase dice “dispnea
+  risolta”, crea un item absent per dispnea e uno present per SpO2;
+- suspected=ipotesi, excluded=escluso; “non documentato”=unknown, non excluded;
+- farmaci=medication: k.m con nome, principio se univoco, dose/via/frequenza,
+  indicazione e lifecycle; “ultima somministrazione” usa il nome del farmaco;
+- linea/schema/ciclo in k.o (k.o.l/k.o.r/k.o.c); prima linea va in k.o.l;
+- una diagnosi usata come indicazione terapeutica va estratta anche come diagnosis;
+- reperto/sospetto non diventa diagnosi; discordanti separati; nessuna sintesi;
+- ometti ogni campo non documentato: non emettere null, stringhe vuote o confidence."""
+
+_ATOMIC_SYSTEM_PROMPT = (
+    "Estrai evidenze cliniche atomiche dal testo italiano. Un item descrive "
+    "un solo dato. Usa solo la fonte: non fondere, deduplicare, inventare o "
+    "inferire causalità. Solo JSON conforme allo schema.\n\n" + _ATOMIC_TASK
+)
+
+_THERAPY_LIFECYCLE_STATUSES = (
+    "proposed", "planned", "prescribed", "started", "taken",
+    "administered", "active", "ongoing", "dose_changed", "interrupted",
+    "suspended", "stopped", "resumed", "completed", "cancelled", "unknown",
+)
+
+# These are projections produced after atomic extraction. Allowing the LLM to
+# emit them here would duplicate syndrome, trend and oncology-line notes.
+_DERIVED_EVENT_CATEGORIES = {
+    "clinical_syndrome", "laboratory_trend", "oncology_treatment_line",
+}
+ATOMIC_EVENT_CATEGORIES = tuple(
+    category for category in EVENT_CATEGORIES
+    if category not in _DERIVED_EVENT_CATEGORIES
+)
+
+
+ATOMIC_EVIDENCE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "array",
+                # llama.cpp's JSON-schema grammar converter accepts an array
+                # of schemas in ``items`` as a fixed positional tuple.  The
+                # grammar therefore guarantees all seven positions and their
+                # types while avoiding six repeated property names per atom.
+                "items": [
+                    {
+                        "type": "string", "enum": list(ATOMIC_EVENT_CATEGORIES),
+                    },
+                    {"type": "string"},
+                    {
+                        "type": "array", "minItems": 1, "maxItems": 6,
+                        "items": {"type": "integer", "minimum": 1},
+                    },
+                    {
+                        "type": "string", "enum": list(ASSERTION_TYPES),
+                    },
+                    {
+                        "type": "string",
+                        "enum": [
+                            "confirmed", "suspected", "patient_reported",
+                            "excluded", "unknown",
+                        ],
+                    },
+                    {
+                        "type": "string",
+                        "enum": [
+                            "critical", "high", "clinically_relevant",
+                            "potentially_relevant", "uncertain",
+                        ],
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "s": {"type": "string"},
+                            "d": {"type": "string"},
+                            "de": {"type": "string"},
+                            "p": {
+                                "type": "string", "enum": [
+                                    "day", "month", "year", "interval",
+                                    "approximate", "unknown",
+                                ],
+                            },
+                            "i": {"type": "string"},
+                            "l": {"type": "string"},
+                            "v": {"type": "string"},
+                            "x": {"type": "string"},
+                            "n": {"type": "number"},
+                            "u": {"type": "string"},
+                            "m": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "n": {"type": "string"},
+                                    "i": {"type": "string"},
+                                    "l": {
+                                        "type": "string",
+                                        "enum": list(_THERAPY_LIFECYCLE_STATUSES),
+                                    },
+                                    "d": {"type": "string"},
+                                    "r": {"type": "string"},
+                                    "f": {"type": "string"},
+                                    "x": {"type": "string"},
+                                    "t": {"type": "string"},
+                                    "a": {"type": "string"},
+                                },
+                            },
+                            "o": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "l": {"type": "string"},
+                                    "r": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "c": {"type": "string"},
+                                    "d": {"type": "string"},
+                                    "m": {"type": "string"},
+                                    "t": {"type": "string"},
+                                    "p": {"type": "string"},
+                                    "s": {"type": "string"},
+                                    "i": {"type": "string"},
+                                    "x": {"type": "string"},
+                                },
+                            },
+                            "z": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "r": {"type": "string"},
+                                    "g": {"type": "string"},
+                                    "s": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+    },
+    "required": ["evidence"],
+}
+
+ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v5"
+ATOMIC_PROMPT_DIGEST = hashlib.sha256(
+    (
+        _ATOMIC_SYSTEM_PROMPT
+        + "\x1f"
+        + json.dumps(ATOMIC_EVIDENCE_SCHEMA, sort_keys=True)
+    ).encode("utf-8")
+).hexdigest()
+
+# This is deliberately an output-safety limit, not a context-window limit.
+# Clinical documents are often dense enough to produce more JSON than source
+# text.  Sending an entire document merely because it fits in context is slow:
+# llama.cpp must finish a doomed generation before the caller can bisect and
+# repeat it.  Small, deterministic chunks keep each answer below the output
+# ceiling while document-level workers still keep every inference slot busy.
+_ATOMIC_SOURCE_CHUNK_CHARS = 2800
+
+
+@dataclass(frozen=True, slots=True)
+class TextChunk:
+    index: int
+    text: str
+    page_start: int | None = None
+    page_end: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SentenceSpan:
+    """A citable, exact slice of one prompt chunk."""
+
+    sentence_id: int
+    start: int
+    end: int
+    text: str
+
+
+class AtomicEvidenceExtractor:
+    """Extract every observation before any deduplication or synthesis."""
+
+    def __init__(self, llm_client):
+        self.llm = llm_client
+        # One extractor instance is shared by all registry workers.  Keep
+        # request counters thread-local so timings/tokens from simultaneous
+        # documents can never contaminate one another.
+        self._metrics_local = threading.local()
+
+    @property
+    def model_name(self) -> str:
+        return str(getattr(self.llm, "model", "") or "")
+
+    @property
+    def model_digest(self) -> str:
+        try:
+            info = self.llm.backend.model_info(self.model_name) or {}
+        except Exception:
+            info = {}
+        payload = {
+            "name": self.model_name,
+            "file": info.get("file"),
+            "size_bytes": info.get("size_bytes"),
+            "architecture": info.get("architecture"),
+            "temperature": getattr(self.llm, "temperature", None),
+            "top_p": getattr(self.llm, "top_p", None),
+            "top_k": getattr(self.llm, "top_k", None),
+            "seed": getattr(self.llm, "seed", None),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def extract_document(
+        self,
+        *,
+        patient_id: str,
+        document_id: str,
+        document_type: str,
+        document_date: str | None,
+        text: str,
+        geometry_path: Path | None = None,
+    ) -> list[ClinicalEvidence]:
+        self._metrics_local.value = {
+            "llm_calls": 0,
+            "output_limit_retries": 0,
+            "source_chunks": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "prompt_ms": 0.0,
+            "predicted_ms": 0.0,
+        }
+        geometry = self._load_geometry(geometry_path)
+        evidence: list[ClinicalEvidence] = []
+        position = 0
+        chunks = split_text_chunks(text, self._text_budget())
+        self._current_metrics()["source_chunks"] = len(chunks)
+        for chunk in chunks:
+            extracted_chunks = self._extract_chunk_adaptive(
+                chunk, document_type=document_type,
+                document_date=document_date,
+            )
+            for resolved_chunk, payload, sentence_spans, retry_depth in (
+                extracted_chunks
+            ):
+                for item in payload:
+                    parsed = self._to_evidence(
+                        _expand_atomic_item(item),
+                        patient_id=patient_id,
+                        document_id=document_id,
+                        document_date=document_date,
+                        chunk=resolved_chunk,
+                        position=position,
+                        full_text=text,
+                        geometry=geometry,
+                        sentence_spans=sentence_spans,
+                        retry_depth=retry_depth,
+                    )
+                    position += 1
+                    if parsed is not None:
+                        evidence.append(parsed)
+        evidence.extend(_explicit_resolution_evidence(
+            patient_id=patient_id,
+            document_id=document_id,
+            document_date=document_date,
+            full_text=text,
+            geometry=geometry,
+            model_name=self.model_name,
+            existing=evidence,
+        ))
+        return _deduplicate_atomic(evidence)
+
+    def _extract_chunk_adaptive(
+        self,
+        chunk: TextChunk,
+        *,
+        document_type: str,
+        document_date: str | None,
+        retry_depth: int = 0,
+    ) -> list[tuple[TextChunk, list[dict[str, Any]], list[SentenceSpan], int]]:
+        """Retry a dense chunk by deterministic bisection on output limit."""
+        try:
+            payload, spans = self._extract_chunk(
+                chunk, document_type=document_type,
+                document_date=document_date,
+            )
+            return [(chunk, payload, spans, retry_depth)]
+        except OutputLimitError:
+            metrics = self._current_metrics()
+            metrics["output_limit_retries"] += 1
+            children = bisect_text_chunk(chunk)
+            if retry_depth >= 5 or len(children) < 2:
+                raise
+            extracted = []
+            for child in children:
+                extracted.extend(self._extract_chunk_adaptive(
+                    child,
+                    document_type=document_type,
+                    document_date=document_date,
+                    retry_depth=retry_depth + 1,
+                ))
+            return extracted
+
+    def _extract_chunk(
+        self,
+        chunk: TextChunk,
+        *,
+        document_type: str,
+        document_date: str | None,
+    ) -> tuple[list[dict[str, Any]], list[SentenceSpan]]:
+        sentence_spans = split_sentence_spans(chunk.text)
+        prompt = build_atomic_prompt(
+            chunk,
+            document_type=document_type,
+            document_date=document_date,
+            sentence_spans=sentence_spans,
+        )
+        generator = self.llm.generate_structured
+        parameters = inspect.signature(generator).parameters
+        supports_limit = (
+            "max_tokens" in parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        )
+        try:
+            if supports_limit:
+                data = generator(
+                    prompt, _ATOMIC_SYSTEM_PROMPT, ATOMIC_EVIDENCE_SCHEMA,
+                    max_tokens=self._output_budget(sentence_spans),
+                )
+            else:  # compatibility clients used by integrations/tests
+                data = generator(
+                    prompt, _ATOMIC_SYSTEM_PROMPT, ATOMIC_EVIDENCE_SCHEMA
+                )
+        finally:
+            self._record_last_generation()
+        if not isinstance(data, dict) or not isinstance(data.get("evidence"), list):
+            return [], sentence_spans
+        items = []
+        for raw in data["evidence"]:
+            item = _normalize_atomic_wire_item(raw)
+            if item is not None:
+                items.append(item)
+        return _coalesce_adjacent_wire_items(items), sentence_spans
+
+    def last_extraction_metrics(self) -> dict[str, int | float]:
+        """Metrics for the document most recently handled by this thread."""
+        return dict(self._current_metrics())
+
+    def _current_metrics(self) -> dict[str, int | float]:
+        metrics = getattr(self._metrics_local, "value", None)
+        if metrics is None:
+            metrics = {
+                "llm_calls": 0,
+                "output_limit_retries": 0,
+                "source_chunks": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "prompt_ms": 0.0,
+                "predicted_ms": 0.0,
+            }
+            self._metrics_local.value = metrics
+        return metrics
+
+    def _record_last_generation(self) -> None:
+        metrics = self._current_metrics()
+        metrics["llm_calls"] += 1
+        getter = getattr(self.llm, "last_generation_metadata", None)
+        if not callable(getter):
+            return
+        try:
+            metadata = getter() or {}
+        except Exception:
+            return
+        numeric_keys = (
+            "prompt_tokens", "completion_tokens", "total_tokens",
+            "prompt_ms", "predicted_ms",
+        )
+        for key in numeric_keys:
+            value = metadata.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                metrics[key] += value
+
+    def _to_evidence(
+        self,
+        item: dict[str, Any],
+        *,
+        patient_id: str,
+        document_id: str,
+        document_date: str | None,
+        chunk: TextChunk,
+        position: int,
+        full_text: str,
+        geometry,
+        sentence_spans: list[SentenceSpan] | None = None,
+        retry_depth: int = 0,
+    ) -> ClinicalEvidence | None:
+        entity = _clean_text(item.get("normalized_entity"), 300)
+        refs = _safe_sentence_refs(item.get("source_refs"), sentence_spans)
+        source_quote = _quote_from_sentence_refs(refs, sentence_spans)
+        if not source_quote:
+            # Backward compatibility for stored/test v2-v3 payloads. Current
+            # compact prompts never ask the model to generate a quotation.
+            source_quote = _clean_text(item.get("source_text"), 2000)
+        if not entity or not source_quote:
+            return None
+        category = str(item.get("category") or "other").strip().lower()
+        if category == "laboratory_trend":
+            category = "laboratory_finding"
+        elif category == "clinical_syndrome":
+            category = "diagnosis"
+        elif category == "oncology_treatment_line":
+            category = "medication"
+        if category not in EVENT_CATEGORIES:
+            category = "other"
+        assertion = str(item.get("assertion") or "present").strip().lower()
+        if assertion not in ASSERTION_TYPES:
+            assertion = "unknown"
+        certainty = str(item.get("certainty") or "unknown").strip().lower()
+        if certainty not in CERTAINTY_LEVELS:
+            certainty = "unknown"
+        quote_verified, matched_quote = locate_quote(source_quote, full_text)
+        quote_folded = matched_quote.casefold()
+        if category == "symptom" and re.search(
+            r"\b(?:riferisc|riferit|lament|segnal)\w*", quote_folded
+        ):
+            certainty = "patient_reported"
+        if re.search(r"\bnon\s+(?:è\s+)?documentat\w*", quote_folded):
+            certainty = "unknown"
+            if category == "laboratory_finding" and re.search(
+                r"\b(?:causa\s+infettiva|infezion\w*)\b", quote_folded
+            ):
+                category = "diagnosis"
+        elif (
+            assertion not in {"absent", "conditional", "hypothetical"}
+            and re.search(
+                r"\b(?:quadro\s+)?compatibile\s+con\b|"
+                r"\b(?:sospett[oa]|possibile|probabile|verosimile)\b",
+                quote_folded,
+            )
+        ):
+            certainty = "suspected"
+
+        if category in {"diagnosis", "adverse_event"} and (
+            re.search(r"\bimmuno[- ]?mediat\w*\b", quote_folded)
+            and re.search(
+                r"\b(?:durante|in\s+corso\s+di)\s+(?:la\s+)?terapia\b|"
+                r"\bimmunoterap\w*\b|\bcorrelat\w*\s+(?:al|alla)\s+tratt",
+                quote_folded,
+            )
+        ):
+            category = "toxicity"
+
+        temporal_value = item.get("observed_date")
+        if _temporal_context_mismatch(category, matched_quote):
+            temporal_value = None
+        grounded_temporal = _temporal_expression_from_quote(
+            matched_quote, category=category
+        )
+        context_temporal, context_ref, context_text = (
+            _contextual_date_for_refs(refs, sentence_spans)
+        )
+        # Prefer a date/duration that can be verified in the quoted passage,
+        # then the nearest preceding date heading.  The model-provided value
+        # remains a last resort for expressions such as "ieri" that the
+        # deterministic parser intentionally does not enumerate.
+        if grounded_temporal:
+            temporal_value = grounded_temporal
+            context_ref = None
+            context_text = None
+        elif context_temporal:
+            temporal_value = context_temporal
+        temporal = normalize_clinical_date(
+            temporal_value,
+            document_date=_duration_reference_date(
+                temporal_value,
+                matched_quote=matched_quote,
+                contextual_date=context_temporal,
+                document_date=document_date,
+            ),
+            explicit_precision=item.get("date_precision"),
+            date_end=item.get("observed_date_end"),
+        )
+        if temporal.start is None and grounded_temporal:
+            if grounded_temporal != temporal_value:
+                temporal = normalize_clinical_date(
+                    grounded_temporal,
+                    document_date=document_date,
+                    explicit_precision=None,
+                    date_end=None,
+                )
+        page_hint = _safe_int(item.get("source_page")) or chunk.page_start
+        page, bbox = page_hint, None
+        if geometry is not None:
+            page, bbox = geometry.locate_source(matched_quote, page_hint)
+        data = _sanitize_nested_payload(
+            item.get("additional_data"),
+            allowed={
+                "reference_range", "grade", "stage",
+            },
+        )
+        therapy = _sanitize_nested_payload(
+            item.get("therapy"),
+            allowed={
+                "original_name", "active_ingredient", "lifecycle_status",
+                "dose", "route", "frequency", "indication", "intent",
+                "adherence",
+            },
+        )
+        oncology = _sanitize_nested_payload(
+            item.get("oncology"),
+            allowed={
+                "line_label", "regimen", "cycle", "dose", "modification",
+                "toxicity", "response", "setting", "intent",
+                "indication",
+            },
+            list_fields={"regimen"},
+        )
+        if category not in {
+            "medication", "toxicity", "response", "progression"
+        }:
+            oncology = {}
+        if category not in {"medication", "toxicity", "adverse_event"}:
+            therapy = {}
+        severity = _clean_optional(item.get("severity"), 100)
+        if severity is None and data.get("grade"):
+            severity = f"grado {data['grade']}"
+        therapy, oncology = _enrich_medication_payload(
+            category, entity, matched_quote, therapy, oncology
+        )
+        meaningful_oncology_structure = any(
+            oncology.get(field) for field in (
+                "line_label", "cycle", "setting", "intent", "modification",
+            )
+        )
+        if (
+            category == "medication" and oncology
+            and not meaningful_oncology_structure
+            and not re.search(
+                r"(?i)\b(?:linea|schema|regime|ciclo|adiuvant|neoadiuvant|"
+                r"palliativ|curativ|mantenimento)\w*\b",
+                matched_quote,
+            )
+        ):
+            oncology = {}
+        if therapy:
+            if therapy.get("lifecycle_status") not in (
+                None, *_THERAPY_LIFECYCLE_STATUSES
+            ):
+                therapy.pop("lifecycle_status", None)
+        clinical_status = _clean_optional(item.get("clinical_status"), 100)
+        assertion, clinical_status, therapy = _medication_transition(
+            category, matched_quote, assertion, clinical_status, therapy
+        )
+        if therapy:
+            data["therapy"] = therapy
+        if oncology:
+            data["oncology"] = oncology
+        data.update({
+            "quote_verified": quote_verified,
+            "date_original_text": temporal.original_text,
+            "date_approximate": temporal.approximate,
+            "chunk_index": chunk.index,
+            "sentence_refs": refs,
+            "adaptive_retry_depth": retry_depth,
+        })
+        if context_ref is not None and context_text:
+            data["date_context_sentence_ref"] = context_ref
+            data["date_context_text"] = context_text
+        if item.get("confidence") is not None:
+            # Compatibility with evidence created by prompt v2. Prompt v3 no
+            # longer asks the model for an uncalibrated self-assessment.
+            data["llm_confidence_uncalibrated"] = _bounded_float(
+                item.get("confidence"), 0.5
+            )
+        numeric_value = _safe_float(item.get("numeric_value"))
+        unit = _clean_optional(item.get("unit"), 80)
+        entity, category, numeric_value, unit = _normalize_measurement(
+            entity, category, matched_quote, numeric_value, unit
+        )
+        if (
+            category == "toxicity" and numeric_value is not None
+            and str(unit or "").casefold() in {"grado", "grade"}
+        ):
+            severity = severity or f"grado {numeric_value:g}"
+            numeric_value, unit = None, None
+        entity, severity = _normalize_entity_severity(entity, severity)
+        # A recorded number cannot itself be absent.  This deterministic
+        # correction also collapses a common duplicate where the model
+        # incorrectly transfers a nearby symptom resolution to the vital.
+        if numeric_value is not None and assertion == "absent":
+            assertion = "present"
+        certainty = _ground_certainty(
+            category=category,
+            assertion=assertion,
+            certainty=certainty,
+            quote=matched_quote,
+            numeric_value=numeric_value,
+            quote_verified=quote_verified,
+        )
+        evidence_id = stable_evidence_id(
+            document_id=document_id,
+            category=category,
+            entity=entity,
+            quote=matched_quote,
+            observed_date=temporal.start,
+            page=page,
+            assertion=assertion,
+            certainty=certainty,
+        )
+        return ClinicalEvidence(
+            evidence_id=evidence_id,
+            patient_id=patient_id,
+            document_id=document_id,
+            category=category,
+            normalized_entity=entity,
+            source_text=matched_quote,
+            assertion=assertion,
+            certainty=certainty,
+            temporality=(
+                "historical" if temporal.source in {
+                    "explicit_or_retroactive", "retrospective_duration",
+                }
+                and temporal.start and document_date
+                and temporal.start < document_date else "current"
+            ),
+            clinical_status=clinical_status,
+            observed_date=temporal.start,
+            observed_date_end=temporal.end,
+            document_date=document_date,
+            date_precision=temporal.precision,
+            date_source=temporal.source,
+            anatomical_site=_clean_optional(item.get("anatomical_site"), 200),
+            laterality=_clean_optional(item.get("laterality"), 50),
+            severity=severity,
+            significance=_normalize_significance(item.get("significance")),
+            value_text=_clean_optional(item.get("value_text"), 300),
+            numeric_value=numeric_value,
+            unit=unit,
+            source_page=page,
+            bbox=bbox,
+            confidence=(0.75 if quote_verified else 0.35),
+            extraction_method="llm_atomic_v2",
+            model_name=self.model_name,
+            prompt_version=ATOMIC_PROMPT_VERSION,
+            schema_version="2.0",
+            status="proposed" if quote_verified else "needs_review",
+            data=data,
+        )
+
+    def _output_budget(self, spans: list[SentenceSpan]) -> int:
+        """Use a small per-operation cap; adaptive splitting handles outliers."""
+        configured = max(
+            256, int(getattr(self.llm, "max_output_tokens", 4096) or 4096)
+        )
+        source_chars = sum(len(span.text) for span in spans)
+        # JSON atoms repeat field names and can exceed their short source.
+        # Too small a cap is slower because it discards one generation and
+        # forces two retries. Dense outliers are still bisected safely.
+        estimated = max(1536, 512 + int(source_chars * 2.2))
+        return min(configured, estimated)
+
+    def _text_budget(self) -> int:
+        context = int(getattr(self.llm, "context_length", 32768) or 32768)
+        output = int(getattr(self.llm, "max_output_tokens", 4096) or 4096)
+        available = max(2000, context - min(output, context // 2) - 3500)
+        context_safe_chars = max(1000, int(available * 2.5))
+        return min(_ATOMIC_SOURCE_CHUNK_CHARS, context_safe_chars)
+
+    @staticmethod
+    def _load_geometry(path: Path | None):
+        if path is None or not path.exists():
+            return None
+        try:
+            from ..pipeline.pdf_extractor import PdfExtractionResult
+            return PdfExtractionResult.from_dict(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, ValueError, TypeError):
+            return None
+
+
+def build_atomic_prompt(
+    chunk: TextChunk,
+    *,
+    document_type: str,
+    document_date: str | None,
+    sentence_spans: list[SentenceSpan] | None = None,
+) -> str:
+    """Return a cache-friendly prompt with deterministic source references."""
+    pages = (
+        f"{chunk.page_start or 'n.d.'}-{chunk.page_end or 'n.d.'}"
+    )
+    spans = sentence_spans or split_sentence_spans(chunk.text)
+    numbered_text = "\n".join(
+        f"[S{span.sentence_id}] {span.text}" for span in spans
+    )
+    return (
+        f"CONTESTO: tipo={document_type or 'non classificato'}; "
+        f"data_documento={document_date or 'non disponibile'}; "
+        f"pagine={pages}\n"
+        "In refs usa solo i numeri degli ID S seguenti.\n\n"
+        f"TESTO:\n{numbered_text}"
+    )
+
+
+def split_sentence_spans(text: str, maximum_chars: int = 1200) -> list[SentenceSpan]:
+    """Split a chunk into exact, addressable spans without rewriting text."""
+    value = str(text or "")
+    if not value.strip():
+        return []
+    boundaries = [0]
+    # A single newline is usually a PDF line wrap, not a semantic boundary.
+    for match in re.finditer(r"(?:\n\s*\n+|(?<=[.!?;])\s+)", value):
+        boundaries.append(match.end())
+    boundaries.append(len(value))
+
+    raw_ranges: list[tuple[int, int]] = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        while start < end and value[start].isspace():
+            start += 1
+        while end > start and value[end - 1].isspace():
+            end -= 1
+        if start >= end:
+            continue
+        cursor = start
+        while end - cursor > maximum_chars:
+            target = cursor + maximum_chars
+            split_at = max(
+                value.rfind(", ", cursor, target),
+                value.rfind(" ", cursor, target),
+            )
+            if split_at <= cursor + maximum_chars // 2:
+                split_at = target
+            else:
+                split_at += 1
+            raw_ranges.append((cursor, split_at))
+            cursor = split_at
+            while cursor < end and value[cursor].isspace():
+                cursor += 1
+        if cursor < end:
+            raw_ranges.append((cursor, end))
+    return [
+        SentenceSpan(index, start, end, value[start:end])
+        for index, (start, end) in enumerate(raw_ranges, start=1)
+    ]
+
+
+def bisect_text_chunk(chunk: TextChunk) -> list[TextChunk]:
+    """Split near a sentence boundary while retaining coarse page provenance."""
+    spans = split_sentence_spans(chunk.text)
+    if len(spans) < 2:
+        return []
+    total_chars = sum(len(span.text) for span in spans)
+    target = total_chars / 2
+    consumed = 0
+    cut_index = 1
+    for index, span in enumerate(spans[:-1], start=1):
+        consumed += len(span.text)
+        cut_index = index
+        if consumed >= target:
+            break
+    left_end = spans[cut_index - 1].end
+    right_start = spans[cut_index].start
+    left = chunk.text[:left_end].strip()
+    right = chunk.text[right_start:].strip()
+    if not left or not right:
+        return []
+    return [
+        TextChunk(
+            index=chunk.index * 10 + 1, text=left,
+            page_start=chunk.page_start, page_end=chunk.page_end,
+        ),
+        TextChunk(
+            index=chunk.index * 10 + 2, text=right,
+            page_start=chunk.page_start, page_end=chunk.page_end,
+        ),
+    ]
+
+
+def split_text_chunks(text: str, max_chars: int) -> list[TextChunk]:
+    """Output-safe paragraph chunks; no prefix-only truncation.
+
+    A short date heading is carried into the following chunk instead of being
+    stranded at the end of the preceding one.  This keeps temporal scope intact
+    without overlapping (and therefore duplicating) clinical evidence.
+    """
+    value = str(text or "").strip()
+    if not value:
+        return []
+    max_chars = max(1000, int(max_chars))
+    page_pattern = re.compile(
+        r"(?im)^\s*(?:"
+        r"---\s*PAGINA\s+(\d+)\s*---|"
+        r"\[PAGINA\s*:?\s*(\d+)\]|"
+        r"<!--\s*page\s*:\s*(\d+)\s*-->"
+        r")\s*$"
+    )
+    pieces: list[tuple[str, int | None]] = []
+    current_page: int | None = None
+    cursor = 0
+    for match in page_pattern.finditer(value):
+        before = value[cursor:match.start()].strip()
+        if before:
+            pieces.append((before, current_page))
+        current_page = int(next(group for group in match.groups() if group))
+        cursor = match.end()
+    tail = value[cursor:].strip()
+    if tail:
+        pieces.append((tail, current_page))
+    if not pieces:
+        pieces = [(value, None)]
+
+    paragraphs: list[tuple[str, int | None]] = []
+    for piece, page in pieces:
+        blocks = [block.strip() for block in re.split(r"\n\s*\n", piece)]
+        for block in blocks:
+            if not block:
+                continue
+            if len(block) <= max_chars:
+                paragraphs.append((block, page))
+                continue
+            start = 0
+            while start < len(block):
+                end = min(len(block), start + max_chars)
+                if end < len(block):
+                    boundary = max(
+                        block.rfind("\n", start, end),
+                        block.rfind(". ", start, end),
+                        block.rfind("; ", start, end),
+                    )
+                    if boundary > start + max_chars // 2:
+                        end = boundary + 1
+                paragraphs.append((block[start:end].strip(), page))
+                start = end
+
+    chunks: list[TextChunk] = []
+    buffer: list[str] = []
+    buffer_pages: list[int | None] = []
+    size = 0
+    for paragraph, page in paragraphs:
+        added = len(paragraph) + (2 if buffer else 0)
+        if buffer and size + added > max_chars:
+            carry: tuple[str, int | None] | None = None
+            if len(buffer) > 1 and _looks_like_temporal_heading(buffer[-1]):
+                carry = (buffer.pop(), buffer_pages.pop())
+            chunks.append(TextChunk(
+                index=len(chunks), text="\n\n".join(buffer),
+                page_start=min(
+                    value for value in buffer_pages if value is not None
+                ) if any(value is not None for value in buffer_pages) else None,
+                page_end=max(
+                    value for value in buffer_pages if value is not None
+                ) if any(value is not None for value in buffer_pages) else None,
+            ))
+            if carry:
+                buffer, buffer_pages = [carry[0]], [carry[1]]
+                size = len(carry[0])
+            else:
+                buffer, buffer_pages, size = [], [], 0
+        buffer.append(paragraph)
+        size += len(paragraph) + (2 if len(buffer) > 1 else 0)
+        buffer_pages.append(page)
+    if buffer:
+        chunks.append(TextChunk(
+            index=len(chunks), text="\n\n".join(buffer),
+            page_start=min(
+                value for value in buffer_pages if value is not None
+            ) if any(value is not None for value in buffer_pages) else None,
+            page_end=max(
+                value for value in buffer_pages if value is not None
+            ) if any(value is not None for value in buffer_pages) else None,
+        ))
+    return chunks
+
+
+def _looks_like_temporal_heading(value: str) -> bool:
+    """Recognise compact dated section headers, not ordinary dated prose."""
+    text = " ".join(str(value or "").split()).strip(" :-–—")
+    return bool(
+        len(text) <= 120
+        and len(text.split()) <= 8
+        and _explicit_date_expression(text)
+    )
+
+
+def locate_quote(quote: str, full_text: str) -> tuple[bool, str]:
+    """Verify a citation, tolerating whitespace differences only."""
+    source = str(full_text or "")
+    wanted = " ".join(str(quote or "").split())
+    if not wanted:
+        return False, ""
+    if wanted in source:
+        return True, wanted
+    flexible = re.compile(
+        r"\s+".join(re.escape(token) for token in wanted.split()),
+        re.IGNORECASE,
+    )
+    match = flexible.search(source)
+    if match:
+        return True, source[match.start():match.end()]
+    return False, wanted
+
+
+def _expand_atomic_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Map compact v4/v5 wire payloads to the stable internal fields."""
+    is_v5 = any(key in item for key in ("c", "e", "r"))
+    is_v4 = "entity" in item or "refs" in item
+    if not is_v5 and not is_v4:
+        return dict(item)
+    drug_key = "m" if is_v5 else "drug"
+    oncology_key = "o" if is_v5 else "oncology"
+    extra_key = "z" if is_v5 else "extra"
+    drug = item.get(drug_key) if isinstance(item.get(drug_key), dict) else {}
+    oncology = (
+        item.get(oncology_key)
+        if isinstance(item.get(oncology_key), dict) else {}
+    )
+    extra = (
+        item.get(extra_key) if isinstance(item.get(extra_key), dict) else {}
+    )
+    def field(short: str, long: str):
+        return item.get(short) if is_v5 else item.get(long)
+
+    def nested(payload: dict[str, Any], short: str, long: str):
+        return payload.get(short) if is_v5 else payload.get(long)
+
+    therapy = {
+        "original_name": nested(drug, "n", "name"),
+        "active_ingredient": nested(drug, "i", "ingredient"),
+        "lifecycle_status": nested(drug, "l", "lifecycle"),
+        "dose": nested(drug, "d", "dose"),
+        "route": nested(drug, "r", "route"),
+        "frequency": nested(drug, "f", "frequency"),
+        "indication": nested(drug, "x", "indication"),
+        "intent": nested(drug, "t", "intent"),
+        "adherence": nested(drug, "a", "adherence"),
+    }
+
+    expanded_oncology = {
+        "line_label": nested(oncology, "l", "line"),
+        "regimen": nested(oncology, "r", "regimen"),
+        "cycle": nested(oncology, "c", "cycle"),
+        "dose": nested(oncology, "d", "dose"),
+        "modification": nested(oncology, "m", "change"),
+        "toxicity": nested(oncology, "t", "toxicity"),
+        "response": nested(oncology, "p", "response"),
+        "setting": nested(oncology, "s", "setting"),
+        "intent": nested(oncology, "i", "intent"),
+        "indication": nested(oncology, "x", "indication"),
+    }
+    additional = {
+        "reference_range": nested(extra, "r", "range"),
+        "grade": nested(extra, "g", "grade"),
+        "stage": nested(extra, "s", "stage"),
+    }
+    return {
+        "category": field("c", "category"),
+        "normalized_entity": field("e", "entity"),
+        "source_refs": field("r", "refs"),
+        "assertion": field("a", "assertion"),
+        "certainty": field("q", "certainty"),
+        "clinical_status": field("s", "status"),
+        "observed_date": field("d", "date"),
+        "observed_date_end": field("de", "date_end"),
+        "date_precision": field("p", "precision"),
+        "anatomical_site": field("i", "site"),
+        "laterality": field("l", "side"),
+        "severity": field("v", "severity"),
+        "significance": field("g", "significance"),
+        "value_text": field("x", "value"),
+        "numeric_value": field("n", "number"),
+        "unit": field("u", "unit"),
+        "therapy": therapy,
+        "oncology": expanded_oncology,
+        "additional_data": additional,
+    }
+
+
+def _normalize_atomic_wire_item(value: object) -> dict[str, Any] | None:
+    """Normalize v5 tuples while accepting object payloads from v2-v4."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, list) or len(value) != 7:
+        return None
+    category, entity, refs, assertion, certainty, significance, details = value
+    if not isinstance(details, dict):
+        return None
+    item = {
+        "c": category,
+        "e": entity,
+        "r": refs,
+        "a": assertion,
+        "q": certainty,
+        "g": significance,
+    }
+    item.update(details)
+    return item
+
+
+def stable_evidence_id(
+    *,
+    document_id: str,
+    category: str,
+    entity: str,
+    quote: str,
+    observed_date: str | None,
+    page: int | None,
+    assertion: str,
+    certainty: str,
+) -> str:
+    """Content-derived ID stable across chunk size and worker scheduling."""
+    stable_payload = json.dumps(
+        {
+            "document": document_id,
+            "category": category,
+            "entity": str(entity or "").casefold(),
+            "quote": " ".join(str(quote or "").casefold().split()),
+            "date": observed_date,
+            "page": page,
+            "assertion": assertion,
+            "certainty": certainty,
+        },
+        ensure_ascii=False, sort_keys=True,
+    )
+    return "EVD_" + uuid.uuid5(uuid.NAMESPACE_URL, stable_payload).hex
+
+
+def _safe_sentence_refs(
+    value: object, spans: list[SentenceSpan] | None
+) -> list[int]:
+    if not spans or not isinstance(value, list):
+        return []
+    maximum = len(spans)
+    refs = []
+    for raw in value[:6]:
+        try:
+            parsed = int(str(raw).strip().lstrip("Ss"))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= parsed <= maximum and parsed not in refs:
+            refs.append(parsed)
+    refs.sort()
+    return refs
+
+
+def _quote_from_sentence_refs(
+    refs: list[int], spans: list[SentenceSpan] | None
+) -> str:
+    if not refs or not spans:
+        return ""
+    # Reassemble a whitespace-normalized contiguous slice. ``locate_quote``
+    # maps it back to the exact bytes in the immutable full document.
+    selected = spans[refs[0] - 1:refs[-1]]
+    return " ".join(span.text for span in selected).strip()
+
+
+def _coalesce_adjacent_wire_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join compatible fragments of one concept on adjacent source IDs."""
+    result: list[dict[str, Any]] = []
+    for raw in items:
+        item = copy.deepcopy(raw)
+        refs = _wire_refs(item)
+        if not result or not refs:
+            result.append(item)
+            continue
+        previous = result[-1]
+        previous_refs = _wire_refs(previous)
+        same_concept = (
+            _clean_text(_wire_value(previous, "c", "category"), 100).casefold()
+            == _clean_text(_wire_value(item, "c", "category"), 100).casefold()
+            and _clean_text(_wire_value(previous, "e", "entity"), 300).casefold()
+            == _clean_text(_wire_value(item, "e", "entity"), 300).casefold()
+        )
+        adjacent = bool(
+            previous_refs
+            and refs[0] <= previous_refs[-1] + 1
+            and len(set(previous_refs + refs)) <= 6
+        )
+        refs_key = "r" if "r" in item or "r" in previous else "refs"
+        merged = (
+            _merge_wire_values(previous, item, ignored={refs_key})
+            if same_concept and adjacent else None
+        )
+        if merged is None:
+            result.append(item)
+            continue
+        merged[refs_key] = sorted(set(previous_refs + refs))
+        result[-1] = merged
+    return result
+
+
+def _wire_value(item: dict[str, Any], short: str, long: str) -> object:
+    return item.get(short) if short in item else item.get(long)
+
+
+def _wire_refs(item: dict[str, Any]) -> list[int]:
+    value = _wire_value(item, "r", "refs")
+    if not isinstance(value, list):
+        return []
+    result = []
+    for raw in value:
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0 and parsed not in result:
+            result.append(parsed)
+    return sorted(result)
+
+
+def _merge_wire_values(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    ignored: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Deep-merge missing wire fields; return None on any real conflict."""
+    ignored = ignored or set()
+    merged = copy.deepcopy(left)
+    for key, right_value in right.items():
+        if key in ignored or right_value in (None, "", [], {}):
+            continue
+        left_value = merged.get(key)
+        if left_value in (None, "", [], {}):
+            merged[key] = copy.deepcopy(right_value)
+            continue
+        if isinstance(left_value, dict) and isinstance(right_value, dict):
+            child = _merge_wire_values(left_value, right_value)
+            if child is None:
+                return None
+            merged[key] = child
+            continue
+        if left_value != right_value:
+            return None
+    return merged
+
+
+def _contextual_date_for_refs(
+    refs: list[int],
+    spans: list[SentenceSpan] | None,
+    *,
+    maximum_distance: int = 6,
+) -> tuple[str | None, int | None, str | None]:
+    """Return the nearest explicit date heading governing a later sentence."""
+    if not refs or not spans:
+        return None, None, None
+    first = refs[0]
+    lower = max(1, first - maximum_distance)
+    for sentence_id in range(first - 1, lower - 1, -1):
+        span = spans[sentence_id - 1]
+        expression = _explicit_date_expression(span.text)
+        if expression:
+            return expression, sentence_id, span.text
+    return None, None, None
+
+
+_RESOLVABLE_SYMPTOMS = (
+    "dispnea", "tosse", "febbre", "dolore", "nausea", "vomito",
+    "diarrea", "astenia", "prurito", "rash", "cefalea", "vertigini",
+    "edema", "disfagia", "disuria", "ematuria", "parestesie",
+)
+
+
+def _explicit_resolution_evidence(
+    *,
+    patient_id: str,
+    document_id: str,
+    document_date: str | None,
+    full_text: str,
+    geometry,
+    model_name: str,
+    existing: list[ClinicalEvidence],
+) -> list[ClinicalEvidence]:
+    """Recover explicitly documented symptom resolutions without inference."""
+    spans = split_sentence_spans(full_text)
+    result: list[ClinicalEvidence] = []
+    pattern = re.compile(
+        r"(?i)\b(?:la|il|lo|l['’]|i|gli|le)\s+"
+        r"(?P<subject>[a-zà-öø-ÿ][a-zà-öø-ÿ'’\- ]{0,70}?)\s+"
+        r"(?:è|e'|sono|risulta(?:no)?)\s+"
+        r"(?P<state>risolt[oaie]?|scompars[oaie]?|regredit[oaie]?|assente)\b"
+    )
+    for span in spans:
+        for match in pattern.finditer(span.text):
+            subject = " ".join(match.group("subject").casefold().split())
+            if re.search(r"\bnon$", subject):
+                continue
+            entities = [
+                symptom for symptom in _RESOLVABLE_SYMPTOMS
+                if re.search(rf"\b{re.escape(symptom)}\b", subject)
+            ]
+            if not entities:
+                continue
+            quote_verified, matched_quote = locate_quote(span.text, full_text)
+            if not quote_verified:
+                continue
+            temporal_value = _temporal_expression_from_quote(matched_quote)
+            context_value, context_ref, context_text = (
+                _contextual_date_for_refs([span.sentence_id], spans)
+            )
+            if not temporal_value:
+                temporal_value = context_value
+            temporal = normalize_clinical_date(
+                temporal_value, document_date=document_date
+            )
+            page, bbox = None, None
+            if geometry is not None:
+                page, bbox = geometry.locate_source(matched_quote, None)
+            for entity in entities:
+                if any(
+                    item.assertion == "absent"
+                    and item.normalized_entity.casefold() == entity
+                    and " ".join(item.source_text.casefold().split())
+                    == " ".join(matched_quote.casefold().split())
+                    for item in (*existing, *result)
+                ):
+                    continue
+                data: dict[str, Any] = {
+                    "quote_verified": True,
+                    "date_original_text": temporal.original_text,
+                    "date_approximate": temporal.approximate,
+                    "sentence_refs": [span.sentence_id],
+                    "deterministic_explicit_resolution": True,
+                }
+                if context_ref is not None and context_text:
+                    data["date_context_sentence_ref"] = context_ref
+                    data["date_context_text"] = context_text
+                certainty = (
+                    "patient_reported" if re.search(
+                        r"(?i)\b(?:riferisc|riferit|segnal)\w*", matched_quote
+                    ) else "confirmed"
+                )
+                result.append(ClinicalEvidence(
+                    evidence_id=stable_evidence_id(
+                        document_id=document_id,
+                        category="symptom",
+                        entity=entity,
+                        quote=matched_quote,
+                        observed_date=temporal.start,
+                        page=page,
+                        assertion="absent",
+                        certainty=certainty,
+                    ),
+                    patient_id=patient_id,
+                    document_id=document_id,
+                    category="symptom",
+                    normalized_entity=entity,
+                    source_text=matched_quote,
+                    assertion="absent",
+                    certainty=certainty,
+                    clinical_status="resolved",
+                    temporality=(
+                        "historical" if temporal.start and document_date
+                        and temporal.start < document_date else "current"
+                    ),
+                    observed_date=temporal.start,
+                    document_date=document_date,
+                    date_precision=temporal.precision,
+                    date_source=temporal.source,
+                    source_page=page,
+                    bbox=bbox,
+                    confidence=0.95,
+                    extraction_method="llm_atomic_v2",
+                    model_name=model_name,
+                    prompt_version=ATOMIC_PROMPT_VERSION,
+                    schema_version="2.0",
+                    status="proposed",
+                    data=data,
+                ))
+    return result
+
+
+def _deduplicate_atomic(
+    evidence: Iterable[ClinicalEvidence],
+) -> list[ClinicalEvidence]:
+    """Remove only exact same-document extraction duplicates."""
+    unique: dict[tuple, ClinicalEvidence] = {}
+    for item in evidence:
+        key = (
+            item.document_id, item.category,
+            item.normalized_entity.casefold(),
+            " ".join(item.source_text.casefold().split()),
+            item.observed_date, item.assertion, item.certainty,
+        )
+        current = unique.get(key)
+        if current is None or item.confidence > current.confidence:
+            unique[key] = item
+    return list(unique.values())
+
+
+def content_hash(*values: object) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(str(value or "").encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _clean_text(value: object, maximum: int) -> str:
+    return " ".join(str(value or "").split())[:maximum].strip()
+
+
+def _clean_optional(value: object, maximum: int) -> str | None:
+    cleaned = _clean_text(value, maximum)
+    return cleaned or None
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        parsed = int(value) if value is not None else None
+        return parsed if parsed and parsed > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _bounded_float(value: object, default: float) -> float:
+    parsed = _safe_float(value)
+    return max(0.0, min(parsed if parsed is not None else default, 1.0))
+
+
+def _sanitize_nested_payload(
+    value: object,
+    *,
+    allowed: set[str],
+    list_fields: set[str] | None = None,
+) -> dict[str, Any]:
+    """Keep schema-defined explicit metadata even if a backend ignores it."""
+    if not isinstance(value, dict):
+        return {}
+    list_fields = list_fields or set()
+    clean: dict[str, Any] = {}
+    for key in allowed:
+        raw = value.get(key)
+        if raw in (None, "", [], {}):
+            continue
+        if key in list_fields:
+            items = raw if isinstance(raw, list) else [raw]
+            normalized = [
+                _clean_wire_scalar(item, 300) for item in items
+                if _clean_wire_scalar(item, 300)
+            ]
+            if normalized:
+                clean[key] = list(dict.fromkeys(normalized))
+            continue
+        if isinstance(raw, (dict, list)):
+            continue
+        cleaned = _clean_wire_scalar(raw, 500)
+        if cleaned:
+            clean[key] = cleaned
+    return clean
+
+
+def _clean_wire_scalar(value: object, maximum: int) -> str:
+    cleaned = _clean_text(value, maximum).strip("{}[]")
+    if cleaned.casefold().strip(" .") in {
+        "unknown", "n.d", "nd", "non disponibile", "none", "null",
+    }:
+        return ""
+    return cleaned
+
+
+def _temporal_expression_from_quote(
+    quote: str, *, category: str | None = None
+) -> str | None:
+    """Recover an explicit event date/duration omitted by the model."""
+    text = str(quote or "")
+    duration = re.search(
+        r"(?i)\b(?:da(?:\s+circa)?|circa\s+da)\s+"
+        r"(?:\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|"
+        r"dieci|undici|dodici)\s+"
+        r"(?:giorn(?:o|i)|settiman(?:a|e)|mes(?:e|i)|ann(?:o|i))\b",
+        text,
+    )
+    if duration:
+        return duration.group(0)
+    if _temporal_context_mismatch(category, text):
+        return None
+    return _explicit_date_expression(text)
+
+
+def _explicit_date_expression(text: str) -> str | None:
+    explicit = re.search(
+        r"\b(?:\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})|"
+        r"(?:19|20)\d{2}-\d{1,2}-\d{1,2})\b",
+        str(text or ""),
+    )
+    return explicit.group(0) if explicit else None
+
+
+def _duration_reference_date(
+    temporal_value: object,
+    *,
+    matched_quote: str,
+    contextual_date: str | None,
+    document_date: str | None,
+) -> str | None:
+    """Anchor a retrospective duration to its local dated note section."""
+    if not re.search(
+        r"(?i)\b(?:da(?:\s+circa)?|circa\s+da)\s+"
+        r"(?:\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|"
+        r"dieci|undici|dodici)\s+"
+        r"(?:giorn(?:o|i)|settiman(?:a|e)|mes(?:e|i)|ann(?:o|i))\b",
+        str(temporal_value or ""),
+    ):
+        return document_date
+    for candidate in (
+        _explicit_date_expression(matched_quote), contextual_date
+    ):
+        if not candidate:
+            continue
+        normalized = normalize_clinical_date(candidate)
+        if normalized.start and normalized.precision == "day":
+            return normalized.start
+    return document_date
+
+
+def _ground_certainty(
+    *,
+    category: str,
+    assertion: str,
+    certainty: str,
+    quote: str,
+    numeric_value: float | None,
+    quote_verified: bool,
+) -> str:
+    """Correct certainty values contradicted by the cited source itself."""
+    text = str(quote or "").casefold()
+    if re.search(
+        r"\b(?:esclus[oa]|assenza\s+di|non\s+(?:si\s+)?evidenz\w*|"
+        r"negativ[oa]\s+per)\b",
+        text,
+    ):
+        return "excluded"
+    if category == "symptom" and re.search(
+        r"\b(?:riferisc|riferit|lament|segnal)\w*", text
+    ):
+        return "patient_reported"
+    if re.search(
+        r"\b(?:quadro\s+)?compatibile\s+con\b|"
+        r"\b(?:sospett[oa]|possibile|probabile|verosimile)\b",
+        text,
+    ):
+        return "suspected"
+    objective = {
+        "diagnosis", "clinical_sign", "vital_sign", "laboratory_finding",
+        "imaging_finding", "pathology_finding", "biomarker", "medication",
+        "procedure", "toxicity", "response", "progression",
+    }
+    if (
+        quote_verified and assertion == "present"
+        and (numeric_value is not None or category in objective)
+        and certainty in {"unknown", "excluded"}
+    ):
+        return "confirmed"
+    return certainty
+
+
+def _temporal_context_mismatch(category: str | None, quote: str) -> bool:
+    """Reject a date explicitly scoped to another event in a shared quote."""
+    if category == "medication":
+        return False
+    return bool(re.search(
+        r"(?i)\bultima\s+somministrazione\b[^.;]*"
+        r"\b\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})\b",
+        str(quote or ""),
+    ))
+
+
+def _medication_transition(
+    category: str,
+    quote: str,
+    assertion: str,
+    clinical_status: str | None,
+    therapy: dict[str, Any],
+) -> tuple[str, str | None, dict[str, Any]]:
+    """Correct common confusion between negation and medication lifecycle."""
+    if category != "medication":
+        return assertion, clinical_status, therapy
+    text = str(quote or "").casefold()
+    lifecycle = therapy.get("lifecycle_status")
+    if (
+        re.search(
+            r"\b(?:si\s+)?sospend\w*|\bsospes[oaie]?\b|"
+            r"\binterrott[oaie]?\b",
+            text,
+        )
+        and not re.search(r"\bnon\s+(?:si\s+)?sospend", text)
+        and assertion not in {"conditional", "hypothetical"}
+    ):
+        lifecycle = "suspended"
+    elif re.search(
+        r"\b(?:si\s+)?(?:avvia|inizia)\b|\b(?:avviat|iniziat)[oaie]?\b",
+        text,
+    ):
+        lifecycle = "started"
+    elif re.search(
+        r"\b(?:dose\s+)?(?:ridott|aumentat)[oaie]?\b|"
+        r"\b(?:riduzione|incremento)\s+(?:della\s+)?dose\b",
+        text,
+    ):
+        lifecycle = "dose_changed"
+    elif re.search(r"\b(?:ripres|riavviat)[oaie]?\b|\briprende\b", text):
+        lifecycle = "resumed"
+    elif re.search(r"\b(?:completat|terminat)[oaie]?\b", text):
+        lifecycle = "completed"
+    elif "ultima somministrazione" in text:
+        lifecycle = "administered"
+    elif re.search(r"\b(?:è|e)\s+in trattamento con\b", text):
+        lifecycle = "active"
+    if lifecycle:
+        assertion = "present"
+        clinical_status = lifecycle
+        therapy = dict(therapy)
+        therapy["lifecycle_status"] = lifecycle
+        if therapy.get("intent") in {
+            "sospeso", "sospesa", "avviato", "avviata", "iniziato", "iniziata"
+        }:
+            therapy.pop("intent", None)
+    return assertion, clinical_status, therapy
+
+
+def _enrich_medication_payload(
+    category: str,
+    entity: str,
+    quote: str,
+    therapy: dict[str, Any],
+    oncology: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Recover explicit drug attributes without external normalization."""
+    if category != "medication":
+        return therapy, oncology
+    therapy = dict(therapy)
+    oncology = dict(oncology)
+    therapy.setdefault("original_name", entity)
+    dose = re.search(
+        r"(?i)\b\d+(?:[.,]\d+)?\s*(?:mg|mcg|µg|g|ml|UI|U\.I\.)"
+        r"(?:\s*/\s*(?:die|giorno))?\b",
+        quote,
+    )
+    if dose and not therapy.get("dose"):
+        therapy["dose"] = " ".join(dose.group(0).split())
+    route = re.search(
+        r"(?i)\b(?:e\.v\.|ev|i\.v\.|iv|per\s+os|orale|p\.o\.|po|"
+        r"s\.c\.|sc|i\.m\.|im)\b",
+        quote,
+    )
+    if route and not therapy.get("route"):
+        therapy["route"] = " ".join(route.group(0).split())
+    frequency = re.search(
+        r"(?i)\b(?:ogni\s+\d+\s+(?:ore|giorni?|settimane?|mesi)|"
+        r"\d+\s+volte\s+(?:al|/\s*)\s*(?:die|giorno)|die)\b",
+        quote,
+    )
+    if frequency and not therapy.get("frequency"):
+        therapy["frequency"] = " ".join(frequency.group(0).split())
+    intent = str(oncology.get("intent") or "").casefold()
+    if intent and not re.search(
+        r"\b(?:curativ|palliativ|adiuvant|neoadiuvant|radical|mantenimento)",
+        intent,
+    ):
+        oncology.setdefault("indication", oncology.pop("intent"))
+    if oncology and not oncology.get("regimen"):
+        oncology["regimen"] = [entity]
+    return therapy, oncology
+
+
+def _normalize_measurement(
+    entity: str,
+    category: str,
+    quote: str,
+    numeric_value: float | None,
+    unit: str | None,
+) -> tuple[str, str, float | None, str | None]:
+    """Normalize high-value vital measurements without clinical inference."""
+    combined = f"{entity} {quote}"
+    if re.search(r"(?i)\b(?:spo2|saturazione(?:\s+di\s+ossigeno)?)\b", combined):
+        match = re.search(
+            r"(?i)\b(?:spo2|saturazione(?:\s+di\s+ossigeno)?)\s*"
+            r"(?:[:=]?\s*)([<>≤≥]?\s*\d+(?:[.,]\d+)?)\s*%?",
+            combined,
+        )
+        if numeric_value is None and match:
+            numeric_value = _safe_float(
+                re.sub(r"[^\d,.-]", "", match.group(1)).replace(",", ".")
+            )
+        return "SpO2", "vital_sign", numeric_value, unit or "%"
+    return entity, category, numeric_value, unit
+
+
+def _normalize_entity_severity(
+    entity: str, severity: str | None
+) -> tuple[str, str | None]:
+    """Keep explicit grade in severity rather than inside the base entity."""
+    match = re.search(
+        r"(?i)\b(?:di\s+)?grado\s+([0-5]|I{1,3}|IV|V)\b", entity
+    )
+    if not match:
+        return entity, severity
+    if severity is None:
+        severity = f"grado {match.group(1)}"
+    normalized = (entity[:match.start()] + entity[match.end():]).strip(" ,;:-")
+    return normalized or entity, severity
+
+
+def _normalize_significance(value: object) -> str:
+    normalized = str(value or "clinically_relevant").strip().lower()
+    return normalized if normalized in {
+        "critical", "high", "clinically_relevant", "potentially_relevant",
+        "uncertain",
+    } else "uncertain"

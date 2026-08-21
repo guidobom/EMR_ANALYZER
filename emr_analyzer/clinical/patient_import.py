@@ -88,7 +88,6 @@ class PatientImportService:
         target_db = DatabaseEngine(target_db_path)
         init_database(target_db)
 
-        self._load_target_ids(target_db)
         stats = {"patients": 0, "documents": 0, "timeline": 0, "profiles": 0}
 
         try:
@@ -279,7 +278,3 @@ class PatientImportService:
             if num_part.isdigit():
                 return f"{prefix}{int(num_part) + 1:0{len(num_part)}d}"
         return f"{prefix}001"
-
-    def _load_target_ids(self, db) -> None:
-        """Pre-load existing IDs to avoid conflicts (no-op, _next_id handles it)."""
-        pass

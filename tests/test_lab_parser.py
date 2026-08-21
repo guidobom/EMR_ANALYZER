@@ -256,7 +256,10 @@ Referto Completo
         hbsab = by_name.get("HBsAb")
         self.assertIsNotNone(hbsab, "HBsAb non trovato")
         self.assertEqual(hbsab.value_text, "POSITIVO")
-        self.assertTrue(hbsab.is_abnormal, "POSITIVO dovrebbe essere marcato anomalo")
+        self.assertFalse(
+            hbsab.is_abnormal,
+            "HBsAb positivo non è di per sé patologico (possibile immunità)",
+        )
 
     def test_textual_result_in_table_format(self):
         """Valori testuali in formato tabellare."""

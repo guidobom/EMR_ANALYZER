@@ -17,9 +17,17 @@ della pratica clinica.
 - pseudonimizzazione deterministica prima e dopo l’elaborazione LLM;
 - estrazione strutturata dei valori di laboratorio con unità, range, flag,
   data e pagina sorgente;
-- ricostruzione temporale incrementale del Clinical State;
+- registro clinico evidence-first con prima evidenza, prima documentazione,
+  precisione temporale e provenienza verificabile;
+- fusione delle fonti duplicate, separazione delle recidive e conservazione
+  delle informazioni contraddittorie;
+- trend di laboratorio, corsi farmacologici e linee di terapia oncologica;
+- correlazioni cliniche prudenti fra sintomi, laboratorio, imaging e terapie;
 - interrogazione individuale o di coorti mediante modelli locali configurabili;
-- revisione, validazione, audit trail ed esportazione Excel.
+- revisione persistente, audit append-only ed esportazione JSON, CSV, XLSX,
+  Markdown, TXT, PDF e DOCX.
+- gold set clinico con doppia annotazione cieca, adjudication, blocco del test,
+  confronto con le predizioni ed export JSONL.
 
 ## Principi di sicurezza
 
@@ -51,6 +59,14 @@ Usare nei test pubblicabili esclusivamente documenti sintetici.
 La configurazione dei modelli, della temperatura, del contesto e dell’output
 avviene dall’interfaccia tramite **Configura LLM**.
 
+I due ruoli condividono un solo processo `llama-server` e una sola copia dei
+pesi quando usano lo stesso GGUF con uguale contesto per richiesta e uguale
+numero di slot. Temperatura, top-p/top-k, seed e limite di output restano
+indipendenti perché sono parametri della singola richiesta. La finestra mostra
+se i server fisici sono condivisi o distinti, gli slot realmente caricati e
+una stima complessiva della memoria; cambiando contesto o slot, **Salva e
+applica** sostituisce il runtime precedente.
+
 ## Installazione
 
 ```bash
@@ -59,6 +75,10 @@ conda activate emr-analyzer
 pip install -r requirements.txt
 brew install llama.cpp    # solo macOS
 ```
+
+Evitare di mescolare nella stessa environment i runtime Qt forniti da Conda e
+quelli installati da `pip`: scegliere una sola distribuzione PyQt5. L'app prova
+comunque a risolvere automaticamente il percorso dei plugin Qt di Conda.
 
 Registrazione dei modelli: se Ollama è (stato) installato, lo script di setup
 copia i GGUF già presenti in `~/.ollama/models/blobs` in
@@ -102,9 +122,9 @@ sm_100, 128 GB di memoria unificata):
 3. `python tools/setup_llama_backend.py` stampa le stesse istruzioni quando
    il binario manca.
 
-Il dimensionamento dei worker è automatico e basato sulla RAM: con 128 GB
-il numero di slot paralleli cresce fino al massimo configurato (8), il
-limite pratico del pool di estrazione.
+Il dimensionamento dei worker è automatico e basato sulla RAM. Il limite reale
+va confermato con il benchmark e con dossier rappresentativi, perché contesto,
+quantizzazione e cache del modello incidono sulla memoria per slot.
 
 I dati runtime vengono salvati fuori dal repository in:
 
@@ -116,19 +136,21 @@ I dati runtime vengono salvati fuori dal repository in:
 
 ```bash
 conda activate emr-analyzer
-python -m unittest discover -s tests -v
+QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
 
-La suite include test per parsing PDF, identificazione del paziente,
-pseudonimizzazione, estrazione del laboratorio, gestione dei workspace,
-configurazione LLM e validazione del testo clinico.
+La suite include inoltre datazione retrospettiva, deduplicazione, recidive,
+correlazioni tiroidee e respiratorie, provenienza, revisioni persistenti,
+formati di input, export, audit, flusso gold set e metriche di valutazione.
 
 ## Struttura
 
 ```text
 emr_analyzer/
-├── clinical/    # Clinical State, eventi e cancellazione clinica
+├── clinical/    # evidenze, episodi, registro, correlazioni e query
 ├── database/    # SQLite, migrazioni e repository
+├── evaluation/  # metriche e runner per gold set a livello paziente
+├── export/      # export completi e verificabili del registro
 ├── extraction/  # LLM locale, laboratorio e normalizzazione
 ├── gui/         # interfaccia desktop PyQt5
 ├── models/      # modelli del dominio
@@ -146,5 +168,32 @@ separatamente per:
 1. isolamento del testo clinico dai singoli documenti;
 2. costruzione e interrogazione del Clinical State.
 
+Da **Configura LLM → Scarica o importa modelli** è possibile:
+
+- importare selettivamente un GGUF già presente nell'archivio Ollama;
+- chiedere a Ollama di scaricare un nuovo tag e registrarlo;
+- scaricare direttamente un singolo file GGUF da un URL HTTPS, verificando
+  facoltativamente la checksum SHA-256.
+
+Download e copia mostrano l'avanzamento, possono essere interrotti e usano un
+file temporaneo che viene rinominato soltanto dopo la validazione. I modelli
+sono registrati in `~/.emr_analyzer/models/index.json` e diventano subito
+selezionabili. Il processo clinico resta offline: il processo separato di
+installazione riceve soltanto identificativo/URL del modello e non accede ai
+workspace. I GGUF suddivisi in più file non sono ancora installabili dalla
+finestra.
+
 Prompt, modello e parametri di generazione vengono versionati nei metadati e
-nei log di audit per favorire la riproducibilità delle analisi.
+nei log di audit per favorire la riproducibilità delle analisi. La matrice dei
+modelli e il protocollo di benchmark sono in
+[docs/MODEL_SELECTION.md](docs/MODEL_SELECTION.md).
+
+## Registro clinico v2
+
+La descrizione di schema, datazione, fusione, revisione, query, valutazione e
+bonifica dei metadati legacy è in
+[docs/CLINICAL_REGISTRY_V2.md](docs/CLINICAL_REGISTRY_V2.md).
+
+Il registro viene costruito a valle dell'estrazione: i testi normalizzati e le
+righe di laboratorio preesistenti non vengono modificati. Le decisioni manuali
+sono overlay tracciati e sopravvivono alle ricostruzioni automatiche.

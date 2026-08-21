@@ -1,10 +1,10 @@
 """Process-level offline policy for clinical processing.
 
 The policy blocks network connections initiated by this Python process except
-for loopback connections (for example llama-server on localhost).  It cannot control
-another process such as the llama-server engine, so model download actions are also
-disabled in the clinical UI and models must be installed before the offline
-session starts.
+for loopback connections (for example llama-server on localhost).  An explicit
+model installation may launch the dedicated ``model_download_helper`` process;
+that helper receives only a model tag/URL and destination, never a workspace or
+clinical content.  The clinical process itself remains loopback-only.
 """
 
 from __future__ import annotations

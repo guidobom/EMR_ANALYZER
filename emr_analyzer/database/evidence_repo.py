@@ -19,12 +19,16 @@ class EvidenceRepository:
             """INSERT INTO clinical_evidence
                (evidence_id, patient_id, document_id, category,
                 normalized_entity, assertion, temporality, clinical_status,
-                observed_date, value_text, numeric_value, unit, source_page,
-                source_text, bbox_json, confidence, extraction_method,
-                model_name, prompt_version, schema_version, status, data_json,
-                created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?)""",
+                observed_date, observed_date_end, document_date,
+                date_precision, date_source, anatomical_site, laterality,
+                severity, significance, certainty, value_text, numeric_value,
+                unit, source_page, source_text, bbox_json, confidence,
+                extraction_method, model_name, prompt_version, schema_version,
+                status, data_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?)""",
             [self._params(item) for item in evidence],
         )
         self.db.commit()
@@ -40,12 +44,17 @@ class EvidenceRepository:
                     """INSERT INTO clinical_evidence
                        (evidence_id, patient_id, document_id, category,
                         normalized_entity, assertion, temporality, clinical_status,
-                        observed_date, value_text, numeric_value, unit, source_page,
-                        source_text, bbox_json, confidence, extraction_method,
-                        model_name, prompt_version, schema_version, status,
-                        data_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               ?, ?, ?, ?, ?, ?, ?)""",
+                        observed_date, observed_date_end, document_date,
+                        date_precision, date_source, anatomical_site, laterality,
+                        severity, significance, certainty, value_text,
+                        numeric_value, unit, source_page, source_text, bbox_json,
+                        confidence, extraction_method, model_name,
+                        prompt_version, schema_version, status, data_json,
+                        created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?)""",
                     [self._params(item) for item in evidence],
                 )
 
@@ -62,12 +71,17 @@ class EvidenceRepository:
                     """INSERT INTO clinical_evidence
                        (evidence_id, patient_id, document_id, category,
                         normalized_entity, assertion, temporality, clinical_status,
-                        observed_date, value_text, numeric_value, unit, source_page,
-                        source_text, bbox_json, confidence, extraction_method,
-                        model_name, prompt_version, schema_version, status,
-                        data_json, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               ?, ?, ?, ?, ?, ?, ?)""",
+                        observed_date, observed_date_end, document_date,
+                        date_precision, date_source, anatomical_site, laterality,
+                        severity, significance, certainty, value_text,
+                        numeric_value, unit, source_page, source_text, bbox_json,
+                        confidence, extraction_method, model_name,
+                        prompt_version, schema_version, status, data_json,
+                        created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?)""",
                     [self._params(item) for item in evidence],
                 )
 
@@ -98,7 +112,10 @@ class EvidenceRepository:
         return (
             item.evidence_id, item.patient_id, item.document_id, item.category,
             item.normalized_entity, item.assertion, item.temporality,
-            item.clinical_status, item.observed_date, item.value_text,
+            item.clinical_status, item.observed_date, item.observed_date_end,
+            item.document_date, item.date_precision,
+            item.date_source, item.anatomical_site, item.laterality,
+            item.severity, item.significance, item.certainty, item.value_text,
             item.numeric_value, item.unit, item.source_page, item.source_text,
             json.dumps(item.bbox) if item.bbox else None, item.confidence,
             item.extraction_method, item.model_name, item.prompt_version,
@@ -118,6 +135,15 @@ class EvidenceRepository:
             temporality=row["temporality"],
             clinical_status=row["clinical_status"],
             observed_date=row["observed_date"],
+            observed_date_end=row["observed_date_end"],
+            document_date=row["document_date"],
+            date_precision=row["date_precision"] or "unknown",
+            date_source=row["date_source"],
+            anatomical_site=row["anatomical_site"],
+            laterality=row["laterality"],
+            severity=row["severity"],
+            significance=row["significance"] or "clinically_relevant",
+            certainty=row["certainty"] or "confirmed",
             value_text=row["value_text"],
             numeric_value=row["numeric_value"],
             unit=row["unit"],

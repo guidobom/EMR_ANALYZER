@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import csv
+import io
+import json
 from pathlib import Path
 import re
 import time
 from typing import Any
+import zipfile
+from xml.etree import ElementTree
 
 
 @dataclass
@@ -197,7 +202,6 @@ class PdfPlumberExtractor:
     def is_available(self) -> bool:
         try:
             import pdfplumber  # noqa: F401
-            import pandas  # noqa: F401
             return True
         except ImportError as exc:
             self._init_error = str(exc)
@@ -205,9 +209,192 @@ class PdfPlumberExtractor:
 
     def convert(self, file_path: str | Path) -> PdfExtractionResult:
         path = Path(file_path)
-        if path.suffix.lower() == ".pdf":
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
             return self._extract_pdf(path)
-        return self._extract_image(path)
+        if suffix in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}:
+            return self._extract_image(path)
+        if suffix in {".txt", ".md", ".hl7"}:
+            return self._extract_plain_text(path)
+        if suffix == ".csv":
+            return self._extract_csv(path)
+        if suffix in {".xml", ".cda"}:
+            return self._extract_xml(path)
+        if suffix == ".json":
+            return self._extract_json(path)
+        if suffix == ".docx":
+            return self._extract_docx(path)
+        if suffix == ".xlsx":
+            return self._extract_xlsx(path)
+        if suffix == ".doc":
+            raise ValueError(
+                "Il formato DOC binario richiede il convertitore Docling/LibreOffice"
+            )
+        raise ValueError(f"Formato non supportato: {suffix or '(senza estensione)'}")
+
+    @staticmethod
+    def _read_text(path: Path) -> str:
+        """Decode institutional text exports without silently dropping bytes."""
+        raw = path.read_bytes()
+        for encoding in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+            try:
+                return raw.decode(encoding)
+            except UnicodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    def _text_result(
+        self,
+        path: Path,
+        text: str,
+        *,
+        method: str,
+        tables: list[PdfTable] | None = None,
+        warnings: list[str] | None = None,
+        started: float | None = None,
+    ) -> PdfExtractionResult:
+        # Form-feed is retained by many native converters as a reliable page
+        # delimiter.  Other formats remain a single logical page rather than
+        # inventing page citations that do not exist in the source.
+        chunks = text.replace("\r\n", "\n").replace("\r", "\n").split("\f")
+        pages = []
+        for number, chunk in enumerate(chunks or [""], start=1):
+            page_tables = tables if number == 1 else []
+            pages.append(PdfPage(
+                page=number,
+                width=0.0,
+                height=0.0,
+                text=chunk.strip(),
+                words=[],
+                tables=page_tables or [],
+            ))
+        return PdfExtractionResult(
+            source_path=str(path),
+            pages=pages,
+            method=method,
+            has_native_text=bool(text.strip()),
+            warnings=warnings or [],
+            elapsed_seconds=(time.perf_counter() - started) if started else 0.0,
+        )
+
+    def _extract_plain_text(self, path: Path) -> PdfExtractionResult:
+        started = time.perf_counter()
+        text = self._read_text(path)
+        if path.suffix.lower() == ".hl7":
+            text = text.replace("\r", "\n")
+        return self._text_result(path, text, method="native_text", started=started)
+
+    def _extract_csv(self, path: Path) -> PdfExtractionResult:
+        started = time.perf_counter()
+        decoded = self._read_text(path)
+        try:
+            dialect = csv.Sniffer().sniff(decoded[:8192], delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        rows = [
+            [str(cell).strip() for cell in row]
+            for row in csv.reader(io.StringIO(decoded), dialect)
+            if any(str(cell).strip() for cell in row)
+        ]
+        table = PdfTable("T_001_01", 1, None, rows, "csv") if rows else None
+        rendered = "\n".join(" | ".join(row) for row in rows)
+        return self._text_result(
+            path, rendered, method="native_csv",
+            tables=[table] if table else [], started=started,
+        )
+
+    def _extract_xml(self, path: Path) -> PdfExtractionResult:
+        started = time.perf_counter()
+        raw = path.read_bytes()
+        root = ElementTree.fromstring(raw)
+        lines = []
+        for element in root.iter():
+            text = " ".join((element.text or "").split())
+            if not text:
+                continue
+            tag = element.tag.rsplit("}", 1)[-1]
+            lines.append(f"{tag}: {text}")
+        return self._text_result(
+            path, "\n".join(lines), method="native_xml_cda", started=started,
+        )
+
+    def _extract_json(self, path: Path) -> PdfExtractionResult:
+        started = time.perf_counter()
+        data = json.loads(self._read_text(path))
+        lines: list[str] = []
+
+        def visit(value: Any, prefix: str = "") -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    visit(child, f"{prefix}.{key}" if prefix else str(key))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    visit(child, f"{prefix}[{index}]")
+            elif value is not None:
+                lines.append(f"{prefix}: {value}")
+
+        visit(data)
+        return self._text_result(
+            path, "\n".join(lines), method="native_json_fhir", started=started,
+        )
+
+    def _extract_docx(self, path: Path) -> PdfExtractionResult:
+        started = time.perf_counter()
+        with zipfile.ZipFile(path) as archive:
+            document_xml = archive.read("word/document.xml")
+        root = ElementTree.fromstring(document_xml)
+        namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        paragraphs = []
+        for paragraph in root.iter(namespace + "p"):
+            value = "".join(
+                node.text or "" for node in paragraph.iter(namespace + "t")
+            ).strip()
+            if value:
+                paragraphs.append(value)
+        tables = []
+        for table_node in root.iter(namespace + "tbl"):
+            rows = []
+            for row_node in table_node.iter(namespace + "tr"):
+                row = []
+                for cell in row_node.iter(namespace + "tc"):
+                    row.append(" ".join(
+                        (node.text or "").strip()
+                        for node in cell.iter(namespace + "t") if (node.text or "").strip()
+                    ))
+                if row:
+                    rows.append(row)
+            if rows:
+                tables.append(PdfTable(
+                    f"T_001_{len(tables) + 1:02d}", 1, None, rows, "docx",
+                ))
+        return self._text_result(
+            path, "\n".join(paragraphs), method="native_docx",
+            tables=tables, started=started,
+        )
+
+    def _extract_xlsx(self, path: Path) -> PdfExtractionResult:
+        started = time.perf_counter()
+        import pandas as pd
+
+        workbook = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
+        tables = []
+        sections = []
+        for sheet_name, frame in workbook.items():
+            frame = frame.fillna("")
+            rows = [[str(cell).strip() for cell in row] for row in frame.values.tolist()]
+            rows = [row for row in rows if any(row)]
+            if not rows:
+                continue
+            tables.append(PdfTable(
+                f"T_001_{len(tables) + 1:02d}", 1, None, rows, "xlsx",
+            ))
+            sections.append(
+                f"FOGLIO: {sheet_name}\n" + "\n".join(" | ".join(row) for row in rows)
+            )
+        return self._text_result(
+            path, "\n\n".join(sections), method="native_xlsx",
+            tables=tables, started=started,
+        )
 
     def _extract_pdf(self, path: Path) -> PdfExtractionResult:
         import pdfplumber

@@ -1,9 +1,11 @@
-"""Database schema creation and migration for EMR Analyzer."""
+"""Database schema creation and additive migrations for EMR Analyzer."""
+
+import re
 
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -172,6 +174,13 @@ CREATE_TABLES_SQL = [
         timestamp TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS audit_chain_heads (
+        patient_id TEXT PRIMARY KEY,
+        last_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
     # Clinical Timeline — strictly temporal clinical registry
     """
     CREATE TABLE IF NOT EXISTS clinical_timeline (
@@ -187,6 +196,319 @@ CREATE_TABLES_SQL = [
         confidence REAL DEFAULT 0.5,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+    )
+    """,
+    # Evidence-based registry v2.  The existing clinical_timeline remains a
+    # backwards-compatible projection; these tables are the downstream source
+    # of truth and never rewrite normalized document text or laboratory rows.
+    """
+    CREATE TABLE IF NOT EXISTS clinical_episodes (
+        episode_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        category TEXT NOT NULL,
+        canonical_entity TEXT NOT NULL,
+        onset_date TEXT,
+        onset_date_end TEXT,
+        onset_precision TEXT NOT NULL DEFAULT 'unknown',
+        first_documented_date TEXT,
+        resolution_date TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        recurrence_index INTEGER NOT NULL DEFAULT 1,
+        previous_episode_id TEXT REFERENCES clinical_episodes(episode_id)
+            ON DELETE SET NULL,
+        data_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS clinical_events (
+        event_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        episode_id TEXT REFERENCES clinical_episodes(episode_id)
+            ON DELETE SET NULL,
+        category TEXT NOT NULL,
+        canonical_entity TEXT NOT NULL,
+        summary_short TEXT NOT NULL,
+        summary_detail TEXT NOT NULL DEFAULT '',
+        anatomical_site TEXT,
+        laterality TEXT,
+        severity TEXT,
+        significance TEXT NOT NULL DEFAULT 'clinically_relevant',
+        status TEXT NOT NULL DEFAULT 'active',
+        certainty TEXT NOT NULL DEFAULT 'confirmed',
+        assertion TEXT NOT NULL DEFAULT 'present',
+        first_evidence_date TEXT,
+        first_documented_date TEXT,
+        date_end TEXT,
+        date_precision TEXT NOT NULL DEFAULT 'unknown',
+        confidence REAL,
+        review_status TEXT NOT NULL DEFAULT 'auto',
+        structured_data_json TEXT NOT NULL DEFAULT '{}',
+        model_name TEXT,
+        prompt_version TEXT,
+        schema_version TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS clinical_event_evidence (
+        link_id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL REFERENCES clinical_events(event_id)
+            ON DELETE CASCADE,
+        evidence_id TEXT NOT NULL REFERENCES clinical_evidence(evidence_id)
+            ON DELETE CASCADE,
+        relation TEXT NOT NULL DEFAULT 'supports',
+        relation_confidence REAL,
+        rationale TEXT NOT NULL DEFAULT '',
+        included_in_summary INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        UNIQUE(event_id, evidence_id, relation)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS clinical_event_updates (
+        update_id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL REFERENCES clinical_events(event_id)
+            ON DELETE CASCADE,
+        update_date TEXT,
+        date_precision TEXT NOT NULL DEFAULT 'unknown',
+        summary TEXT NOT NULL,
+        status_after TEXT,
+        evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+        structured_data_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS clinical_event_relations (
+        relation_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        source_event_id TEXT NOT NULL REFERENCES clinical_events(event_id)
+            ON DELETE CASCADE,
+        target_event_id TEXT NOT NULL REFERENCES clinical_events(event_id)
+            ON DELETE CASCADE,
+        relation_type TEXT NOT NULL,
+        confidence REAL,
+        rationale TEXT NOT NULL DEFAULT '',
+        review_status TEXT NOT NULL DEFAULT 'auto',
+        created_at TEXT NOT NULL,
+        UNIQUE(source_event_id, target_event_id, relation_type)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS processing_runs (
+        run_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        model_name TEXT,
+        model_digest TEXT,
+        prompt_version TEXT,
+        schema_version TEXT NOT NULL,
+        parameters_json TEXT NOT NULL DEFAULT '{}',
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        error_message TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS processing_manifest (
+        manifest_id TEXT PRIMARY KEY,
+        run_id TEXT REFERENCES processing_runs(run_id) ON DELETE SET NULL,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL,
+        input_hash TEXT NOT NULL,
+        pipeline_version TEXT NOT NULL,
+        prompt_version TEXT NOT NULL DEFAULT '',
+        model_digest TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        output_hash TEXT,
+        output_count INTEGER NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        error_message TEXT,
+        processed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(document_id, stage, input_hash, pipeline_version,
+               prompt_version, model_digest)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS review_decisions (
+        decision_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        reviewer_id TEXT NOT NULL,
+        reviewer_role TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        previous_value_json TEXT NOT NULL DEFAULT '{}',
+        corrected_value_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_text_overlays (
+        overlay_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        base_text_hash TEXT NOT NULL,
+        corrected_text TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        author_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        UNIQUE(document_id, version)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS medication_courses (
+        course_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        normalized_name TEXT NOT NULL,
+        original_names_json TEXT NOT NULL DEFAULT '[]',
+        indication TEXT,
+        intent TEXT,
+        lifecycle_status TEXT NOT NULL DEFAULT 'unknown',
+        start_date TEXT,
+        end_date TEXT,
+        dose TEXT,
+        route TEXT,
+        frequency TEXT,
+        adherence TEXT,
+        episode_id TEXT REFERENCES clinical_episodes(episode_id)
+            ON DELETE SET NULL,
+        event_ids_json TEXT NOT NULL DEFAULT '[]',
+        data_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS oncology_lines (
+        line_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        line_label TEXT NOT NULL,
+        regimen_json TEXT NOT NULL DEFAULT '[]',
+        setting TEXT,
+        intent TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        status TEXT NOT NULL DEFAULT 'unknown',
+        cycles_json TEXT NOT NULL DEFAULT '[]',
+        modifications_json TEXT NOT NULL DEFAULT '[]',
+        toxicities_json TEXT NOT NULL DEFAULT '[]',
+        responses_json TEXT NOT NULL DEFAULT '[]',
+        progression_event_id TEXT REFERENCES clinical_events(event_id)
+            ON DELETE SET NULL,
+        event_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS lab_trends (
+        trend_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        normalized_name TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        start_date TEXT,
+        end_date TEXT,
+        direction TEXT NOT NULL DEFAULT 'variable',
+        severity TEXT,
+        resolved INTEGER NOT NULL DEFAULT 0,
+        lab_value_ids_json TEXT NOT NULL DEFAULT '[]',
+        event_id TEXT REFERENCES clinical_events(event_id) ON DELETE SET NULL,
+        data_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    # Gold-set validation v1. Reviewer A and B annotations remain independent;
+    # only adjudicated rows form the final reference standard.
+    """
+    CREATE TABLE IF NOT EXISTS gold_set_cases (
+        patient_id TEXT PRIMARY KEY REFERENCES patients(id) ON DELETE CASCADE,
+        included INTEGER NOT NULL DEFAULT 0,
+        split TEXT NOT NULL DEFAULT 'pilot',
+        status TEXT NOT NULL DEFAULT 'draft',
+        reviewer_a_id TEXT NOT NULL DEFAULT '',
+        reviewer_b_id TEXT NOT NULL DEFAULT '',
+        adjudicator_id TEXT NOT NULL DEFAULT '',
+        reviewer_a_status TEXT NOT NULL DEFAULT 'draft',
+        reviewer_b_status TEXT NOT NULL DEFAULT 'draft',
+        notes TEXT NOT NULL DEFAULT '',
+        locked_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS gold_annotations (
+        annotation_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        reviewer_slot TEXT NOT NULL,
+        reviewer_id TEXT NOT NULL,
+        category TEXT NOT NULL,
+        canonical_entity TEXT NOT NULL,
+        summary_short TEXT NOT NULL,
+        summary_detail TEXT NOT NULL DEFAULT '',
+        first_evidence_date TEXT,
+        first_documented_date TEXT,
+        date_end TEXT,
+        date_precision TEXT NOT NULL DEFAULT 'unknown',
+        status TEXT NOT NULL DEFAULT 'active',
+        certainty TEXT NOT NULL DEFAULT 'confirmed',
+        assertion TEXT NOT NULL DEFAULT 'present',
+        anatomical_site TEXT,
+        laterality TEXT,
+        severity TEXT,
+        significance TEXT NOT NULL DEFAULT 'clinically_relevant',
+        episode_key TEXT,
+        recurrence_index INTEGER NOT NULL DEFAULT 1,
+        evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+        source_refs_json TEXT NOT NULL DEFAULT '[]',
+        structured_data_json TEXT NOT NULL DEFAULT '{}',
+        source_annotation_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS gold_annotation_sources (
+        source_id TEXT PRIMARY KEY,
+        annotation_id TEXT NOT NULL REFERENCES gold_annotations(annotation_id)
+            ON DELETE CASCADE,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        evidence_id TEXT NOT NULL,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
+        source_page INTEGER,
+        source_text TEXT NOT NULL,
+        relation TEXT NOT NULL DEFAULT 'supports',
+        created_at TEXT NOT NULL,
+        UNIQUE(annotation_id, evidence_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS gold_adjudication_decisions (
+        decision_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        source_annotation_id TEXT NOT NULL REFERENCES gold_annotations(annotation_id)
+            ON DELETE CASCADE,
+        final_annotation_id TEXT REFERENCES gold_annotations(annotation_id)
+            ON DELETE SET NULL,
+        decision TEXT NOT NULL,
+        rationale TEXT NOT NULL DEFAULT '',
+        adjudicator_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(source_annotation_id)
     )
     """,
     # Hospital patient IDs are many-to-one: a person legitimately holds
@@ -250,6 +572,29 @@ INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_timeline_date ON clinical_timeline(date_observed)",
     "CREATE INDEX IF NOT EXISTS idx_timeline_category ON clinical_timeline(category)",
     "CREATE INDEX IF NOT EXISTS idx_timeline_status ON clinical_timeline(status)",
+    "CREATE INDEX IF NOT EXISTS idx_episode_patient ON clinical_episodes(patient_id)",
+    "CREATE INDEX IF NOT EXISTS idx_episode_entity ON clinical_episodes(patient_id, category, canonical_entity)",
+    "CREATE INDEX IF NOT EXISTS idx_event_patient_date ON clinical_events(patient_id, first_evidence_date)",
+    "CREATE INDEX IF NOT EXISTS idx_event_patient_category ON clinical_events(patient_id, category)",
+    "CREATE INDEX IF NOT EXISTS idx_event_patient_status ON clinical_events(patient_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_event_review ON clinical_events(review_status)",
+    "CREATE INDEX IF NOT EXISTS idx_event_evidence_event ON clinical_event_evidence(event_id)",
+    "CREATE INDEX IF NOT EXISTS idx_event_evidence_evidence ON clinical_event_evidence(evidence_id)",
+    "CREATE INDEX IF NOT EXISTS idx_event_update_event_date ON clinical_event_updates(event_id, update_date)",
+    "CREATE INDEX IF NOT EXISTS idx_event_relation_patient ON clinical_event_relations(patient_id)",
+    "CREATE INDEX IF NOT EXISTS idx_run_patient_stage ON processing_runs(patient_id, stage, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_manifest_doc_stage ON processing_manifest(document_id, stage)",
+    "CREATE INDEX IF NOT EXISTS idx_manifest_patient_status ON processing_manifest(patient_id, stage, status)",
+    "CREATE INDEX IF NOT EXISTS idx_review_patient_target ON review_decisions(patient_id, target_type, target_id)",
+    "CREATE INDEX IF NOT EXISTS idx_overlay_document ON document_text_overlays(document_id, version)",
+    "CREATE INDEX IF NOT EXISTS idx_medication_patient ON medication_courses(patient_id, normalized_name)",
+    "CREATE INDEX IF NOT EXISTS idx_oncology_line_patient ON oncology_lines(patient_id, start_date)",
+    "CREATE INDEX IF NOT EXISTS idx_lab_trend_patient ON lab_trends(patient_id, normalized_name)",
+    "CREATE INDEX IF NOT EXISTS idx_gold_case_split ON gold_set_cases(included, split, status)",
+    "CREATE INDEX IF NOT EXISTS idx_gold_annotation_patient_slot ON gold_annotations(patient_id, reviewer_slot)",
+    "CREATE INDEX IF NOT EXISTS idx_gold_annotation_entity ON gold_annotations(patient_id, category, canonical_entity)",
+    "CREATE INDEX IF NOT EXISTS idx_gold_source_document ON gold_annotation_sources(document_id, patient_id)",
+    "CREATE INDEX IF NOT EXISTS idx_gold_decision_patient ON gold_adjudication_decisions(patient_id, decision)",
     "CREATE INDEX IF NOT EXISTS idx_hpid_patient ON patient_hospital_ids(patient_id)",
     "CREATE INDEX IF NOT EXISTS idx_hpid_key ON patient_hospital_ids(hospital_patient_id_key)",
     "CREATE INDEX IF NOT EXISTS idx_chat_patient ON clinical_chat(patient_id)",
@@ -278,6 +623,31 @@ def init_database(db: DatabaseEngine) -> None:
         # v9: user-confirmed timeline entries for the golden validation set
         _safe_add_column(db, "clinical_timeline", "is_golden", "INTEGER DEFAULT 0")
 
+        # v12: evidence-level clinical structure and tamper-evident audit
+        # metadata. Existing rows remain valid and are not rewritten.
+        for column, col_type in (
+            ("document_date", "TEXT"),
+            ("observed_date_end", "TEXT"),
+            ("date_precision", "TEXT DEFAULT 'unknown'"),
+            ("date_source", "TEXT"),
+            ("anatomical_site", "TEXT"),
+            ("laterality", "TEXT"),
+            ("severity", "TEXT"),
+            ("significance", "TEXT DEFAULT 'clinically_relevant'"),
+            ("certainty", "TEXT DEFAULT 'confirmed'"),
+        ):
+            _safe_add_column(db, "clinical_evidence", column, col_type)
+        for column, col_type in (
+            ("actor_id", "TEXT DEFAULT 'system'"),
+            ("actor_role", "TEXT DEFAULT 'system'"),
+            ("run_id", "TEXT"),
+            ("input_hash", "TEXT"),
+            ("prompt_hash", "TEXT"),
+            ("previous_hash", "TEXT"),
+            ("entry_hash", "TEXT"),
+        ):
+            _safe_add_column(db, "audit_log", column, col_type)
+
         # v10: a person may hold several hospital patient IDs (one per unit).
         # Fold any legacy single-column value into the multi-valued table so
         # both storage forms are consistent; idempotent (UNIQUE + OR IGNORE).
@@ -298,15 +668,106 @@ def init_database(db: DatabaseEngine) -> None:
                 (SCHEMA_VERSION, datetime.now().isoformat()),
             )
 
+        _init_event_fts(db)
+
+        # Audit records may be deleted only by the explicit patient-retention
+        # workflow; ordinary application code cannot silently rewrite them.
+        db.execute(
+            """CREATE TRIGGER IF NOT EXISTS audit_log_no_update
+               BEFORE UPDATE ON audit_log
+               BEGIN
+                   SELECT RAISE(ABORT, 'audit_log is append-only');
+               END"""
+        )
+
 
 def _safe_add_column(db: DatabaseEngine, table: str, column: str,
                      col_type: str) -> None:
     """Add a column if it doesn't already exist (SQLite doesn't have
     ``ALTER TABLE … ADD COLUMN IF NOT EXISTS``)."""
+    identifier = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    if not identifier.fullmatch(table) or not identifier.fullmatch(column):
+        raise ValueError("Nome tabella/colonna non valido")
+    columns = {
+        row["name"] for row in db.execute(
+            f'PRAGMA table_info("{table}")'
+        ).fetchall()
+    }
+    if column in columns:
+        return
+    db.execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {col_type}')
+
+
+def _init_event_fts(db: DatabaseEngine) -> None:
+    """Create the local full-text event index when SQLite supports FTS5."""
     try:
-        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-    except Exception:
-        pass  # Column already exists
+        existed = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("clinical_events_fts",),
+        ).fetchone() is not None
+        db.execute(
+            """CREATE VIRTUAL TABLE IF NOT EXISTS clinical_events_fts
+               USING fts5(event_id UNINDEXED, patient_id UNINDEXED,
+                          canonical_entity, summary_short, summary_detail,
+                          content='clinical_events', content_rowid='rowid',
+                          tokenize='unicode61 remove_diacritics 2')"""
+        )
+        db.execute(
+            """CREATE TRIGGER IF NOT EXISTS clinical_events_fts_ai
+               AFTER INSERT ON clinical_events BEGIN
+                 INSERT INTO clinical_events_fts(
+                   rowid, event_id, patient_id, canonical_entity,
+                   summary_short, summary_detail
+                 ) VALUES (
+                   new.rowid, new.event_id, new.patient_id,
+                   new.canonical_entity, new.summary_short, new.summary_detail
+                 );
+               END"""
+        )
+        db.execute(
+            """CREATE TRIGGER IF NOT EXISTS clinical_events_fts_ad
+               AFTER DELETE ON clinical_events BEGIN
+                 INSERT INTO clinical_events_fts(
+                   clinical_events_fts, rowid, event_id, patient_id,
+                   canonical_entity, summary_short, summary_detail
+                 ) VALUES (
+                   'delete', old.rowid, old.event_id, old.patient_id,
+                   old.canonical_entity, old.summary_short, old.summary_detail
+                 );
+               END"""
+        )
+        db.execute(
+            """CREATE TRIGGER IF NOT EXISTS clinical_events_fts_au
+               AFTER UPDATE ON clinical_events BEGIN
+                 INSERT INTO clinical_events_fts(
+                   clinical_events_fts, rowid, event_id, patient_id,
+                   canonical_entity, summary_short, summary_detail
+                 ) VALUES (
+                   'delete', old.rowid, old.event_id, old.patient_id,
+                   old.canonical_entity, old.summary_short, old.summary_detail
+                 );
+                 INSERT INTO clinical_events_fts(
+                   rowid, event_id, patient_id, canonical_entity,
+                   summary_short, summary_detail
+                 ) VALUES (
+                   new.rowid, new.event_id, new.patient_id,
+                   new.canonical_entity, new.summary_short, new.summary_detail
+                 );
+               END"""
+        )
+        # Populate only an index created over an existing registry. Rebuilding
+        # on every startup scales poorly with large multi-patient projects.
+        if not existed:
+            db.execute(
+                "INSERT INTO clinical_events_fts(clinical_events_fts) "
+                "VALUES('rebuild')"
+            )
+    except Exception as exc:
+        # FTS is an optional acceleration layer. Only suppress the known
+        # feature-availability case; schema or trigger defects must surface.
+        message = str(exc).lower()
+        if "no such module: fts5" not in message:
+            raise
 
 
 def reset_stale_processing(db: DatabaseEngine) -> None:
@@ -330,8 +791,16 @@ def reset_stale_processing(db: DatabaseEngine) -> None:
 def drop_all_tables(db: DatabaseEngine) -> None:
     """Drop all tables (for testing/reset). Use with caution."""
     tables = [
-        "audit_log", "validation_queue", "clinical_chat",
-        "clinical_state", "lab_values", "clinical_timeline",
+        "clinical_events_fts", "clinical_event_relations",
+        "clinical_event_updates", "clinical_event_evidence",
+        "gold_adjudication_decisions", "gold_annotation_sources",
+        "gold_annotations", "gold_set_cases",
+        "lab_trends", "oncology_lines", "medication_courses",
+        "document_text_overlays", "review_decisions",
+        "processing_manifest", "processing_runs", "clinical_events",
+        "clinical_episodes", "audit_log", "audit_chain_heads",
+        "validation_queue",
+        "clinical_chat", "clinical_state", "lab_values", "clinical_timeline",
         "clinical_evidence", "document_identity_evidence",
         "patient_hospital_ids", "patient_identities",
         "documents", "patients", "schema_version",

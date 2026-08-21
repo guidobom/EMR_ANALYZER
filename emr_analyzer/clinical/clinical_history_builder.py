@@ -31,12 +31,14 @@ class ClinicalHistoryBuilder:
         cs_repo,
         clinical_state_llm_client,
         audit_repo=None,
+        registry_builder=None,
     ):
         self._timeline_repo = timeline_repo
         self._doc_repo = document_repo
         self._cs_repo = cs_repo
         self._llm = clinical_state_llm_client
         self._audit = audit_repo
+        self._registry_builder = registry_builder
 
     # ------------------------------------------------------------------
     # Public API
@@ -56,6 +58,14 @@ class ClinicalHistoryBuilder:
         Returns a summary dict with keys *total_entries*, *deduplicated*,
         and *final_entries*.
         """
+        if self._registry_builder is not None:
+            result = self._registry_builder.build(
+                patient_id, incremental=False, num_workers=1,
+                progress_callback=progress_callback,
+            )
+            if generate_narrative:
+                self.generate_narrative(patient_id)
+            return result
         if not self._llm or not self._llm.is_available:
             raise RuntimeError(
                 "Il modello LLM per il Clinical State non e' disponibile. "
@@ -207,6 +217,15 @@ class ClinicalHistoryBuilder:
         The save is atomic: old entries are only removed after the new
         batch has been successfully saved.
         """
+        if self._registry_builder is not None:
+            workers = max(1, int(getattr(self._llm, "parallel_workers", 1) or 1))
+            result = self._registry_builder.build(
+                patient_id, incremental=True, num_workers=workers,
+                progress_callback=progress_callback,
+            )
+            if generate_narrative:
+                self.generate_narrative(patient_id)
+            return result
         if not self._llm or not self._llm.is_available:
             raise RuntimeError(
                 "Il modello LLM per il Clinical State non e' disponibile."
@@ -362,6 +381,15 @@ class ClinicalHistoryBuilder:
 
         Returns the same summary dict as :meth:`build_from_documents`.
         """
+        if self._registry_builder is not None:
+            result = self._registry_builder.build(
+                patient_id, incremental=False, num_workers=num_workers,
+                progress_callback=progress_callback,
+            )
+            if generate_narrative:
+                self.generate_narrative(patient_id)
+            return result
+
         import time
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -698,6 +726,13 @@ OSSERVAZIONI CLINICHE:
         the registry with the deduplicated result.  Returns the number
         of duplicates removed.
         """
+        if self._registry_builder is not None:
+            before = self._timeline_repo.count_by_patient(patient_id)
+            result = self._registry_builder.build(
+                patient_id, incremental=True, num_workers=1
+            )
+            return max(0, before - int(result.get("final_entries", before)))
+
         entries = self._timeline_repo.get_by_patient(patient_id)
         if len(entries) <= 1:
             return 0

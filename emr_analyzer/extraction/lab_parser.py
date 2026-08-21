@@ -89,10 +89,15 @@ class LabParser:
         """
         results = []
 
-        # Extract dates from the text
-        detected_dates = self._extract_dates(text) if not sample_date else []
+        # A specifically labelled specimen/collection date is clinically more
+        # accurate than the report date supplied by the caller.  Generic dates
+        # are only a fallback when neither is available.
+        detected_sample_date = self._extract_sample_date(text)
+        detected_dates = self._extract_dates(text)
         effective_sample_date = (
-            sample_date or (detected_dates[0] if detected_dates else None)
+            detected_sample_date
+            or sample_date
+            or (detected_dates[0] if detected_dates else None)
         )
 
         # Phase 1: Extract from structured tables
@@ -143,6 +148,25 @@ class LabParser:
                     dates.append(iso_date)
 
         return dates
+
+    @staticmethod
+    def _extract_sample_date(text: str) -> str | None:
+        """Return an explicitly labelled specimen/collection date."""
+        from ..utils.date_utils import parse_italian_date
+
+        patterns = (
+            r"(?:data\s+(?:del\s+)?prelievo|prelievo\s+(?:del|in\s+data)|"
+            r"data\s+(?:di\s+)?raccolta|data\s+(?:del\s+)?campione|"
+            r"campione\s+(?:del|raccolto\s+il))\s*:?\s*"
+            r"(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, str(text or ""), re.IGNORECASE)
+            if match:
+                parsed = parse_italian_date(match.group(1))
+                if parsed:
+                    return parsed
+        return None
 
     def _parse_tables(self, tables: list, patient_id: str,
                       document_id: str) -> list[LabValue]:
@@ -199,8 +223,9 @@ class LabParser:
                 if self.normalizer.is_textual_result(value_str):
                     value = None
                     value_text_result = self.normalizer.normalize_textual_value(value_str)
-                    is_abnormal = "POSITIVO" in value_text_result.upper()
-                    flag = "*" if is_abnormal else None
+                    is_abnormal, flag = self._textual_abnormal_status(
+                        param_name, value_text_result
+                    )
                     ref_low, ref_high = None, None
                 else:
                     try:
@@ -237,6 +262,35 @@ class LabParser:
                 ))
 
         return results
+
+    def _textual_abnormal_status(
+        self, parameter_name: str, value_text: str
+    ) -> tuple[bool, str | None]:
+        """Conservative interpretation of qualitative results.
+
+        A positive result is not universally pathological: anti-HBs positivity
+        commonly documents immunity. Unknown qualitative assays are retained
+        as evidence but are not automatically labelled abnormal.
+        """
+        normalized = self.normalizer.normalize_parameter(parameter_name)
+        value = str(value_text or "").upper()
+        if "POSITIVO" not in value and value not in {"PRESENTE", "RILEVABILE"}:
+            return (value == "ALTERATO", "*" if value == "ALTERATO" else None)
+        protective = {
+            "hbsab", "anti_hbs", "anticorpi_anti_hbs",
+        }
+        if normalized in protective or (
+            "hbs" in normalized and "ag" not in normalized
+            and ("ab" in normalized or "anticorp" in normalized)
+        ):
+            return False, None
+        direct_pathogen_markers = (
+            "hiv", "hcv", "hbsag", "sars", "tpha", "vdrl",
+            "antigene", "pcr_vir", "tampone",
+        )
+        if any(token in normalized for token in direct_pathogen_markers):
+            return True, "*"
+        return False, None
 
     def _parse_text(self, text: str, patient_id: str,
                     document_id: str) -> list[LabValue]:
@@ -356,6 +410,9 @@ class LabParser:
             )
         elif textual_match:
             # Textual results: flag may still be present
+            is_abnormal, flag = self._textual_abnormal_status(
+                param_name, value_text_result or ""
+            )
             marker = str(explicit_flag).strip().upper()
             if marker in {"H", "↑"}:
                 is_abnormal, flag = True, "H"
@@ -363,10 +420,6 @@ class LabParser:
                 is_abnormal, flag = True, "L"
             elif marker in {"*", "**", "***", "!"}:
                 is_abnormal, flag = True, "*"
-            # "POSITIVO" is inherently abnormal for many tests
-            if value_text_result and "POSITIVO" in value_text_result.upper():
-                is_abnormal = True
-                flag = flag or "*"
 
         return LabValue(
             patient_id=patient_id,
@@ -628,8 +681,10 @@ class LabParser:
             value = None
             value_text_result = self.normalizer.normalize_textual_value(value_str)
             ref_low, ref_high = None, None
-            is_abnormal = "POSITIVO" in value_text_result.upper()
-            flag = (flag_str or None) if flag_str else ("*" if is_abnormal else None)
+            is_abnormal, inferred_flag = self._textual_abnormal_status(
+                param_cell, value_text_result
+            )
+            flag = (flag_str or None) if flag_str else inferred_flag
         elif value_clean:
             try:
                 value = self.normalizer.normalize_value(

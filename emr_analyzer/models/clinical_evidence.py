@@ -20,6 +20,15 @@ class ClinicalEvidence:
     temporality: str = "current"
     clinical_status: Optional[str] = None
     observed_date: Optional[str] = None
+    observed_date_end: Optional[str] = None
+    document_date: Optional[str] = None
+    date_precision: str = "unknown"
+    date_source: Optional[str] = None
+    anatomical_site: Optional[str] = None
+    laterality: Optional[str] = None
+    severity: Optional[str] = None
+    significance: str = "clinically_relevant"
+    certainty: str = "confirmed"
     value_text: Optional[str] = None
     numeric_value: Optional[float] = None
     unit: Optional[str] = None
@@ -29,7 +38,7 @@ class ClinicalEvidence:
     extraction_method: str = "llm"
     model_name: Optional[str] = None
     prompt_version: Optional[str] = None
-    schema_version: str = "1.0"
+    schema_version: str = "2.0"
     status: str = "proposed"
     data: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())

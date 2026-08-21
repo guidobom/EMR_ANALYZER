@@ -4,7 +4,7 @@ from pathlib import Path
 
 # --- Application paths ---
 APP_NAME = "EMR Analyzer"
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.7.0"
 OFFLINE_MODE = True
 # Verify each document's workspace attribution with the LLM before its
 # clinical text is normalized. The check runs on the pre-anonymization
@@ -45,7 +45,13 @@ LOG_DIR = BASE_DIR / "logs"
 IDENTITY_KEY_PATH = BASE_DIR / "identity.key"
 
 # --- Supported file types ---
-SUPPORTED_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png")
+SUPPORTED_EXTENSIONS = (
+    ".pdf",
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp",
+    ".txt", ".md", ".csv", ".hl7",
+    ".xml", ".cda", ".json",
+    ".docx", ".doc", ".xlsx",
+)
 
 # --- Local models via llama.cpp (app-managed llama-server) ---
 # The app spawns its own llama-server child processes; the only external
@@ -120,7 +126,6 @@ LAB_SYNONYMS = {
     "d-dimero": "d_dimero",
     "pcr": "proteina_c_reattiva",
     "proteina_c_reattiva": "proteina_c_reattiva",
-    "ves": "velocita_eritrosedimentazione",
     "tsh": "ormone_tireostimolante",
     "ft3": "triiodotironina_libera",
     "ft4": "tiroxina_libera",
