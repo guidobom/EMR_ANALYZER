@@ -106,55 +106,90 @@ def model_name_from_ollama_tag(tag: str) -> str:
     return normalize_model_name(requested.rsplit("/", 1)[-1])
 
 
+def _ollama_models_roots() -> list[Path]:
+    """Candidate roots for an Ollama model store, most authoritative first.
+
+    Ollama keeps its store under ``<root>/manifests`` and ``<root>/blobs``.
+    When the daemon runs as a system service it stores models in the service
+    user's home (``/usr/share/ollama/.ollama/models`` on Debian/Ubuntu) rather
+    than the caller's ``~/.ollama/models``; ``ollama list`` still reports them
+    because it asks the daemon over the socket.  Probing these roots keeps
+    discovery working even when the daemon is stopped and makes the local
+    archive match what the CLI shows.
+    """
+    candidates: list[Path] = []
+    configured = os.environ.get("OLLAMA_MODELS")
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(Path("/usr/share/ollama/.ollama/models"))
+    candidates.append(Path("/var/lib/ollama"))
+    candidates.append(Path.home() / ".ollama" / "models")
+    seen: list[Path] = []
+    for root in candidates:
+        if root not in seen and root.is_dir():
+            seen.append(root)
+    return seen
+
+
 def discover_ollama_models(
     ollama_models_dir: str | Path | None = None,
 ) -> list[OllamaModel]:
-    """Read Ollama manifests directly, even when its daemon is stopped."""
+    """Read Ollama manifests directly, even when its daemon is stopped.
 
-    root = Path(ollama_models_dir or (Path.home() / ".ollama" / "models"))
-    manifests = root / "manifests"
-    blobs = root / "blobs"
-    if not manifests.is_dir():
-        return []
+    With no explicit directory every candidate store found via
+    :func:`_ollama_models_roots` is scanned and models are deduplicated by
+    tag, so a system-service Ollama (root in the service user's home) and a
+    user-local store are both honoured.
+    """
+    roots = (
+        [Path(ollama_models_dir)]
+        if ollama_models_dir is not None
+        else _ollama_models_roots()
+    )
 
     discovered: dict[str, OllamaModel] = {}
-    for manifest_path in sorted(manifests.rglob("*")):
-        if not manifest_path.is_file():
+    for root in roots:
+        manifests = root / "manifests"
+        blobs = root / "blobs"
+        if not manifests.is_dir():
             continue
-        try:
-            relative = manifest_path.relative_to(manifests)
-            parts = relative.parts
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        # host / namespace... / model / tag
-        if len(parts) < 3:
-            continue
-        namespace = list(parts[1:-2])
-        if namespace == ["library"]:
-            namespace = []
-        model_path = "/".join([*namespace, parts[-2]])
-        display_tag = f"{model_path}:{parts[-1]}"
-        for layer in payload.get("layers", []):
-            if layer.get("mediaType") != MODEL_LAYER_TYPE:
+        for manifest_path in sorted(manifests.rglob("*")):
+            if not manifest_path.is_file():
                 continue
-            digest = str(layer.get("digest") or "").removeprefix("sha256:")
-            blob = blobs / f"sha256-{digest}"
-            if not digest or not blob.is_file():
+            try:
+                relative = manifest_path.relative_to(manifests)
+                parts = relative.parts
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
                 continue
-            expected_size = int(layer.get("size") or 0)
-            actual_size = blob.stat().st_size
-            if expected_size and actual_size != expected_size:
+            # host / namespace... / model / tag
+            if len(parts) < 3:
                 continue
-            if not _has_gguf_magic(blob):
-                continue
-            discovered[display_tag] = OllamaModel(
-                tag=display_tag,
-                blob_path=blob,
-                size_bytes=expected_size or actual_size,
-                digest=digest,
-            )
-            break
+            namespace = list(parts[1:-2])
+            if namespace == ["library"]:
+                namespace = []
+            model_path = "/".join([*namespace, parts[-2]])
+            display_tag = f"{model_path}:{parts[-1]}"
+            for layer in payload.get("layers", []):
+                if layer.get("mediaType") != MODEL_LAYER_TYPE:
+                    continue
+                digest = str(layer.get("digest") or "").removeprefix("sha256:")
+                blob = blobs / f"sha256-{digest}"
+                if not digest or not blob.is_file():
+                    continue
+                expected_size = int(layer.get("size") or 0)
+                actual_size = blob.stat().st_size
+                if expected_size and actual_size != expected_size:
+                    continue
+                if not _has_gguf_magic(blob):
+                    continue
+                discovered[display_tag] = OllamaModel(
+                    tag=display_tag,
+                    blob_path=blob,
+                    size_bytes=expected_size or actual_size,
+                    digest=digest,
+                )
+                break
     return sorted(discovered.values(), key=lambda item: item.tag.casefold())
 
 

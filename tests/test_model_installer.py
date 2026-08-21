@@ -22,6 +22,7 @@ from emr_analyzer.llm_backend.model_installer import (
     model_name_from_ollama_tag,
     model_name_from_url,
     normalize_model_name,
+    _ollama_models_roots,
     _pull_with_ollama,
 )
 
@@ -149,6 +150,58 @@ def test_ollama_manifest_is_discovered_and_imported_without_pull(tmp_path):
     assert name == "medgemma-4b"
     assert Path(entry["file"]).read_bytes() == blob_bytes
     assert entry["source"] == "Ollama medgemma:4b"
+
+
+def _write_ollama_store(store, tag="27b"):
+    """Create a minimal Ollama store with one GGUF model layer."""
+    manifest = store / f"manifests/registry.ollama.ai/library/medgemma/{tag}"
+    manifest.parent.mkdir(parents=True)
+    blob_bytes = _minimal_gguf(b"medgemma-27b")
+    digest = hashlib.sha256(blob_bytes).hexdigest()
+    blob = store / "blobs" / f"sha256-{digest}"
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(blob_bytes)
+    manifest.write_text(
+        json.dumps(
+            {
+                "layers": [
+                    {
+                        "mediaType": MODEL_LAYER_TYPE,
+                        "digest": f"sha256:{digest}",
+                        "size": len(blob_bytes),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return blob, blob_bytes
+
+
+def test_ollama_models_roots_honour_ollama_models_env(tmp_path, monkeypatch):
+    # A system-service Ollama keeps its store in the service user's home, not
+    # the caller's ~/.ollama/models — yet `ollama list` reports it.  The
+    # resolved roots must include an explicitly configured OLLAMA_MODELS dir.
+    store = tmp_path / "system-ollama"
+    store.mkdir(parents=True)
+    monkeypatch.setenv("OLLAMA_MODELS", str(store))
+    roots = _ollama_models_roots()
+    assert roots and roots[0] == store
+
+
+def test_default_roots_discover_system_service_store(tmp_path, monkeypatch):
+    # Discovery without an explicit dir scans the resolved roots (a store in
+    # the service user's home), so the local archive matches `ollama list`.
+    store = tmp_path / "system-ollama"
+    blob, _ = _write_ollama_store(store)
+    monkeypatch.setenv("OLLAMA_MODELS", str(store))
+    with patch(
+        "emr_analyzer.llm_backend.model_installer._ollama_models_roots",
+        return_value=[store],
+    ):
+        discovered = discover_ollama_models()
+    assert [item.tag for item in discovered] == ["medgemma:27b"]
+    assert discovered[0].blob_path == blob
 
 
 def test_ollama_pull_starts_and_stops_a_temporary_daemon_when_needed():
