@@ -52,8 +52,8 @@ Usare nei test pubblicabili esclusivamente documenti sintetici.
 - macOS o Linux;
 - Python 3.12;
 - ambiente Conda consigliato;
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) con modelli GGUF
-  (`brew install llama.cpp` su macOS; build CUDA su Linux), oppure vLLM con
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) con modelli GGUF e un
+  runtime Metal/CUDA importato e verificato dall'applicazione, oppure vLLM con
   modelli Hugging Face già locali su Linux/NVIDIA.
 
 La configurazione dei modelli, della temperatura, del contesto e dell’output
@@ -74,8 +74,12 @@ applica** sostituisce il runtime precedente.
 conda create -n emr-analyzer python=3.12
 conda activate emr-analyzer
 pip install -r requirements.txt
-brew install llama.cpp    # solo macOS
 ```
+
+La compilazione e l'importazione del runtime `llama-server` gestito sono
+descritte in
+[docs/LLAMA_SERVER_RUNTIME.md](docs/LLAMA_SERVER_RUNTIME.md). Non affidarsi a
+una build Homebrew senza verificare che esponga realmente Metal.
 
 Evitare di mescolare nella stessa environment i runtime Qt forniti da Conda e
 quelli installati da `pip`: scegliere una sola distribuzione PyQt5. L'app prova
@@ -116,14 +120,14 @@ dei processi, le porte, il parallelismo multi-slot e i modelli GGUF sono
 identici su macOS e Linux. Su DGX Spark (DGX OS, arm64, Blackwell Ultra /
 sm_100, 128 GB di memoria unificata):
 
-1. installa una build CUDA di llama.cpp (nessun Homebrew):
+1. compila una build CUDA autosufficiente di llama.cpp:
 
    ```bash
    git clone --depth 1 https://github.com/ggml-org/llama.cpp
    cd llama.cpp
-   cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON
+   cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF
    cmake --build build --config Release -j
-   sudo cp build/bin/llama-server /usr/local/bin/
+   python tools/setup_llama_backend.py --server-binary build/bin/llama-server
    ```
 
    oppure usa un container NGC con llama.cpp già compilato;
@@ -148,8 +152,12 @@ I dati runtime vengono salvati fuori dal repository in:
 
 ```bash
 conda activate emr-analyzer
+python -m pip install -r requirements-dev.txt
 QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
+
+`tests/conftest.py` è un file di configurazione caricato automaticamente da
+pytest: non deve essere eseguito direttamente con Python.
 
 La suite include inoltre datazione retrospettiva, deduplicazione, recidive,
 correlazioni tiroidee e respiratorie, provenienza, revisioni persistenti,

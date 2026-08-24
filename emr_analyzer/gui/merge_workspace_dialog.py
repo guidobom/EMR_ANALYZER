@@ -22,7 +22,7 @@ class _MergeWorker(QThread):
     """Run the merge in a background thread."""
 
     progress = pyqtSignal(int, str)
-    finished = pyqtSignal(list)
+    result_ready = pyqtSignal(list)
     error = pyqtSignal(str)
 
     def __init__(self, services: dict, pairs: list[tuple[str, str]]):
@@ -45,7 +45,7 @@ class _MergeWorker(QThread):
                 self._pairs,
                 progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
             )
-            self.finished.emit(results)
+            self.result_ready.emit(results)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -286,7 +286,7 @@ class MergeWorkspaceDialog(QDialog):
                 self._progress.setToolTip(msg),
             )
         )
-        self._worker.finished.connect(self._on_finished)
+        self._worker.result_ready.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 

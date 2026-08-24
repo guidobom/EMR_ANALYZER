@@ -55,6 +55,7 @@ from ..models.clinical_registry import (
 from ..models.clinical_timeline import ClinicalTimelineEntry
 from ..models.clinical_pipeline import (
     EventClaim,
+    EvidenceRelation,
     EvidenceSourceReference,
     ExcludedEvidence,
 )
@@ -67,6 +68,8 @@ class RegistryBuildCancelled(RuntimeError):
 
 class ClinicalRegistryBuilder:
     """Incremental, order-independent construction of the clinical registry."""
+
+    BUILD_MODES = {"full", "atomic", "events"}
 
     def __init__(
         self,
@@ -144,26 +147,60 @@ class ClinicalRegistryBuilder:
         num_workers: int = 1,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        mode: str = "full",
     ) -> dict:
+        mode = str(mode or "full").strip().casefold()
+        if mode not in self.BUILD_MODES:
+            raise ValueError(f"Fase del registro non valida: {mode}")
+        run_atomic = mode in {"full", "atomic"}
+        run_events = mode in {"full", "events"}
+
+        # Each standalone phase owns a full 0–100 progress interval although
+        # the legacy combined build keeps its historical 0–60/60–100 split.
+        external_progress = progress_callback
+        if external_progress is not None and mode == "atomic":
+            progress_callback = lambda pct, msg: external_progress(
+                min(100, max(0, round(float(pct) * 100 / 60))), msg
+            )
+        elif external_progress is not None and mode == "events":
+            progress_callback = lambda pct, msg: external_progress(
+                min(100, max(0, round((float(pct) - 60) * 100 / 40))), msg
+            )
+
         started = time.monotonic()
         documents = sorted(
             self.document_repo.list_by_patient(patient_id),
             key=lambda doc: (doc.document_date or "9999", doc.id),
         )
+        atomic_model_digest = (
+            self.atomic_extractor.model_digest if self.atomic_extractor else ""
+        )
+        event_model_digest = _llm_model_digest(self.event_llm)
+        input_evidence_hash = _evidence_hash(
+            self.evidence_repo.get_by_patient(patient_id)
+        ) if mode == "events" else ""
         run = ProcessingRun(
             patient_id=patient_id,
-            stage="clinical_registry_v3",
+            stage={
+                "full": "clinical_registry_v3",
+                "atomic": "atomic_evidence_v3",
+                "events": "clinical_events_v3",
+            }[mode],
             model_name=(
+                getattr(self.event_llm, "model", None)
+                if mode == "events" else
                 self.atomic_extractor.model_name if self.atomic_extractor else None
             ),
             model_digest=(
-                self.atomic_extractor.model_digest if self.atomic_extractor else None
+                event_model_digest if mode == "events" else atomic_model_digest
             ),
             prompt_version=ATOMIC_PROMPT_VERSION,
             parameters={
                 "incremental": incremental,
                 "requested_workers": num_workers,
                 "document_count": len(documents),
+                "mode": mode,
+                "input_evidence_hash": input_evidence_hash,
                 "atomic_prompt_digest": ATOMIC_PROMPT_DIGEST,
                 "atomic_model": getattr(self.atomic_llm, "model", None),
                 "event_model": getattr(self.event_llm, "model", None),
@@ -175,6 +212,7 @@ class ClinicalRegistryBuilder:
         processed = 0
         extracted_count = 0
         abnormal_lab_evidence_count = 0
+        inactive_runtimes_released = 0
 
         def check_cancelled() -> None:
             if cancel_check is not None and cancel_check():
@@ -195,9 +233,10 @@ class ClinicalRegistryBuilder:
 
         try:
             check_cancelled()
-            abnormal_lab_evidence_count = self._sync_abnormal_lab_evidence(
-                patient_id, documents
-            )
+            if run_atomic:
+                abnormal_lab_evidence_count = self._sync_abnormal_lab_evidence(
+                    patient_id, documents
+                )
             check_cancelled()
             tasks = []
             reuse_rows = []
@@ -222,13 +261,15 @@ class ClinicalRegistryBuilder:
                 # sent to the LLM again unless focused verification discovers
                 # a previously unmapped clinical block.
                 reuse_rows.append((doc, effective_text, input_hash))
-                current = incremental and self.processing_repo.is_current(
-                    doc.id, "atomic_evidence", input_hash,
-                    ATOMIC_PIPELINE_VERSION, ATOMIC_PROMPT_VERSION,
-                    run.model_digest or "",
-                    compatible_pipeline_versions=(
-                        ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS
-                    ),
+                current = (incremental or not run_atomic) and (
+                    self.processing_repo.is_current(
+                        doc.id, "atomic_evidence", input_hash,
+                        ATOMIC_PIPELINE_VERSION, ATOMIC_PROMPT_VERSION,
+                        atomic_model_digest,
+                        compatible_pipeline_versions=(
+                            ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS
+                        ),
+                    )
                 )
                 if current:
                     skipped += 1
@@ -243,7 +284,20 @@ class ClinicalRegistryBuilder:
                 self.event_llm
                 and getattr(self.event_llm, "is_available", False)
             )
-            model_unavailable = bool(tasks) and not atomic_llm_available
+            if not run_atomic and tasks:
+                raise RuntimeError(
+                    "Le evidenze atomiche non sono aggiornate per "
+                    f"{len(tasks)} documenti. Esegui prima la fase 1 "
+                    "“Estrai evidenze atomiche”; la creazione degli eventi "
+                    "non avvia più automaticamente l'estrazione."
+                )
+            model_unavailable = (
+                run_atomic and bool(tasks) and not atomic_llm_available
+            )
+            if run_atomic and tasks and atomic_llm_available:
+                inactive_runtimes_released += (
+                    self._release_event_runtime_before_atomic()
+                )
             if model_unavailable:
                 message = (
                     "Modello locale non disponibile: consolidate le evidenze "
@@ -256,7 +310,9 @@ class ClinicalRegistryBuilder:
                 )
                 tasks = []
 
-            reuse_plans = plan_exact_block_reuse(reuse_rows)
+            reuse_plans = (
+                plan_exact_block_reuse(reuse_rows) if run_atomic else {}
+            )
             task_ids = {doc.id for doc, _, _ in tasks}
             reused_blocks = sum(
                 len(plan.reuse_links)
@@ -274,7 +330,7 @@ class ClinicalRegistryBuilder:
                 self.event_llm, "parallel_workers", configured_workers
             ) or configured_workers))
             actual_workers = max(1, min(configured_workers, len(tasks) or 1))
-            if progress_callback:
+            if progress_callback and run_atomic:
                 progress_callback(
                     0, f"Evidenze atomiche: {len(tasks)} documenti da elaborare, "
                     f"{skipped} invariati"
@@ -287,7 +343,7 @@ class ClinicalRegistryBuilder:
                     stage="atomic_evidence", input_hash=input_hash,
                     pipeline_version=ATOMIC_PIPELINE_VERSION,
                     run_id=run.run_id, prompt_version=ATOMIC_PROMPT_VERSION,
-                    model_digest=run.model_digest or "", status="running",
+                    model_digest=atomic_model_digest, status="running",
                 )
                 self.processing_repo.upsert_manifest(item)
                 manifests[doc.id] = item.manifest_id
@@ -463,6 +519,23 @@ class ClinicalRegistryBuilder:
             source_text_by_doc = {
                 doc.id: text for doc, text, _ in reuse_rows
             }
+            # A source document can back hundreds of repeated blocks.  Read
+            # its evidence once per build instead of issuing one database
+            # query for every link.
+            source_evidence_cache: dict[str, list] = {}
+
+            def source_llm_evidence(document_id: str) -> list:
+                cached = source_evidence_cache.get(document_id)
+                if cached is None:
+                    cached = [
+                        item for item in self.evidence_repo.get_by_document(
+                            document_id
+                        )
+                        if item.extraction_method == "llm_atomic_v2"
+                    ]
+                    source_evidence_cache[document_id] = cached
+                return cached
+
             task_by_id = {
                 doc.id: (doc, original_text, input_hash)
                 for doc, original_text, input_hash in tasks
@@ -485,15 +558,10 @@ class ClinicalRegistryBuilder:
                     active_workspace.path / patient_id / "extraction" /
                     f"{doc.id}.json"
                 )
+                cloned_items = []
                 for link in plan.reuse_links:
-                    source_items = [
-                        item for item in self.evidence_repo.get_by_document(
-                            link.source_document_id
-                        )
-                        if item.extraction_method == "llm_atomic_v2"
-                    ]
                     clones = clone_reused_evidence(
-                        source_items,
+                        source_llm_evidence(link.source_document_id),
                         link,
                         patient_id=patient_id,
                         target_document_date=doc.document_date,
@@ -503,10 +571,13 @@ class ClinicalRegistryBuilder:
                     if not clones:
                         unresolved_links.append(link)
                         continue
-                    before = len(deduplicate_atomic_evidence(combined))
-                    combined = deduplicate_atomic_evidence((*combined, *clones))
-                    after = len(combined)
-                    reused_evidence_count += max(0, after - before)
+                    cloned_items.extend(clones)
+                if cloned_items:
+                    before = len(combined)
+                    combined = deduplicate_atomic_evidence((
+                        *combined, *cloned_items,
+                    ))
+                    reused_evidence_count += max(0, len(combined) - before)
                 combined_by_doc[doc.id] = combined
                 if unresolved_links:
                     unresolved_by_doc[doc.id] = unresolved_links
@@ -674,17 +745,14 @@ class ClinicalRegistryBuilder:
             for source_doc_id, additions in source_additions.items():
                 if not additions:
                     continue
-                current = [
-                    item for item in self.evidence_repo.get_by_document(
-                        source_doc_id
-                    ) if item.extraction_method == "llm_atomic_v2"
-                ]
+                current = source_llm_evidence(source_doc_id)
                 merged_items = deduplicate_atomic_evidence(
                     (*current, *additions)
                 )
                 self._replace_atomic_document_evidence(
                     source_doc_id, merged_items, clear_missing=False
                 )
+                source_evidence_cache[source_doc_id] = merged_items
                 partial = partial_results.get(source_doc_id)
                 if partial is not None:
                     partial_results[source_doc_id] = (
@@ -715,6 +783,7 @@ class ClinicalRegistryBuilder:
                     f"{doc.id}.json"
                 )
                 combined = combined_by_doc[doc_id]
+                cloned_items = []
                 for link in links:
                     templates = verified_by_fingerprint.get(link.fingerprint)
                     if link.fingerprint in verification_errors:
@@ -733,11 +802,14 @@ class ClinicalRegistryBuilder:
                     if not clones:
                         target_checks.setdefault(doc_id, []).append(link)
                         continue
-                    before = len(deduplicate_atomic_evidence(combined))
-                    combined = deduplicate_atomic_evidence((*combined, *clones))
+                    cloned_items.extend(clones)
+                if cloned_items:
+                    before = len(combined)
+                    combined = deduplicate_atomic_evidence((
+                        *combined, *cloned_items,
+                    ))
                     combined_by_doc[doc_id] = combined
-                    after = len(combined)
-                    reused_evidence_count += max(0, after - before)
+                    reused_evidence_count += max(0, len(combined) - before)
 
             def merge_metrics(*payloads):
                 merged = {}
@@ -864,10 +936,139 @@ class ClinicalRegistryBuilder:
                 ), final=True)
 
             check_cancelled()
+            if not run_events:
+                stored_evidence = self.evidence_repo.get_by_patient(patient_id)
+                source_evidence = deduplicate_atomic_evidence(stored_evidence)
+                elapsed = round(time.monotonic() - started, 2)
+                self.processing_repo.finish_run(
+                    run.run_id,
+                    "completed_with_warnings" if failures else "completed",
+                )
+                if self.audit:
+                    self.audit.log(
+                        patient_id, "atomic_evidence_v3_extracted",
+                        "clinical_evidence", patient_id,
+                        {
+                            "documents_total": len(documents),
+                            "documents_processed": processed,
+                            "documents_skipped": skipped,
+                            "documents_failed": len(failures),
+                            "evidence_stored_occurrences": len(stored_evidence),
+                            "evidence_total": len(source_evidence),
+                            "inactive_runtimes_released": (
+                                inactive_runtimes_released
+                            ),
+                            "llm_calls": sum(
+                                int(item.get("llm_calls", 0))
+                                for item in doc_stats
+                            ),
+                            "source_chunks": sum(
+                                int(item.get("source_chunks", 0))
+                                for item in doc_stats
+                            ),
+                            "prompt_tokens": sum(
+                                int(item.get("prompt_tokens", 0))
+                                for item in doc_stats
+                            ),
+                            "completion_tokens": sum(
+                                int(item.get("completion_tokens", 0))
+                                for item in doc_stats
+                            ),
+                            "prompt_ms": round(sum(
+                                float(item.get("prompt_ms", 0.0))
+                                for item in doc_stats
+                            ), 3),
+                            "predicted_ms": round(sum(
+                                float(item.get("predicted_ms", 0.0))
+                                for item in doc_stats
+                            ), 3),
+                            "completion_tokens_per_wall_second": round(
+                                sum(
+                                    int(item.get("completion_tokens", 0))
+                                    for item in doc_stats
+                                ) / elapsed,
+                                2,
+                            ) if elapsed > 0 else 0.0,
+                            "elapsed_seconds": elapsed,
+                        },
+                        model_used=getattr(self.atomic_llm, "model", None),
+                        model_version=ATOMIC_PROMPT_VERSION,
+                        run_id=run.run_id,
+                    )
+                if progress_callback:
+                    progress_callback(60, "Evidenze atomiche completate")
+                return {
+                    "stage": "atomic",
+                    "total_entries": len(source_evidence),
+                    "stored_evidence_occurrences": len(stored_evidence),
+                    "documents_processed": processed,
+                    "documents_skipped": skipped,
+                    "documents_failed": len(failures),
+                    "failed_doc_ids": [
+                        item["document_id"] for item in failures
+                    ],
+                    "failures": failures,
+                    "document_stats": sorted(
+                        doc_stats, key=lambda item: item["document_id"]
+                    ),
+                    "atomic_evidence_extracted": extracted_count,
+                    "abnormal_lab_evidence": abnormal_lab_evidence_count,
+                    "exact_blocks_reused": reused_blocks,
+                    "exact_reused_characters": reused_chars,
+                    "reused_evidence": reused_evidence_count,
+                    "unique_reuse_blocks_verified": unique_blocks_verified,
+                    "reuse_verification_batches": reuse_verification_batches,
+                    "targeted_reuse_verifications": (
+                        targeted_verification_count
+                    ),
+                    "full_document_fallbacks": fallback_count,
+                    "inactive_runtimes_released": (
+                        inactive_runtimes_released
+                    ),
+                    "llm_calls": sum(
+                        int(item.get("llm_calls", 0)) for item in doc_stats
+                    ),
+                    "source_chunks": sum(
+                        int(item.get("source_chunks", 0))
+                        for item in doc_stats
+                    ),
+                    "prompt_tokens": sum(
+                        int(item.get("prompt_tokens", 0))
+                        for item in doc_stats
+                    ),
+                    "completion_tokens": sum(
+                        int(item.get("completion_tokens", 0))
+                        for item in doc_stats
+                    ),
+                    "prompt_ms": round(sum(
+                        float(item.get("prompt_ms", 0.0))
+                        for item in doc_stats
+                    ), 3),
+                    "predicted_ms": round(sum(
+                        float(item.get("predicted_ms", 0.0))
+                        for item in doc_stats
+                    ), 3),
+                    "completion_tokens_per_wall_second": round(
+                        sum(
+                            int(item.get("completion_tokens", 0))
+                            for item in doc_stats
+                        ) / elapsed,
+                        2,
+                    ) if elapsed > 0 else 0.0,
+                    "incremental": incremental,
+                    "atomic_model": getattr(self.atomic_llm, "model", None),
+                    "run_id": run.run_id,
+                    "elapsed_seconds": elapsed,
+                }
             if progress_callback:
                 progress_callback(60, "Ricostruzione eventi ed episodi...")
 
             stored_evidence = self.evidence_repo.get_by_patient(patient_id)
+            if not stored_evidence:
+                raise RuntimeError(
+                    "Nessuna evidenza atomica disponibile. Esegui prima la "
+                    "fase 1 “Estrai evidenze atomiche”."
+                )
             document_dates = {doc.id: doc.document_date for doc in documents}
             for item in stored_evidence:
                 if not item.document_date:
@@ -944,8 +1145,10 @@ class ClinicalRegistryBuilder:
             existing_events = self.registry_repo.get_events(
                 patient_id, include_rejected=True
             )
-            self._release_atomic_runtime_before_events(
-                enabled=event_llm_available
+            inactive_runtimes_released += (
+                self._release_atomic_runtime_before_events(
+                    enabled=event_llm_available
+                )
             )
             consolidator = ClinicalConsolidator(
                 fusion_llm=(
@@ -1103,13 +1306,16 @@ class ClinicalRegistryBuilder:
             profile_invalidated = self._invalidate_clinical_profile(
                 patient_id
             ) if timeline_changed else False
-            self._sync_review_queue(patient_id, all_bundles)
-            self._sync_duplicate_review_queue(
-                patient_id, pending_duplicate_groups
-            )
-            self._sync_relation_review_queue(
-                patient_id, graph_result.relations
-            )
+            # In staged mode validation is deliberately prepared by its own
+            # command.  The legacy full build retains the former behaviour.
+            if mode == "full":
+                self._sync_review_queue(patient_id, all_bundles)
+                self._sync_duplicate_review_queue(
+                    patient_id, pending_duplicate_groups
+                )
+                self._sync_relation_review_queue(
+                    patient_id, graph_result.relations
+                )
 
             elapsed = round(time.monotonic() - started, 2)
             self.processing_repo.finish_run(
@@ -1141,6 +1347,9 @@ class ClinicalRegistryBuilder:
                             targeted_verification_count
                         ),
                         "full_document_fallbacks": fallback_count,
+                        "inactive_runtimes_released": (
+                            inactive_runtimes_released
+                        ),
                         "llm_calls": sum(
                             int(item.get("llm_calls", 0)) for item in doc_stats
                         ),
@@ -1212,6 +1421,7 @@ class ClinicalRegistryBuilder:
             if progress_callback:
                 progress_callback(100, "Registro clinico v3 completato")
             return {
+                "stage": "events" if mode == "events" else "full",
                 "total_entries": len(source_evidence),
                 "stored_evidence_occurrences": len(stored_evidence),
                 "atomic_duplicates_suppressed": (
@@ -1262,6 +1472,7 @@ class ClinicalRegistryBuilder:
                 "reuse_verification_batches": reuse_verification_batches,
                 "targeted_reuse_verifications": targeted_verification_count,
                 "full_document_fallbacks": fallback_count,
+                "inactive_runtimes_released": inactive_runtimes_released,
                 "llm_calls": sum(
                     int(item.get("llm_calls", 0)) for item in doc_stats
                 ),
@@ -1308,6 +1519,221 @@ class ClinicalRegistryBuilder:
             self.processing_repo.finish_run(run.run_id, "failed", str(exc))
             raise
 
+    def extract_atomic_evidence(
+        self,
+        patient_id: str,
+        *,
+        incremental: bool = True,
+        num_workers: int = 1,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> dict:
+        """Run only source-grounded document/laboratory extraction."""
+
+        return self.build(
+            patient_id,
+            incremental=incremental,
+            num_workers=num_workers,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            mode="atomic",
+        )
+
+    def build_structured_events(
+        self,
+        patient_id: str,
+        *,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> dict:
+        """Build events exclusively from already-current atomic evidence."""
+
+        event_workers = max(1, int(getattr(
+            self.event_llm, "parallel_workers", 1
+        ) or 1))
+        return self.build(
+            patient_id,
+            incremental=True,
+            num_workers=event_workers,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            mode="events",
+        )
+
+    def prepare_validation(self, patient_id: str) -> dict:
+        """Populate the human-review queue from persisted structured data.
+
+        This is deliberately deterministic and model-independent: an LLM may
+        generate or correlate candidates, but cannot validate its own output.
+        The final clinical validation remains an explicit human decision.
+        """
+
+        events = self.registry_repo.get_events(patient_id)
+        if not events:
+            raise RuntimeError(
+                "Nessun evento clinico strutturato disponibile. Esegui prima "
+                "la fase 2 “Crea eventi clinici”."
+            )
+        if not self.pipeline_status(patient_id).get("events_current"):
+            raise RuntimeError(
+                "Gli eventi clinici non sono aggiornati rispetto alle "
+                "evidenze o al modello correnti. Esegui prima la fase 2."
+            )
+        event_hash = _event_hash(events)
+        event_run = self._latest_stage_run(patient_id, "clinical_events_v3")
+        event_run_id = str(event_run["run_id"] or "") if event_run else ""
+        run = ProcessingRun(
+            patient_id=patient_id,
+            stage="clinical_validation_v3",
+            parameters={
+                "mode": "validation",
+                "input_event_hash": event_hash,
+                "input_event_run_id": event_run_id,
+                "event_count": len(events),
+            },
+        )
+        self.processing_repo.start_run(run)
+        try:
+            self._sync_persisted_event_review_queue(patient_id, events)
+            duplicate_rows = self.db.execute(
+                """SELECT duplicate_group_id
+                   FROM evidence_duplicate_groups
+                   WHERE patient_id=? AND review_status='pending'
+                   ORDER BY duplicate_group_id""",
+                (patient_id,),
+            ).fetchall()
+            self._sync_duplicate_review_queue(
+                patient_id,
+                [row["duplicate_group_id"] for row in duplicate_rows],
+            )
+            relations = []
+            if self.pipeline_repo is not None:
+                for row in self.pipeline_repo.list_evidence_relations(
+                    patient_id
+                ):
+                    relations.append(EvidenceRelation(
+                        relation_id=row["relation_id"],
+                        patient_id=row["patient_id"],
+                        source_evidence_id=row["source_evidence_id"],
+                        target_evidence_id=row["target_evidence_id"],
+                        relation_type=row["relation_type"],
+                        direction=row["direction"],
+                        weight=row["weight"],
+                        cluster_effect=row["cluster_effect"],
+                        rationale=row["rationale"],
+                        rule_features=row.get("rule_features") or {},
+                        model_votes=row.get("model_votes") or [],
+                        generation_method=row["generation_method"],
+                        review_status=row["review_status"],
+                        created_at=row["created_at"],
+                    ))
+            self._sync_relation_review_queue(patient_id, relations)
+            pending = self.db.execute(
+                """SELECT COUNT(*) FROM validation_queue
+                   WHERE patient_id=? AND status='pending'""",
+                (patient_id,),
+            ).fetchone()[0]
+            self.processing_repo.finish_run(run.run_id, "completed")
+            if self.audit:
+                self.audit.log(
+                    patient_id, "clinical_validation_v3_prepared",
+                    "validation_queue", patient_id,
+                    {"events": len(events), "pending_items": int(pending)},
+                    run_id=run.run_id,
+                )
+            return {
+                "stage": "validation",
+                "events_total": len(events),
+                "validation_pending": int(pending),
+                "run_id": run.run_id,
+            }
+        except Exception as exc:
+            self.processing_repo.finish_run(run.run_id, "failed", str(exc))
+            raise
+
+    def pipeline_status(self, patient_id: str) -> dict:
+        """Return persisted readiness/freshness of the three registry phases."""
+
+        documents = self.document_repo.list_by_patient(patient_id)
+        atomic_digest = (
+            self.atomic_extractor.model_digest if self.atomic_extractor else ""
+        )
+        eligible = current = 0
+        for document in documents:
+            if document.document_type == "laboratorio":
+                continue
+            path = self._normalized_text_path(patient_id, document.id)
+            if path is None:
+                continue
+            eligible += 1
+            base_text = path.read_text(encoding="utf-8")
+            effective_text = self.overlay_repo.effective_text(
+                document.id, base_text
+            ) if self.overlay_repo else base_text
+            input_hash = content_hash(
+                effective_text, document.document_date,
+                document.document_type, ATOMIC_PROMPT_VERSION,
+                ATOMIC_PROMPT_DIGEST,
+            )
+            if self.processing_repo.is_current(
+                document.id, "atomic_evidence", input_hash,
+                ATOMIC_PIPELINE_VERSION, ATOMIC_PROMPT_VERSION,
+                atomic_digest,
+                compatible_pipeline_versions=(
+                    ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS
+                ),
+            ):
+                current += 1
+
+        evidence = self.evidence_repo.get_by_patient(patient_id)
+        events = self.registry_repo.get_events(patient_id)
+        evidence_hash = _evidence_hash(evidence)
+        event_run = self._latest_stage_run(patient_id, "clinical_events_v3")
+        validation_run = self._latest_stage_run(
+            patient_id, "clinical_validation_v3"
+        )
+        event_parameters = _run_parameters(event_run)
+        validation_parameters = _run_parameters(validation_run)
+        event_current = bool(
+            event_run and event_run["status"] in {
+                "completed", "completed_with_warnings"
+            }
+            and event_parameters.get("input_evidence_hash") == evidence_hash
+            and str(event_run["model_digest"] or "")
+            == _llm_model_digest(self.event_llm)
+        )
+        validation_current = bool(
+            validation_run and validation_run["status"] == "completed"
+            and validation_parameters.get("input_event_run_id")
+            == (str(event_run["run_id"] or "") if event_run else "")
+        )
+        pending_validation = self.db.execute(
+            """SELECT COUNT(*) FROM validation_queue
+               WHERE patient_id=? AND status='pending'""",
+            (patient_id,),
+        ).fetchone()[0]
+        return {
+            "atomic_documents_total": eligible,
+            "atomic_documents_current": current,
+            "atomic_documents_pending": max(0, eligible - current),
+            "atomic_evidence_count": len(evidence),
+            "atomic_current": eligible == current and bool(
+                eligible or evidence
+            ),
+            "event_count": len(events),
+            "events_current": event_current,
+            "validation_current": validation_current,
+            "validation_pending": int(pending_validation),
+        }
+
+    def _latest_stage_run(self, patient_id: str, stage: str):
+        return self.db.execute(
+            """SELECT * FROM processing_runs
+               WHERE patient_id=? AND stage=?
+               ORDER BY started_at DESC LIMIT 1""",
+            (patient_id, stage),
+        ).fetchone()
+
     def rebuild_from_evidence(
         self,
         patient_id: str,
@@ -1323,26 +1749,58 @@ class ClinicalRegistryBuilder:
         """Refresh the legacy GUI projection after a manual event operation."""
         return self._sync_legacy_timeline(patient_id, [], [])
 
-    def _release_atomic_runtime_before_events(self, *, enabled: bool) -> None:
-        """Release distinct extraction weights before event synthesis.
+    def _release_atomic_runtime_before_events(self, *, enabled: bool) -> int:
+        """Reserve accelerator memory for event synthesis.
 
-        llama.cpp starts clients lazily.  When the two stages use different
-        runtime identities, keeping the extraction server resident would make
-        the event model an avoidable second copy in RAM/GPU memory.  Failures
-        are intentionally non-fatal: the backend can still try to load the
-        event model and report an actionable error from the generation call.
+        All LLM operations are serialized by the GUI.  Models left resident by
+        document extraction, atomic extraction or analysis are therefore idle
+        and can only reduce the memory and bandwidth available to this stage.
+        Failures remain non-fatal so generation can report the backend error.
         """
-        if not enabled or not self.atomic_llm or not self.event_llm:
-            return
+        if not enabled or not self.event_llm:
+            return 0
         try:
+            reserve = getattr(
+                self.event_llm, "retain_only_this_runtime", None
+            )
+            if callable(reserve):
+                return int(reserve() or 0)
+            if not self.atomic_llm:
+                return 0
             if (
                 self.atomic_llm.runtime_identity()
                 == self.event_llm.runtime_identity()
             ):
-                return
-            self.atomic_llm.backend.stop_config(self.atomic_llm)
+                return 0
+            return int(bool(
+                self.atomic_llm.backend.stop_config(self.atomic_llm)
+            ))
         except Exception:
-            return
+            return 0
+
+    def _release_event_runtime_before_atomic(self) -> int:
+        """Reserve accelerator memory for atomic-evidence extraction."""
+
+        if not self.atomic_llm:
+            return 0
+        try:
+            reserve = getattr(
+                self.atomic_llm, "retain_only_this_runtime", None
+            )
+            if callable(reserve):
+                return int(reserve() or 0)
+            if not self.event_llm:
+                return 0
+            if (
+                self.atomic_llm.runtime_identity()
+                == self.event_llm.runtime_identity()
+            ):
+                return 0
+            return int(bool(
+                self.event_llm.backend.stop_config(self.event_llm)
+            ))
+        except Exception:
+            return 0
 
     @staticmethod
     def _normalized_text_path(
@@ -1517,6 +1975,63 @@ class ClinicalRegistryBuilder:
                             "category": bundle.event.category,
                             "certainty": bundle.event.certainty,
                             "evidence_count": len(bundle.links),
+                        }, ensure_ascii=False),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+
+    def _sync_persisted_event_review_queue(
+        self, patient_id: str, events
+    ) -> None:
+        """Recreate event-review items without rebuilding clinical events."""
+
+        # The explicit validation phase exposes every machine-generated event,
+        # not only low-confidence ones.  Already accepted/corrected/rejected
+        # clinical decisions remain locked and are never re-queued.
+        pending = [
+            event for event in events
+            if event.review_status in {"auto", "pending"}
+        ]
+        with self.db:
+            self.db.execute(
+                """DELETE FROM validation_queue
+                   WHERE patient_id=?
+                     AND item_type IN ('clinical_event_v2','clinical_event_v3')
+                     AND status='pending'""",
+                (patient_id,),
+            )
+            for event in pending:
+                detail = self.registry_repo.get_event_detail(event.event_id) or {}
+                evidence_count = len(detail.get("evidence") or [])
+                reasons = []
+                data = event.structured_data or {}
+                if data.get("conflicts"):
+                    reasons.append("fonti discordanti")
+                if event.certainty == "inferred":
+                    reasons.append("correlazione/inferenza clinica")
+                if not data.get("fusion_validated", True):
+                    reasons.append("sintesi non verificata completamente")
+                if data.get("unit_compatible") is False:
+                    reasons.append("unità laboratoristiche incompatibili")
+                if data.get("merged_into_ids"):
+                    reasons.append("duplicati unificati — verifica")
+                issue = ", ".join(reasons) or "evidenza da revisionare"
+                self.db.execute(
+                    """INSERT INTO validation_queue
+                       (patient_id, item_type, item_id, issue, severity,
+                        status, original_value, created_at)
+                       VALUES (?, 'clinical_event_v3', ?, ?, ?, 'pending', ?, ?)""",
+                    (
+                        patient_id, event.event_id, issue,
+                        "high" if event.category in {
+                            "diagnosis", "toxicity", "progression",
+                            "oncology_treatment_line",
+                        } else "medium",
+                        json.dumps({
+                            "summary_short": event.summary_short,
+                            "category": event.category,
+                            "certainty": event.certainty,
+                            "evidence_count": evidence_count,
                         }, ensure_ascii=False),
                         datetime.now(timezone.utc).isoformat(),
                     ),
@@ -1937,6 +2452,39 @@ def _evidence_hash(evidence) -> str:
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _llm_model_digest(llm) -> str:
+    if llm is None:
+        return ""
+    return AtomicEvidenceExtractor(llm).model_digest
+
+
+def _event_hash(events) -> str:
+    payload = [
+        {
+            "event_id": event.event_id,
+            "summary": event.summary_short,
+            "date": event.first_evidence_date,
+            "status": event.status,
+            "review_status": event.review_status,
+            "version": event.version,
+        }
+        for event in sorted(events, key=lambda item: item.event_id)
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _run_parameters(row) -> dict:
+    if row is None:
+        return {}
+    try:
+        value = json.loads(row["parameters_json"] or "{}")
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
 
 
 def _unique_bundles(bundles):

@@ -132,11 +132,19 @@ class DocumentsTab(QWidget):
         self._batch_success_count = 0
         self._batch_error_count = 0
         self._llm_processing_depth = 0
+        self._processing_depth = 0
         self._setup_ui()
 
     def llm_operation_running(self) -> bool:
-        """Whether this tab is currently issuing document-LLM requests."""
-        return self._llm_processing_depth > 0
+        """Whether this tab is processing documents (CPU or local LLM)."""
+        return self._processing_depth > 0 or self._llm_processing_depth > 0
+
+    def request_shutdown(self) -> None:
+        """Long loops also observe the application-wide shutdown flag."""
+
+        from .application_shutdown import mark_shutdown_requested
+
+        mark_shutdown_requested()
 
     def _process_documents_with_busy_state(self, *args, **kwargs):
         """Run a document batch while runtime changes are blocked."""
@@ -336,6 +344,24 @@ class DocumentsTab(QWidget):
 
     def extract_clinical_text(self, doc_ids=None, progress=None,
                               patient_label=None):
+        """Track the complete two-phase operation for application shutdown."""
+
+        from .application_shutdown import shutdown_requested
+
+        if shutdown_requested():
+            return
+        self._processing_depth += 1
+        try:
+            return self._extract_clinical_text(
+                doc_ids=doc_ids,
+                progress=progress,
+                patient_label=patient_label,
+            )
+        finally:
+            self._processing_depth = max(0, self._processing_depth - 1)
+
+    def _extract_clinical_text(self, doc_ids=None, progress=None,
+                               patient_label=None):
         """Run the complete clinical-text pipeline for unprocessed documents.
 
         This is the shared entry point used both by the visible button and by
@@ -401,6 +427,12 @@ class DocumentsTab(QWidget):
         if to_parse:
             # Phase 1 (CPU): parse + classify + lab, no LLM.
             self._process_documents(to_parse, parse_only=True, progress=progress)
+        from .application_shutdown import shutdown_requested
+        if shutdown_requested() or (
+            callable(getattr(progress, "is_cancelled", None))
+            and progress.is_cancelled()
+        ):
+            return
         llm_ids = parsed + to_parse
         if llm_ids:
             # Phase 2 (LLM): parallel isolation over every parsed document.
@@ -431,6 +463,10 @@ class DocumentsTab(QWidget):
         created for the phase.
         """
         from .progress_dialog import ProgressDialog
+        from .application_shutdown import shutdown_requested
+
+        if shutdown_requested():
+            return
 
         self._consecutive_llm_errors = 0
         self._batch_success_count = 0
@@ -524,6 +560,7 @@ class DocumentsTab(QWidget):
         from .progress_dialog import ProgressDialog
         from PyQt5.QtWidgets import QApplication
         from PyQt5.QtCore import QThread
+        from .application_shutdown import shutdown_requested
 
         doc_repo = self._services.get("document_repo")
         total = len(doc_ids)
@@ -598,6 +635,13 @@ class DocumentsTab(QWidget):
             futures = {executor.submit(_llm_isolate_one, did): did
                        for did in doc_ids}
             for future in as_completed(futures):
+                if shutdown_requested() or (
+                    callable(getattr(progress, "is_cancelled", None))
+                    and progress.is_cancelled()
+                ):
+                    for pending in futures:
+                        pending.cancel()
+                    return
                 completed += 1
                 doc_id, error = future.result()
                 elapsed = time.monotonic() - t0
@@ -614,6 +658,10 @@ class DocumentsTab(QWidget):
                     pct, f"Completati {completed}/{total} ({elapsed:.0f}s)",
                 )
                 process_gui_events()
+                if shutdown_requested():
+                    for pending in futures:
+                        pending.cancel()
+                    return
 
         progress.set_progress(
             100,
@@ -628,6 +676,13 @@ class DocumentsTab(QWidget):
                                 parse_only: bool = False,
                                 llm_only: bool = False):
         """Process one document, then chain to the next."""
+        from .application_shutdown import shutdown_requested
+
+        if shutdown_requested() or (
+            callable(getattr(progress, "is_cancelled", None))
+            and progress.is_cancelled()
+        ):
+            return
         if index >= len(doc_ids):
             progress.set_progress(
                 100,

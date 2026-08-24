@@ -33,6 +33,7 @@ class MainWindow(QMainWindow):
         self._current_patient_id = None
         self._services = {}
         self._ollama_available = False
+        self._closing = False
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1400, 900)
         self.setMinimumSize(1024, 700)
@@ -479,22 +480,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        missing_registry_models = [
-            label for key, label in (
-                ("atomic_evidence_llm_client", "evidenze atomiche"),
-                ("clinical_events_llm_client", "eventi clinici"),
-            )
-            if self._services.get(key) is None
-        ]
-        if missing_registry_models:
-            QMessageBox.warning(
-                self, "LLM non configurato",
-                "Configura e carica i modelli LLM per: "
-                + ", ".join(missing_registry_models)
-                + ".",
-            )
-            return
-
         from .registry_queue_dialog import (
             RegistryQueueDialog,
             build_registry_queue_summaries,
@@ -519,10 +504,25 @@ class MainWindow(QMainWindow):
         if dialog.exec_() != QDialog.Accepted:
             return
         selected = dialog.selected_patient_ids()
+        stage = dialog.selected_stage()
+        required_client = {
+            "atomic": (
+                "atomic_evidence_llm_client", "evidenze atomiche"
+            ),
+            "events": ("clinical_events_llm_client", "eventi clinici"),
+        }.get(stage)
+        if required_client and self._services.get(required_client[0]) is None:
+            QMessageBox.warning(
+                self, "LLM non configurato",
+                f"Configura e carica il modello LLM per "
+                f"{required_client[1]}.",
+            )
+            return
         if selected:
             self.workspace_tabs.run_registry_queue(
                 selected,
                 force_rebuild=dialog.force_rebuild(),
+                stage=stage,
             )
 
     def _on_about(self):
@@ -797,22 +797,75 @@ class MainWindow(QMainWindow):
             history_builder._llm = client
 
     def closeEvent(self, event):
-        """Never tear down the LLM client while clinical work is running."""
-        if self.workspace_tabs.llm_operation_running():
-            QMessageBox.warning(
-                self,
-                "Elaborazione in corso",
-                "Non è possibile chiudere EMR Analyzer mentre è in corso "
-                "un'elaborazione. Attendi il completamento: i risultati "
-                "vengono salvati progressivamente e il programma potrà poi "
-                "essere chiuso in sicurezza.",
-            )
-            event.ignore()
+        """Always permit an explicit exit, even while background work runs."""
+
+        if getattr(self, "_closing", False):
+            event.accept()
             return
+
+        from .application_shutdown import (
+            mark_shutdown_requested,
+            request_qthread_shutdown,
+            running_qthreads,
+            schedule_emergency_exit,
+        )
+
+        threads = running_qthreads()
+        workspace_busy = self.workspace_tabs.llm_operation_running()
+        work_in_progress = workspace_busy or bool(threads)
+        if work_in_progress:
+            reply = QMessageBox.question(
+                self,
+                "Interrompere le elaborazioni e uscire?",
+                "È in corso almeno un'elaborazione. Puoi comunque chiudere "
+                "EMR Analyzer.\n\n"
+                "I risultati già salvati resteranno disponibili; l'unità di "
+                "lavoro attiva potrebbe rimanere incompleta e verrà "
+                "riconosciuta come interrotta al prossimo avvio.\n\n"
+                "Interrompere ora tutte le attività e chiudere?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
+        self._closing = True
+        mark_shutdown_requested()
+        # Accept and hide before cleanup: even if an external library ignores
+        # cancellation, the application visibly closes immediately.
+        event.accept()
+        hide = getattr(self, "hide", None)
+        if callable(hide):
+            hide()
+
+        if work_in_progress:
+            # Absolute guarantee requested by the user.  Normal cooperative
+            # shutdown normally wins; this fires only if a worker/library is
+            # still stuck after the grace period.
+            schedule_emergency_exit(delay_seconds=5.0)
+
+        request_shutdown = getattr(
+            self.workspace_tabs, "request_shutdown", None
+        )
+        if callable(request_shutdown):
+            request_shutdown()
+        request_qthread_shutdown(threads)
+
+        if work_in_progress:
+            # Breaking local HTTP connections makes QThreads blocked in a
+            # long LLM request return promptly instead of waiting 30 minutes.
+            try:
+                from ..llm_backend import shutdown_all_backends
+                shutdown_all_backends()
+            except Exception:
+                pass
         try:
-            self.workspace_tabs.shutdown()
+            self.workspace_tabs.shutdown(wait_ms=1000)
         except Exception:
             pass
         if "db" in self._services and self._services["db"]:
-            self._services["db"].close()
-        event.accept()
+            try:
+                self._services["db"].close()
+            except Exception:
+                pass

@@ -1028,9 +1028,16 @@ class ClinicalRegistryV2Test(unittest.TestCase):
                 llm_client=llm,
                 db=self.db,
             )
-            result = builder.build(
+            atomic_result = builder.extract_atomic_evidence(
                 "P001", incremental=False, num_workers=2,
             )
+            self.assertEqual(
+                ClinicalRegistryRepository(self.db).get_events("P001"), []
+            )
+            result = builder.build_structured_events("P001")
+            calls_before_validation = len(llm.atomic_calls)
+            validation_result = builder.prepare_validation("P001")
+            self.assertEqual(len(llm.atomic_calls), calls_before_validation)
         finally:
             active_workspace.set_path(old_workspace)
 
@@ -1050,10 +1057,14 @@ class ClinicalRegistryV2Test(unittest.TestCase):
             item["relation"] for item in (detail or {}).get("evidence", [])
         }
         self.assertIn("duplicate_source", relations)
-        self.assertEqual(result["unique_reuse_blocks_verified"], 1)
-        self.assertGreaterEqual(result["reused_evidence"], 1)
-        self.assertEqual(result["targeted_reuse_verifications"], 0)
-        self.assertEqual(result["full_document_fallbacks"], 0)
+        self.assertEqual(atomic_result["stage"], "atomic")
+        self.assertEqual(result["stage"], "events")
+        self.assertEqual(validation_result["stage"], "validation")
+        self.assertGreaterEqual(validation_result["validation_pending"], 1)
+        self.assertEqual(atomic_result["unique_reuse_blocks_verified"], 1)
+        self.assertGreaterEqual(atomic_result["reused_evidence"], 1)
+        self.assertEqual(atomic_result["targeted_reuse_verifications"], 0)
+        self.assertEqual(atomic_result["full_document_fallbacks"], 0)
 
     def test_reused_relative_evidence_is_redated_and_keeps_provenance(self):
         source_text = (

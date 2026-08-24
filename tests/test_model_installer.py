@@ -7,6 +7,7 @@ import struct
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import pytest
 
@@ -332,9 +333,34 @@ def test_catalog_update_downloads_validates_and_caches_manifest(tmp_path):
         )
 
     assert result["catalog_version"] == 2
+    assert result["updated"] is True
     assert result["model_count"] == len(manifest["models"])
     assert cache.read_bytes() == payload
     assert progress[-1][:2] == (len(payload), len(payload))
+
+
+def test_catalog_update_uses_integrated_catalog_when_remote_is_private(tmp_path):
+    cache = tmp_path / "catalog.json"
+    progress = []
+    opener = _FakeOpener(b"", "https://unused.test")
+    opener.open = lambda request, timeout: (_ for _ in ()).throw(
+        HTTPError(request.full_url, 404, "Not Found", {}, None)
+    )
+
+    with patch("urllib.request.build_opener", return_value=opener):
+        result = update_model_catalog(
+            cache_path=cache,
+            progress=lambda completed, total, message: progress.append(
+                (completed, total, message)
+            ),
+        )
+
+    assert result["updated"] is False
+    assert result["source"] == "integrated"
+    assert result["model_count"] > 0
+    assert "senza credenziali" in result["notice"]
+    assert "catalogo validato" in progress[-1][2]
+    assert not cache.exists()
 
 
 def test_catalog_update_rejects_untrusted_source_and_invalid_manifest(tmp_path):

@@ -120,27 +120,24 @@ class TestEnsureBinary(unittest.TestCase):
     def tearDown(self):
         setup.DRY_RUN = self._old_dry_run
 
-    def test_darwin_missing_binary_runs_brew(self):
+    def test_darwin_missing_binary_prints_managed_runtime_instructions(self):
         with mock.patch(
             "emr_analyzer.llm_backend.server_manager.find_server_binary",
             return_value=None,
-        ), mock.patch.object(
-            setup.subprocess, "run",
-            return_value=mock.MagicMock(returncode=0),
-        ) as fake_run, mock.patch("builtins.print"):
+        ), mock.patch("builtins.print") as fake_print:
             self.assertIsNone(setup.ensure_binary(platform="darwin"))
-            fake_run.assert_called_once_with(
-                ["brew", "install", "llama.cpp"], text=True
-            )
+        printed = " ".join(
+            str(call.args[0]) for call in fake_print.call_args_list
+        )
+        self.assertIn("--server-binary", printed)
+        self.assertIn("Metal", printed)
 
     def test_linux_missing_binary_prints_cuda_instructions(self):
         with mock.patch(
             "emr_analyzer.llm_backend.server_manager.find_server_binary",
             return_value=None,
-        ), mock.patch.object(setup.subprocess, "run") as fake_run, \
-                mock.patch("builtins.print") as fake_print:
+        ), mock.patch("builtins.print") as fake_print:
             self.assertIsNone(setup.ensure_binary(platform="linux"))
-        fake_run.assert_not_called()
         printed = " ".join(
             str(call.args[0]) for call in fake_print.call_args_list
         )

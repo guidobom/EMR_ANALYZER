@@ -14,18 +14,19 @@ from ..clinical.registry_builder import RegistryBuildCancelled
 class ClinicalHistoryWorker(QThread):
     """Background worker for building the clinical history timeline."""
     progress = pyqtSignal(int, str)         # percentage, message
-    finished = pyqtSignal(dict)             # result summary
+    result_ready = pyqtSignal(dict)         # result summary
     cancelled = pyqtSignal()
     error = pyqtSignal(str)
 
     def __init__(self, builder, patient_id: str,
                  generate_narrative: bool = False,
-                 num_workers: int = 1, parent=None):
+                 num_workers: int = 1, stage: str = "full", parent=None):
         super().__init__(parent)
         self.builder = builder
         self.patient_id = patient_id
         self.generate_narrative = generate_narrative
         self.num_workers = num_workers
+        self.stage = str(stage or "full")
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -34,6 +35,30 @@ class ClinicalHistoryWorker(QThread):
 
     def run(self):
         try:
+            progress = lambda pct, msg: self.progress.emit(pct, msg)
+            if self.stage == "atomic":
+                result = self.builder.extract_atomic_evidence(
+                    self.patient_id,
+                    incremental=True,
+                    num_workers=self.num_workers,
+                    progress_callback=progress,
+                    cancel_check=self._cancel_event.is_set,
+                )
+                self.result_ready.emit(result)
+                return
+            if self.stage == "events":
+                result = self.builder.build_structured_events(
+                    self.patient_id,
+                    progress_callback=progress,
+                    cancel_check=self._cancel_event.is_set,
+                )
+                self.result_ready.emit(result)
+                return
+            if self.stage == "validation":
+                self.result_ready.emit(
+                    self.builder.prepare_validation(self.patient_id)
+                )
+                return
             # A crash can leave no final timeline rows even though many
             # document-level checkpoints are already durable.  Prefer the
             # incremental builder in that case; it validates hashes, prompt
@@ -49,7 +74,7 @@ class ClinicalHistoryWorker(QThread):
             if existing_count > 0 or has_checkpoint:
                 result = self.builder.build_incremental(
                     self.patient_id,
-                    progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
+                    progress_callback=progress,
                     generate_narrative=self.generate_narrative,
                     cancel_check=self._cancel_event.is_set,
                 )
@@ -57,18 +82,18 @@ class ClinicalHistoryWorker(QThread):
                 result = self.builder.build_from_documents_parallel(
                     self.patient_id,
                     num_workers=self.num_workers,
-                    progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
+                    progress_callback=progress,
                     generate_narrative=self.generate_narrative,
                     cancel_check=self._cancel_event.is_set,
                 )
             else:
                 result = self.builder.build_from_documents(
                     self.patient_id,
-                    progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
+                    progress_callback=progress,
                     generate_narrative=self.generate_narrative,
                     cancel_check=self._cancel_event.is_set,
                 )
-            self.finished.emit(result)
+            self.result_ready.emit(result)
         except RegistryBuildCancelled:
             self.cancelled.emit()
         except Exception as e:
@@ -97,6 +122,7 @@ class RegistryQueueWorker(QThread):
         *,
         num_workers: int = 1,
         force_rebuild: bool = False,
+        stage: str = "full",
         parent=None,
     ):
         super().__init__(parent)
@@ -104,6 +130,7 @@ class RegistryQueueWorker(QThread):
         self.patient_ids = list(patient_ids)
         self.num_workers = max(1, int(num_workers or 1))
         self.force_rebuild = bool(force_rebuild)
+        self.stage = str(stage or "full")
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -121,7 +148,24 @@ class RegistryQueueWorker(QThread):
                 self.patient_progress.emit(pid, int(percent), str(message))
 
             try:
-                if self.force_rebuild:
+                if self.stage == "atomic":
+                    result = self.builder.extract_atomic_evidence(
+                        patient_id,
+                        incremental=not self.force_rebuild,
+                        num_workers=self.num_workers,
+                        progress_callback=progress,
+                        cancel_check=self._cancel_event.is_set,
+                    )
+                elif self.stage == "events":
+                    result = self.builder.build_structured_events(
+                        patient_id,
+                        progress_callback=progress,
+                        cancel_check=self._cancel_event.is_set,
+                    )
+                elif self.stage == "validation":
+                    result = self.builder.prepare_validation(patient_id)
+                    progress(100, "Coda di validazione preparata")
+                elif self.force_rebuild:
                     result = self.builder.build_from_documents_parallel(
                         patient_id,
                         num_workers=self.num_workers,
@@ -149,7 +193,7 @@ class RegistryQueueWorker(QThread):
 
 class DedupWorker(QThread):
     """Deduplicate existing timeline entries without re-extracting."""
-    finished = pyqtSignal(int)              # number of removed entries
+    result_ready = pyqtSignal(int)          # number of removed entries
     error = pyqtSignal(str)
 
     def __init__(self, builder, patient_id: str, parent=None):
@@ -160,14 +204,14 @@ class DedupWorker(QThread):
     def run(self):
         try:
             removed = self.builder.deduplicate_existing(self.patient_id)
-            self.finished.emit(removed)
+            self.result_ready.emit(removed)
         except Exception as e:
             self.error.emit(str(e))
 
 
 class NarrativeWorker(QThread):
     """Generate the narrative clinical profile from the existing timeline."""
-    finished = pyqtSignal(str)             # narrative text
+    result_ready = pyqtSignal(str)          # narrative text
     error = pyqtSignal(str)
 
     def __init__(self, builder, patient_id: str, parent=None):
@@ -178,7 +222,7 @@ class NarrativeWorker(QThread):
     def run(self):
         try:
             narrative = self.builder.generate_narrative(self.patient_id)
-            self.finished.emit(narrative)
+            self.result_ready.emit(narrative)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -246,7 +290,7 @@ def build_query_prompt(
 
 class ClinicalHistoryQueryWorker(QThread):
     """Run a clinical query against the timeline history."""
-    finished = pyqtSignal(str)
+    result_ready = pyqtSignal(str)
     error = pyqtSignal(str)
 
     def __init__(self, llm_client, entries: list[dict],
@@ -291,7 +335,7 @@ class ClinicalHistoryQueryWorker(QThread):
                 answer = self.llm_client.generate_text(
                     user_prompt, system_prompt
                 )
-            self.finished.emit(answer)
+            self.result_ready.emit(answer)
         except Exception as e:
             self.error.emit(f"Errore query: {str(e)}")
 
@@ -440,7 +484,6 @@ class IraeQueueWorker(QThread):
     chunk_progress = pyqtSignal(int, int)        # chunk_index, chunk_total
     patient_finished = pyqtSignal(str, str)      # patient_id, markdown
     patient_error = pyqtSignal(str, str)         # patient_id, error
-    finished = pyqtSignal()
 
     def __init__(self, llm_client, patient_plans, parent=None):
         super().__init__(parent)
@@ -482,13 +525,12 @@ class IraeQueueWorker(QThread):
                 self.patient_error.emit(
                     patient_id, f"Errore analisi irAE: {str(exc)}"
                 )
-        self.finished.emit()
 
 
 class IraeAnalysisWorker(QThread):
     """Run the irAE protocol over the whole registry, chunk by chunk."""
     progress = pyqtSignal(int, int)  # chunk_index, chunk_total
-    finished = pyqtSignal(str)
+    result_ready = pyqtSignal(str)
     error = pyqtSignal(str)
 
     def __init__(self, llm_client, prompts: list[str], parent=None):
@@ -510,7 +552,7 @@ class IraeAnalysisWorker(QThread):
                 parts.append(
                     f"### Parte {index}/{total}\n\n{answer}"
                 )
-            self.finished.emit(reconcile_irae_parts(
+            self.result_ready.emit(reconcile_irae_parts(
                 self.llm_client, parts, self.prompts, SYSTEM_PROMPT
             ))
         except Exception as exc:

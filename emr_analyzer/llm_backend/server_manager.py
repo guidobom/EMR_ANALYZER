@@ -62,7 +62,17 @@ class _ServerInstance:
 
 
 def find_server_binary() -> str | None:
-    """Locate the llama-server binary (PATH, then common install prefixes)."""
+    """Select managed verified runtime first, then external fallbacks."""
+    from .server_runtime import active_managed_server
+
+    managed = active_managed_server()
+    if managed is not None:
+        return str(managed.binary_path)
+    return find_external_server_binary()
+
+
+def find_external_server_binary() -> str | None:
+    """Locate an unmanaged compatibility fallback outside the runtime store."""
     configured = str(LLAMA_SERVER_BINARY or "").strip()
     if configured and os.path.isfile(configured):
         return configured
@@ -109,6 +119,22 @@ class ServerManager:
     def usable(self) -> bool:
         """Binary present; model availability is checked separately."""
         return self._binary is not None
+
+    def select_binary(self, binary: str | None) -> None:
+        """Use *binary* for future servers when no process is still running."""
+        with self._lock:
+            active = [
+                item for item in self._instances.values()
+                if item.proc.poll() is None
+            ]
+            if active:
+                raise BackendError(
+                    "Scarica i modelli in memoria prima di cambiare "
+                    "llama-server."
+                )
+            if binary is not None and not os.path.isfile(binary):
+                raise BackendError(f"llama-server non trovato: {binary}")
+            self._binary = binary
 
     def status(self, key: ServerKey) -> str | None:
         """``"loading"``, ``"running"``, or ``None`` when not started."""

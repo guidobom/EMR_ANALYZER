@@ -43,6 +43,8 @@ active_workspace = _ActiveWorkspace()
 CACHE_DIR = BASE_DIR / "cache"
 LOG_DIR = BASE_DIR / "logs"
 IDENTITY_KEY_PATH = BASE_DIR / "identity.key"
+LLAMA_RUNTIME_DIR = BASE_DIR / "runtimes" / "llama.cpp"
+LLAMA_RUNTIME_INDEX_PATH = LLAMA_RUNTIME_DIR / "index.json"
 
 # --- Supported file types ---
 SUPPORTED_EXTENSIONS = (
@@ -54,10 +56,10 @@ SUPPORTED_EXTENSIONS = (
 )
 
 # --- Local models via llama.cpp (app-managed llama-server) ---
-# The app spawns its own llama-server child processes; the only external
-# requirement is the binary (brew install llama.cpp) and GGUF model files
-# registered in the local model index.
-LLAMA_SERVER_BINARY = ""  # resolved at runtime: PATH, then brew prefixes
+# The app spawns its own llama-server child processes.  A verified runtime
+# imported into LLAMA_RUNTIME_DIR takes priority; this explicit deployment
+# override and PATH/common prefixes remain compatibility fallbacks.
+LLAMA_SERVER_BINARY = ""
 LLAMA_SERVER_HOST = "127.0.0.1"
 # Base port for the app-owned servers; allocated upward from here, avoiding
 # a possibly still-running Ollama daemon on 11434.

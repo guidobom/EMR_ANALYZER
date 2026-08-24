@@ -9,9 +9,11 @@ from PyQt5.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -97,6 +99,9 @@ class LLMConfigDialog(QDialog):
         ] = {}
         self._unload_worker: _ModelUnloadWorker | None = None
         self._unload_affected_roles: set[str] = set()
+        self._slot_benchmark_worker: _SlotBenchmarkWorker | None = None
+        self._slot_benchmark_role: str | None = None
+        self._server_install_worker: _ManagedServerInstallWorker | None = None
 
         layout = QVBoxLayout(self)
         if self._models:
@@ -116,7 +121,33 @@ class LLMConfigDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        acceleration_box = QGroupBox("Accelerazione CUDA / Metal e vLLM")
+        server_box = QGroupBox("llama-server gestito dall'applicazione")
+        server_layout = QHBoxLayout(server_box)
+        self._managed_server_status = QLabel()
+        self._managed_server_status.setWordWrap(True)
+        server_layout.addWidget(self._managed_server_status, stretch=1)
+        self._import_server_button = QPushButton("Importa llama-server…")
+        self._import_server_button.setToolTip(
+            "Copia un eseguibile locale nel runtime privato dell'app, ne "
+            "verifica SHA-256, piattaforma, architettura e backend GPU."
+        )
+        self._import_server_button.clicked.connect(
+            self._import_managed_server
+        )
+        server_layout.addWidget(self._import_server_button)
+        self._deactivate_server_button = QPushButton("Usa server di sistema")
+        self._deactivate_server_button.setToolTip(
+            "Disattiva il runtime gestito senza cancellarlo e torna alla "
+            "ricerca in PATH/Homebrew."
+        )
+        self._deactivate_server_button.clicked.connect(
+            self._deactivate_managed_server
+        )
+        server_layout.addWidget(self._deactivate_server_button)
+        layout.addWidget(server_box)
+        self._refresh_managed_server_status()
+
+        acceleration_box = QGroupBox("Accelerazione hardware locale")
         acceleration_layout = QHBoxLayout(acceleration_box)
         self._acceleration_status = QLabel(
             "Accelerazione non ancora verificata. Il controllo non carica "
@@ -126,11 +157,12 @@ class LLMConfigDialog(QDialog):
         self._acceleration_status.setStyleSheet("color: #5d6d7e;")
         acceleration_layout.addWidget(self._acceleration_status, stretch=1)
         self._acceleration_probe_button = QPushButton(
-            "Verifica CUDA / Metal / vLLM"
+            "Verifica accelerazione"
         )
         self._acceleration_probe_button.setToolTip(
-            "Verifica llama-server, vLLM e i dispositivi disponibili senza "
-            "caricare modelli o interrompere server."
+            "Verifica i backend pertinenti al sistema operativo e i "
+            "dispositivi disponibili, senza caricare modelli o interrompere "
+            "server."
         )
         self._acceleration_probe_button.clicked.connect(
             self._start_acceleration_probe
@@ -233,6 +265,142 @@ class LLMConfigDialog(QDialog):
         worker.completed.connect(self._show_acceleration_diagnostic)
         worker.finished.connect(self._release_acceleration_worker)
         worker.start()
+
+    def _refresh_managed_server_status(self) -> None:
+        from ..llm_backend.server_runtime import active_managed_server
+        from ..llm_backend.server_manager import find_external_server_binary
+
+        runtime = active_managed_server()
+        if runtime is not None:
+            devices = "; ".join(runtime.devices) or runtime.backend
+            self._managed_server_status.setText(
+                f"<b>Attivo e verificato:</b> {runtime.version} · "
+                f"{runtime.system}/{runtime.machine} · {devices}<br>"
+                f"<span style='color:#5d6d7e'>{runtime.binary_path} · "
+                f"SHA-256 {runtime.sha256[:16]}…</span>"
+            )
+            self._managed_server_status.setStyleSheet("color: #1e8449;")
+            self._managed_server_status.setToolTip(runtime.sha256)
+            self._deactivate_server_button.setEnabled(True)
+            return
+        external = find_external_server_binary()
+        if external:
+            self._managed_server_status.setText(
+                "Nessun runtime gestito attivo. Server esterno di ripiego: "
+                f"<code>{external}</code>."
+            )
+            self._managed_server_status.setStyleSheet("color: #b9770e;")
+        else:
+            self._managed_server_status.setText(
+                "Nessun llama-server disponibile. Importa una build locale "
+                "compatibile con questa macchina."
+            )
+            self._managed_server_status.setStyleSheet("color: #c0392b;")
+        self._managed_server_status.setToolTip("")
+        self._deactivate_server_button.setEnabled(False)
+
+    def _import_managed_server(self) -> None:
+        if (
+            self._server_install_worker is not None
+            and self._server_install_worker.isRunning()
+        ):
+            return
+        source, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleziona llama-server",
+            "",
+            "llama-server (llama-server llama-server.exe);;Tutti i file (*)",
+        )
+        if not source:
+            return
+        expected_sha256, checksum_ok = QInputDialog.getText(
+            self,
+            "Verifica origine",
+            "SHA-256 attesa (opzionale per una build compilata localmente):",
+        )
+        if not checksum_ok:
+            return
+        if QMessageBox.question(
+            self,
+            "Importa runtime verificato",
+            "L'app verificherà ed eseguirà localmente il file selezionato, "
+            "quindi ne conserverà una copia privata identificata dalla sua "
+            "checksum SHA-256. Su una macchina GPU il backend Metal/CUDA "
+            "deve esporre realmente un dispositivo.\n\nContinuare?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self._import_server_button.setEnabled(False)
+        self._deactivate_server_button.setEnabled(False)
+        self._managed_server_status.setText(
+            "Verifica e copia atomica di llama-server in corso…"
+        )
+        self._managed_server_status.setStyleSheet(
+            "color: #2980b9; font-weight: bold;"
+        )
+        worker = _ManagedServerInstallWorker(
+            source, expected_sha256.strip(), self
+        )
+        self._server_install_worker = worker
+        worker.succeeded.connect(self._managed_server_installed)
+        worker.failed.connect(self._managed_server_install_failed)
+        worker.finished.connect(self._release_server_install_worker)
+        worker.start()
+
+    def _managed_server_installed(self, runtime) -> None:
+        from ..llm_backend import get_backend
+
+        backend = get_backend("llama_cpp")
+        backend.stop_all()
+        backend.select_server_binary(str(runtime.binary_path))
+        self._refresh_managed_server_status()
+        QMessageBox.information(
+            self,
+            "llama-server attivato",
+            f"Runtime verificato e attivato:\n{runtime.binary_path}\n\n"
+            f"Backend: {runtime.backend}\n"
+            f"Dispositivi: {'; '.join(runtime.devices) or 'CPU'}\n"
+            f"SHA-256: {runtime.sha256}",
+        )
+        self._start_acceleration_probe()
+
+    def _managed_server_install_failed(self, message: str) -> None:
+        QMessageBox.warning(
+            self,
+            "llama-server rifiutato",
+            "Il runtime non è stato attivato.\n\n" + message,
+        )
+        self._refresh_managed_server_status()
+
+    def _release_server_install_worker(self) -> None:
+        worker = self._server_install_worker
+        self._server_install_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._import_server_button.setEnabled(True)
+        self._refresh_managed_server_status()
+
+    def _deactivate_managed_server(self) -> None:
+        if QMessageBox.question(
+            self,
+            "Usa server di sistema",
+            "Il runtime gestito verrà disattivato ma non cancellato. "
+            "I modelli attualmente residenti saranno scaricati. Continuare?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        from ..llm_backend import get_backend
+        from ..llm_backend.server_manager import find_external_server_binary
+        from ..llm_backend.server_runtime import deactivate_managed_server
+
+        backend = get_backend("llama_cpp")
+        backend.stop_all()
+        deactivate_managed_server()
+        backend.select_server_binary(find_external_server_binary())
+        self._refresh_managed_server_status()
+        self._start_acceleration_probe()
 
     def _show_acceleration_diagnostic(self, diagnostic) -> None:
         colors = {
@@ -345,10 +513,25 @@ class LLMConfigDialog(QDialog):
         status.setMinimumWidth(112)
         test_button = QPushButton("▶ Carica e testa")
         optimize_button = QPushButton("⚡ Ottimizza")
-        optimize_button.setToolTip(
-            "Analizza l'hardware e il modello per suggerire "
-            "i parametri ottimali (contesto, token, worker)."
+        benchmark_button = QPushButton("⏱ Misura slot")
+        benchmark_button.setVisible(role == "atomic_evidence")
+        benchmark_button.setToolTip(
+            "Misura 4/6/8 slot, entro la capacità RAM stimata, usando il "
+            "vero estrattore su un testo clinico sintetico. Ferma i runtime "
+            "locali inattivi, non legge dati dei pazienti e può richiedere "
+            "alcuni minuti."
         )
+        if role == "atomic_evidence":
+            optimize_button.setToolTip(
+                "Applica il preset specifico per l'estrazione di evidenze "
+                "atomiche: contesto dimensionato sui chunk, tetto di risposta "
+                "adattivo e concorrenza prudenziale."
+            )
+        else:
+            optimize_button.setToolTip(
+                "Analizza l'hardware e il modello per suggerire "
+                "i parametri ottimali (contesto, token, worker)."
+            )
         unload_button = QPushButton("■ Scarica dalla memoria")
         unload_button.setEnabled(False)
 
@@ -462,6 +645,7 @@ class LLMConfigDialog(QDialog):
             grid.addWidget(QLabel("Richieste parallele (slot):"), 9, 0)
             grid.addWidget(workers_combo, 9, 1)
             grid.addWidget(workers_info, 9, 3, 1, 3)
+            grid.addWidget(benchmark_button, 9, 6)
 
         speculative = QCheckBox(
             "Decodifica speculativa n-gram (sperimentale)"
@@ -535,6 +719,7 @@ class LLMConfigDialog(QDialog):
             "status": status,
             "test": test_button,
             "optimize": optimize_button,
+            "benchmark": benchmark_button,
             "rec_label": rec_label,
             "unload": unload_button,
             "max_context": max_context,
@@ -579,6 +764,11 @@ class LLMConfigDialog(QDialog):
         optimize_button.clicked.connect(
             lambda _checked=False, selected_role=role: self._optimize_params(
                 selected_role
+            )
+        )
+        benchmark_button.clicked.connect(
+            lambda _checked=False, selected_role=role: (
+                self._start_slot_benchmark(selected_role)
             )
         )
         unload_button.clicked.connect(
@@ -705,6 +895,9 @@ class LLMConfigDialog(QDialog):
         combo.blockSignals(False)
         widgets["vllm_group"].setVisible(backend == "vllm")
         widgets["speculative_decoding"].setVisible(backend == "llama_cpp")
+        widgets["benchmark"].setVisible(
+            role == "atomic_evidence" and backend == "llama_cpp"
+        )
         self._on_model_changed(role)
 
     def _on_model_changed(self, role: str, initial: bool = False) -> None:
@@ -712,12 +905,16 @@ class LLMConfigDialog(QDialog):
         backend = str(widgets["backend"].currentData() or "llama_cpp")
         widgets["vllm_group"].setVisible(backend == "vllm")
         widgets["speculative_decoding"].setVisible(backend == "llama_cpp")
+        widgets["benchmark"].setVisible(
+            role == "atomic_evidence" and backend == "llama_cpp"
+        )
         model = self._selected_model(widgets)
         if not model:
             widgets["max_context"].setText("Contesto massimo: —")
             widgets["context_length"].setMaximum(2_000_000)
             widgets["test"].setEnabled(False)
             widgets["optimize"].setEnabled(False)
+            widgets["benchmark"].setEnabled(False)
             widgets["unload"].setEnabled(False)
             widgets["rec_label"].setVisible(False)
             self._set_status(role, "non_selezionato")
@@ -737,6 +934,7 @@ class LLMConfigDialog(QDialog):
             widgets["context_length"].setMaximum(2_000_000)
             widgets["test"].setEnabled(False)
             widgets["optimize"].setEnabled(False)
+            widgets["benchmark"].setEnabled(False)
             widgets["unload"].setEnabled(False)
             widgets["rec_label"].setVisible(False)
             location = (
@@ -753,6 +951,11 @@ class LLMConfigDialog(QDialog):
 
         widgets["test"].setEnabled(role not in self._workers)
         widgets["optimize"].setEnabled(backend == "llama_cpp")
+        widgets["benchmark"].setEnabled(
+            role == "atomic_evidence"
+            and backend == "llama_cpp"
+            and self._slot_benchmark_worker is None
+        )
         widgets["unload"].setEnabled(False)
         try:
             cache_key = (backend, model)
@@ -778,6 +981,7 @@ class LLMConfigDialog(QDialog):
                 "Contesto massimo: impossibile leggere i metadati"
             )
             widgets["optimize"].setEnabled(False)
+            widgets["benchmark"].setEnabled(False)
             self._set_status(role, "errore", str(exc))
             self._refresh_worker_options(role)
             self._refresh_output_guidance(role)
@@ -1254,7 +1458,11 @@ class LLMConfigDialog(QDialog):
                 )
             return
 
-        # Apply recommended values
+        # Every pipeline owns its model and generation settings.  Applying a
+        # preset must therefore update this role only, even when another role
+        # happens to reference the same GGUF.  Users who intentionally prefer
+        # one shared physical runtime can still use the explicit alignment
+        # action shown by the runtime summary.
         widgets["context_length"].setValue(rec.context_length)
         widgets["max_output_tokens"].setValue(rec.max_output_tokens)
 
@@ -1262,35 +1470,20 @@ class LLMConfigDialog(QDialog):
         combo = widgets.get("workers_combo")
         if combo is not None and combo.count() > 0:
             idx = combo.findData(rec.parallel_workers)
-            if idx >= 0:
+            if (
+                idx >= 0
+                and combo.model().item(idx).isEnabled()
+            ):
                 combo.setCurrentIndex(idx)
 
-        # The same GGUF should keep one physical runtime. Synchronize only
-        # context and slots; generation parameters remain role-specific.
-        role_identity = self._runtime_identity(self._collect_config(role))[0]
-        synchronized = []
-        for other_role in self._widgets:
-            if other_role == role:
-                continue
-            other = self._collect_config(other_role)
-            if not other.model or self._runtime_identity(other)[0] != role_identity:
-                continue
-            self._widgets[other_role]["context_length"].setValue(
-                rec.context_length
-            )
-            self._refresh_worker_options(other_role)
-            other_combo = self._widgets[other_role]["workers_combo"]
-            other_index = other_combo.findData(rec.parallel_workers)
-            if (
-                other_index >= 0
-                and other_combo.model().item(other_index).isEnabled()
-            ):
-                other_combo.setCurrentIndex(other_index)
-            synchronized.append(ROLE_DEFINITIONS[other_role][0])
-
         # Build recommendation text
+        recommendation_title = (
+            "⚡ Preset specifico Evidenze atomiche"
+            if role == "atomic_evidence"
+            else "⚡ Parametri ottimizzati automaticamente"
+        )
         lines = [
-            "<b>⚡ Parametri ottimizzati automaticamente</b>",
+            f"<b>{recommendation_title}</b>",
             f"• Contesto: {self._format_integer(rec.context_length)} token — "
             f"{rec.context_rationale}",
             f"• Token risposta: {self._format_integer(rec.max_output_tokens)} — "
@@ -1298,11 +1491,6 @@ class LLMConfigDialog(QDialog):
             f"• Slot paralleli: {rec.parallel_workers} — "
             f"{rec.workers_rationale}",
         ]
-        if synchronized:
-            lines.append(
-                "• Runtime condiviso allineato con: "
-                + ", ".join(synchronized)
-            )
         widgets["rec_label"].setText(
             "<br>".join(lines)
         )
@@ -1316,14 +1504,181 @@ class LLMConfigDialog(QDialog):
                 "sono stati configurati in base all'hardware rilevato.\n\n"
                 f"Contesto: {self._format_integer(rec.context_length)} token\n"
                 f"Token risposta: {self._format_integer(rec.max_output_tokens)}\n"
-                f"Slot paralleli: {rec.parallel_workers}"
-                + (
-                    "\nRuntime condiviso allineato con: "
-                    + ", ".join(synchronized)
-                    if synchronized else ""
-                ),
+                f"Slot paralleli: {rec.parallel_workers}",
             )
         self._refresh_runtime_statuses()
+
+    def _start_slot_benchmark(self, role: str) -> None:
+        """Measure real atomic-extraction throughput off the GUI thread."""
+        if role != "atomic_evidence":
+            return
+        if (
+            self._workers
+            or self._unload_worker is not None
+            or self._slot_benchmark_worker is not None
+        ):
+            QMessageBox.information(
+                self,
+                "Operazione LLM in corso",
+                "Attendi il completamento dell'operazione corrente.",
+            )
+            return
+        config = self._collect_config(role)
+        if not config.model or not self._validate_role(role, config):
+            return
+        if config.backend != "llama_cpp":
+            QMessageBox.information(
+                self,
+                "Benchmark non disponibile",
+                "La misura degli slot è specifica per llama.cpp/GGUF. "
+                "vLLM pianifica dinamicamente le sequenze.",
+            )
+            return
+
+        # Include both saved and currently edited shapes: the latter may not
+        # describe a still-running registry job until settings are applied.
+        configs_to_probe = list(self._initial_configs.values())
+        configs_to_probe.extend(self.configurations().values())
+        seen = set()
+        busy = []
+        for candidate_config in configs_to_probe:
+            if not candidate_config.model:
+                continue
+            try:
+                identity = self._runtime_identity(candidate_config)
+            except Exception:
+                continue
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                runtime = LlmClient(
+                    config=candidate_config
+                ).loaded_model_info()
+            except Exception:
+                runtime = None
+            if runtime and runtime.get("processing"):
+                busy.append(candidate_config.model)
+        if busy:
+            QMessageBox.warning(
+                self,
+                "Elaborazione in corso",
+                "Il benchmark deve riconfigurare llama-server e non può "
+                "partire mentre una pipeline usa: "
+                + ", ".join(sorted(set(busy)))
+                + ".",
+            )
+            return
+
+        from ..utils.slot_benchmark import slot_benchmark_candidates
+        candidates = slot_benchmark_candidates(
+            config.model, config.context_length, config.parallel_workers
+        )
+        if len(candidates) < 2:
+            QMessageBox.information(
+                self,
+                "Nessun confronto possibile",
+                f"La capacità RAM stimata consente soltanto {candidates[0]} "
+                "slot con questo modello e contesto.",
+            )
+            return
+        if QMessageBox.question(
+            self,
+            "Misura slot per evidenze atomiche",
+            "Verranno provate le configurazioni "
+            + ", ".join(str(value) for value in candidates)
+            + " slot sul vero estrattore, usando esclusivamente un breve "
+              "testo clinico sintetico. Ogni configurazione eseguirà due "
+              "ondate complete.\n\n"
+              "I server locali residenti saranno fermati per liberare RAM; "
+              "al termine rimarranno scaricati. L'operazione può richiedere "
+              "alcuni minuti. Continuare?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
+        self._runtime_timer.stop()
+        self._unload_all_button.setEnabled(False)
+        self._set_role_enabled(role, False)
+        self._set_status(role, "benchmark")
+        widgets = self._widgets[role]
+        widgets["rec_label"].setText(
+            "<b>⏱ Benchmark in corso</b><br>Preparazione del test sintetico…"
+        )
+        widgets["rec_label"].setVisible(True)
+
+        worker = _SlotBenchmarkWorker(role, config, candidates)
+        self._slot_benchmark_worker = worker
+        self._slot_benchmark_role = role
+        worker.progress.connect(self._on_slot_benchmark_progress)
+        worker.succeeded.connect(self._on_slot_benchmark_success)
+        worker.failed.connect(self._on_slot_benchmark_failure)
+        worker.finished.connect(self._release_slot_benchmark_worker)
+        worker.start()
+
+    def _on_slot_benchmark_progress(self, role: str, message: str) -> None:
+        self._widgets[role]["rec_label"].setText(
+            "<b>⏱ Benchmark in corso</b><br>" + message
+        )
+
+    def _on_slot_benchmark_success(self, role: str, result) -> None:
+        widgets = self._widgets[role]
+        combo = widgets["workers_combo"]
+        selected_index = combo.findData(result.recommended_slots)
+        if selected_index >= 0 and combo.model().item(selected_index).isEnabled():
+            combo.setCurrentIndex(selected_index)
+
+        rows = []
+        for sample in result.samples:
+            status = "✓" if sample.reliable else "⚠"
+            rows.append(
+                f"{status} {sample.slots} slot: "
+                f"{sample.documents_per_minute:.2f} documenti/min · "
+                f"{sample.completion_tokens_per_second:.1f} token/s · "
+                f"copertura test {sample.quality_score:.0%} · "
+                f"{sample.completed}/{sample.requests} completate"
+            )
+        widgets["rec_label"].setText(
+            "<b>⏱ Benchmark completato — "
+            f"selezionati {result.recommended_slots} slot</b><br>"
+            + "<br>".join(rows)
+            + "<br><i>" + result.rationale + "</i>"
+        )
+        widgets["rec_label"].setToolTip("\n".join(
+            f"{sample.slots} slot: {sample.error}"
+            for sample in result.samples if sample.error
+        ))
+        QMessageBox.information(
+            self,
+            "Benchmark completato",
+            f"Configurazione consigliata: {result.recommended_slots} slot.\n\n"
+            f"{result.rationale}\n\n"
+            "Premi “Salva e applica” per conservarla.",
+        )
+
+    def _on_slot_benchmark_failure(self, role: str, error: str) -> None:
+        self._widgets[role]["rec_label"].setText(
+            "<b>⚠ Benchmark non concluso</b><br>" + error
+        )
+        QMessageBox.warning(
+            self,
+            "Benchmark non concluso",
+            "Non è stato modificato il numero di slot.\n\n" + error,
+        )
+
+    def _release_slot_benchmark_worker(self) -> None:
+        worker = self._slot_benchmark_worker
+        role = self._slot_benchmark_role
+        self._slot_benchmark_worker = None
+        self._slot_benchmark_role = None
+        if worker is not None:
+            worker.deleteLater()
+        if role is not None:
+            self._set_role_enabled(role, True)
+        self._unload_all_button.setEnabled(True)
+        self._refresh_runtime_statuses()
+        self._runtime_timer.start()
 
     def _refresh_runtime_statuses(self) -> None:
         identities, runtime_by_role = self._runtime_snapshot()
@@ -1358,6 +1713,7 @@ class LLMConfigDialog(QDialog):
             test_button.setEnabled(
                 role not in self._workers
                 and self._unload_worker is None
+                and self._slot_benchmark_worker is None
                 and not processing
             )
             if runtime:
@@ -1393,7 +1749,11 @@ class LLMConfigDialog(QDialog):
         self._refresh_runtime_statuses()
 
     def _test_model(self, role: str) -> None:
-        if self._workers or self._unload_worker is not None:
+        if (
+            self._workers
+            or self._unload_worker is not None
+            or self._slot_benchmark_worker is not None
+        ):
             QMessageBox.information(
                 self,
                 "Operazione LLM in corso",
@@ -1529,7 +1889,11 @@ class LLMConfigDialog(QDialog):
         configs: list[LLMRoleConfig] | None,
         affected_roles: set[str],
     ) -> None:
-        if self._workers or self._unload_worker is not None:
+        if (
+            self._workers
+            or self._unload_worker is not None
+            or self._slot_benchmark_worker is not None
+        ):
             QMessageBox.information(
                 self,
                 "Operazione LLM in corso",
@@ -1613,6 +1977,7 @@ class LLMConfigDialog(QDialog):
             "disponibile": ("● disponibile", "#d68910"),
             "caricamento": ("● caricamento…", "#2980b9"),
             "scaricamento": ("● scaricamento…", "#2980b9"),
+            "benchmark": ("● benchmark slot…", "#2980b9"),
             "caricato": ("● caricato", "#27ae60"),
             "caricato_condiviso": ("● caricato · condiviso", "#27ae60"),
             "in_uso": ("● in uso", "#2980b9"),
@@ -1655,6 +2020,15 @@ class LLMConfigDialog(QDialog):
 
     def accept(self) -> None:
         if (
+            self._server_install_worker is not None
+            and self._server_install_worker.isRunning()
+        ):
+            QMessageBox.information(
+                self, "Importazione in corso",
+                "Attendi il completamento dell'importazione di llama-server.",
+            )
+            return
+        if (
             self._acceleration_worker is not None
             and self._acceleration_worker.isRunning()
         ):
@@ -1665,7 +2039,11 @@ class LLMConfigDialog(QDialog):
                 "CUDA/Metal.",
             )
             return
-        if self._workers or self._unload_worker is not None:
+        if (
+            self._workers
+            or self._unload_worker is not None
+            or self._slot_benchmark_worker is not None
+        ):
             QMessageBox.information(
                 self,
                 "Operazione in corso",
@@ -1770,6 +2148,15 @@ class LLMConfigDialog(QDialog):
 
     def reject(self) -> None:
         if (
+            self._server_install_worker is not None
+            and self._server_install_worker.isRunning()
+        ):
+            QMessageBox.information(
+                self, "Importazione in corso",
+                "Attendi il completamento dell'importazione di llama-server.",
+            )
+            return
+        if (
             self._acceleration_worker is not None
             and self._acceleration_worker.isRunning()
         ):
@@ -1780,7 +2167,11 @@ class LLMConfigDialog(QDialog):
                 "CUDA/Metal.",
             )
             return
-        if self._workers or self._unload_worker is not None:
+        if (
+            self._workers
+            or self._unload_worker is not None
+            or self._slot_benchmark_worker is not None
+        ):
             QMessageBox.information(
                 self,
                 "Operazione in corso",
@@ -1851,6 +2242,29 @@ class LLMConfigDialog(QDialog):
         return "\n".join(lines)
 
 
+class _ManagedServerInstallWorker(QThread):
+    """Validate and copy a user-selected local runtime off the GUI thread."""
+
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, source: str, expected_sha256: str = "", parent=None):
+        super().__init__(parent)
+        self.source = source
+        self.expected_sha256 = expected_sha256
+
+    def run(self) -> None:
+        from ..llm_backend.server_runtime import install_managed_server
+
+        try:
+            self.succeeded.emit(install_managed_server(
+                self.source,
+                expected_sha256=self.expected_sha256 or None,
+            ))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class _AccelerationProbeWorker(QThread):
     """Probe local engines without loading or stopping a model."""
 
@@ -1879,6 +2293,41 @@ class _ModelWarmupWorker(QThread):
             self.succeeded.emit(self.role, self.config.model, runtime)
         except Exception as exc:
             self.failed.emit(self.role, self.config.model, str(exc))
+
+
+class _SlotBenchmarkWorker(QThread):
+    """Run the measured atomic slot tuner without blocking Qt."""
+
+    progress = pyqtSignal(str, str)
+    succeeded = pyqtSignal(str, object)
+    failed = pyqtSignal(str, str)
+
+    def __init__(
+        self,
+        role: str,
+        config: LLMRoleConfig,
+        candidates: tuple[int, ...],
+    ):
+        super().__init__()
+        self.role = role
+        self.config = config
+        self.candidates = candidates
+
+    def run(self) -> None:
+        from ..utils.slot_benchmark import benchmark_atomic_slots
+
+        try:
+            result = benchmark_atomic_slots(
+                self.config,
+                candidates=self.candidates,
+                progress_callback=lambda message: self.progress.emit(
+                    self.role, message
+                ),
+                cancel_check=self.isInterruptionRequested,
+            )
+            self.succeeded.emit(self.role, result)
+        except Exception as exc:
+            self.failed.emit(self.role, str(exc))
 
 
 class _ModelUnloadWorker(QThread):

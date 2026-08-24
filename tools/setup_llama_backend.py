@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """One-time setup of the llama.cpp backend for EMR Analyzer.
 
-1. Ensures the llama-server binary is available (brew on macOS; on Linux
-   prints the CUDA build instructions for DGX Spark and similar hosts).
+1. Ensures a llama-server binary is available.  ``--server-binary PATH``
+   imports and verifies a locally built Metal/CUDA runtime in the private app
+   store; the script never installs an unverified package implicitly.
 2. Copies the GGUF model files that Ollama already stores locally
    (~/.ollama/models/blobs, renamed by digest) into
    ~/.emr_analyzer/models/<family>-<tag>.gguf with readable names, mapping
@@ -15,15 +16,13 @@
 
 By default only the models referenced by the saved settings (plus the app
 defaults) are copied; pass --all to copy every model Ollama has.  Pass
---dry-run to preview without writing, --skip-brew to leave the binary
-alone.
+--dry-run to preview without writing.
 """
 from __future__ import annotations
 
 import json
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -45,7 +44,16 @@ from emr_analyzer.settings import (
 
 DRY_RUN = "--dry-run" in sys.argv
 COPY_ALL = "--all" in sys.argv
-SKIP_BREW = "--skip-brew" in sys.argv
+
+
+def _argument_value(name: str) -> str:
+    try:
+        return sys.argv[sys.argv.index(name) + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
+SERVER_BINARY_SOURCE = _argument_value("--server-binary")
 
 OLLAMA_MODELS_DIR = Path.home() / ".ollama" / "models"
 OLLAMA_MANIFESTS_DIR = OLLAMA_MODELS_DIR / "manifests"
@@ -60,21 +68,37 @@ BREW_PREFIX_CANDIDATES = (
 
 
 def ensure_binary(platform: str | None = None) -> str | None:
-    """Locate llama-server, installing it when the platform allows.
+    """Import an explicit runtime or locate the currently selected server."""
+    if SERVER_BINARY_SOURCE:
+        if DRY_RUN:
+            return f"(dry-run: importa {SERVER_BINARY_SOURCE})"
+        from emr_analyzer.llm_backend.server_runtime import (
+            ServerRuntimeError,
+            install_managed_server,
+        )
 
-    On macOS the binary is installed via Homebrew; on Linux (e.g. NVIDIA
-    DGX Spark / DGX OS) it must be a CUDA build from source or from an NGC
-    container — the script prints the build instructions instead.
-    """
+        try:
+            runtime = install_managed_server(SERVER_BINARY_SOURCE)
+        except ServerRuntimeError as exc:
+            print(f"Importazione llama-server fallita: {exc}")
+            return None
+        return str(runtime.binary_path)
+
     from emr_analyzer.llm_backend.server_manager import find_server_binary
 
     found = find_server_binary()
     if found:
         return found
-    if SKIP_BREW:
-        return None
     system = platform or sys.platform
-    if system != "darwin":
+    if system == "darwin":
+        print(
+            "\nllama-server verificato non trovato. Compila una build Metal "
+            "statica seguendo docs/LLAMA_SERVER_RUNTIME.md, quindi importala "
+            "da Configura LLM oppure esegui:\n\n"
+            "  python tools/setup_llama_backend.py --server-binary "
+            "/percorso/build/bin/llama-server\n"
+        )
+    else:
         print(
             "\nllama-server non trovato nel PATH.\n"
             "Su Linux serve una build CUDA di llama.cpp (DGX Spark / "
@@ -82,24 +106,15 @@ def ensure_binary(platform: str | None = None) -> str | None:
             "\n"
             "  git clone --depth 1 https://github.com/ggml-org/llama.cpp\n"
             "  cd llama.cpp\n"
-            "  cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON\n"
+            "  cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON "
+            "-DBUILD_SHARED_LIBS=OFF\n"
             "  cmake --build build --config Release -j\n"
-            "  sudo cp build/bin/llama-server /usr/local/bin/\n"
+            "  python tools/setup_llama_backend.py --server-binary "
+            "build/bin/llama-server\n"
             "\n"
             "oppure usa un container NGC con llama.cpp già compilato.\n"
         )
-        return None
-    print("llama-server non trovato: installo llama.cpp via Homebrew…")
-    if DRY_RUN:
-        return "(dry-run: brew install llama.cpp)"
-    result = subprocess.run(
-        ["brew", "install", "llama.cpp"], text=True
-    )
-    if result.returncode != 0:
-        print("Installazione di llama.cpp fallita; procedi a mano con "
-              "`brew install llama.cpp`")
-        return None
-    return find_server_binary()
+    return None
 
 
 def find_ollama_models() -> dict[str, dict]:
@@ -292,8 +307,8 @@ def main() -> int:
     binary = ensure_binary()
     if binary is None:
         if sys.platform == "darwin":
-            print("llama-server non disponibile. Installalo con "
-                  "`brew install llama.cpp` e riprova.")
+            print("llama-server non disponibile: importa una build Metal "
+                  "verificata seguendo docs/LLAMA_SERVER_RUNTIME.md.")
         else:
             print("llama-server non disponibile: installa una build CUDA "
                   "(vedi istruzioni sopra) e riprova.")

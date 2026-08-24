@@ -13,6 +13,7 @@ from emr_analyzer.extraction.llm_client import LlmClient
 from emr_analyzer.gui.llm_config_dialog import LLMConfigDialog
 from emr_analyzer.llm_backend.diagnostics import AccelerationDiagnostic
 from emr_analyzer.settings import LLMRoleConfig, MODEL_ROLES
+from emr_analyzer.utils.hardware import RecommendedParams
 
 
 class LLMConfigDialogTest(unittest.TestCase):
@@ -327,6 +328,143 @@ class LLMConfigDialogTest(unittest.TestCase):
         self.assertFalse(combo.model().item(combo.findData(8)).isEnabled())
         self.assertIn(
             "Un solo server fisico configurato",
+            dialog._runtime_summary.text(),
+        )
+        dialog._runtime_timer.stop()
+        dialog.deleteLater()
+
+    def test_atomic_optimizer_applies_its_workload_specific_preset(self):
+        configs = {
+            role: LLMRoleConfig(model="") for role in MODEL_ROLES
+        }
+        configs["atomic_evidence"] = LLMRoleConfig(
+            model="medgemma-4b", context_length=131072,
+            max_output_tokens=32768, parallel_workers=3,
+        )
+        recommendation = RecommendedParams(
+            context_length=8192,
+            max_output_tokens=6144,
+            parallel_workers=4,
+            context_rationale="preset per chunk clinici",
+            output_rationale="limite adattivo per chunk",
+            workers_rationale="concorrenza prudenziale",
+        )
+        with (
+            patch.object(
+                LlmClient,
+                "model_capabilities",
+                return_value={"max_context_length": 131072},
+            ),
+            patch.object(
+                LlmClient,
+                "runtime_identity",
+                new=lambda client: (
+                    "/models/medgemma-4b.gguf",
+                    client.context_length,
+                    client.parallel_workers,
+                ),
+            ),
+            patch.object(LlmClient, "loaded_model_info", return_value=None),
+            patch(
+                "emr_analyzer.utils.hardware.get_total_ram_gb",
+                return_value=48.0,
+            ),
+            patch(
+                "emr_analyzer.utils.hardware.get_available_ram_gb",
+                return_value=24.0,
+            ),
+            patch(
+                "emr_analyzer.utils.hardware.get_model_size_gb",
+                return_value=2.3,
+            ),
+            patch(
+                "emr_analyzer.utils.hardware.recommend_all",
+                return_value=recommendation,
+            ),
+        ):
+            dialog = LLMConfigDialog(configs, ["medgemma-4b"])
+            dialog._optimize_params("atomic_evidence", silent=True)
+
+        atomic = dialog._collect_config("atomic_evidence")
+        self.assertEqual(atomic.context_length, 8192)
+        self.assertEqual(atomic.max_output_tokens, 6144)
+        self.assertEqual(atomic.parallel_workers, 4)
+        self.assertIn(
+            "Preset specifico Evidenze atomiche",
+            dialog._widgets["atomic_evidence"]["rec_label"].text(),
+        )
+        dialog._runtime_timer.stop()
+        dialog.deleteLater()
+
+    def test_atomic_optimizer_does_not_modify_another_pipeline(self):
+        configs = {
+            role: LLMRoleConfig(model="") for role in MODEL_ROLES
+        }
+        configs["atomic_evidence"] = LLMRoleConfig(
+            model="qwen3-14b", context_length=131072,
+            max_output_tokens=32768, parallel_workers=3,
+        )
+        configs["clinical_state"] = LLMRoleConfig(
+            model="qwen3-14b", context_length=32768,
+            max_output_tokens=8192, parallel_workers=3,
+        )
+        recommendation = RecommendedParams(
+            context_length=8192,
+            max_output_tokens=6144,
+            parallel_workers=4,
+            context_rationale="preset per chunk clinici",
+            output_rationale="limite adattivo per chunk",
+            workers_rationale="concorrenza prudenziale",
+        )
+        with (
+            patch.object(
+                LlmClient,
+                "model_capabilities",
+                return_value={"max_context_length": 131072},
+            ),
+            patch.object(
+                LlmClient,
+                "runtime_identity",
+                new=lambda client: (
+                    "/models/qwen3-14b.gguf",
+                    client.context_length,
+                    client.parallel_workers,
+                ),
+            ),
+            patch.object(LlmClient, "loaded_model_info", return_value=None),
+            patch(
+                "emr_analyzer.utils.hardware.get_total_ram_gb",
+                return_value=48.0,
+            ),
+            patch(
+                "emr_analyzer.utils.hardware.get_available_ram_gb",
+                return_value=24.0,
+            ),
+            patch(
+                "emr_analyzer.utils.hardware.get_model_size_gb",
+                return_value=9.3,
+            ),
+            patch(
+                "emr_analyzer.utils.hardware.recommend_all",
+                return_value=recommendation,
+            ),
+        ):
+            dialog = LLMConfigDialog(configs, ["qwen3-14b"])
+            dialog._optimize_params("atomic_evidence", silent=True)
+
+        atomic = dialog._collect_config("atomic_evidence")
+        analysis = dialog._collect_config("clinical_state")
+        self.assertEqual(atomic.context_length, 8192)
+        self.assertEqual(atomic.max_output_tokens, 6144)
+        self.assertEqual(atomic.parallel_workers, 4)
+        self.assertEqual(analysis.context_length, 32768)
+        self.assertEqual(analysis.max_output_tokens, 8192)
+        self.assertEqual(analysis.parallel_workers, 3)
+        label = dialog._widgets["atomic_evidence"]["rec_label"].text()
+        self.assertIn("Contesto: 8.192 token", label)
+        self.assertNotIn("runtime condiviso", label.casefold())
+        self.assertIn(
+            "Lo stesso GGUF richiede più server fisici",
             dialog._runtime_summary.text(),
         )
         dialog._runtime_timer.stop()

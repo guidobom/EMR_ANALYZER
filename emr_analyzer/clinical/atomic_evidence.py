@@ -380,6 +380,23 @@ class AtomicEvidenceExtractor:
         # request counters thread-local so timings/tokens from simultaneous
         # documents can never contaminate one another.
         self._metrics_local = threading.local()
+        self._schema_cache: dict[tuple[int, tuple[str, ...]], dict[str, Any]] = {}
+        self._schema_cache_lock = threading.Lock()
+        try:
+            parameters = inspect.signature(
+                self.llm.generate_structured
+            ).parameters
+            self._supports_generation_limit = (
+                "max_tokens" in parameters
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            # A few native/test callables do not expose a signature.  Preserve
+            # the most compatible legacy call shape for those clients.
+            self._supports_generation_limit = False
 
     @property
     def model_name(self) -> str:
@@ -551,15 +568,7 @@ class AtomicEvidenceExtractor:
             sentence_spans=sentence_spans,
         )
         generator = self.llm.generate_structured
-        parameters = inspect.signature(generator).parameters
-        supports_limit = (
-            "max_tokens" in parameters
-            or any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            )
-        )
-        base_schema = build_atomic_evidence_schema(len(sentence_spans))
+        base_schema = self._schema_for(len(sentence_spans))
 
         def generate(
             system_prompt: str,
@@ -570,7 +579,7 @@ class AtomicEvidenceExtractor:
         ):
             effective_prompt = prompt + repair_note
             try:
-                if supports_limit:
+                if self._supports_generation_limit:
                     return generator(
                         effective_prompt, system_prompt, schema,
                         max_tokens=(
@@ -598,7 +607,7 @@ class AtomicEvidenceExtractor:
                 issue.fact_type for issue in pending
                 if issue.fact_type in LLM_ATOMIC_FACT_TYPES
             ))
-            repair_schema = build_atomic_evidence_schema(
+            repair_schema = self._schema_for(
                 len(sentence_spans),
                 fact_types=relevant_types or LLM_ATOMIC_FACT_TYPES,
             )
@@ -640,6 +649,29 @@ class AtomicEvidenceExtractor:
     def last_extraction_metrics(self) -> dict[str, int | float]:
         """Metrics for the document most recently handled by this thread."""
         return dict(self._current_metrics())
+
+    def _schema_for(
+        self,
+        sentence_count: int,
+        *,
+        fact_types: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Reuse immutable response contracts across parallel chunks."""
+        selected = tuple(
+            fact_type for fact_type in (
+                fact_types or LLM_ATOMIC_FACT_TYPES
+            )
+            if fact_type in LLM_ATOMIC_FACT_TYPES
+        )
+        key = (max(0, int(sentence_count)), selected)
+        with self._schema_cache_lock:
+            cached = self._schema_cache.get(key)
+            if cached is None:
+                cached = build_atomic_evidence_schema(
+                    key[0], fact_types=selected
+                )
+                self._schema_cache[key] = cached
+            return cached
 
     def _current_metrics(self) -> dict[str, int | float]:
         metrics = getattr(self._metrics_local, "value", None)

@@ -56,6 +56,9 @@ class WorkspaceTabs(QTabWidget):
         self._validation_tab.document_reattributed.connect(
             self._on_document_reattributed
         )
+        self._clinical_history_tab.validation_requested.connect(
+            self._show_validation_tab
+        )
 
         # Forward tab selections to context panel
         self._laboratory_tab.lab_selected.connect(self._on_lab_selected)
@@ -77,18 +80,65 @@ class WorkspaceTabs(QTabWidget):
         self._validation_tab.load_patient(patient_id)
         self._gold_set_tab.load_patient(patient_id)
 
-    def shutdown(self) -> None:
-        """Stop background workers of the tabs (application quit path)."""
+    def _show_validation_tab(self) -> None:
+        """Open and refresh phase 3 after its queue has been prepared."""
+
+        self._validation_tab.load_patient(self._current_patient_id)
+        self.setCurrentWidget(self._validation_tab)
+
+    def request_shutdown(self) -> None:
+        """Request cancellation without waiting for long LLM timeouts."""
+
         try:
-            self._clinical_history_tab.shutdown()
+            self._documents_tab.request_shutdown()
+        except Exception:
+            pass
+        try:
+            self._clinical_history_tab.request_shutdown()
         except Exception:
             pass
         for worker in (
             self._irae_queue_worker, self._registry_queue_worker,
         ):
             if worker is not None and worker.isRunning():
-                worker.cancel()
-                worker.wait(5000)
+                cancel = getattr(worker, "cancel", None)
+                if callable(cancel):
+                    cancel()
+                worker.requestInterruption()
+
+    def shutdown(self, wait_ms: int = 1500) -> int:
+        """Cooperatively stop workers; never wait beyond a small total budget."""
+
+        import time
+
+        self.request_shutdown()
+        deadline = time.monotonic() + max(0, int(wait_ms)) / 1000
+        try:
+            self._clinical_history_tab.shutdown(
+                max(0, int((deadline - time.monotonic()) * 1000))
+            )
+        except Exception:
+            pass
+        workers = [
+            worker for worker in (
+                self._irae_queue_worker, self._registry_queue_worker,
+            )
+            if worker is not None and worker.isRunning()
+        ]
+        for worker in workers:
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining:
+                worker.wait(remaining)
+        return sum(
+            1 for worker in (
+                self._irae_queue_worker, self._registry_queue_worker,
+            )
+            if worker is not None and worker.isRunning()
+        ) + sum(
+            1 for attr in self._clinical_history_tab._WORKER_ATTRS
+            if getattr(self._clinical_history_tab, attr, None) is not None
+            and getattr(self._clinical_history_tab, attr).isRunning()
+        )
 
     def llm_operation_running(self) -> bool:
         """True while any workspace operation is using an LLM runtime."""
@@ -355,9 +405,10 @@ class WorkspaceTabs(QTabWidget):
     # ------------------------------------------------------------------
 
     def run_registry_queue(
-        self, patient_ids: list[str], *, force_rebuild: bool = False
+        self, patient_ids: list[str], *, force_rebuild: bool = False,
+        stage: str = "atomic",
     ) -> None:
-        """Build registries sequentially while each patient uses all slots."""
+        """Run one explicit registry phase for several patients in order."""
         if not patient_ids:
             return
         if self.llm_operation_running():
@@ -369,22 +420,27 @@ class WorkspaceTabs(QTabWidget):
             return
 
         builder = self._services.get("clinical_history_builder")
-        atomic_llm = self._services.get("atomic_evidence_llm_client")
-        event_llm = self._services.get("clinical_events_llm_client")
-        if (
-            builder is None
-            or atomic_llm is None or not atomic_llm.is_available
-            or event_llm is None or not event_llm.is_available
+        client_key = {
+            "atomic": "atomic_evidence_llm_client",
+            "events": "clinical_events_llm_client",
+        }.get(stage)
+        required_llm = self._services.get(client_key) if client_key else None
+        if builder is None or (
+            client_key and (
+                required_llm is None or not required_llm.is_available
+            )
         ):
             QMessageBox.warning(
                 self, "LLM non disponibile",
-                "I modelli per evidenze atomiche ed eventi clinici, oppure "
-                "il generatore dei registri, non sono disponibili.",
+                "Il modello richiesto dalla fase selezionata, oppure il "
+                "generatore dei registri, non è disponibile.",
             )
             return
 
         configs = self._services.get("llm_configs") or {}
-        state_config = configs.get("atomic_evidence")
+        state_config = configs.get(
+            "clinical_events" if stage == "events" else "atomic_evidence"
+        )
         num_workers = max(
             1, int(getattr(state_config, "parallel_workers", 1) or 1)
         )
@@ -394,12 +450,13 @@ class WorkspaceTabs(QTabWidget):
         worker = RegistryQueueWorker(
             builder, patient_ids, num_workers=num_workers,
             force_rebuild=force_rebuild,
+            stage=stage,
         )
         self._registry_queue_worker = worker
         results: list[dict] = []
         state = {"index": 0, "total": len(patient_ids), "patient": ""}
         progress = ProgressDialog(
-            f"Coda registri — paziente 1/{len(patient_ids)}", parent=self,
+            f"Coda {stage} — paziente 1/{len(patient_ids)}", parent=self,
         )
         progress.show()
         process_gui_events()
@@ -407,7 +464,7 @@ class WorkspaceTabs(QTabWidget):
         def on_started(index: int, total: int, patient_id: str) -> None:
             state.update(index=index, total=total, patient=patient_id)
             progress.setWindowTitle(
-                f"Coda registri — paziente {index}/{total}"
+                f"Coda {stage} — paziente {index}/{total}"
             )
             progress.add_log(
                 f"\n===== Paziente {index}/{total}: {patient_id} ====="
@@ -432,11 +489,22 @@ class WorkspaceTabs(QTabWidget):
             })
             processed = int(result.get("documents_processed", 0) or 0)
             skipped = int(result.get("documents_skipped", 0) or 0)
-            label = (
-                "già aggiornato"
-                if processed == 0 and skipped else
-                f"completato ({processed} documenti elaborati)"
-            )
+            result_stage = result.get("stage") or stage
+            if result_stage == "events":
+                label = (
+                    f"eventi completati ({result.get('final_entries', 0)} voci)"
+                )
+            elif result_stage == "validation":
+                label = (
+                    "validazione preparata "
+                    f"({result.get('validation_pending', 0)} elementi)"
+                )
+            else:
+                label = (
+                    "evidenze già aggiornate"
+                    if processed == 0 and skipped else
+                    f"evidenze completate ({processed} documenti elaborati)"
+                )
             progress.add_log(f"✓ {patient_id}: {label}")
             progress.set_progress(
                 int(state["index"] * 100 / max(state["total"], 1)),

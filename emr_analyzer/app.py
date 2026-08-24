@@ -331,7 +331,22 @@ class EMRAnalyzerApp:
 
     @staticmethod
     def _shutdown_backend() -> None:
-        """Terminate every app-owned local LLM process on quit."""
+        """Terminate workers and local LLM processes on every Qt quit path."""
+
+        try:
+            from .gui.application_shutdown import (
+                mark_shutdown_requested,
+                request_qthread_shutdown,
+                running_qthreads,
+                schedule_emergency_exit,
+            )
+            threads = running_qthreads()
+            if threads:
+                mark_shutdown_requested()
+                request_qthread_shutdown(threads)
+                schedule_emergency_exit(delay_seconds=5.0)
+        except Exception:
+            pass
         try:
             from .llm_backend import shutdown_all_backends
             shutdown_all_backends()

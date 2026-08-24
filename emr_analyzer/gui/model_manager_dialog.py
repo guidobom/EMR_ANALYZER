@@ -283,8 +283,9 @@ class ModelManagerDialog(QDialog):
         filters.addWidget(self._catalog_compatible)
         self._catalog_update_button = QPushButton("↻ Aggiorna catalogo")
         self._catalog_update_button.setToolTip(
-            "Scarica esplicitamente il manifesto dal repository ufficiale, "
-            "lo valida e lo salva nella cache locale."
+            "Verifica esplicitamente il manifesto del catalogo. Se la fonte "
+            "remota non è pubblicamente accessibile, conserva il catalogo "
+            "validato incluso nell'app."
         )
         self._catalog_update_button.clicked.connect(
             self._start_catalog_update
@@ -417,10 +418,28 @@ class ModelManagerDialog(QDialog):
         self._refresh_catalog()
         self._progress.setRange(0, 100)
         self._progress.setValue(100)
-        self._progress.setFormat("Catalogo aggiornato")
         count = int(result.get("model_count") or 0)
         version = int(result.get("catalog_version") or 0)
         review_date = str(result.get("review_date") or "n.d.")
+        if result.get("updated", True) is False:
+            notice = str(result.get("notice") or (
+                "Il catalogo remoto non è disponibile; resta attivo il "
+                "catalogo validato incluso nell'applicazione."
+            ))
+            self._progress.setFormat("Catalogo locale attivo")
+            self._status.setText(
+                f"Catalogo integrato v{version} attivo: {count} modelli, "
+                f"revisione {review_date}."
+            )
+            QMessageBox.information(
+                self,
+                "Catalogo integrato attivo",
+                f"{notice}\n\nVersione: {version}\n"
+                f"Modelli disponibili: {count}\n"
+                f"Ultima revisione: {review_date}.",
+            )
+            return
+        self._progress.setFormat("Catalogo aggiornato")
         self._status.setText(
             f"✓ Catalogo v{version} aggiornato: {count} modelli, "
             f"revisione {review_date}."

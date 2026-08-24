@@ -164,6 +164,24 @@ class LlamaBackend:
             return False
         return self._manager.stop(key)
 
+    def stop_other_runtimes(self, config) -> int:
+        """Stop every llama.cpp runtime except the one required by *config*.
+
+        Pipeline stages are mutually exclusive in the GUI.  Keeping models
+        from a previous stage resident only consumes unified/VRAM and can push
+        the active model's KV cache into memory pressure.  The selected
+        runtime is retained when it is already warm.
+        """
+        try:
+            retained = self.key_for(config)
+        except KeyError:
+            return 0
+        stopped = 0
+        for key in self._manager.running_keys():
+            if key != retained:
+                stopped += int(self._manager.stop(key))
+        return stopped
+
     def stop_model(self, name: str) -> bool:
         """Stop every server running the model *name*; True if any stopped."""
         entry = model_store.resolve(name)
@@ -177,6 +195,10 @@ class LlamaBackend:
 
     def stop_all(self) -> int:
         return self._manager.stop_all()
+
+    def select_server_binary(self, binary: str | None) -> None:
+        """Switch the process-wide backend after all current servers stop."""
+        self._manager.select_binary(binary)
 
     def running_model_names(self) -> list[str]:
         """Friendly names of the models with a running server process."""

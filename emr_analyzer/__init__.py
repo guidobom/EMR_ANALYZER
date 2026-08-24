@@ -9,21 +9,30 @@ __version__ = "0.7.0"
 
 
 def _configure_qt_plugins() -> None:
-    """Use conda's Qt plugins when PyQt reports a stale bundled path.
+    """Keep PyQt and its platform plugins in the same Python environment.
 
-    A mixed pip/conda repair can leave ``QLibraryInfo`` pointing at the
-    removed pip runtime even though the conda Qt libraries are valid. Setting
-    the plugin root before QApplication is constructed is deterministic and
-    avoids a native abort.
+    A parent shell may expose the *base* ``CONDA_PREFIX`` while executing the
+    Python binary of a named environment.  Loading base Qt plugins beside the
+    pip PyQt frameworks of that environment creates duplicate Objective-C
+    classes and aborts QApplication.  Prefer the plugins shipped beside the
+    imported PyQt package; only then consider an environment-level fallback.
     """
     if os.environ.get("QT_PLUGIN_PATH"):
         return
-    for candidate in (
+    python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = (
+        Path(sys.prefix) / "lib" / python_version
+        / "site-packages" / "PyQt5" / "Qt5" / "plugins",
+        Path(sys.prefix) / "Lib" / "site-packages"
+        / "PyQt5" / "Qt5" / "plugins",
         Path(sys.prefix) / "plugins",
-        Path(os.environ.get("CONDA_PREFIX", "")) / "plugins",
-    ):
+    )
+    for candidate in candidates:
         if (candidate / "platforms").is_dir():
             os.environ["QT_PLUGIN_PATH"] = str(candidate)
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(
+                candidate / "platforms"
+            )
             return
 
 

@@ -21,6 +21,16 @@ import psutil
 MIN_WORKERS = 1
 MAX_WORKERS = 8
 
+# Atomic extraction never sends a full longitudinal record to the model.  The
+# extractor caps source chunks at 2,800 characters and applies a request-local
+# output budget before every call.  Allocating the model's maximum context per
+# llama-server slot therefore wastes unified/VRAM and can reduce throughput by
+# forcing memory pressure.  Keep these role-specific targets next to the
+# hardware policy instead of duplicating them in the GUI.
+ATOMIC_EVIDENCE_CONTEXT_TARGET = 8_192
+ATOMIC_EVIDENCE_OUTPUT_TARGET = 6_144
+ATOMIC_EVIDENCE_WORKER_CAP = 4
+
 # Empirical KV-cache + working-memory overhead per token of context.
 # llama-server runs the KV cache in q8_0: ~80 KB per token for a ~14B
 # model; 100 KB keeps a safety margin (was 50 KB in the f16 Ollama era).
@@ -111,7 +121,7 @@ class RecommendedParams:
         event/episode synthesis and longitudinal analysis.
         """
         # ---- context_length ------------------------------------------------
-        context, context_rationale = _recommend_context(hw, model)
+        context, context_rationale = _recommend_context(hw, model, role)
 
         # ---- max_output_tokens ---------------------------------------------
         max_out, output_rationale = _recommend_output(
@@ -120,7 +130,7 @@ class RecommendedParams:
 
         # ---- parallel_workers ----------------------------------------------
         workers, workers_rationale = _recommend_workers(
-            hw, model, context
+            hw, model, context, role
         )
 
         return cls(
@@ -311,11 +321,27 @@ def _detect_gpu_name() -> str:
 
 
 def _recommend_context(
-    hw: HardwareProfile, model: ModelProfile
+    hw: HardwareProfile, model: ModelProfile, role: str = "document"
 ) -> tuple[int, str]:
     """Recommend a context length based on hardware and model limits."""
     model_max = model.max_context_length or 131_072  # Conservative fallback
     model_size = model.size_gb or 4.0
+
+    if role == "atomic_evidence":
+        chosen = min(model_max, ATOMIC_EVIDENCE_CONTEXT_TARGET)
+        if chosen >= ATOMIC_EVIDENCE_CONTEXT_TARGET:
+            rationale = (
+                "Preset per chunk clinici ≤2.800 caratteri: il contesto "
+                f"massimo del modello ({_fmt_tokens(model_max)}) non viene "
+                "preallocato inutilmente per ogni slot"
+            )
+        else:
+            rationale = (
+                "Preset atomico ridotto al limite del modello: "
+                f"{_fmt_tokens(model_max)} token; i passaggi densi saranno "
+                "suddivisi automaticamente"
+            )
+        return max(512, chosen), rationale
 
     # Configuration describes a cold server. Use total capacity rather than
     # a volatile post-load snapshot that already excludes resident weights.
@@ -358,15 +384,25 @@ def _recommend_output(
     The document model filters full text → needs larger output.
     Clinical State also produces long narrative/irAE reports.
     """
+    if role == "atomic_evidence":
+        # The extractor applies a tighter per-chunk cap derived from source
+        # density (currently at most ~4.5K for a full 2,800-character chunk).
+        # 6K here is headroom, not a request to generate 6K tokens every time.
+        chosen = (
+            ATOMIC_EVIDENCE_OUTPUT_TARGET
+            if context >= ATOMIC_EVIDENCE_CONTEXT_TARGET
+            else max(1_024, context // 2)
+        )
+        return chosen, (
+            "Preset atomico: tetto di sicurezza; ogni chunk usa un limite "
+            "adattivo inferiore e viene suddiviso se la risposta è troppo densa"
+        )
+
     # Base ratio: output gets a fraction of the context.
     if role == "document":
         # Document filtering can produce output up to ~50 % of source
         ratio = 0.30
         workload = "Filtraggio testo"
-    elif role == "atomic_evidence":
-        # Per-chunk JSON is relatively compact and is validated downstream.
-        ratio = 0.18
-        workload = "Evidenze atomiche JSON"
     elif role == "clinical_events":
         ratio = 0.22
         workload = "Fusione eventi/episodi"
@@ -390,7 +426,10 @@ def _recommend_output(
 
 
 def _recommend_workers(
-    hw: HardwareProfile, model: ModelProfile, context: int
+    hw: HardwareProfile,
+    model: ModelProfile,
+    context: int,
+    role: str = "document",
 ) -> tuple[int, str]:
     """Recommend parallel workers based on RAM headroom."""
     capacity = hw.total_ram_gb
@@ -411,6 +450,13 @@ def _recommend_workers(
         # fits. Keep automatic recommendations conservative; advanced users
         # can still select any capacity-safe value manually.
         performance_cap = 3 if model_size >= 8 else 4 if model_size >= 4 else 6
+        if role == "atomic_evidence":
+            # Memory capacity alone is not proof that more simultaneous decodes
+            # increase aggregate throughput.  Four is a conservative preset;
+            # a separate measured benchmark may later select a higher value.
+            performance_cap = min(
+                performance_cap, ATOMIC_EVIDENCE_WORKER_CAP
+            )
         workers = max(
             MIN_WORKERS,
             min(MAX_WORKERS, theoretical, performance_cap),
@@ -430,6 +476,11 @@ def _recommend_workers(
             f"(modello {model_size:.1f} GiB + "
             f"{per_request * workers:.1f} GiB KV-cache)"
         )
+        if role == "atomic_evidence":
+            rationale += (
+                "; limite prudenziale di 4 slot per i chunk atomici, in attesa "
+                "di un benchmark di throughput specifico della macchina"
+            )
     return workers, rationale
 
 

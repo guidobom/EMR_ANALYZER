@@ -17,11 +17,12 @@ import shutil
 import subprocess
 import time
 import urllib.request
+from urllib.error import HTTPError
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 
 from ..config import (
     LLM_MODEL_CATALOG_CACHE_PATH,
@@ -30,7 +31,7 @@ from ..config import (
     LLM_MODELS_DIR,
 )
 from . import model_store
-from .model_catalog import cache_catalog_manifest
+from .model_catalog import cache_catalog_manifest, load_catalog_snapshot
 
 
 MODEL_LAYER_TYPE = "application/vnd.ollama.image.model"
@@ -38,6 +39,10 @@ _COPY_CHUNK_SIZE = 4 * 1024 * 1024
 _MIN_FREE_SPACE = 512 * 1024 * 1024
 _MAX_CATALOG_BYTES = 2 * 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+_HF_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*")
+_GGUF_SHARD_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
+_HF_API_BASE = "https://huggingface.co"
+_MAX_CATALOG_RESPONSE_BYTES = 8 * 1024 * 1024
 
 ProgressCallback = Callable[[int, int | None, str], None]
 CancelCallback = Callable[[], bool]
@@ -59,6 +64,252 @@ class OllamaModel:
     blob_path: Path
     size_bytes: int
     digest: str
+
+
+@dataclass(frozen=True)
+class HuggingFaceModel:
+    """Public Hugging Face repository advertised as containing GGUF files."""
+
+    repo_id: str
+    downloads: int
+    likes: int
+    last_modified: str
+
+    def as_dict(self) -> dict:
+        return {
+            "repo_id": self.repo_id,
+            "downloads": self.downloads,
+            "likes": self.likes,
+            "last_modified": self.last_modified,
+        }
+
+
+@dataclass(frozen=True)
+class HuggingFaceGGUFFile:
+    """One downloadable, non-sharded GGUF file pinned to a Hub revision."""
+
+    repo_id: str
+    filename: str
+    size_bytes: int
+    sha256: str
+    revision: str
+    quantization: str
+    download_url: str
+
+    def as_dict(self) -> dict:
+        return {
+            "repo_id": self.repo_id,
+            "filename": self.filename,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+            "revision": self.revision,
+            "quantization": self.quantization,
+            "download_url": self.download_url,
+        }
+
+
+def search_huggingface_gguf(
+    query: str,
+    *,
+    limit: int = 20,
+    opener=None,
+) -> list[HuggingFaceModel]:
+    """Search public, non-gated GGUF repositories on Hugging Face.
+
+    This function is intended to run only in the dedicated downloader process.
+    No application or clinical state is included in the request.
+    """
+
+    clean_query = " ".join(str(query or "").split())
+    if len(clean_query) < 2:
+        raise ModelInstallError(
+            "Inserisci almeno due caratteri per cercare un modello GGUF."
+        )
+    safe_limit = max(1, min(int(limit or 20), 50))
+    url = f"{_HF_API_BASE}/api/models?" + urlencode(
+        {
+            "search": clean_query,
+            "filter": "gguf",
+            "sort": "downloads",
+            "direction": "-1",
+            "limit": safe_limit,
+            "full": "true",
+        }
+    )
+    payload = _fetch_catalog_json(url, opener=opener)
+    if not isinstance(payload, list):
+        raise ModelInstallError(
+            "Hugging Face ha restituito una risposta di ricerca non valida."
+        )
+
+    results: list[HuggingFaceModel] = []
+    seen: set[str] = set()
+    for raw in payload:
+        if not isinstance(raw, dict):
+            continue
+        repo_id = str(raw.get("id") or raw.get("modelId") or "").strip()
+        if not _HF_REPO_RE.fullmatch(repo_id) or repo_id.casefold() in seen:
+            continue
+        # Public catalog browsing deliberately excludes repositories that need
+        # credentials or an accepted licence workflow.
+        if raw.get("private") or raw.get("gated") not in (None, False):
+            continue
+        tags = {str(tag).casefold() for tag in raw.get("tags") or []}
+        siblings = raw.get("siblings") or []
+        has_gguf = "gguf" in tags or any(
+            str(item.get("rfilename") or "").casefold().endswith(".gguf")
+            for item in siblings
+            if isinstance(item, dict)
+        )
+        if not has_gguf:
+            continue
+        seen.add(repo_id.casefold())
+        results.append(
+            HuggingFaceModel(
+                repo_id=repo_id,
+                downloads=max(0, int(raw.get("downloads") or 0)),
+                likes=max(0, int(raw.get("likes") or 0)),
+                last_modified=str(raw.get("lastModified") or ""),
+            )
+        )
+    return results
+
+
+def list_huggingface_gguf_files(
+    repo_id: str,
+    *,
+    opener=None,
+) -> list[HuggingFaceGGUFFile]:
+    """List standalone GGUF files in one public Hugging Face repository."""
+
+    clean_repo = str(repo_id or "").strip()
+    if not _HF_REPO_RE.fullmatch(clean_repo):
+        raise ModelInstallError("Identificativo repository Hugging Face non valido.")
+    encoded_repo = "/".join(quote(part, safe="") for part in clean_repo.split("/"))
+    payload = _fetch_catalog_json(
+        f"{_HF_API_BASE}/api/models/{encoded_repo}?blobs=true",
+        opener=opener,
+    )
+    if not isinstance(payload, dict):
+        raise ModelInstallError(
+            "Hugging Face ha restituito dettagli del repository non validi."
+        )
+    if payload.get("private") or payload.get("gated") not in (None, False):
+        raise ModelInstallError(
+            "Il repository è privato o gated e richiede autenticazione."
+        )
+    revision = str(payload.get("sha") or "main").strip() or "main"
+    files: list[HuggingFaceGGUFFile] = []
+    for raw in payload.get("siblings") or []:
+        if not isinstance(raw, dict):
+            continue
+        filename = str(raw.get("rfilename") or "").strip()
+        if not _is_standalone_gguf_filename(filename):
+            continue
+        lfs = raw.get("lfs") if isinstance(raw.get("lfs"), dict) else {}
+        size = int(raw.get("size") or lfs.get("size") or 0)
+        checksum = str(
+            lfs.get("sha256") or lfs.get("oid") or ""
+        ).removeprefix("sha256:").casefold()
+        if checksum and not _SHA256_RE.fullmatch(checksum):
+            checksum = ""
+        encoded_revision = quote(revision, safe="")
+        encoded_filename = "/".join(
+            quote(part, safe="") for part in filename.split("/")
+        )
+        download_url = (
+            f"{_HF_API_BASE}/{encoded_repo}/resolve/{encoded_revision}/"
+            f"{encoded_filename}?download=true"
+        )
+        files.append(
+            HuggingFaceGGUFFile(
+                repo_id=clean_repo,
+                filename=filename,
+                size_bytes=max(0, size),
+                sha256=checksum,
+                revision=revision,
+                quantization=_quantization_from_filename(filename),
+                download_url=download_url,
+            )
+        )
+    return sorted(files, key=_hub_file_sort_key)
+
+
+def _fetch_catalog_json(url: str, *, opener=None):
+    parsed = _validate_https_url(url)
+    if parsed.hostname != "huggingface.co":
+        raise ModelInstallError(
+            "La ricerca del catalogo è limitata a huggingface.co."
+        )
+    request = urllib.request.Request(
+        parsed.geturl(),
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "EMR-Analyzer-model-catalog/1.0",
+        },
+    )
+    active_opener = opener or urllib.request.build_opener(
+        _HTTPSRedirectHandler()
+    )
+    try:
+        with active_opener.open(request, timeout=30) as response:
+            _validate_https_url(response.geturl())
+            body = response.read(_MAX_CATALOG_RESPONSE_BYTES + 1)
+    except ModelInstallError:
+        raise
+    except Exception as exc:
+        raise ModelInstallError(
+            f"Consultazione del catalogo Hugging Face non riuscita: {exc}"
+        ) from exc
+    if len(body) > _MAX_CATALOG_RESPONSE_BYTES:
+        raise ModelInstallError(
+            "La risposta del catalogo Hugging Face è troppo grande."
+        )
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ModelInstallError(
+            "Hugging Face ha restituito una risposta JSON non valida."
+        ) from exc
+
+
+def _is_standalone_gguf_filename(filename: str) -> bool:
+    folded = filename.casefold()
+    if not folded.endswith(".gguf") or _GGUF_SHARD_RE.search(filename):
+        return False
+    basename = Path(folded).name
+    return not any(
+        marker in basename
+        for marker in ("mmproj", "projector", "vision-adapter", "lora", "adapter")
+    )
+
+
+def _quantization_from_filename(filename: str) -> str:
+    stem = Path(filename).stem.upper()
+    match = re.search(
+        r"(?:^|[-_.])(IQ\d(?:_[A-Z0-9]+)*|Q\d(?:_[A-Z0-9]+)*|BF16|F16|F32)(?:$|[-_.])",
+        stem,
+    )
+    return match.group(1) if match else "non indicata"
+
+
+def _hub_file_sort_key(item: HuggingFaceGGUFFile) -> tuple:
+    preferred = {
+        "Q4_K_M": 0,
+        "Q5_K_M": 1,
+        "Q6_K": 2,
+        "Q8_0": 3,
+        "Q4_K_S": 4,
+        "F16": 8,
+        "BF16": 9,
+        "F32": 10,
+        "non indicata": 11,
+    }
+    return (
+        preferred.get(item.quantization, 6),
+        item.size_bytes or 2**63,
+        item.filename.casefold(),
+    )
 
 
 def normalize_model_name(value: str) -> str:
@@ -267,7 +518,33 @@ def update_model_catalog(
             "review_date": snapshot.review_date,
             "model_count": len(snapshot.models),
             "source": parsed.geturl(),
+            "updated": True,
+            "notice": "",
         }
+    except HTTPError as exc:
+        # GitHub deliberately answers 404 (rather than 403) for unauthenticated
+        # access to a private repository.  The model manager must never ask for
+        # or embed GitHub credentials, so keep the validated offline catalogue
+        # active and report the situation accurately instead of presenting a
+        # network failure that prevents model installation.
+        if exc.code in {401, 403, 404}:
+            snapshot = load_catalog_snapshot(cache_path)
+            notice = (
+                "Il catalogo remoto non è accessibile senza credenziali; "
+                "resta attivo il catalogo validato incluso nell'applicazione."
+            )
+            _emit(progress, 0, None, notice)
+            return {
+                "catalog_version": snapshot.catalog_version,
+                "review_date": snapshot.review_date,
+                "model_count": len(snapshot.models),
+                "source": snapshot.source,
+                "updated": False,
+                "notice": notice,
+            }
+        raise ModelInstallError(
+            f"Aggiornamento catalogo non riuscito: HTTP {exc.code}."
+        ) from exc
     except ModelInstallError:
         raise
     except ValueError as exc:

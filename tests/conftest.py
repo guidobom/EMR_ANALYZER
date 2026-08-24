@@ -4,6 +4,16 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+if __name__ == "__main__":
+    raise SystemExit(
+        "tests/conftest.py non è uno script eseguibile: viene caricato "
+        "automaticamente da pytest.\n"
+        "Installa le dipendenze di sviluppo con:\n"
+        "  python -m pip install -r requirements-dev.txt\n"
+        "Poi esegui la suite dalla radice del progetto con:\n"
+        "  python -m pytest -q"
+    )
+
 import pytest
 
 # Importing the package configures a valid conda Qt plugin root before the

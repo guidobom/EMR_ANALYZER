@@ -55,6 +55,27 @@ class FakeBuilder:
         progress_callback(100, "completato")
         return self._result(patient_id)
 
+    def extract_atomic_evidence(
+        self, patient_id, *, incremental, num_workers, progress_callback,
+        cancel_check=None,
+    ):
+        self.calls.append((
+            "atomic", patient_id, incremental, num_workers,
+        ))
+        progress_callback(100, "evidenze completate")
+        return {**self._result(patient_id), "stage": "atomic"}
+
+    def build_structured_events(
+        self, patient_id, *, progress_callback, cancel_check=None,
+    ):
+        self.calls.append(("events", patient_id))
+        progress_callback(100, "eventi completati")
+        return {**self._result(patient_id), "stage": "events"}
+
+    def prepare_validation(self, patient_id):
+        self.calls.append(("validation", patient_id))
+        return {"stage": "validation", "validation_pending": 3}
+
 
 class RegistryQueueWorkerTest(unittest.TestCase):
     def test_runs_incrementally_in_patient_order(self):
@@ -118,6 +139,29 @@ class RegistryQueueWorkerTest(unittest.TestCase):
         worker.run()
 
         self.assertEqual(builder.calls, [("rebuild", "P001", 3, False)])
+
+    def test_each_explicit_queue_stage_calls_only_its_builder_method(self):
+        atomic_builder = FakeBuilder()
+        RegistryQueueWorker(
+            atomic_builder, ["P001"], num_workers=3, stage="atomic"
+        ).run()
+        self.assertEqual(
+            atomic_builder.calls, [("atomic", "P001", True, 3)]
+        )
+
+        event_builder = FakeBuilder()
+        RegistryQueueWorker(
+            event_builder, ["P001"], stage="events"
+        ).run()
+        self.assertEqual(event_builder.calls, [("events", "P001")])
+
+        validation_builder = FakeBuilder()
+        RegistryQueueWorker(
+            validation_builder, ["P001"], stage="validation"
+        ).run()
+        self.assertEqual(
+            validation_builder.calls, [("validation", "P001")]
+        )
 
 
 class ClinicalHistoryWorkerResumeTest(unittest.TestCase):
@@ -228,9 +272,27 @@ class RegistryQueueDialogTest(unittest.TestCase):
         dialog = RegistryQueueDialog(self._summaries())
         self.assertEqual(dialog.selected_patient_ids(), ["P001"])
         self.assertFalse(dialog.force_rebuild())
+        self.assertEqual(dialog.selected_stage(), "atomic")
         self.assertFalse(
             bool(dialog._table.item(1, 0).flags() & Qt.ItemIsEnabled)
         )
+        dialog.deleteLater()
+
+    def test_event_and_validation_phases_disable_full_document_rebuild(self):
+        dialog = RegistryQueueDialog(self._summaries())
+        dialog._mode.setCurrentIndex(1)
+        dialog._phase.setCurrentIndex(
+            dialog._phase.findData(RegistryQueueDialog.EVENTS)
+        )
+        self.assertEqual(dialog.selected_stage(), "events")
+        self.assertFalse(dialog.force_rebuild())
+        self.assertFalse(dialog._mode.isEnabled())
+
+        dialog._phase.setCurrentIndex(
+            dialog._phase.findData(RegistryQueueDialog.VALIDATION)
+        )
+        self.assertEqual(dialog.selected_stage(), "validation")
+        self.assertFalse(dialog.force_rebuild())
         dialog.deleteLater()
 
     def test_can_choose_full_rebuild(self):

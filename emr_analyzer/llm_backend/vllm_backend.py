@@ -259,6 +259,18 @@ class VllmBackend:
         except KeyError:
             return False
 
+    def stop_other_runtimes(self, config) -> int:
+        """Stop every vLLM runtime except the selected pipeline runtime."""
+        try:
+            retained = self.key_for(config)
+        except KeyError:
+            return 0
+        stopped = 0
+        for key in self._manager.running_keys():
+            if key != retained:
+                stopped += int(self._manager.stop(key))
+        return stopped
+
     def stop_model(self, name: str) -> bool:
         clean = str(name or "").strip()
         stopped = False

@@ -6,11 +6,12 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
     QTreeWidget, QTreeWidgetItem, QComboBox, QLabel, QSplitter,
     QMessageBox, QProgressBar, QFileDialog, QMenu, QAction,
-    QInputDialog, QCheckBox, QTextBrowser, QDialog,
+    QInputDialog, QCheckBox, QTextBrowser, QDialog, QTabWidget,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
 
+from ..clinical.atomic_evidence import deduplicate_atomic_evidence
 from ..models.chat_message import ChatMessage
 from ..models.clinical_timeline import CATEGORY_LABELS
 from ..settings import (
@@ -48,6 +49,8 @@ HISTORY_QUERIES = [
 class ClinicalHistoryTab(QWidget):
     """Chronological clinical history view with generation and query."""
 
+    validation_requested = pyqtSignal()
+
     def __init__(self, parent=None, settings_path=None):
         super().__init__(parent)
         self._services = {}
@@ -59,6 +62,20 @@ class ClinicalHistoryTab(QWidget):
         self._query_worker = None
         self._dedup_worker = None
         self._irae_worker = None
+        self._active_registry_stage = None
+        self._pipeline_status: dict = {}
+        self._atomic_evidence = []
+        self._atomic_view_dirty = True
+        # Several document workers can finish almost simultaneously.  A
+        # single-shot timer coalesces their queued Qt signals into one database
+        # read/UI redraw, without delaying the worker or touching uncommitted
+        # LLM output.
+        self._live_evidence_timer = QTimer(self)
+        self._live_evidence_timer.setSingleShot(True)
+        self._live_evidence_timer.setInterval(350)
+        self._live_evidence_timer.timeout.connect(
+            self._refresh_atomic_evidence
+        )
         # Per-patient chat trace: every prompt and response is persisted and
         # rendered as a timeline; switching patient replaces it entirely.
         self._chat_messages: list[ChatMessage] = []
@@ -81,14 +98,34 @@ class ClinicalHistoryTab(QWidget):
         # ---- Top: Generation bar ---------------------------------------
         gen_layout = QHBoxLayout()
 
-        self._gen_btn = QPushButton("🔄 Genera Registro Cronologico")
+        self._gen_btn = QPushButton("1 · Estrai evidenze")
         self._gen_btn.setToolTip(
-            "Elabora tutti i testi clinici normalizzati in ordine "
-            "cronologico, estrae le informazioni cliniche e costruisce "
-            "il registro temporale deduplicato."
+            "Estrae e salva esclusivamente le evidenze cliniche atomiche "
+            "dai testi normalizzati. Non crea né modifica gli eventi del "
+            "registro cronologico. Usa il modello Evidenze atomiche."
         )
         self._gen_btn.clicked.connect(self._on_generate)
         gen_layout.addWidget(self._gen_btn)
+
+        self._events_btn = QPushButton("2 · Crea eventi clinici")
+        self._events_btn.setToolTip(
+            "Fonde le evidenze atomiche già salvate e aggiornate in eventi "
+            "clinici strutturati, episodi e registro cronologico. Non rilegge "
+            "i documenti e usa soltanto il modello Eventi clinici."
+        )
+        self._events_btn.clicked.connect(self._on_build_events)
+        self._events_btn.setEnabled(False)
+        gen_layout.addWidget(self._events_btn)
+
+        self._validation_btn = QPushButton("3 · Prepara validazione")
+        self._validation_btn.setToolTip(
+            "Prepara la coda di revisione a partire dagli eventi già salvati "
+            "e apre la scheda Validazione. La decisione finale è umana e non "
+            "viene affidata allo stesso LLM che ha generato gli eventi."
+        )
+        self._validation_btn.clicked.connect(self._on_prepare_validation)
+        self._validation_btn.setEnabled(False)
+        gen_layout.addWidget(self._validation_btn)
 
         self._cancel_generation_btn = QPushButton("⏹ Interrompi")
         self._cancel_generation_btn.setToolTip(
@@ -101,6 +138,16 @@ class ClinicalHistoryTab(QWidget):
         self._cancel_generation_btn.setVisible(False)
         gen_layout.addWidget(self._cancel_generation_btn)
 
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setVisible(False)
+        self._progress_bar.setMaximum(100)
+        gen_layout.addWidget(self._progress_bar, stretch=1)
+
+        gen_layout.addStretch()
+        layout.addLayout(gen_layout)
+
+        auxiliary_layout = QHBoxLayout()
+
         self._dedup_btn = QPushButton("🔍 Deduplica Registro")
         self._dedup_btn.setToolTip(
             "Analizza il registro cronologico esistente ed elimina le "
@@ -108,7 +155,7 @@ class ClinicalHistoryTab(QWidget):
         )
         self._dedup_btn.clicked.connect(self._on_dedup)
         self._dedup_btn.setEnabled(False)
-        gen_layout.addWidget(self._dedup_btn)
+        auxiliary_layout.addWidget(self._dedup_btn)
 
         self._narrative_btn = QPushButton("📝 Genera Profilo Narrativo")
         self._narrative_btn.setToolTip(
@@ -118,18 +165,13 @@ class ClinicalHistoryTab(QWidget):
         )
         self._narrative_btn.clicked.connect(self._on_generate_narrative)
         self._narrative_btn.setEnabled(False)
-        gen_layout.addWidget(self._narrative_btn)
-
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setVisible(False)
-        self._progress_bar.setMaximum(100)
-        gen_layout.addWidget(self._progress_bar, stretch=1)
+        auxiliary_layout.addWidget(self._narrative_btn)
+        auxiliary_layout.addStretch()
+        layout.addLayout(auxiliary_layout)
 
         self._status_label = QLabel("")
-        gen_layout.addWidget(self._status_label)
-        gen_layout.addStretch()
-
-        layout.addLayout(gen_layout)
+        self._status_label.setWordWrap(True)
+        layout.addWidget(self._status_label)
 
         # ---- Query bar --------------------------------------------------
         query_layout = QHBoxLayout()
@@ -187,7 +229,15 @@ class ClinicalHistoryTab(QWidget):
         # ---- Main content: splitter timeline | profile + answer --------
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left: Flat chronological list with context menu
+        # Left: registry and inspectable atomic evidence.  The latter is a
+        # deduplicated projection; every fused physical occurrence remains
+        # expandable below its canonical clinical fact.
+        self._clinical_data_tabs = QTabWidget()
+
+        registry_page = QWidget()
+        registry_layout = QVBoxLayout(registry_page)
+        registry_layout.setContentsMargins(0, 0, 0, 0)
+
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["Data", "Cat.", "Descrizione"])
         self._tree.setAlternatingRowColors(True)
@@ -198,7 +248,43 @@ class ClinicalHistoryTab(QWidget):
         self._tree.customContextMenuRequested.connect(
             self._on_tree_context_menu
         )
-        splitter.addWidget(self._tree)
+        registry_layout.addWidget(self._tree)
+        self._clinical_data_tabs.addTab(
+            registry_page, "Registro cronologico"
+        )
+
+        evidence_page = QWidget()
+        evidence_layout = QVBoxLayout(evidence_page)
+        evidence_layout.setContentsMargins(0, 0, 0, 0)
+        self._atomic_evidence_status = QLabel(
+            "Nessuna evidenza atomica disponibile."
+        )
+        self._atomic_evidence_status.setWordWrap(True)
+        self._atomic_evidence_status.setToolTip(
+            "La vista mostra un fatto clinico per riga. Le citazioni ripetute "
+            "vengono fuse senza perdere documento, pagina o testo sorgente."
+        )
+        evidence_layout.addWidget(self._atomic_evidence_status)
+
+        self._atomic_evidence_tree = QTreeWidget()
+        self._atomic_evidence_tree.setHeaderLabels([
+            "Data", "Categoria", "Evidenza", "Fonte"
+        ])
+        self._atomic_evidence_tree.setAlternatingRowColors(True)
+        self._atomic_evidence_tree.setRootIsDecorated(True)
+        self._atomic_evidence_tree.setUniformRowHeights(True)
+        self._atomic_evidence_tree.setColumnWidth(0, 105)
+        self._atomic_evidence_tree.setColumnWidth(1, 125)
+        self._atomic_evidence_tree.setColumnWidth(2, 380)
+        self._atomic_evidence_tree.setColumnWidth(3, 150)
+        evidence_layout.addWidget(self._atomic_evidence_tree)
+        self._evidence_page_index = self._clinical_data_tabs.addTab(
+            evidence_page, "Evidenze atomiche"
+        )
+        self._clinical_data_tabs.currentChanged.connect(
+            self._on_clinical_data_tab_changed
+        )
+        splitter.addWidget(self._clinical_data_tabs)
 
         # Right: Profile + Answer
         right_widget = QWidget()
@@ -315,10 +401,15 @@ class ClinicalHistoryTab(QWidget):
 
     def _running_operation_name(self) -> str | None:
         """Label of the operation currently running, if any."""
+        registry_label = {
+            "atomic": "l'estrazione delle evidenze atomiche",
+            "events": "la creazione degli eventi clinici",
+            "validation": "la preparazione della validazione",
+        }.get(self._active_registry_stage, "la pipeline del registro")
         running = (
             ("_irae_worker", "l'analisi irAE"),
             ("_query_worker", "l'interrogazione"),
-            ("_worker", "la generazione del registro"),
+            ("_worker", registry_label),
             ("_dedup_worker", "la deduplicazione"),
             ("_narrative_worker", "la generazione del profilo narrativo"),
         )
@@ -345,6 +436,15 @@ class ClinicalHistoryTab(QWidget):
         patient has no registry (silent no-ops are never acceptable)."""
         busy = self._worker_running()
         has_entries = bool(self._timeline_entries)
+        has_patient = bool(self._current_patient_id)
+        atomic_current = bool(self._pipeline_status.get("atomic_current"))
+        event_count = int(self._pipeline_status.get("event_count", 0) or 0)
+        events_current = bool(self._pipeline_status.get("events_current"))
+        self._gen_btn.setEnabled(has_patient and not busy)
+        self._events_btn.setEnabled(atomic_current and not busy)
+        self._validation_btn.setEnabled(
+            events_current and event_count > 0 and not busy
+        )
         self._irae_btn.setEnabled(has_entries and not busy)
         index = self._query_preset.findData("__IRAE_ANALYSIS__")
         if index >= 0:
@@ -361,20 +461,62 @@ class ClinicalHistoryTab(QWidget):
         signal, which fires only after the thread has stopped.
         """
         worker = getattr(self, attr, None)
+        if worker is not None and worker.isRunning():
+            # Defensive guard for unusual Qt event ordering during shutdown.
+            return
         setattr(self, attr, None)
         if worker is not None:
             worker.deleteLater()
         self._update_busy_ui()
 
-    def shutdown(self) -> None:
-        """Wait for running workers (application quit path)."""
+    # Use bound QObject slots, not lambdas capturing ``self``.  Qt can then
+    # disconnect them automatically if the tab is destroyed while a queued
+    # thread-completion event is still pending.
+    def _release_generation_worker(self) -> None:
+        self._release_worker("_worker")
+
+    def _release_dedup_worker(self) -> None:
+        self._release_worker("_dedup_worker")
+
+    def _release_narrative_worker(self) -> None:
+        self._release_worker("_narrative_worker")
+
+    def _release_query_worker(self) -> None:
+        self._release_worker("_query_worker")
+
+    def _release_irae_worker(self) -> None:
+        self._release_worker("_irae_worker")
+
+    def request_shutdown(self) -> None:
+        """Ask every clinical-history worker to stop at a safe boundary."""
+
         for attr in self._WORKER_ATTRS:
             worker = getattr(self, attr, None)
             if worker is not None and worker.isRunning():
                 cancel = getattr(worker, "cancel", None)
                 if callable(cancel):
                     cancel()
-                worker.wait(5000)
+                worker.requestInterruption()
+
+    def shutdown(self, wait_ms: int = 1500) -> int:
+        """Request shutdown and briefly wait; return workers still running."""
+
+        import time
+
+        self.request_shutdown()
+        deadline = time.monotonic() + max(0, int(wait_ms)) / 1000
+        for attr in self._WORKER_ATTRS:
+            worker = getattr(self, attr, None)
+            if worker is None or not worker.isRunning():
+                continue
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining:
+                worker.wait(remaining)
+        return sum(
+            1 for attr in self._WORKER_ATTRS
+            if getattr(self, attr, None) is not None
+            and getattr(self, attr).isRunning()
+        )
 
     # ------------------------------------------------------------------
     # Data loading
@@ -383,11 +525,20 @@ class ClinicalHistoryTab(QWidget):
     def _refresh(self):
         """Reload timeline entries and clinical profile from the database."""
         if not self._current_patient_id:
+            self._timeline_entries = []
+            self._pipeline_status = {}
+            self._atomic_evidence = []
+            self._atomic_view_dirty = False
             self._tree.clear()
+            self._atomic_evidence_tree.clear()
+            self._atomic_evidence_status.setText(
+                "Nessuna evidenza atomica disponibile."
+            )
             self._profile_text.clear()
             self._chat_messages = []
             self._chat_transient_error = ""
             self._render_chat()
+            self._update_busy_ui()
             return
 
         # Load timeline entries
@@ -409,7 +560,17 @@ class ClinicalHistoryTab(QWidget):
         else:
             self._clinical_profile = ""
 
+        builder = self._services.get("clinical_history_builder")
+        try:
+            self._pipeline_status = (
+                builder.registry_pipeline_status(self._current_patient_id)
+                if builder else {}
+            )
+        except Exception:
+            self._pipeline_status = {}
+
         self._build_tree()
+        self._refresh_atomic_evidence()
         self._profile_text.setMarkdown(
             self._clinical_profile
             or "*Nessun profilo narrativo generato. "
@@ -423,6 +584,7 @@ class ClinicalHistoryTab(QWidget):
         self._count_label.setText(
             f"{len(self._timeline_entries)} voci nel registro cronologico"
         )
+        self._render_pipeline_status()
 
         # Load the chat trace of THIS patient only — the single reload
         # funnel guarantees that switching patients never shows another
@@ -430,6 +592,194 @@ class ClinicalHistoryTab(QWidget):
         self._chat_messages = self._load_chat_messages()
         self._chat_transient_error = ""
         self._render_chat()
+
+    def _on_clinical_data_tab_changed(self, index: int) -> None:
+        """Materialize the live evidence projection only when it is visible."""
+        if index == self._evidence_page_index and self._atomic_view_dirty:
+            self._refresh_atomic_evidence()
+
+    def _schedule_atomic_evidence_refresh(self) -> None:
+        """Coalesce worker checkpoints into a cheap, thread-safe GUI refresh."""
+        self._atomic_view_dirty = True
+        if (
+            self._clinical_data_tabs.currentIndex()
+            != self._evidence_page_index
+        ):
+            return
+        if not self._live_evidence_timer.isActive():
+            self._live_evidence_timer.start()
+
+    def _refresh_atomic_evidence(self) -> None:
+        """Show the latest committed atomic facts and their fused sources.
+
+        The source table intentionally remains immutable.  Deduplication is a
+        lossless projection: one canonical row represents the clinical fact,
+        while every copied/repeated citation is retained as an expandable child.
+        """
+        self._live_evidence_timer.stop()
+        patient_id = self._current_patient_id
+        evidence_repo = self._services.get("evidence_repo")
+        if not patient_id or evidence_repo is None:
+            self._atomic_evidence = []
+            self._atomic_evidence_tree.clear()
+            self._atomic_evidence_status.setText(
+                "Nessuna evidenza atomica disponibile."
+            )
+            self._atomic_view_dirty = False
+            return
+
+        try:
+            stored = evidence_repo.get_by_patient(patient_id)
+            unique = deduplicate_atomic_evidence(stored)
+        except Exception as exc:
+            # A live refresh is informative, never a reason to abort the
+            # extraction.  A later checkpoint/manual refresh retries the read.
+            self._atomic_evidence_status.setText(
+                f"Aggiornamento evidenze in attesa: {exc}"
+            )
+            self._atomic_view_dirty = True
+            return
+
+        self._atomic_evidence = unique
+        self._atomic_evidence_tree.setUpdatesEnabled(False)
+        try:
+            self._atomic_evidence_tree.clear()
+            for evidence in sorted(
+                unique,
+                key=lambda item: (
+                    item.observed_date or item.document_date or "",
+                    item.document_id,
+                    item.evidence_id,
+                ),
+                reverse=True,
+            ):
+                self._add_atomic_evidence_item(evidence)
+        finally:
+            self._atomic_evidence_tree.setUpdatesEnabled(True)
+
+        fused = max(0, len(stored) - len(unique))
+        running = (
+            self._active_registry_stage == "atomic"
+            and self._worker is not None
+            and self._worker.isRunning()
+        )
+        live_mark = " · aggiornamento automatico attivo" if running else ""
+        self._atomic_evidence_status.setText(
+            f"{len(unique)} fatti clinici unici da {len(stored)} evidenze "
+            f"salvate · {fused} occorrenze duplicate fuse{live_mark}. "
+            "Espandi una riga per ispezionare tutte le fonti."
+        )
+        self._clinical_data_tabs.setTabText(
+            self._evidence_page_index,
+            f"Evidenze atomiche ({len(unique)})",
+        )
+        self._atomic_view_dirty = False
+
+    def _add_atomic_evidence_item(self, evidence) -> None:
+        date_text = evidence.observed_date or evidence.document_date or "data n.d."
+        category = CATEGORY_LABELS.get(
+            evidence.category, evidence.category or "altro"
+        )
+        entity = (
+            evidence.canonical_label
+            or evidence.normalized_entity
+            or evidence.concept_original
+            or "Evidenza clinica"
+        )
+        qualifiers = []
+        value = evidence.value_text
+        if not value and evidence.numeric_value is not None:
+            value = f"{evidence.numeric_value:g}"
+            if evidence.unit:
+                value += f" {evidence.unit}"
+        if value:
+            qualifiers.append(str(value))
+        if evidence.severity:
+            qualifiers.append(f"gravità: {evidence.severity}")
+        if evidence.assertion and evidence.assertion != "present":
+            qualifiers.append(f"asserzione: {evidence.assertion}")
+        if evidence.certainty and evidence.certainty != "confirmed":
+            qualifiers.append(f"certezza: {evidence.certainty}")
+        description = str(entity)
+        if qualifiers:
+            description += " — " + "; ".join(qualifiers)
+
+        occurrences = list(
+            (evidence.data or {}).get("source_occurrences") or []
+        )
+        if not occurrences:
+            occurrences = [{
+                "evidence_id": evidence.evidence_id,
+                "document_id": evidence.document_id,
+                "document_date": evidence.document_date,
+                "observed_date": evidence.observed_date,
+                "source_page": evidence.source_page,
+                "source_text": evidence.source_text,
+            }]
+        source_label = self._atomic_source_label(occurrences[0])
+        if len(occurrences) > 1:
+            source_label = f"{len(occurrences)} fonti fuse"
+
+        item = QTreeWidgetItem([
+            date_text, str(category), description, source_label,
+        ])
+        item.setData(0, Qt.UserRole, evidence.evidence_id)
+        item.setToolTip(2, evidence.source_text or description)
+        item.setToolTip(
+            3,
+            "\n".join(self._atomic_source_label(row) for row in occurrences),
+        )
+        if evidence.assertion == "absent":
+            for column in range(4):
+                item.setForeground(column, Qt.gray)
+        elif evidence.confidence < 0.6 or evidence.certainty in {
+            "suspected", "uncertain"
+        }:
+            for column in range(4):
+                item.setForeground(column, Qt.darkYellow)
+
+        if len(occurrences) > 1:
+            for occurrence in occurrences:
+                source_text = occurrence.get("source_text") or "(testo non disponibile)"
+                child = QTreeWidgetItem([
+                    occurrence.get("observed_date")
+                    or occurrence.get("document_date")
+                    or "data n.d.",
+                    "Fonte fusa",
+                    source_text,
+                    self._atomic_source_label(occurrence),
+                ])
+                child.setData(
+                    0, Qt.UserRole, occurrence.get("evidence_id")
+                )
+                child.setToolTip(2, source_text)
+                item.addChild(child)
+        self._atomic_evidence_tree.addTopLevelItem(item)
+
+    @staticmethod
+    def _atomic_source_label(source: dict) -> str:
+        label = f"doc {source.get('document_id') or '?'}"
+        if source.get("source_page") is not None:
+            label += f", p. {source['source_page']}"
+        return label
+
+    def _render_pipeline_status(self) -> None:
+        status = self._pipeline_status
+        if not status:
+            return
+        atomic_total = int(status.get("atomic_documents_total", 0) or 0)
+        atomic_done = int(status.get("atomic_documents_current", 0) or 0)
+        evidence_count = int(status.get("atomic_evidence_count", 0) or 0)
+        event_count = int(status.get("event_count", 0) or 0)
+        atomic_mark = "✓" if status.get("atomic_current") else "○"
+        event_mark = "✓" if status.get("events_current") else "○"
+        validation_mark = "✓" if status.get("validation_current") else "○"
+        pending = int(status.get("validation_pending", 0) or 0)
+        self._status_label.setText(
+            f"{atomic_mark} Evidenze {atomic_done}/{atomic_total} documenti "
+            f"({evidence_count} fatti) · {event_mark} Eventi {event_count} · "
+            f"{validation_mark} Validazione ({pending} da revisionare)"
+        )
 
     # ------------------------------------------------------------------
     # Tree building — flat chronological list
@@ -440,7 +790,7 @@ class ClinicalHistoryTab(QWidget):
         if not self._timeline_entries:
             self._tree.addTopLevelItem(
                 QTreeWidgetItem([
-                    "Nessuna voce — clicca 'Genera Registro Cronologico'",
+                    "Nessuna voce — completa le fasi 1 e 2 del registro",
                     "", "",
                 ])
             )
@@ -928,11 +1278,9 @@ class ClinicalHistoryTab(QWidget):
         self._dedup_worker = DedupWorker(
             builder, self._current_patient_id
         )
-        self._dedup_worker.finished.connect(self._on_dedup_finished)
+        self._dedup_worker.result_ready.connect(self._on_dedup_finished)
         self._dedup_worker.error.connect(self._on_dedup_error)
-        self._dedup_worker.finished.connect(
-            lambda _result, attr="_dedup_worker": self._release_worker(attr)
-        )
+        self._dedup_worker.finished.connect(self._release_dedup_worker)
         self._dedup_btn.setEnabled(False)
         self._dedup_btn.setText("⏳ Deduplica in corso...")
         self._dedup_worker.start()
@@ -988,6 +1336,15 @@ class ClinicalHistoryTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_generate(self):
+        self._start_registry_stage("atomic")
+
+    def _on_build_events(self):
+        self._start_registry_stage("events")
+
+    def _on_prepare_validation(self):
+        self._start_registry_stage("validation")
+
+    def _start_registry_stage(self, stage: str) -> None:
         if self._guard_busy():
             return
         if not self._current_patient_id:
@@ -997,17 +1354,44 @@ class ClinicalHistoryTab(QWidget):
             )
             return
 
-        atomic_llm = self._services.get("atomic_evidence_llm_client")
-        event_llm = self._services.get("clinical_events_llm_client")
-        if (
-            not atomic_llm or not atomic_llm.is_available
-            or not event_llm or not event_llm.is_available
-        ):
+        role = {
+            "atomic": "atomic_evidence",
+            "events": "clinical_events",
+        }.get(stage)
+        client_key = {
+            "atomic": "atomic_evidence_llm_client",
+            "events": "clinical_events_llm_client",
+        }.get(stage)
+        llm = self._services.get(client_key) if client_key else None
+        if role and (not llm or not llm.is_available):
             QMessageBox.warning(
                 self, "LLM non disponibile",
-                "I modelli per le evidenze atomiche e gli eventi clinici "
-                "devono essere entrambi disponibili. Configurali in "
-                "Strumenti → Configura LLM."
+                f"Il modello per la fase “{role.replace('_', ' ')}” non è "
+                "disponibile. Configuralo in Strumenti → Configura LLM."
+            )
+            return
+
+        if stage == "events" and not self._pipeline_status.get(
+            "atomic_current"
+        ):
+            pending = int(
+                self._pipeline_status.get("atomic_documents_pending", 0) or 0
+            )
+            QMessageBox.information(
+                self, "Evidenze atomiche non aggiornate",
+                "La fase 2 non esegue implicitamente la fase 1. "
+                f"Restano {pending} documenti da elaborare o aggiornare. "
+                "Esegui prima “1 · Estrai evidenze”.",
+            )
+            return
+        if stage == "validation" and (
+            not int(self._pipeline_status.get("event_count", 0) or 0)
+            or not self._pipeline_status.get("events_current")
+        ):
+            QMessageBox.information(
+                self, "Eventi non disponibili",
+                "Gli eventi sono assenti o non aggiornati rispetto alle "
+                "evidenze correnti. Esegui prima “2 · Crea eventi clinici”.",
             )
             return
 
@@ -1021,49 +1405,59 @@ class ClinicalHistoryTab(QWidget):
 
         from .workers import ClinicalHistoryWorker
 
-        # Atomic extraction fans out by document.  Event fusion reads its own
-        # independent slot count directly inside ClinicalRegistryBuilder.
         num_workers = 1
         llm_configs = self._services.get("llm_configs")
-        if llm_configs:
-            atomic_config = llm_configs.get("atomic_evidence")
-            if atomic_config:
+        if llm_configs and role:
+            stage_config = llm_configs.get(role)
+            if stage_config:
                 num_workers = getattr(
-                    atomic_config, "parallel_workers", 1
+                    stage_config, "parallel_workers", 1
                 )
 
         self._worker = ClinicalHistoryWorker(
             builder, self._current_patient_id,
             generate_narrative=False,
             num_workers=num_workers,
+            stage=stage,
         )
+        self._active_registry_stage = stage
         self._worker.progress.connect(self._on_generation_progress)
-        self._worker.finished.connect(self._on_generation_finished)
+        self._worker.result_ready.connect(self._on_generation_finished)
         self._worker.cancelled.connect(self._on_generation_cancelled)
         self._worker.error.connect(self._on_generation_error)
-        self._worker.finished.connect(
-            lambda _result, attr="_worker": self._release_worker(attr)
-        )
-        self._worker.cancelled.connect(
-            lambda attr="_worker": self._release_worker(attr)
-        )
-        self._worker.error.connect(
-            lambda _error, attr="_worker": self._release_worker(attr)
-        )
-        self._gen_btn.setEnabled(False)
+        self._worker.finished.connect(self._release_generation_worker)
         self._cancel_generation_btn.setVisible(True)
         self._cancel_generation_btn.setEnabled(True)
         self._narrative_btn.setEnabled(False)
         self._dedup_btn.setEnabled(False)
         self._progress_bar.setVisible(True)
         self._progress_bar.setValue(0)
-        self._status_label.setText("Estrazione osservazioni cliniche...")
+        if stage == "atomic":
+            # Put the live result in front of the user as soon as phase 1
+            # starts; switching back to the registry stops redraw work while
+            # extraction continues normally in the background.
+            self._clinical_data_tabs.setCurrentIndex(
+                self._evidence_page_index
+            )
+            self._schedule_atomic_evidence_refresh()
+        elif stage == "events":
+            self._clinical_data_tabs.setCurrentIndex(0)
+        self._status_label.setText({
+            "atomic": "Fase 1: estrazione delle evidenze atomiche...",
+            "events": "Fase 2: costruzione degli eventi clinici...",
+            "validation": "Fase 3: preparazione della validazione...",
+        }[stage])
         self._worker.start()
         self._update_busy_ui()
 
     def _on_generation_progress(self, percent: int, message: str):
         self._progress_bar.setValue(percent)
         self._status_label.setText(message)
+        if self._active_registry_stage == "atomic":
+            # RegistryBuilder emits progress only after each document-level
+            # replacement has committed, so the GUI never displays an
+            # incomplete or unvalidated LLM response.
+            self._schedule_atomic_evidence_refresh()
 
     def _on_cancel_generation(self):
         worker = self._worker
@@ -1080,9 +1474,64 @@ class ClinicalHistoryTab(QWidget):
         self._progress_bar.setVisible(False)
         self._cancel_generation_btn.setVisible(False)
         self._cancel_generation_btn.setText("⏹ Interrompi")
-        self._gen_btn.setEnabled(True)
-        self._narrative_btn.setEnabled(True)
-        self._dedup_btn.setEnabled(True)
+        stage = result.get("stage") or self._active_registry_stage or "full"
+        self._active_registry_stage = None
+
+        if stage == "atomic":
+            total = int(result.get("total_entries", 0) or 0)
+            processed = int(result.get("documents_processed", 0) or 0)
+            skipped = int(result.get("documents_skipped", 0) or 0)
+            failed = int(result.get("documents_failed", 0) or 0)
+            elapsed = result.get("elapsed_seconds")
+            released = int(
+                result.get("inactive_runtimes_released", 0) or 0
+            )
+            throughput = float(
+                result.get("completion_tokens_per_wall_second", 0.0) or 0.0
+            )
+            message = (
+                "Fase 1 completata senza creare eventi clinici:\n\n"
+                f"• {processed} documenti elaborati\n"
+                f"• {skipped} documenti già aggiornati e riutilizzati\n"
+                f"• {total} evidenze atomiche disponibili\n"
+                f"• {result.get('llm_calls', 0)} chiamate LLM"
+            )
+            if elapsed is not None:
+                message += f"\n• tempo: {elapsed:.0f} secondi"
+            if throughput > 0:
+                message += (
+                    f"\n• throughput effettivo: {throughput:.1f} "
+                    "token di risposta/s"
+                )
+            if released:
+                message += (
+                    f"\n• {released} runtime LLM inattivi liberati "
+                    "prima dell'estrazione"
+                )
+            if failed:
+                message += (
+                    f"\n\n⚠ {failed} documenti non completati. La fase 2 "
+                    "rimarrà disabilitata finché la fase 1 non sarà aggiornata."
+                )
+            else:
+                message += (
+                    "\n\nOra puoi eseguire “2 · Crea eventi clinici” usando "
+                    "il modello configurato specificamente per quella fase."
+                )
+            self._refresh()
+            QMessageBox.information(self, "Evidenze atomiche", message)
+            return
+
+        if stage == "validation":
+            pending = int(result.get("validation_pending", 0) or 0)
+            self._refresh()
+            self.validation_requested.emit()
+            QMessageBox.information(
+                self, "Validazione preparata",
+                f"La coda di revisione è stata aggiornata: {pending} elementi "
+                "richiedono una decisione umana.",
+            )
+            return
 
         total = result.get('total_entries', 0)
         dedup = result.get('deduplicated', 0)
@@ -1119,7 +1568,18 @@ class ClinicalHistoryTab(QWidget):
             status_text += f" in {elapsed:.0f}s"
         self._status_label.setText(status_text)
 
-        if incremental and skipped:
+        if stage == "events":
+            msg = (
+                "Fase 2 completata usando esclusivamente le evidenze "
+                "atomiche già salvate:\n\n"
+                f"• {total} evidenze disponibili\n"
+                f"• {dedup} duplicati/fusioni applicati\n"
+                f"• {final} eventi clinici nel registro\n"
+                f"• {relation_calls} batch LLM per le relazioni\n\n"
+                "Nessun documento è stato riletto e la fase di validazione "
+                "non è stata avviata. Usa “3 · Prepara validazione”."
+            )
+        elif incremental and skipped:
             msg = (
                 f"Registro aggiornato incrementalmente:\n\n"
                 f"• {skipped} documenti già presenti (saltati)\n"
@@ -1176,18 +1636,22 @@ class ClinicalHistoryTab(QWidget):
         self._progress_bar.setVisible(False)
         self._cancel_generation_btn.setVisible(False)
         self._cancel_generation_btn.setText("⏹ Interrompi")
-        self._gen_btn.setEnabled(True)
+        stage = self._active_registry_stage
+        self._active_registry_stage = None
+        self._schedule_atomic_evidence_refresh()
+        self._update_busy_ui()
         self._status_label.setText(f"Errore: {error}")
         QMessageBox.critical(
-            self, "Errore Generazione",
-            f"Errore durante la generazione del registro:\n\n{error}"
+            self, "Errore pipeline clinica",
+            f"Errore durante la fase {stage or 'corrente'}:\n\n{error}"
         )
 
     def _on_generation_cancelled(self):
         self._progress_bar.setVisible(False)
         self._cancel_generation_btn.setVisible(False)
         self._cancel_generation_btn.setText("⏹ Interrompi")
-        self._gen_btn.setEnabled(True)
+        self._active_registry_stage = None
+        self._schedule_atomic_evidence_refresh()
         self._status_label.setText(
             "Interrotto in sicurezza; i documenti completati sono salvati."
         )
@@ -1244,12 +1708,12 @@ class ClinicalHistoryTab(QWidget):
         self._narrative_worker = NarrativeWorker(
             builder, self._current_patient_id
         )
-        self._narrative_worker.finished.connect(self._on_narrative_finished)
+        self._narrative_worker.result_ready.connect(
+            self._on_narrative_finished
+        )
         self._narrative_worker.error.connect(self._on_narrative_error)
         self._narrative_worker.finished.connect(
-            lambda _result, attr="_narrative_worker": (
-                self._release_worker(attr)
-            )
+            self._release_narrative_worker
         )
         self._narrative_btn.setEnabled(False)
         self._narrative_btn.setText("⏳ Generazione in corso...")
@@ -1356,11 +1820,9 @@ class ClinicalHistoryTab(QWidget):
             registry_repo=self._services.get("registry_repo"),
             patient_id=patient_id,
         )
-        self._query_worker.finished.connect(self._on_query_result)
+        self._query_worker.result_ready.connect(self._on_query_result)
         self._query_worker.error.connect(self._on_query_error)
-        self._query_worker.finished.connect(
-            lambda _result, attr="_query_worker": self._release_worker(attr)
-        )
+        self._query_worker.finished.connect(self._release_query_worker)
         self._query_btn.setEnabled(False)
         self._query_btn.setText("⏳ Interrogazione in corso...")
         self._query_worker.start()
@@ -1451,11 +1913,9 @@ class ClinicalHistoryTab(QWidget):
 
         self._irae_worker = IraeAnalysisWorker(llm, prompts)
         self._irae_worker.progress.connect(self._on_irae_progress)
-        self._irae_worker.finished.connect(self._on_irae_finished)
+        self._irae_worker.result_ready.connect(self._on_irae_finished)
         self._irae_worker.error.connect(self._on_irae_error)
-        self._irae_worker.finished.connect(
-            lambda _result, attr="_irae_worker": self._release_worker(attr)
-        )
+        self._irae_worker.finished.connect(self._release_irae_worker)
         self._irae_btn.setEnabled(False)
         self._progress_bar.setVisible(True)
         self._progress_bar.setMaximum(len(prompts))

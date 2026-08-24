@@ -13,7 +13,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 class _ImportWorker(QThread):
     """Import selected patients in a background thread."""
     progress = pyqtSignal(int, str)
-    finished = pyqtSignal(dict)
+    result_ready = pyqtSignal(dict)
     error = pyqtSignal(str)
 
     def __init__(self, source_path, patient_ids):
@@ -29,7 +29,7 @@ class _ImportWorker(QThread):
                 self.source_path, self.patient_ids,
                 progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
             )
-            self.finished.emit(result)
+            self.result_ready.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -180,7 +180,7 @@ class ImportPatientDialog(QDialog):
         self._worker.progress.connect(
             lambda pct, msg: (self._progress.setValue(pct),)
         )
-        self._worker.finished.connect(self._on_finished)
+        self._worker.result_ready.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 

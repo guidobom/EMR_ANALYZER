@@ -102,6 +102,12 @@ class LlmClient:
     def keep_alive(self) -> str:
         return f"{self.keep_alive_minutes}m"
 
+    def retain_only_this_runtime(self) -> int:
+        """Unload app-owned models from inactive pipeline stages."""
+        from ..llm_backend import retain_only_runtime
+
+        return retain_only_runtime(self.backend, self)
+
     @classmethod
     def list_available_models(
         cls,

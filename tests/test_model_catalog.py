@@ -172,5 +172,17 @@ def test_visual_catalog_filters_and_prefills_one_click_install():
             "model_count": len(remote_snapshot.models),
         })
     assert "cache locale v2" in dialog._catalog_header.text()
+
+    with patch.object(QMessageBox, "information") as information:
+        dialog._on_catalog_updated({
+            "catalog_version": 1,
+            "review_date": "2026-08-21",
+            "model_count": len(MODEL_CATALOG),
+            "updated": False,
+            "notice": "Catalogo remoto privato; catalogo integrato attivo.",
+        })
+    assert dialog._progress.text() == "Catalogo locale attivo"
+    assert "Catalogo integrato v1 attivo" in dialog._status.text()
+    information.assert_called_once()
     dialog.deleteLater()
     app.processEvents()

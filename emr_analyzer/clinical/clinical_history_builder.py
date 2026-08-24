@@ -44,6 +44,62 @@ class ClinicalHistoryBuilder:
     # Public API
     # ------------------------------------------------------------------
 
+    def extract_atomic_evidence(
+        self,
+        patient_id: str,
+        *,
+        incremental: bool = True,
+        num_workers: int = 1,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> dict:
+        """Run phase 1 without creating or modifying clinical events."""
+
+        if self._registry_builder is None:
+            raise RuntimeError(
+                "La pipeline evidence-based non è disponibile."
+            )
+        return self._registry_builder.extract_atomic_evidence(
+            patient_id,
+            incremental=incremental,
+            num_workers=num_workers,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def build_structured_events(
+        self,
+        patient_id: str,
+        *,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> dict:
+        """Run phase 2 from stored atomic evidence only."""
+
+        if self._registry_builder is None:
+            raise RuntimeError(
+                "La pipeline evidence-based non è disponibile."
+            )
+        return self._registry_builder.build_structured_events(
+            patient_id,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def prepare_validation(self, patient_id: str) -> dict:
+        """Run phase 3: prepare the independent human-review queue."""
+
+        if self._registry_builder is None:
+            raise RuntimeError(
+                "La pipeline evidence-based non è disponibile."
+            )
+        return self._registry_builder.prepare_validation(patient_id)
+
+    def registry_pipeline_status(self, patient_id: str) -> dict:
+        if self._registry_builder is None or not patient_id:
+            return {}
+        return self._registry_builder.pipeline_status(patient_id)
+
     def build_from_documents(
         self,
         patient_id: str,
@@ -739,8 +795,8 @@ OSSERVAZIONI CLINICHE:
         """
         if self._registry_builder is not None:
             before = self._timeline_repo.count_by_patient(patient_id)
-            result = self._registry_builder.build(
-                patient_id, incremental=True, num_workers=1
+            result = self._registry_builder.build_structured_events(
+                patient_id
             )
             return max(0, before - int(result.get("final_entries", before)))
 

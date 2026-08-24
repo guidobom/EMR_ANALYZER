@@ -66,6 +66,9 @@ class RegistryQueueDialog(QDialog):
 
     INCREMENTAL = "incremental"
     REBUILD = "rebuild"
+    ATOMIC = "atomic"
+    EVENTS = "events"
+    VALIDATION = "validation"
 
     def __init__(self, summaries: list[dict], parent=None):
         super().__init__(parent)
@@ -86,6 +89,22 @@ class RegistryQueueDialog(QDialog):
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
+
+        phase_row = QHBoxLayout()
+        phase_row.addWidget(QLabel("Fase indipendente:"))
+        self._phase = QComboBox()
+        self._phase.addItem(
+            "1 · Estrai/aggiorna evidenze atomiche", self.ATOMIC
+        )
+        self._phase.addItem(
+            "2 · Crea eventi clinici dalle evidenze", self.EVENTS
+        )
+        self._phase.addItem(
+            "3 · Prepara le code di validazione", self.VALIDATION
+        )
+        self._phase.currentIndexChanged.connect(self._on_phase_changed)
+        phase_row.addWidget(self._phase, stretch=1)
+        layout.addLayout(phase_row)
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Modalità:"))
@@ -198,16 +217,42 @@ class RegistryQueueDialog(QDialog):
 
     def _update_run_button(self) -> None:
         rebuild = self.force_rebuild()
-        verb = "Rigenera" if rebuild else "Avvia coda"
+        stage = self.selected_stage()
+        verb = {
+            self.ATOMIC: "Rigenera evidenze" if rebuild else "Estrai evidenze",
+            self.EVENTS: "Crea eventi",
+            self.VALIDATION: "Prepara validazione",
+        }[stage]
         self._run_btn.setText(f"📋 {verb} ({len(self._selected)})")
         self._run_btn.setEnabled(bool(self._selected))
         self._warning.setText(
             "La rigenerazione integrale ignora i manifest correnti e può "
             "richiedere molte ore."
             if rebuild else
-            "I registri già aggiornati vengono verificati senza ripetere "
-            "le chiamate LLM."
+            {
+                self.ATOMIC: (
+                    "I documenti con evidenze correnti vengono saltati; non "
+                    "saranno creati eventi clinici."
+                ),
+                self.EVENTS: (
+                    "Usa soltanto evidenze atomiche già aggiornate e non "
+                    "rilegge i documenti."
+                ),
+                self.VALIDATION: (
+                    "Aggiorna deterministicamente la coda per la revisione "
+                    "umana; non esegue alcun LLM."
+                ),
+            }[stage]
         )
+
+    def _on_phase_changed(self) -> None:
+        atomic = self.selected_stage() == self.ATOMIC
+        self._mode.setEnabled(atomic)
+        if not atomic:
+            self._mode.setCurrentIndex(
+                self._mode.findData(self.INCREMENTAL)
+            )
+        self._update_run_button()
 
     def selected_patient_ids(self) -> list[str]:
         """Selected eligible IDs in their displayed order."""
@@ -217,4 +262,10 @@ class RegistryQueueDialog(QDialog):
         ]
 
     def force_rebuild(self) -> bool:
-        return self._mode.currentData() == self.REBUILD
+        return (
+            self.selected_stage() == self.ATOMIC
+            and self._mode.currentData() == self.REBUILD
+        )
+
+    def selected_stage(self) -> str:
+        return str(self._phase.currentData() or self.ATOMIC)

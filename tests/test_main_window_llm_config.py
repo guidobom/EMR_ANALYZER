@@ -47,12 +47,13 @@ def test_each_live_client_is_propagated_only_to_its_pipeline_stage():
 
 def test_registry_builder_keeps_atomic_and_event_models_independent():
     atomic_backend = SimpleNamespace(stop_config=Mock())
+    event_backend = SimpleNamespace(stop_config=Mock())
     atomic = SimpleNamespace(
         model="atomic-model", backend=atomic_backend,
         runtime_identity=lambda: ("atomic.gguf", 32768, 4),
     )
     events = SimpleNamespace(
-        model="event-model",
+        model="event-model", backend=event_backend,
         runtime_identity=lambda: ("events.gguf", 65536, 2),
     )
     builder = ClinicalRegistryBuilder(
@@ -73,8 +74,38 @@ def test_registry_builder_keeps_atomic_and_event_models_independent():
     assert builder.llm is events
 
     builder._release_atomic_runtime_before_events(enabled=True)
+    builder._release_event_runtime_before_atomic()
 
     atomic_backend.stop_config.assert_called_once_with(atomic)
+    event_backend.stop_config.assert_called_once_with(events)
+
+
+def test_registry_stages_reserve_memory_from_every_inactive_runtime():
+    atomic = SimpleNamespace(
+        model="atomic-model",
+        retain_only_this_runtime=Mock(return_value=2),
+    )
+    events = SimpleNamespace(
+        model="event-model",
+        retain_only_this_runtime=Mock(return_value=1),
+    )
+    builder = ClinicalRegistryBuilder(
+        registry_repo=None,
+        evidence_repo=None,
+        processing_repo=None,
+        timeline_repo=None,
+        document_repo=None,
+        lab_repo=None,
+        overlay_repo=None,
+        atomic_llm_client=atomic,
+        event_llm_client=events,
+        db=object(),
+    )
+
+    assert builder._release_event_runtime_before_atomic() == 2
+    assert builder._release_atomic_runtime_before_events(enabled=True) == 1
+    atomic.retain_only_this_runtime.assert_called_once_with()
+    events.retain_only_this_runtime.assert_called_once_with()
 
 
 def test_apply_stops_only_obsolete_physical_runtime_shapes():
@@ -175,15 +206,71 @@ def test_request_only_changes_keep_shared_runtime_loaded():
     unload.assert_not_called()
 
 
-def test_close_is_refused_while_an_llm_operation_is_running():
+def test_close_can_be_cancelled_while_an_operation_is_running():
     event = SimpleNamespace(ignore=Mock(), accept=Mock())
     window = SimpleNamespace(
         workspace_tabs=SimpleNamespace(llm_operation_running=lambda: True),
         _services={},
     )
-    with patch("emr_analyzer.gui.main_window.QMessageBox.warning") as warning:
+    with (
+        patch(
+            "emr_analyzer.gui.main_window.QMessageBox.question",
+            return_value=0x00010000,  # QMessageBox.No
+        ) as question,
+        patch(
+            "emr_analyzer.gui.application_shutdown.running_qthreads",
+            return_value=[],
+        ),
+    ):
         MainWindow.closeEvent(window, event)
 
-    warning.assert_called_once()
+    question.assert_called_once()
     event.ignore.assert_called_once()
     event.accept.assert_not_called()
+
+
+def test_confirmed_close_stops_work_and_arms_emergency_exit():
+    event = SimpleNamespace(ignore=Mock(), accept=Mock())
+    workspace = SimpleNamespace(
+        llm_operation_running=lambda: True,
+        request_shutdown=Mock(),
+        shutdown=Mock(return_value=1),
+    )
+    database = SimpleNamespace(close=Mock())
+    window = SimpleNamespace(
+        workspace_tabs=workspace,
+        _services={"db": database},
+        hide=Mock(),
+    )
+    with (
+        patch(
+            "emr_analyzer.gui.main_window.QMessageBox.question",
+            return_value=0x00004000,  # QMessageBox.Yes
+        ),
+        patch(
+            "emr_analyzer.gui.application_shutdown.running_qthreads",
+            return_value=[],
+        ),
+        patch(
+            "emr_analyzer.gui.application_shutdown.mark_shutdown_requested"
+        ) as mark_shutdown,
+        patch(
+            "emr_analyzer.gui.application_shutdown.request_qthread_shutdown"
+        ) as stop_threads,
+        patch(
+            "emr_analyzer.gui.application_shutdown.schedule_emergency_exit"
+        ) as emergency_exit,
+        patch("emr_analyzer.llm_backend.shutdown_all_backends") as stop_llms,
+    ):
+        MainWindow.closeEvent(window, event)
+
+    event.accept.assert_called_once()
+    event.ignore.assert_not_called()
+    window.hide.assert_called_once()
+    mark_shutdown.assert_called_once()
+    emergency_exit.assert_called_once_with(delay_seconds=5.0)
+    workspace.request_shutdown.assert_called_once()
+    stop_threads.assert_called_once_with([])
+    stop_llms.assert_called_once()
+    workspace.shutdown.assert_called_once_with(wait_ms=1000)
+    database.close.assert_called_once()

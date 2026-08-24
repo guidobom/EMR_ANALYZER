@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from emr_analyzer.llm_backend import model_store
+from emr_analyzer.llm_backend.backend import LlamaBackend
 from emr_analyzer.llm_backend.server_manager import (
     BackendError,
     ServerKey,
@@ -287,6 +288,31 @@ class TestServerManager(unittest.TestCase):
         other = ServerKey(str(self._model_path), 65536, 4)
         self.manager.ensure(other, load_timeout=5)
         self.assertEqual(self.fake_popen.call_count, 2)
+
+    def test_backend_can_reserve_memory_for_one_pipeline_runtime(self):
+        retained = self.key
+        obsolete_model = ServerKey(
+            str(self._model_path) + ".other", 65536, 2
+        )
+        obsolete_shape = ServerKey(
+            str(self._model_path), 131072, 3
+        )
+        manager = mock.Mock()
+        manager.running_keys.return_value = [
+            obsolete_model, retained, obsolete_shape,
+        ]
+        manager.stop.return_value = True
+        backend = LlamaBackend(manager=manager)
+        backend.key_for = mock.Mock(return_value=retained)
+
+        stopped = backend.stop_other_runtimes(mock.Mock())
+
+        self.assertEqual(stopped, 2)
+        self.assertEqual(
+            manager.stop.call_args_list,
+            [mock.call(obsolete_model), mock.call(obsolete_shape)],
+        )
+        backend.shutdown()
 
     def test_second_server_skips_port_owned_by_first(self):
         self._patch_spawn_and_health()

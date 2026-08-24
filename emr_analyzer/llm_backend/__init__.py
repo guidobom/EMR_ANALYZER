@@ -41,6 +41,31 @@ def shutdown_all_backends() -> None:
     if backend is not None:
         backend.shutdown()
 
+
+def retain_only_runtime(active_backend, config) -> int:
+    """Reserve local accelerator memory for one pipeline runtime.
+
+    The application serializes the document, atomic, event and analysis
+    pipelines.  It is therefore safe and preferable to unload app-owned
+    runtimes belonging to inactive stages before a new stage starts.  The
+    exact active runtime remains warm when it is already loaded.
+    """
+    stopped = 0
+    llama_backend = _get_llama_backend()
+    if active_backend is llama_backend:
+        stopped += llama_backend.stop_other_runtimes(config)
+    else:
+        stopped += llama_backend.stop_all()
+
+    with _vllm_lock:
+        vllm_backend = _vllm_backend
+    if vllm_backend is not None:
+        if active_backend is vllm_backend:
+            stopped += vllm_backend.stop_other_runtimes(config)
+        else:
+            stopped += vllm_backend.stop_all()
+    return stopped
+
 __all__ = [
     "BackendError",
     "LlamaBackend",
@@ -51,5 +76,6 @@ __all__ = [
     "VllmServerManager",
     "get_backend",
     "list_cached_vllm_models",
+    "retain_only_runtime",
     "shutdown_all_backends",
 ]

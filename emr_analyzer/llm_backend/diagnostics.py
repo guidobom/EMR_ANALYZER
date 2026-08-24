@@ -77,7 +77,10 @@ def diagnose_llama_acceleration(
 
     try:
         completed = subprocess.run(
-            [resolved, "--list-devices"],
+            # Dynamic Homebrew backends are only named in verbose output.
+            # Without ``-v`` a loaded-but-unusable Metal/CUDA plugin is
+            # indistinguishable from a binary compiled without that backend.
+            [resolved, "-v", "--list-devices"],
             capture_output=True,
             text=True,
             timeout=max(1.0, float(timeout)),
@@ -161,8 +164,9 @@ def diagnose_llama_acceleration(
     if expected in {"CUDA", "METAL"}:
         if expected in compiled:
             summary = (
-                f"Supporto {expected} compilato, ma nessun dispositivo "
-                "utilizzabile dal processo llama-server."
+                f"Il backend {expected} è presente, ma non espone alcun "
+                "dispositivo utilizzabile a llama-server; l'inferenza "
+                "ricadrebbe sulla CPU."
             )
             status = "backend_unavailable"
         else:
@@ -340,6 +344,30 @@ def diagnose_vllm_acceleration(
 def diagnose_local_acceleration() -> AccelerationDiagnostic:
     """Combine non-invasive llama.cpp and vLLM diagnostics for the GUI."""
     llama = diagnose_llama_acceleration()
+
+    # vLLM is not a macOS backend.  Reporting its expected absence beside a
+    # useful llama.cpp result makes a healthy Metal installation look partly
+    # broken and makes a Metal failure unnecessarily noisy.
+    if llama.system.casefold() == "darwin":
+        return AccelerationDiagnostic(
+            status=llama.status,
+            expected_backend=llama.expected_backend,
+            runtime_backend=llama.runtime_backend,
+            compiled_backends=llama.compiled_backends,
+            devices=llama.devices,
+            binary_path=llama.binary_path,
+            system=llama.system,
+            machine=llama.machine,
+            gpu_name=llama.gpu_name,
+            summary=f"llama.cpp: {llama.summary}",
+            details=(
+                llama.details
+                + "\n\nNota: vLLM non viene verificato su macOS perché "
+                "richiede Linux/CUDA."
+            ),
+            raw_output=llama.raw_output,
+        )
+
     vllm = diagnose_vllm_acceleration()
     accelerated = [item for item in (llama, vllm) if item.accelerated]
     if accelerated:
@@ -437,9 +465,18 @@ def _expected_backend(system: str, gpu_name: str) -> str:
 def _compiled_backends(output: str) -> tuple[str, ...]:
     lowered = output.casefold()
     backends = []
-    if "ggml_cuda" in lowered or re.search(r"\bcuda\d*\s*:", output, re.I):
+    if (
+        "ggml_cuda" in lowered
+        or "loaded cuda backend" in lowered
+        or re.search(r"\bcuda\d*\s*:", output, re.I)
+    ):
         backends.append("CUDA")
-    if "ggml_metal" in lowered or re.search(r"\bmetal\d*\s*:", output, re.I):
+    if (
+        "ggml_metal" in lowered
+        or "loaded metal backend" in lowered
+        or "loaded mtl backend" in lowered
+        or re.search(r"\b(?:metal|mtl)\d*\s*:", output, re.I)
+    ):
         backends.append("METAL")
     return tuple(backends)
 
@@ -450,9 +487,12 @@ def _parse_devices(output: str) -> tuple[str, ...]:
         line = raw_line.strip()
         if not line or line.casefold() == "(none)":
             continue
-        match = re.match(r"(CUDA\d*|Metal\d*)\s*:\s*(.+)", line, re.I)
+        match = re.match(r"(CUDA\d*|Metal\d*|MTL\d*)\s*:\s*(.+)", line, re.I)
         if match:
-            devices.append(f"{match.group(1)}: {match.group(2).strip()}")
+            device_name = match.group(1)
+            if device_name.casefold().startswith("mtl"):
+                device_name = "Metal" + device_name[3:]
+            devices.append(f"{device_name}: {match.group(2).strip()}")
             continue
         if "ggml_metal" in line.casefold() and "gpu name:" in line.casefold():
             devices.append("Metal: " + line.split(":", 2)[-1].strip())
