@@ -15,10 +15,13 @@ from emr_analyzer.clinical.atomic_evidence import (
     ATOMIC_EVIDENCE_SCHEMA,
     ATOMIC_PROMPT_DIGEST,
     ATOMIC_PROMPT_VERSION,
+    AtomicExtractionCancelled,
     AtomicEvidenceExtractor,
     TextChunk,
+    build_atomic_evidence_schema,
     build_atomic_prompt,
     deduplicate_atomic_evidence,
+    infer_document_content_type,
     split_sentence_spans,
     split_text_chunks,
 )
@@ -279,7 +282,7 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertEqual(len(unique), 1)
         self.assertEqual(unique[0].observed_date, "2024-11-10")
 
-    def test_atomic_v5_prompt_is_compact_and_schema_constrains_core_fields(self):
+    def test_atomic_v6_schema_is_explicit_strict_and_excludes_labs_from_llm(self):
         prompt = build_atomic_prompt(
             TextChunk(0, "Dispnea.", 1, 1),
             document_type="visita", document_date="2025-01-10",
@@ -288,24 +291,259 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertLess(len(fixed_prompt), 180)
         self.assertIn("[S1] Dispnea.", prompt)
         self.assertNotIn("1 item=1 concetto", prompt)
-        item_schema = ATOMIC_EVIDENCE_SCHEMA["properties"]["evidence"][
-            "items"
-        ]
-        positions = item_schema["items"]
-        self.assertEqual(item_schema["type"], "array")
-        self.assertEqual(len(positions), 7)
-        self.assertIn("medication", positions[0]["enum"])
-        self.assertNotIn("laboratory_trend", positions[0]["enum"])
-        self.assertNotIn("clinical_syndrome", positions[0]["enum"])
-        self.assertIn("absent", positions[3]["enum"])
-        details = positions[6]["properties"]
-        self.assertIn("i", details["m"]["properties"])
-        self.assertIn("l", details["o"]["properties"])
-        self.assertNotIn("source_text", details)
-        self.assertNotIn("normalized_entity", details)
-        self.assertNotIn("confidence", details)
-        self.assertTrue(ATOMIC_PROMPT_VERSION.startswith("atomic_evidence_it_v5"))
+        item_schema = ATOMIC_EVIDENCE_SCHEMA["properties"][
+            "radiology_finding"
+        ]["items"]
+        properties = item_schema["properties"]
+        self.assertEqual(item_schema["type"], "object")
+        self.assertFalse(item_schema["additionalProperties"])
+        self.assertEqual(
+            set(item_schema["required"]),
+            {"concept", "polarity", "source_refs"},
+        )
+        buckets = ATOMIC_EVIDENCE_SCHEMA["properties"]
+        self.assertIn("medication", buckets)
+        self.assertIn("radiology_finding", buckets)
+        self.assertIn("clinical_decision", buckets)
+        self.assertNotIn("laboratory_test", buckets)
+        self.assertEqual(
+            properties["polarity"]["enum"],
+            ["present", "negated", "suspected"],
+        )
+        medication_properties = buckets["medication"]["items"]["properties"]
+        self.assertIn(
+            "active_ingredient",
+            medication_properties["medication"]["properties"],
+        )
+        self.assertNotIn("source_text", properties)
+        self.assertNotIn("document_date", properties)
+        self.assertNotIn("confidence", properties)
+        self.assertTrue(ATOMIC_PROMPT_VERSION.startswith("atomic_evidence_it_v8"))
         self.assertEqual(len(ATOMIC_PROMPT_DIGEST), 64)
+
+    def test_atomic_v8_dynamic_schema_prevents_invalid_citation_ids(self):
+        schema = build_atomic_evidence_schema(3)
+        refs = schema["properties"]["diagnosis"]["items"]["properties"][
+            "source_refs"
+        ]
+        self.assertEqual(refs["items"]["enum"], [1, 2, 3])
+
+    def test_atomic_v8_normalizes_harmless_wire_variants_without_retry(self):
+        llm = _StructuredCaptureLlm({
+            "radiology_finding": [{
+                "concept": "nodulo polmonare",
+                "polarity": "presente",
+                "source_refs": ["S1"],
+                "numeric_value": "8,0",
+                "unit": "mm",
+                "payload": {
+                    "modality": "TC", "measurement": "8 mm",
+                    "signal_characteristics": "non specificato nel testo",
+                },
+            }],
+        })
+        extractor = AtomicEvidenceExtractor(llm)
+        items = extractor.extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="visita_oncologica",
+            document_date="2025-01-10",
+            text="TC: nodulo polmonare di 8 mm.",
+        )
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].numeric_value, 8.0)
+        self.assertTrue(items[0].data["wire_normalized"])
+        self.assertEqual(
+            items[0].typed_payload["radiology_finding"]["measurement"],
+            "8 mm",
+        )
+        self.assertNotIn(
+            "signal_characteristics",
+            items[0].typed_payload["radiology_finding"],
+        )
+
+    def test_content_hint_follows_radiology_text_not_wrong_declared_label(self):
+        text = (
+            "Area iperintensa in T2 con restrizione del segnale in "
+            "diffusione e potenziamento contrastografico."
+        )
+        self.assertEqual(infer_document_content_type(text), "radiology")
+        prompt = build_atomic_prompt(
+            TextChunk(0, text), document_type="visita_oncologica",
+            document_date="2025-01-10",
+        )
+        self.assertIn("tipo_dichiarato=visita_oncologica", prompt)
+        self.assertIn("contenuto_probabile=radiology", prompt)
+
+    def test_atomic_cancel_stops_before_calling_the_model(self):
+        llm = _StructuredCaptureLlm({})
+        extractor = AtomicEvidenceExtractor(llm)
+        with self.assertRaises(AtomicExtractionCancelled):
+            extractor.extract_document(
+                patient_id="P001", document_id="D1",
+                document_type="visita", document_date="2025-01-10",
+                text="Dispnea.", cancel_check=lambda: True,
+            )
+        self.assertEqual(llm.calls, [])
+
+    def test_normal_variant_is_archived_but_excluded_from_registry(self):
+        llm = _StructuredCaptureLlm({
+            "radiology_finding": [{
+                "concept": "utero antiversoflesso",
+                "polarity": "present", "source_refs": [1],
+            }],
+        })
+        item = AtomicEvidenceExtractor(llm).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="radiologia", document_date="2025-01-10",
+            text=(
+                "Utero antiversoflesso con diametro di 7 cm. "
+                "Piccola cisti cervicale di 5 mm."
+            ),
+        )[0]
+        self.assertEqual(item.clinical_relevance, "excluded_non_informative")
+        self.assertEqual(
+            item.data["registry_role_reason"], "routine_normal_finding"
+        )
+
+    def test_direct_negative_is_grounded_as_polarity_not_absence_concept(self):
+        llm = _StructuredCaptureLlm({
+            "radiology_finding": [{
+                "concept": "assenza di ulteriori lesioni ossee",
+                "polarity": "present", "source_refs": [1],
+            }],
+        })
+        item = AtomicEvidenceExtractor(llm).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="radiologia", document_date="2025-01-10",
+            text="Attualmente non si dimostrano ulteriori lesioni ossee.",
+        )[0]
+        self.assertEqual(item.normalized_entity, "lesioni ossee")
+        self.assertEqual(item.assertion, "absent")
+        self.assertEqual(item.data["polarity"], "negated")
+        self.assertEqual(item.data["registry_role"], "contextual")
+
+    def test_referential_imaging_attribute_stays_in_the_same_atom(self):
+        llm = _StructuredCaptureLlm({
+            "radiology_finding": [
+                {
+                    "concept": "formazione glutea",
+                    "polarity": "present", "source_refs": [1],
+                    "payload": {"measurement": "13 x 8 mm"},
+                },
+                {
+                    "concept": "rapporto con il muscolo gluteo",
+                    "polarity": "present", "source_refs": [2],
+                    "payload": {
+                        "relation_to_adjacent_structures": "piano di clivaggio"
+                    },
+                },
+            ],
+        })
+        items = AtomicEvidenceExtractor(llm).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="radiologia", document_date="2025-01-10",
+            text=(
+                "Formazione glutea di 13 x 8 mm. "
+                "Essa è in rapporto con il muscolo gluteo con piano di "
+                "clivaggio conservato."
+            ),
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].data["sentence_refs"], [1, 2])
+        relation = items[0].typed_payload["radiology_finding"][
+            "relation_to_adjacent_structures"
+        ]
+        self.assertIn("muscolo gluteo", relation)
+
+    def test_unemitted_referential_sentence_extends_previous_atom_source(self):
+        llm = _StructuredCaptureLlm({
+            "radiology_finding": [{
+                "concept": "formazione glutea",
+                "polarity": "present", "source_refs": [1],
+                "payload": {"measurement": "13 x 8 mm"},
+            }],
+        })
+        items = AtomicEvidenceExtractor(llm).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="radiologia", document_date="2025-01-10",
+            text=(
+                "Formazione glutea di 13 x 8 mm. "
+                "Essa è in rapporto con il muscolo gluteo con piano di "
+                "clivaggio conservato."
+            ),
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].data["sentence_refs"], [1, 2])
+        self.assertIn("piano di clivaggio", items[0].source_text)
+
+    def test_atomic_v6_maps_polarity_dates_and_exact_source_reference(self):
+        llm = _StructuredCaptureLlm({
+            "evidence": [{
+                "fact_type": "diagnosis",
+                "concept": "polmonite immuno-mediata",
+                "polarity": "suspected",
+                "observation_date": "13/03/2025",
+                "source_refs": [2],
+                "severity": "grado 2",
+            }],
+        })
+        item = AtomicEvidenceExtractor(llm).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="visita", document_date="2025-03-20",
+            text=(
+                "Controllo oncologico.\n"
+                "Il 13/03/2025 sospetta polmonite immuno-mediata di grado 2."
+            ),
+        )[0]
+
+        self.assertEqual(item.assertion, "present")
+        self.assertEqual(item.certainty, "suspected")
+        self.assertEqual(item.observed_date, "2025-03-13")
+        self.assertEqual(item.document_date, "2025-03-20")
+        self.assertEqual(item.data["polarity"], "suspected")
+        self.assertEqual(item.data["report_date"], "2025-03-20")
+        self.assertEqual(
+            item.data["source_reference"]["passage"],
+            "Il 13/03/2025 sospetta polmonite immuno-mediata di grado 2.",
+        )
+        self.assertEqual(item.schema_version, "3.0")
+
+    def test_atomic_v6_rejects_payload_outside_the_rigid_schema(self):
+        llm = _StructuredCaptureLlm({
+            "evidence": [{
+                "fact_type": "diagnosis",
+                "concept": "melanoma",
+                "polarity": "present",
+                "source_refs": [1],
+                "invented_field": "not allowed",
+            }],
+        })
+        items = AtomicEvidenceExtractor(llm).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="visita", document_date="2025-03-20",
+            text="Diagnosi di melanoma.",
+        )
+        self.assertEqual(items, [])
+
+    def test_atomic_extractor_rejects_llm_generated_laboratory_values(self):
+        llm = _StructuredCaptureLlm({
+            "evidence": [{
+                "category": "laboratory_finding",
+                "normalized_entity": "PCR",
+                "source_text": "PCR 12 mg/dL",
+                "assertion": "present",
+                "certainty": "confirmed",
+                "numeric_value": 12,
+                "unit": "mg/dL",
+            }],
+        })
+        items = AtomicEvidenceExtractor(llm).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="visita", document_date="2025-03-20",
+            text="PCR 12 mg/dL",
+        )
+        self.assertEqual(items, [])
 
     def test_atomic_v5_resolves_sentence_refs_to_exact_source(self):
         llm = _StructuredCaptureLlm({
@@ -971,7 +1209,7 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         quote = "Non è documentata una causa infettiva"
         llm = _StructuredCaptureLlm({
             "evidence": [{
-                "category": "laboratory_finding",
+                "category": "diagnosis",
                 "normalized_entity": "infezione", "source_text": quote,
                 "assertion": "absent", "certainty": "confirmed",
                 "date_precision": "unknown",

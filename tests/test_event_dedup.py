@@ -18,6 +18,7 @@ from emr_analyzer.models.clinical_registry import (
     ClinicalEvent,
     EventEvidenceLink,
 )
+from emr_analyzer.models.clinical_pipeline import EvidenceRelation
 
 
 def evidence(
@@ -262,6 +263,29 @@ class TestCompressMeasurementTable(unittest.TestCase):
 
 
 class TestDeduplicateBundles(unittest.TestCase):
+    def test_v3_merge_requires_a_cohesive_evidence_edge(self):
+        summary = "Polmonite con infiltrati polmonari documentati"
+        e1 = evidence("E1", "polmonite")
+        e2 = evidence("E2", "polmonite")
+        a = bundle("EVT_A", summary=summary, evidence_items=[e1])
+        b = bundle("EVT_B", summary=summary, evidence_items=[e2])
+        final, merged = deduplicate_bundles(
+            [a, b], evidence_by_id=evidence_map(e1, e2),
+            persisted_review_status={}, evidence_relations=[],
+        )
+        self.assertEqual((len(final), merged), (2, 0))
+
+        relation = EvidenceRelation(
+            patient_id="P001", source_evidence_id="E1",
+            target_evidence_id="E2", relation_type="same_process",
+            weight=0.95, cluster_effect="cohesive",
+        )
+        final, merged = deduplicate_bundles(
+            [a, b], evidence_by_id=evidence_map(e1, e2),
+            persisted_review_status={}, evidence_relations=[relation],
+        )
+        self.assertEqual((len(final), merged), (1, 1))
+
     def test_merges_same_date_cross_category_double(self):
         summary = "Sospetto danno miocardico con troponina aumentata"
         a = bundle(

@@ -565,6 +565,7 @@ def _merge_group(
                 event_id=survivor.event.event_id,
                 evidence_id=link.evidence_id,
                 relation=relation,
+                role=link.role,
                 relation_confidence=confidence,
                 rationale=(
                     link.rationale or "Evidenza unificata per evento duplicato"
@@ -593,6 +594,7 @@ def deduplicate_bundles(
     *,
     evidence_by_id: dict[str, ClinicalEvidence],
     persisted_review_status: dict[str, str],
+    evidence_relations=None,
 ) -> tuple[list, int]:
     """Clean every bundle summary and merge cross-document duplicates.
 
@@ -602,6 +604,16 @@ def deduplicate_bundles(
     so ``replace_generated_registry`` deletes their stale rows.
     """
     bundles = list(bundles)
+    graph_pairs = None
+    if evidence_relations is not None:
+        graph_pairs = {
+            frozenset((
+                relation.source_evidence_id,
+                relation.target_evidence_id,
+            ))
+            for relation in evidence_relations
+            if relation.cluster_effect in {"must_link", "cohesive"}
+        }
     cleaned_by_event: dict[str, str] = clean_bundle_summaries(
         bundles, evidence_by_id
     )
@@ -612,6 +624,10 @@ def deduplicate_bundles(
 
     valid_pairs: set[tuple[int, int]] = set()
     for left, right in _candidate_pairs(bundles, cleaned):
+        if graph_pairs is not None and not _bundles_linked_by_graph(
+            bundles[left], bundles[right], graph_pairs
+        ):
+            continue
         if _pair_mergeable(
             bundles[left], bundles[right],
             clean_a=cleaned[left], clean_b=cleaned[right],
@@ -697,3 +713,15 @@ def deduplicate_bundles(
         )
 
     return final, len(merged_away)
+
+
+def _bundles_linked_by_graph(left, right, graph_pairs: set[frozenset]) -> bool:
+    """Require source identity or an explicit cohesive evidence edge."""
+    left_ids = {link.evidence_id for link in left.links}
+    right_ids = {link.evidence_id for link in right.links}
+    if left_ids & right_ids:
+        return True
+    return any(
+        frozenset((left_id, right_id)) in graph_pairs
+        for left_id in left_ids for right_id in right_ids
+    )

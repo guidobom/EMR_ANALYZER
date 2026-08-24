@@ -14,7 +14,7 @@ from typing import Any, Optional
 import uuid
 
 
-REGISTRY_SCHEMA_VERSION = "2.0"
+REGISTRY_SCHEMA_VERSION = "3.0"
 
 EVENT_CATEGORIES = (
     "diagnosis",
@@ -25,6 +25,7 @@ EVENT_CATEGORIES = (
     "laboratory_finding",
     "laboratory_trend",
     "imaging_finding",
+    "instrumental_finding",
     "histopathology",
     "biomarker",
     "medication",
@@ -192,6 +193,7 @@ class EventEvidenceLink:
     event_id: str
     evidence_id: str
     relation: str = "supports"
+    role: str = "core"
     relation_confidence: Optional[float] = None
     rationale: str = ""
     included_in_summary: bool = True

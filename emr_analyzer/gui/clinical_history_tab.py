@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
     QTreeWidget, QTreeWidgetItem, QComboBox, QLabel, QSplitter,
     QMessageBox, QProgressBar, QFileDialog, QMenu, QAction,
-    QInputDialog, QCheckBox, QTextBrowser,
+    QInputDialog, QCheckBox, QTextBrowser, QDialog,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
@@ -89,6 +89,17 @@ class ClinicalHistoryTab(QWidget):
         )
         self._gen_btn.clicked.connect(self._on_generate)
         gen_layout.addWidget(self._gen_btn)
+
+        self._cancel_generation_btn = QPushButton("⏹ Interrompi")
+        self._cancel_generation_btn.setToolTip(
+            "Interrompe in sicurezza al termine della chiamata LLM attiva. "
+            "I documenti già completati restano salvati e saranno riutilizzati."
+        )
+        self._cancel_generation_btn.clicked.connect(
+            self._on_cancel_generation
+        )
+        self._cancel_generation_btn.setVisible(False)
+        gen_layout.addWidget(self._cancel_generation_btn)
 
         self._dedup_btn = QPushButton("🔍 Deduplica Registro")
         self._dedup_btn.setToolTip(
@@ -360,6 +371,9 @@ class ClinicalHistoryTab(QWidget):
         for attr in self._WORKER_ATTRS:
             worker = getattr(self, attr, None)
             if worker is not None and worker.isRunning():
+                cancel = getattr(worker, "cancel", None)
+                if callable(cancel):
+                    cancel()
                 worker.wait(5000)
 
     # ------------------------------------------------------------------
@@ -520,6 +534,7 @@ class ClinicalHistoryTab(QWidget):
         ])
         for evidence in detail.get("evidence", []):
             relation = evidence.get("relation") or "supports"
+            role = evidence.get("role") or "core"
             date = evidence.get("observed_date") or evidence.get("source_document_date") or "data n.d."
             source = evidence.get("source_text") or "(passaggio non disponibile)"
             citation = f"doc {evidence.get('document_id') or '?'}"
@@ -527,7 +542,7 @@ class ClinicalHistoryTab(QWidget):
                 citation += f", p. {evidence['source_page']}"
             included = "in sintesi" if evidence.get("included_in_summary") else "esclusa dalla sintesi"
             evidence_item = QTreeWidgetItem([
-                str(date), relation,
+                str(date), f"{relation} / {role}",
                 f"[{citation}; {included}] {source}",
             ])
             evidence_item.setData(
@@ -632,6 +647,16 @@ class ClinicalHistoryTab(QWidget):
                 lambda: self._open_event_quick_view(item)
             )
             menu.addAction(quick_view_action)
+            split_action = QAction("✂️ Dividi evento per evidenze...", self)
+            split_action.triggered.connect(
+                lambda: self._split_event(item)
+            )
+            menu.addAction(split_action)
+            merge_action = QAction("🔗 Unisci con un altro evento...", self)
+            merge_action.triggered.connect(
+                lambda: self._merge_event(item)
+            )
+            menu.addAction(merge_action)
             menu.addSeparator()
 
         if is_golden:
@@ -665,6 +690,99 @@ class ClinicalHistoryTab(QWidget):
         )
         menu.addAction(delete_action)
         menu.exec_(self._tree.viewport().mapToGlobal(pos))
+
+    def _split_event(self, item):
+        event_id = str(item.data(0, Qt.UserRole) or "")
+        repository = self._services.get("registry_repo")
+        detail = repository.get_event_detail(event_id) if repository else None
+        if not detail or len(detail.get("evidence") or []) < 2:
+            QMessageBox.information(
+                self, "Split non disponibile",
+                "L'evento deve contenere almeno due evidenze."
+            )
+            return
+        from .event_structure_dialog import EventSplitDialog
+        dialog = EventSplitDialog(detail, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        if not dialog.original_summary or not dialog.new_summary:
+            QMessageBox.warning(
+                self, "Sintesi mancanti", "Inserisci entrambe le descrizioni."
+            )
+            return
+        try:
+            new_event_id = repository.split_event_manual(
+                self._current_patient_id, event_id,
+                dialog.selected_evidence_ids,
+                original_summary=dialog.original_summary,
+                new_summary=dialog.new_summary,
+            )
+            review = self._services.get("review_repo")
+            if review:
+                review.decide_event(
+                    self._current_patient_id, event_id, "corrected",
+                    reason=f"Split manuale; nuovo evento {new_event_id}",
+                )
+                review.decide_event(
+                    self._current_patient_id, new_event_id, "corrected",
+                    reason=f"Creato da split manuale di {event_id}",
+                )
+            self._sync_after_manual_structure_change()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Split non eseguito", str(exc))
+
+    def _merge_event(self, item):
+        survivor_id = str(item.data(0, Qt.UserRole) or "")
+        repository = self._services.get("registry_repo")
+        events = [
+            event for event in repository.get_events(self._current_patient_id)
+            if event.event_id != survivor_id
+        ] if repository else []
+        if not events:
+            QMessageBox.information(
+                self, "Unione non disponibile", "Non ci sono altri eventi."
+            )
+            return
+        labels = [
+            f"{event.first_evidence_date or 'n.d.'} · {event.summary_short}"
+            for event in events
+        ]
+        label, ok = QInputDialog.getItem(
+            self, "Unisci eventi", "Evento da incorporare:", labels, 0, False
+        )
+        if not ok:
+            return
+        absorbed = events[labels.index(label)]
+        summary, ok = QInputDialog.getText(
+            self, "Sintesi dell'evento unito", "Descrizione canonica:",
+            text=item.text(2),
+        )
+        if not ok or not summary.strip():
+            return
+        try:
+            repository.merge_events_manual(
+                self._current_patient_id, survivor_id, absorbed.event_id,
+                summary_short=summary,
+            )
+            review = self._services.get("review_repo")
+            if review:
+                review.decide_event(
+                    self._current_patient_id, survivor_id, "corrected",
+                    reason=f"Unione manuale con {absorbed.event_id}",
+                )
+                review.decide_event(
+                    self._current_patient_id, absorbed.event_id, "rejected",
+                    reason=f"Assorbito manualmente in {survivor_id}",
+                )
+            self._sync_after_manual_structure_change()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Unione non eseguita", str(exc))
+
+    def _sync_after_manual_structure_change(self):
+        builder = self._services.get("registry_builder")
+        if builder:
+            builder.sync_timeline_projection(self._current_patient_id)
+        self._refresh()
 
     def _toggle_golden(self, item):
         """Confirm a timeline entry as golden, or remove the confirmation."""
@@ -921,11 +1039,20 @@ class ClinicalHistoryTab(QWidget):
         )
         self._worker.progress.connect(self._on_generation_progress)
         self._worker.finished.connect(self._on_generation_finished)
+        self._worker.cancelled.connect(self._on_generation_cancelled)
         self._worker.error.connect(self._on_generation_error)
         self._worker.finished.connect(
             lambda _result, attr="_worker": self._release_worker(attr)
         )
+        self._worker.cancelled.connect(
+            lambda attr="_worker": self._release_worker(attr)
+        )
+        self._worker.error.connect(
+            lambda _error, attr="_worker": self._release_worker(attr)
+        )
         self._gen_btn.setEnabled(False)
+        self._cancel_generation_btn.setVisible(True)
+        self._cancel_generation_btn.setEnabled(True)
         self._narrative_btn.setEnabled(False)
         self._dedup_btn.setEnabled(False)
         self._progress_bar.setVisible(True)
@@ -938,8 +1065,21 @@ class ClinicalHistoryTab(QWidget):
         self._progress_bar.setValue(percent)
         self._status_label.setText(message)
 
+    def _on_cancel_generation(self):
+        worker = self._worker
+        if worker is None or not worker.isRunning():
+            return
+        worker.cancel()
+        self._cancel_generation_btn.setEnabled(False)
+        self._cancel_generation_btn.setText("⏳ Arresto in corso...")
+        self._status_label.setText(
+            "Arresto richiesto: attendo la fine della chiamata LLM attiva..."
+        )
+
     def _on_generation_finished(self, result: dict):
         self._progress_bar.setVisible(False)
+        self._cancel_generation_btn.setVisible(False)
+        self._cancel_generation_btn.setText("⏹ Interrompi")
         self._gen_btn.setEnabled(True)
         self._narrative_btn.setEnabled(True)
         self._dedup_btn.setEnabled(True)
@@ -963,6 +1103,16 @@ class ClinicalHistoryTab(QWidget):
         llm_calls = result.get('llm_calls', 0)
         source_chunks = result.get('source_chunks', 0)
         output_retries = result.get('output_limit_retries', 0)
+        validation_retries = result.get('validation_retries', 0)
+        wire_normalized = result.get('wire_items_normalized', 0)
+        unresolved_invalid = result.get('unresolved_invalid_items', 0)
+        relation_calls = result.get('evidence_relation_llm_calls', 0)
+        relation_cache_hits = result.get(
+            'evidence_relation_cache_hits', 0
+        )
+        relation_auto = result.get(
+            'evidence_relation_auto_resolved', 0
+        )
 
         status_text = f"Completato: {final} voci (deduplicate: {dedup})"
         if elapsed is not None:
@@ -988,17 +1138,26 @@ class ClinicalHistoryTab(QWidget):
                 f"• {dedup} duplicati rimossi\n"
                 f"• {final} voci finali nel registro"
             )
-        if llm_calls or reused_blocks:
+        if (
+            llm_calls or reused_blocks or relation_calls
+            or relation_cache_hits or relation_auto
+        ):
             msg += (
                 f"\n\nOttimizzazione:\n"
                 f"• {llm_calls} chiamate LLM\n"
                 f"• {source_chunks} segmenti clinici elaborati\n"
                 f"• {output_retries} risposte scartate per limite output\n"
+                f"• {validation_retries} retry mirati di validazione\n"
+                f"• {wire_normalized} difformità corrette localmente\n"
+                f"• {unresolved_invalid} item non validi esclusi\n"
                 f"• {reused_blocks} blocchi identici riutilizzati"
                 f" ({reused_evidence} evidenze replicate con nuova fonte)\n"
                 f"• {verified_reuse_blocks} blocchi unici verificati una volta\n"
                 f"• {targeted_reuse} verifiche mirate sul documento\n"
                 f"• {full_fallbacks} fallback completi di sicurezza"
+                f"\n• {relation_calls} batch LLM per le relazioni"
+                f"\n• {relation_cache_hits} decisioni relazionali riutilizzate"
+                f"\n• {relation_auto} incompatibilità risolte da regole"
             )
         if failed > 0:
             failed_ids = result.get('failed_doc_ids', [])
@@ -1015,11 +1174,29 @@ class ClinicalHistoryTab(QWidget):
 
     def _on_generation_error(self, error: str):
         self._progress_bar.setVisible(False)
+        self._cancel_generation_btn.setVisible(False)
+        self._cancel_generation_btn.setText("⏹ Interrompi")
         self._gen_btn.setEnabled(True)
         self._status_label.setText(f"Errore: {error}")
         QMessageBox.critical(
             self, "Errore Generazione",
             f"Errore durante la generazione del registro:\n\n{error}"
+        )
+
+    def _on_generation_cancelled(self):
+        self._progress_bar.setVisible(False)
+        self._cancel_generation_btn.setVisible(False)
+        self._cancel_generation_btn.setText("⏹ Interrompi")
+        self._gen_btn.setEnabled(True)
+        self._status_label.setText(
+            "Interrotto in sicurezza; i documenti completati sono salvati."
+        )
+        self._refresh()
+        QMessageBox.information(
+            self, "Elaborazione interrotta",
+            "L'elaborazione è stata interrotta in sicurezza. I documenti "
+            "già completati restano disponibili e una nuova esecuzione "
+            "riprenderà soltanto quelli mancanti.",
         )
 
     # ------------------------------------------------------------------

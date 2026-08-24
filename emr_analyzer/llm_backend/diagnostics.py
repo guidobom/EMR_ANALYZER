@@ -16,6 +16,7 @@ import shutil
 import subprocess
 
 from .server_manager import find_server_binary
+from .vllm_server_manager import find_vllm_binary
 
 
 @dataclass(frozen=True)
@@ -217,6 +218,160 @@ def diagnose_llama_acceleration(
     )
 
 
+def diagnose_vllm_acceleration(
+    binary: str | None = None,
+    *,
+    system_name: str | None = None,
+    machine: str | None = None,
+    gpu_name: str | None = None,
+    timeout: float = 20.0,
+) -> AccelerationDiagnostic:
+    """Verify the optional vLLM CLI and an NVIDIA CUDA device.
+
+    This runs only ``vllm --version`` and ``nvidia-smi``; it does not import a
+    model, allocate VRAM, access the network, or touch existing servers.
+    """
+    system = str(system_name or platform.system() or "Sconosciuto")
+    architecture = str(machine or platform.machine() or "sconosciuta")
+    detected_gpu = _host_gpu_name() if gpu_name is None else str(gpu_name)
+    resolved = binary or find_vllm_binary()
+    if system.casefold() != "linux":
+        return _result(
+            status="backend_unavailable",
+            expected="CUDA",
+            runtime="NON APPLICABILE",
+            compiled=(),
+            devices=(),
+            binary=resolved or "",
+            system=system,
+            machine=architecture,
+            gpu_name=detected_gpu,
+            summary="vLLM non è disponibile su macOS; usa llama.cpp/Metal.",
+        )
+    if not resolved:
+        return _result(
+            status="binary_missing",
+            expected="CUDA",
+            runtime="SCONOSCIUTO",
+            compiled=(),
+            devices=(),
+            binary="",
+            system=system,
+            machine=architecture,
+            gpu_name=detected_gpu,
+            summary="vLLM non installato nell'ambiente Python corrente.",
+        )
+    try:
+        version = subprocess.run(
+            [resolved, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, float(timeout)),
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _result(
+            status="error",
+            expected="CUDA",
+            runtime="SCONOSCIUTO",
+            compiled=(),
+            devices=(),
+            binary=resolved,
+            system=system,
+            machine=architecture,
+            gpu_name=detected_gpu,
+            summary=f"Impossibile verificare vLLM: {exc}",
+        )
+    output = "\n".join(
+        part.strip() for part in (version.stdout, version.stderr) if part
+    ).strip()
+    cuda_gpu = detected_gpu
+    cuda_available = gpu_name is not None and bool(cuda_gpu)
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            probe = subprocess.run(
+                [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if probe.returncode == 0 and probe.stdout.strip():
+                cuda_gpu = probe.stdout.strip().splitlines()[0]
+                cuda_available = True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if version.returncode == 0 and cuda_available:
+        return _result(
+            status="accelerated",
+            expected="CUDA",
+            runtime="CUDA / vLLM",
+            compiled=("CUDA",),
+            devices=((f"CUDA: {cuda_gpu}" if cuda_gpu else "CUDA"),),
+            binary=resolved,
+            system=system,
+            machine=architecture,
+            gpu_name=cuda_gpu,
+            summary=(
+                "vLLM disponibile con CUDA"
+                + (f": {cuda_gpu}." if cuda_gpu else ".")
+            ),
+            raw_output=output,
+        )
+    return _result(
+        status="backend_unavailable" if version.returncode == 0 else "error",
+        expected="CUDA",
+        runtime="CPU / NON DISPONIBILE",
+        compiled=(),
+        devices=(),
+        binary=resolved,
+        system=system,
+        machine=architecture,
+        gpu_name=cuda_gpu,
+        summary=(
+            "vLLM è installato, ma CUDA/NVIDIA non risulta utilizzabile."
+            if version.returncode == 0 else
+            f"Il comando vLLM è terminato con codice {version.returncode}."
+        ),
+        raw_output=output,
+    )
+
+
+def diagnose_local_acceleration() -> AccelerationDiagnostic:
+    """Combine non-invasive llama.cpp and vLLM diagnostics for the GUI."""
+    llama = diagnose_llama_acceleration()
+    vllm = diagnose_vllm_acceleration()
+    accelerated = [item for item in (llama, vllm) if item.accelerated]
+    if accelerated:
+        status = "accelerated"
+        runtime = " + ".join(item.runtime_backend for item in accelerated)
+    elif llama.status == "cpu_only":
+        status = "cpu_only"
+        runtime = "CPU"
+    else:
+        status = llama.status if llama.status != "binary_missing" else vllm.status
+        runtime = "SCONOSCIUTO"
+    return AccelerationDiagnostic(
+        status=status,
+        expected_backend=llama.expected_backend,
+        runtime_backend=runtime,
+        compiled_backends=tuple(dict.fromkeys(
+            (*llama.compiled_backends, *vllm.compiled_backends)
+        )),
+        devices=tuple(dict.fromkeys((*llama.devices, *vllm.devices))),
+        binary_path="; ".join(filter(None, (llama.binary_path, vllm.binary_path))),
+        system=llama.system,
+        machine=llama.machine,
+        gpu_name=vllm.gpu_name or llama.gpu_name,
+        summary=f"llama.cpp: {llama.summary}  vLLM: {vllm.summary}",
+        details=(
+            "=== llama.cpp ===\n" + llama.details
+            + "\n\n=== vLLM ===\n" + vllm.details
+        ),
+        raw_output=(llama.raw_output + "\n" + vllm.raw_output)[-6000:],
+    )
+
+
 def _result(
     *,
     status: str,
@@ -240,7 +395,7 @@ def _result(
         f"Backend atteso: {expected}",
         f"Supporto compilato rilevato: {compiled_text}",
         f"Backend utilizzabile: {runtime}",
-        f"Dispositivi esposti da llama.cpp: {device_text}",
+        f"Dispositivi esposti dal backend: {device_text}",
     ))
     if raw_output:
         details += "\n\nOutput llama-server:\n" + raw_output[-6000:]

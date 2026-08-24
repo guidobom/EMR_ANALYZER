@@ -90,6 +90,18 @@ _METHOD_ONLY = re.compile(
     r"protocollo di acquisizione|indicazione di dose|classe dose|"
     r"modalita di esecuzione)\b"
 )
+_REGULATORY_ONLY = re.compile(
+    r"\b(?:ai sensi|secondo|in conformita)\s+(?:dell['’]?\s*)?art\.?\s*\d+|"
+    r"\b(?:d\.?lgs\.?|decreto legislativo)\s*\d+"
+)
+_ROUTINE_NORMAL_VARIANT = re.compile(
+    r"^(?:uter[oa]\s+antiversofless[oa]|uterus\s+antevert\w*|"
+    r"vescica\s+(?:scarsamente\s+)?repleta\s+a\s+pareti\s+regolari)\b"
+)
+_ABNORMAL_IMAGING_CUE = re.compile(
+    r"\b(?:lesion\w*|formazion\w*|massa|nodul\w*|cist\w*|metastas\w*|"
+    r"secondari\w*|edema|versamento|falda|alterat\w*|patologic\w*)\b"
+)
 
 _CONTEXT_STATUS = {
     "normal", "within_range", "negative", "absent", "excluded",
@@ -135,6 +147,14 @@ def _administrative_disposition(
 ) -> EvidenceDisposition | None:
     """Return the non-clinical disposition shared by rows and dataclasses."""
 
+    if (
+        _ROUTINE_NORMAL_VARIANT.search(entity or quote)
+        and not _ABNORMAL_IMAGING_CUE.search(quote)
+    ):
+        return EvidenceDisposition(
+            ADMINISTRATIVE_OR_METHODOLOGICAL, "routine_normal_finding",
+        )
+
     if any(pattern.search(entity) for pattern in _HEADER_ENTITY_PATTERNS):
         return EvidenceDisposition(
             ADMINISTRATIVE_OR_METHODOLOGICAL, "report_metadata",
@@ -156,7 +176,19 @@ def _administrative_disposition(
         return EvidenceDisposition(
             ADMINISTRATIVE_OR_METHODOLOGICAL, "diagnostic_method",
         )
+    if _REGULATORY_ONLY.search(entity):
+        return EvidenceDisposition(
+            ADMINISTRATIVE_OR_METHODOLOGICAL, "regulatory_boilerplate",
+        )
     return None
+
+
+def classify_nonclinical_passage(text: str) -> EvidenceDisposition | None:
+    """Classify one standalone line before it reaches the extraction LLM."""
+    value = _surface(text)
+    if not value:
+        return None
+    return _administrative_disposition(value, value)
 
 
 def is_administrative_mapping(item: dict) -> bool:
@@ -180,6 +212,20 @@ def annotate_evidence_disposition(
     item.data = dict(item.data or {})
     item.data["registry_role"] = disposition.role
     item.data["registry_role_reason"] = disposition.reason
+    if disposition.role == PRIMARY:
+        item.clinical_relevance = "accepted_clinical"
+    elif disposition.role == CONTEXTUAL:
+        item.clinical_relevance = "accepted_low_relevance"
+    elif disposition.reason == "scheduling":
+        item.clinical_relevance = "excluded_administrative"
+    elif disposition.reason in {
+        "diagnostic_method", "diagnostic_tracer_administration",
+    }:
+        item.clinical_relevance = "excluded_methodological"
+    elif disposition.reason == "routine_normal_finding":
+        item.clinical_relevance = "excluded_non_informative"
+    else:
+        item.clinical_relevance = "excluded_boilerplate"
     return disposition
 
 

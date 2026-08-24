@@ -21,6 +21,7 @@ env/
 .DS_Store
 .idea/
 .vscode/
+.claude/
 .Rhistory
 *.swp
 *~

@@ -642,6 +642,7 @@ def _apply_decision(
                 event_id=anchor_id,
                 evidence_id=evidence_id,
                 relation=relation,
+                role=old_link.role,
                 relation_confidence=old_link.relation_confidence,
                 rationale=old_link.rationale or "Evidenza incorporata nell'episodio",
                 included_in_summary=old_link.included_in_summary,

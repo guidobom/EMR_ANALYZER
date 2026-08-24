@@ -7,7 +7,6 @@ from PyQt5.QtCore import Qt
 from .config import (
     APP_NAME, APP_VERSION, active_workspace, CACHE_DIR, LOG_DIR,
     OFFLINE_MODE,
-    DOCUMENT_LLM_MODEL_NAME,
 )
 from .security.offline import OfflinePolicy
 from .database.engine import DatabaseEngine
@@ -44,6 +43,7 @@ from .database.processing_repo import ProcessingRepository
 from .database.overlay_repo import DocumentTextOverlayRepository
 from .database.review_repo import ReviewDecisionRepository
 from .database.gold_set_repo import GoldSetRepository
+from .database.pipeline_repo import ClinicalPipelineRepository
 from .settings import load_llm_configs
 
 
@@ -126,6 +126,7 @@ class EMRAnalyzerApp:
         processing_repo = ProcessingRepository(db)
         overlay_repo = DocumentTextOverlayRepository(db)
         review_repo = ReviewDecisionRepository(db)
+        pipeline_repo = ClinicalPipelineRepository(db)
         gold_set_repo = GoldSetRepository(
             db, registry_repo=registry_repo, audit_repo=audit_repo
         )
@@ -143,6 +144,7 @@ class EMRAnalyzerApp:
             "processing_repo": processing_repo,
             "overlay_repo": overlay_repo,
             "review_repo": review_repo,
+            "pipeline_repo": pipeline_repo,
             "gold_set_repo": gold_set_repo,
         })
         print(f"  ✓ Repositories initialized")
@@ -173,17 +175,9 @@ class EMRAnalyzerApp:
         except Exception:
             self._services["parser_fallback"] = None
 
-        # ---- Function-specific local llama.cpp models ----
+        # ---- Function-specific local llama.cpp / vLLM models ----
         ollama_ok = False
         try:
-            probe_model = next(
-                (
-                    config.model for config in self._llm_configs.values()
-                    if config.model
-                ),
-                DOCUMENT_LLM_MODEL_NAME,
-            )
-            ollama_ok = LlmClient(model=probe_model).server_available
             clients = {}
             for role, config in self._llm_configs.items():
                 client = LlmClient(config=config) if config.model else None
@@ -191,6 +185,10 @@ class EMRAnalyzerApp:
                     client
                     if client is not None and client.is_available else None
                 )
+            ollama_ok = any(
+                client is not None and client.server_available
+                for client in clients.values()
+            )
             self._services.update({
                 "document_llm_client": clients["document"],
                 "atomic_evidence_llm_client": clients["atomic_evidence"],
@@ -201,9 +199,13 @@ class EMRAnalyzerApp:
             })
             if ollama_ok:
                 print(
-                    "  ✓ LLM locale (llama.cpp): "
+                    "  ✓ LLM locale: "
                     + ", ".join(
-                        f"{role}={client.model if client else 'off'}"
+                        f"{role}="
+                        + (
+                            f"{client.model} [{client.backend_type}]"
+                            if client else "off"
+                        )
                         for role, client in clients.items()
                     )
                 )
@@ -214,10 +216,11 @@ class EMRAnalyzerApp:
             else:
                 print(
                     "  ⚠ Motore locale non disponibile — esegui "
-                    "tools/setup_llama_backend.py"
+                    "tools/setup_llama_backend.py oppure "
+                    "tools/setup_vllm_backend.py"
                 )
         except Exception as e:
-            print(f"  ⚠ Motore locale (llama.cpp): {e}")
+            print(f"  ⚠ Motore LLM locale: {e}")
             self._services.update({
                 "document_llm_client": None,
                 "atomic_evidence_llm_client": None,
@@ -271,6 +274,7 @@ class EMRAnalyzerApp:
                 "clinical_events_llm_client"
             ),
             audit_repo=audit_repo,
+            pipeline_repo=pipeline_repo,
             db=db,
         )
         clinical_history_builder = ClinicalHistoryBuilder(
@@ -302,7 +306,7 @@ class EMRAnalyzerApp:
 
     @staticmethod
     def _eager_start_llm_servers(clients: list) -> None:
-        """Spawn the llama-server processes in the background.
+        """Spawn the selected local LLM servers in the background.
 
         The first clinical request would otherwise pay the model load time;
         a daemon thread hides it behind the startup flow.  Failures are
@@ -310,16 +314,16 @@ class EMRAnalyzerApp:
         """
         import threading
 
-        from .llm_backend import get_backend
-
         def _start() -> None:
-            backend = get_backend()
             for client in clients:
                 if client is None:
                     continue
                 try:
-                    backend.ensure(client)
-                    print(f"  ✓ server pronto per {client.model}")
+                    client.backend.ensure(client)
+                    print(
+                        f"  ✓ server {client.backend_type} pronto per "
+                        f"{client.model}"
+                    )
                 except Exception as exc:
                     print(f"  ⚠ avvio server {client.model} rimandato: {exc}")
 
@@ -327,10 +331,10 @@ class EMRAnalyzerApp:
 
     @staticmethod
     def _shutdown_backend() -> None:
-        """Terminate the app-owned llama-server processes on quit."""
+        """Terminate every app-owned local LLM process on quit."""
         try:
-            from .llm_backend import get_backend
-            get_backend().shutdown()
+            from .llm_backend import shutdown_all_backends
+            shutdown_all_backends()
         except Exception:
             pass
 

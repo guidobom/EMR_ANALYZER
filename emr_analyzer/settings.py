@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path
 
@@ -34,6 +34,10 @@ class LLMRoleConfig:
     """Generation settings for one independently configured LLM role."""
 
     model: str
+    # ``llama_cpp`` uses local GGUF files; ``vllm`` uses an already cached
+    # Hugging Face model (or an explicit local model directory).  The legacy
+    # default preserves every existing installation.
+    backend: str = "llama_cpp"
     temperature: float = 0.1
     context_length: int = LLM_DEFAULT_CONTEXT_LENGTH
     max_output_tokens: int = 4096
@@ -47,6 +51,15 @@ class LLMRoleConfig:
     # Target-verified n-gram speculative decoding in llama.cpp. Disabled by
     # default until benchmarked on the local machine.
     speculative_decoding: bool = False
+    # vLLM-only engine parameters.  They are harmless when llama.cpp is
+    # selected and therefore make role settings fully round-trippable when
+    # switching between the two backends.
+    vllm_dtype: str = "auto"
+    vllm_gpu_memory_utilization: float = 0.90
+    vllm_tensor_parallel_size: int = 1
+    vllm_quantization: str = ""
+    vllm_trust_remote_code: bool = False
+    vllm_enforce_eager: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -80,8 +93,20 @@ class LLMRoleConfig:
         model = payload.get("model", default.model)
         if not isinstance(model, str):
             model = default.model
+        backend = str(payload.get("backend", default.backend) or "").strip()
+        if backend not in {"llama_cpp", "vllm"}:
+            backend = default.backend
+        dtype = str(
+            payload.get("vllm_dtype", default.vllm_dtype) or "auto"
+        ).strip().casefold()
+        if dtype not in {"auto", "half", "float16", "bfloat16", "float", "float32"}:
+            dtype = default.vllm_dtype
+        quantization = str(
+            payload.get("vllm_quantization", default.vllm_quantization) or ""
+        ).strip().casefold()
         return cls(
             model=model.strip(),
+            backend=backend,
             temperature=floating("temperature", 0.0, 2.0),
             context_length=integer("context_length", 512, 2_000_000),
             max_output_tokens=integer("max_output_tokens", 1, 262_144),
@@ -91,6 +116,16 @@ class LLMRoleConfig:
             keep_alive_minutes=integer("keep_alive_minutes", 0, 1440),
             parallel_workers=integer("parallel_workers", 1, 8),
             speculative_decoding=boolean("speculative_decoding"),
+            vllm_dtype=dtype,
+            vllm_gpu_memory_utilization=floating(
+                "vllm_gpu_memory_utilization", 0.05, 0.99
+            ),
+            vllm_tensor_parallel_size=integer(
+                "vllm_tensor_parallel_size", 1, 16
+            ),
+            vllm_quantization=quantization,
+            vllm_trust_remote_code=boolean("vllm_trust_remote_code"),
+            vllm_enforce_eager=boolean("vllm_enforce_eager"),
         )
 
 
@@ -150,7 +185,10 @@ def default_llm_configs() -> dict[str, LLMRoleConfig]:
             temperature=doc_cfg.temperature,
             parallel_workers=doc_workers,
         ),
-        "atomic_evidence": clinical_config,
+        # Extraction is a source-grounded classification task. Greedy decode
+        # is both more reproducible and less likely to violate the schema,
+        # reducing corrective calls without weakening the event model.
+        "atomic_evidence": replace(clinical_config, temperature=0.0),
         "clinical_events": clinical_config,
         "clinical_state": clinical_config,
     }
@@ -210,9 +248,12 @@ def load_llm_configs(
                 "model": legacy_models[legacy_role],
             }
         config = LLMRoleConfig.from_dict(role_payload, default)
-        config = replace(
-            config, model=_resolve_legacy_model_name(config.model)
-        )
+        # Hugging Face identifiers contain slashes and must never be mapped
+        # through the legacy GGUF/Ollama-name resolver.
+        if config.backend == "llama_cpp":
+            config = replace(
+                config, model=_resolve_legacy_model_name(config.model)
+            )
 
         # Auto-detect workers if not explicitly set in the saved payload,
         # using the ACTUAL model and context (not the default values).
@@ -321,3 +362,133 @@ def save_model_assignment(
     configs = load_llm_configs(path)
     configs[role] = replace(configs[role], model=str(model_name or "").strip())
     save_llm_configs(configs, path)
+
+
+# ---------------------------------------------------------------------------
+# Clinical pipeline policy (configuration only; never clinical data)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LabEvidencePolicy:
+    explicit_abnormal_flag: bool = True
+    outside_reference_range: bool = True
+    textual_abnormality: bool = True
+    significant_delta_within_range: bool = False
+    delta_window_days: int = 90
+    default_relative_delta: float = 0.25
+    analyzer_rules: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "LabEvidencePolicy":
+        if not isinstance(payload, dict):
+            return cls()
+
+        def boolean(name: str, default: bool) -> bool:
+            value = payload.get(name, default)
+            if isinstance(value, str):
+                return value.strip().casefold() in {"1", "true", "yes", "on"}
+            return bool(value)
+
+        try:
+            window = min(3650, max(1, int(payload.get("delta_window_days", 90))))
+        except (TypeError, ValueError):
+            window = 90
+        try:
+            delta = min(10.0, max(0.0, float(
+                payload.get("default_relative_delta", 0.25)
+            )))
+        except (TypeError, ValueError):
+            delta = 0.25
+        rules = payload.get("analyzer_rules", {})
+        return cls(
+            explicit_abnormal_flag=boolean("explicit_abnormal_flag", True),
+            outside_reference_range=boolean("outside_reference_range", True),
+            textual_abnormality=boolean("textual_abnormality", True),
+            significant_delta_within_range=boolean(
+                "significant_delta_within_range", False
+            ),
+            delta_window_days=window,
+            default_relative_delta=delta,
+            analyzer_rules=dict(rules) if isinstance(rules, dict) else {},
+        )
+
+
+@dataclass(frozen=True)
+class ClinicalPipelinePolicy:
+    adaptive_specialized_retry: bool = True
+    max_specialized_retries: int = 1
+    consensus_profile: str = "selective"
+    local_window_days: int = 10
+    longitudinal_window_days: int = 90
+    longitudinal_step_days: int = 45
+    semantic_top_k: int = 12
+    cohesive_threshold: float = 0.72
+    bridge_split_threshold: float = 0.58
+    lab: LabEvidencePolicy = field(default_factory=LabEvidencePolicy)
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ClinicalPipelinePolicy":
+        if not isinstance(payload, dict):
+            return cls()
+        profile = str(payload.get("consensus_profile", "selective"))
+        if profile not in {"fast", "selective", "robust", "research"}:
+            profile = "selective"
+
+        def integer(name: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                return min(maximum, max(minimum, int(payload.get(name, default))))
+            except (TypeError, ValueError):
+                return default
+
+        def floating(name: str, default: float) -> float:
+            try:
+                return min(1.0, max(0.0, float(payload.get(name, default))))
+            except (TypeError, ValueError):
+                return default
+
+        value = payload.get("adaptive_specialized_retry", True)
+        adaptive = (
+            value.strip().casefold() in {"1", "true", "yes", "on"}
+            if isinstance(value, str) else bool(value)
+        )
+        return cls(
+            adaptive_specialized_retry=adaptive,
+            max_specialized_retries=integer(
+                "max_specialized_retries", 1, 0, 10
+            ),
+            consensus_profile=profile,
+            local_window_days=integer("local_window_days", 10, 0, 365),
+            longitudinal_window_days=integer(
+                "longitudinal_window_days", 90, 1, 3650
+            ),
+            longitudinal_step_days=integer(
+                "longitudinal_step_days", 45, 1, 3650
+            ),
+            semantic_top_k=integer("semantic_top_k", 12, 1, 100),
+            cohesive_threshold=floating("cohesive_threshold", 0.72),
+            bridge_split_threshold=floating("bridge_split_threshold", 0.58),
+            lab=LabEvidencePolicy.from_dict(payload.get("lab", {})),
+        )
+
+
+def load_pipeline_policy(
+    path: str | Path = SETTINGS_PATH,
+) -> ClinicalPipelinePolicy:
+    payload = _read_payload(Path(path))
+    return ClinicalPipelinePolicy.from_dict(payload.get("clinical_pipeline", {}))
+
+
+def save_pipeline_policy(
+    policy: ClinicalPipelinePolicy,
+    path: str | Path = SETTINGS_PATH,
+) -> None:
+    settings_path = Path(path)
+    payload = _read_payload(settings_path)
+    payload["clinical_pipeline"] = asdict(policy)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(settings_path)

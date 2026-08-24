@@ -93,3 +93,34 @@ class GoldAnnotation:
             "source_refs": list(self.source_refs),
             "structured_data": dict(self.structured_data),
         }
+
+
+@dataclass(slots=True)
+class GoldAtomicAnnotation:
+    """Gold label for one atomic fact, exclusion or duplicate occurrence."""
+
+    patient_id: str
+    document_id: str
+    reviewer_slot: str
+    reviewer_id: str
+    source_text: str
+    annotation_id: str = field(
+        default_factory=lambda: f"GATOM_{uuid.uuid4().hex}"
+    )
+    annotation_kind: str = "evidence"
+    fact_type: str | None = None
+    concept_original: str | None = None
+    canonical_label: str | None = None
+    observation_date: str | None = None
+    date_precision: str = "unknown"
+    polarity: str | None = None
+    disposition: str = "accepted_clinical"
+    exclusion_reason: str | None = None
+    source_page: int | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    sentence_refs: list[int] = field(default_factory=list)
+    value: dict[str, Any] = field(default_factory=dict)
+    duplicate_of_annotation_id: str | None = None
+    status: str = "draft"
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)

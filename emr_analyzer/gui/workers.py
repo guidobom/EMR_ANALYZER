@@ -4,13 +4,18 @@ Each worker runs in a separate thread and communicates
 with the main GUI thread via Qt signals.
 """
 
+import threading
+
 from PyQt5.QtCore import QThread, pyqtSignal
+
+from ..clinical.registry_builder import RegistryBuildCancelled
 
 
 class ClinicalHistoryWorker(QThread):
     """Background worker for building the clinical history timeline."""
     progress = pyqtSignal(int, str)         # percentage, message
     finished = pyqtSignal(dict)             # result summary
+    cancelled = pyqtSignal()
     error = pyqtSignal(str)
 
     def __init__(self, builder, patient_id: str,
@@ -21,6 +26,11 @@ class ClinicalHistoryWorker(QThread):
         self.patient_id = patient_id
         self.generate_narrative = generate_narrative
         self.num_workers = num_workers
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        """Request a safe stop after the active LLM call returns."""
+        self._cancel_event.set()
 
     def run(self):
         try:
@@ -41,6 +51,7 @@ class ClinicalHistoryWorker(QThread):
                     self.patient_id,
                     progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
                     generate_narrative=self.generate_narrative,
+                    cancel_check=self._cancel_event.is_set,
                 )
             elif self.num_workers > 1:
                 result = self.builder.build_from_documents_parallel(
@@ -48,14 +59,18 @@ class ClinicalHistoryWorker(QThread):
                     num_workers=self.num_workers,
                     progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
                     generate_narrative=self.generate_narrative,
+                    cancel_check=self._cancel_event.is_set,
                 )
             else:
                 result = self.builder.build_from_documents(
                     self.patient_id,
                     progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
                     generate_narrative=self.generate_narrative,
+                    cancel_check=self._cancel_event.is_set,
                 )
             self.finished.emit(result)
+        except RegistryBuildCancelled:
+            self.cancelled.emit()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -89,16 +104,16 @@ class RegistryQueueWorker(QThread):
         self.patient_ids = list(patient_ids)
         self.num_workers = max(1, int(num_workers or 1))
         self.force_rebuild = bool(force_rebuild)
-        self._cancelled = False
+        self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
         """Request a safe stop after the patient currently being saved."""
-        self._cancelled = True
+        self._cancel_event.set()
 
     def run(self) -> None:
         total = len(self.patient_ids)
         for index, patient_id in enumerate(self.patient_ids, start=1):
-            if self._cancelled:
+            if self._cancel_event.is_set():
                 break
             self.patient_started.emit(index, total, patient_id)
 
@@ -112,6 +127,7 @@ class RegistryQueueWorker(QThread):
                         num_workers=self.num_workers,
                         progress_callback=progress,
                         generate_narrative=False,
+                        cancel_check=self._cancel_event.is_set,
                     )
                 else:
                     # The evidence-first builder verifies input hashes,
@@ -122,8 +138,11 @@ class RegistryQueueWorker(QThread):
                         patient_id,
                         progress_callback=progress,
                         generate_narrative=False,
+                        cancel_check=self._cancel_event.is_set,
                     )
                 self.patient_finished.emit(patient_id, dict(result or {}))
+            except RegistryBuildCancelled:
+                break
             except Exception as exc:
                 self.patient_error.emit(patient_id, str(exc))
 

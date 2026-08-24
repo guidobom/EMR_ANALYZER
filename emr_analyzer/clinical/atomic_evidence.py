@@ -10,11 +10,14 @@ import json
 from pathlib import Path
 import re
 import threading
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 import unicodedata
 import uuid
 
-from .evidence_relevance import annotate_evidence_disposition
+from .evidence_relevance import (
+    annotate_evidence_disposition,
+    classify_nonclinical_passage,
+)
 from .temporal import normalize_clinical_date
 from ..extraction.llm_client import OutputLimitError
 from ..models.clinical_evidence import ClinicalEvidence
@@ -23,49 +26,68 @@ from ..models.clinical_registry import (
     CERTAINTY_LEVELS,
     EVENT_CATEGORIES,
 )
+from ..models.clinical_pipeline import ATOMIC_FACT_TYPES as CONTRACT_FACT_TYPES
+from ..settings import ClinicalPipelinePolicy
 
 
-ATOMIC_PIPELINE_VERSION = "registry_pipeline_v4"
-# v3 and v4 share the same v5 clinical prompt, output schema and immutable
-# evidence identifiers.  v4 changes scheduling/chunk recovery only, so a run
-# interrupted under v3 can safely retain its completed per-document evidence.
-ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS = ("registry_pipeline_v3",)
+ATOMIC_PIPELINE_VERSION = "registry_pipeline_v7"
+# v7 changes the wire contract and the clinical granularity rules.  Stored
+# evidence keeps the same canonical schema, but old extraction checkpoints do
+# not prove that the new relevance/atomicity contract was applied.
+ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS: tuple[str, ...] = ()
 
-_ATOMIC_TASK = """Includi diagnosi/stati, sintomi-segni-vitali e negazioni utili,
-laboratorio-imaging-istologia-biomarcatori, farmaci/oncologia/tossicità,
-procedure, ricoveri, allergie, rischi e follow-up.
+_ATOMIC_TASK = """Estrai i fatti clinici atomici nel contenitore della loro categoria.
 
-Ogni item è esattamente [c,e,r,a,q,g,k]: c=category, e=entity, r=refs,
-a=assertion, q=certainty, g=significance; k è un oggetto per i soli dettagli
-documentati: s=status, d=date, de=date_end, p=precision, i=site, l=side,
-v=severity, x=value, n=number, u=unit, m=drug, o=oncology, z=extra.
+Vincoli obbligatori:
+- usa esclusivamente le chiavi di primo livello definite dallo schema e ometti
+  gli array vuoti; la chiave determina il fact_type;
+- un oggetto descrive un solo reperto, problema, trattamento o decisione;
+  sede, dimensioni, morfologia, andamento e altri attributi dello STESSO
+  reperto restano nello stesso oggetto e nel relativo payload;
+- concept è il concetto clinico essenziale, senza data, stato o valore nel nome;
+- polarity è present, negated o suspected e deve riflettere soltanto il testo;
+- observation_date è la data dell'osservazione/evento, NON la data del referto;
+  omettila quando il testo non documenta una data riferibile a quel fatto;
+- source_refs contiene 1-6 ID S consecutivi con la prova testuale esatta e il
+  referente esplicito; includi l'ID di una data-intestazione solo se governa il
+  fatto. Non generare o parafrasare la citazione: verrà risolta dagli ID;
+- usa numeric_value e unit per misure numeriche; value_text per valori testuali;
+- usa payload soltanto per gli attributi ammessi nella categoria scelta;
+- non fondere fatti, non deduplicare documenti, non inferire causalità o diagnosi;
+- i valori degli esami di laboratorio NON devono essere estratti dal modello:
+  vengono inseriti deterministicamente e soltanto quando fuori range;
+- una sospensione di farmaco è polarity=present con clinical_status=suspended;
+- per un sintomo negato usa negated; per un'ipotesi usa suspected;
+- conserva reperti negativi soltanto se informativi per stadiazione, diagnosi
+  differenziale, sicurezza, risposta o follow-up della patologia nota;
+  in un referto oncologico l'assenza di ulteriori metastasi o di
+  linfoadenomegalie è informativa, la normale anatomia incidentale non lo è;
+- non estrarre anatomia normale, dettagli tecnici/metodologici, appuntamenti,
+  intestazioni o date isolate;
+- il tipo documento nel contesto è soltanto un suggerimento: classifica il
+  contenuto effettivo del passaggio;
+- ometti nel wire i campi non documentati; l'applicazione li espande a null.
 
-Vincoli:
-- 1 item=1 concetto; separa reperti distinti;
-- r: 1-6 ID S consecutivi che contengono la prova e il referente esplicito;
-  includi anche l'ID con la data-intestazione se governa le frasi successive;
-  e: concetto base (dispnea, SpO2, farmaco), senza valore/stato/data;
-- non duplicare lo stesso concetto su frasi adiacenti: usa un item con più refs;
-- copia in k.d la data/durata riferita all'item, senza convertirla;
-  per misure compila k.n e k.u;
-- diagnosis solo se esplicita; symptom=patient_reported salvo prova obiettiva;
-  clinical_sign=obiettivo; toxicity=attribuita a terapia, altrimenti adverse_event;
-- a descrive presenza/negazione del fatto, non il ciclo del farmaco:
-  sospendere è present + k.s/k.m.l=suspended;
-- un valore numerico misurato è present; se la stessa frase dice “dispnea
-  risolta”, crea un item absent per dispnea e uno present per SpO2;
-- suspected=ipotesi, excluded=escluso; “non documentato”=unknown, non excluded;
-- farmaci=medication: k.m con nome, principio se univoco, dose/via/frequenza,
-  indicazione e lifecycle; “ultima somministrazione” usa il nome del farmaco;
-- linea/schema/ciclo in k.o (k.o.l/k.o.r/k.o.c); prima linea va in k.o.l;
-- una diagnosi usata come indicazione terapeutica va estratta anche come diagnosis;
-- reperto/sospetto non diventa diagnosi; discordanti separati; nessuna sintesi;
-- ometti ogni campo non documentato: non emettere null, stringhe vuote o confidence."""
+Includi diagnosi, sintomi, segni/vitali, reperti radiologici e patologici,
+farmaci e trattamenti, decisioni/piani clinici, procedure, ricoveri, tossicità,
+risposta/progressione, allergie, rischi e follow-up clinicamente significativo.
+
+Esempio: "TC: nodulo polmonare destro di 8 mm" produce un solo oggetto in
+radiology_finding con concept "nodulo polmonare", source_refs, anatomical_site,
+laterality e payload.measurement; non creare oggetti separati per sede e misura."""
 
 _ATOMIC_SYSTEM_PROMPT = (
     "Estrai evidenze cliniche atomiche dal testo italiano. Un item descrive "
     "un solo dato. Usa solo la fonte: non fondere, deduplicare, inventare o "
     "inferire causalità. Solo JSON conforme allo schema.\n\n" + _ATOMIC_TASK
+)
+
+_ATOMIC_VALIDATION_REPAIR_SYSTEM_PROMPT = (
+    "Correggi esclusivamente gli oggetti elencati come non validi. Usa il "
+    "testo sorgente numerato per verificarli e restituisci soltanto i loro "
+    "sostituti; non ripetere gli oggetti già validi. Non inventare campi, "
+    "concetti, date o citazioni. Solo JSON conforme allo schema.\n\n"
+    + _ATOMIC_TASK
 )
 
 _THERAPY_LIFECYCLE_STATUSES = (
@@ -83,121 +105,202 @@ ATOMIC_EVENT_CATEGORIES = tuple(
     category for category in EVENT_CATEGORIES
     if category not in _DERIVED_EVENT_CATEGORIES
 )
+ATOMIC_FACT_TYPE_TO_CATEGORY = {
+    "medication": "medication",
+    "laboratory_test": "laboratory_finding",
+    "radiology_finding": "imaging_finding",
+    "instrumental_finding": "instrumental_finding",
+    "diagnosis": "diagnosis",
+    "symptom": "symptom",
+    "clinical_decision": "care_plan",
+    "procedure": "procedure",
+    "clinical_sign": "clinical_sign",
+    "vital_sign": "vital_sign",
+    "histopathology": "histopathology",
+}
+ATOMIC_FACT_TYPES = tuple(CONTRACT_FACT_TYPES)
+LLM_ATOMIC_FACT_TYPES = tuple(
+    fact_type for fact_type in ATOMIC_FACT_TYPES
+    if fact_type != "laboratory_test"
+)
+ATOMIC_POLARITIES = ("present", "negated", "suspected")
 
-
-ATOMIC_EVIDENCE_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "evidence": {
-            "type": "array",
-            "items": {
-                "type": "array",
-                # llama.cpp's JSON-schema grammar converter accepts an array
-                # of schemas in ``items`` as a fixed positional tuple.  The
-                # grammar therefore guarantees all seven positions and their
-                # types while avoiding six repeated property names per atom.
-                "items": [
-                    {
-                        "type": "string", "enum": list(ATOMIC_EVENT_CATEGORIES),
-                    },
-                    {"type": "string"},
-                    {
-                        "type": "array", "minItems": 1, "maxItems": 6,
-                        "items": {"type": "integer", "minimum": 1},
-                    },
-                    {
-                        "type": "string", "enum": list(ASSERTION_TYPES),
-                    },
-                    {
-                        "type": "string",
-                        "enum": [
-                            "confirmed", "suspected", "patient_reported",
-                            "excluded", "unknown",
-                        ],
-                    },
-                    {
-                        "type": "string",
-                        "enum": [
-                            "critical", "high", "clinically_relevant",
-                            "potentially_relevant", "uncertain",
-                        ],
-                    },
-                    {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "s": {"type": "string"},
-                            "d": {"type": "string"},
-                            "de": {"type": "string"},
-                            "p": {
-                                "type": "string", "enum": [
-                                    "day", "month", "year", "interval",
-                                    "approximate", "unknown",
-                                ],
-                            },
-                            "i": {"type": "string"},
-                            "l": {"type": "string"},
-                            "v": {"type": "string"},
-                            "x": {"type": "string"},
-                            "n": {"type": "number"},
-                            "u": {"type": "string"},
-                            "m": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "n": {"type": "string"},
-                                    "i": {"type": "string"},
-                                    "l": {
-                                        "type": "string",
-                                        "enum": list(_THERAPY_LIFECYCLE_STATUSES),
-                                    },
-                                    "d": {"type": "string"},
-                                    "r": {"type": "string"},
-                                    "f": {"type": "string"},
-                                    "x": {"type": "string"},
-                                    "t": {"type": "string"},
-                                    "a": {"type": "string"},
-                                },
-                            },
-                            "o": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "l": {"type": "string"},
-                                    "r": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                    },
-                                    "c": {"type": "string"},
-                                    "d": {"type": "string"},
-                                    "m": {"type": "string"},
-                                    "t": {"type": "string"},
-                                    "p": {"type": "string"},
-                                    "s": {"type": "string"},
-                                    "i": {"type": "string"},
-                                    "x": {"type": "string"},
-                                },
-                            },
-                            "z": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "r": {"type": "string"},
-                                    "g": {"type": "string"},
-                                    "s": {"type": "string"},
-                                },
-                            },
-                        },
-                    },
-                ],
-            },
-        },
+_TYPED_PAYLOAD_FIELDS = {
+    "radiology_finding": {
+        "modality", "body_region", "comparison", "impression", "measurement",
+        "morphology", "signal_characteristics", "enhancement", "distribution",
+        "relation_to_adjacent_structures",
     },
-    "required": ["evidence"],
+    "instrumental_finding": {
+        "modality", "body_region", "measurement", "rhythm", "function",
+        "interpretation",
+    },
+    "diagnosis": {"diagnostic_basis", "stage", "grade", "subtype"},
+    "symptom": {"onset", "course", "frequency", "context"},
+    "clinical_decision": {"action", "target", "rationale", "urgency"},
+    "procedure": {"procedure_type", "intent", "outcome", "complication"},
+    "clinical_sign": {"course", "context", "measurement_method"},
+    "vital_sign": {"context", "measurement_method"},
+    "histopathology": {
+        "specimen", "morphology", "grade", "margins", "invasion",
+        "biomarkers",
+    },
+}
+_WIRE_COMMON_PROPERTIES = {
+    "concept": {"type": "string", "minLength": 1},
+    "value_text": {"type": "string"},
+    "numeric_value": {"type": "number"},
+    "unit": {"type": "string"},
+    "observation_date": {"type": "string"},
+    "observation_date_end": {"type": "string"},
+    "date_precision": {
+        "type": "string", "enum": [
+            "day", "month", "year", "interval", "approximate", "unknown",
+        ],
+    },
+    "polarity": {"type": "string", "enum": list(ATOMIC_POLARITIES)},
+    "source_refs": {
+        "type": "array", "minItems": 1, "maxItems": 6,
+        "items": {"type": "integer", "minimum": 1},
+    },
+    "clinical_status": {"type": "string"},
+    "anatomical_site": {"type": "string"},
+    "laterality": {"type": "string"},
+    "severity": {"type": "string"},
+    "significance": {
+        "type": "string", "enum": [
+            "critical", "high", "clinically_relevant",
+            "potentially_relevant", "uncertain",
+        ],
+    },
 }
 
-ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v5"
+_MEDICATION_WIRE_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "original_name": {"type": "string"},
+        "active_ingredient": {"type": "string"},
+        "lifecycle_status": {
+            "type": "string", "enum": list(_THERAPY_LIFECYCLE_STATUSES),
+        },
+        "dose": {"type": "string"},
+        "route": {"type": "string"},
+        "frequency": {"type": "string"},
+        "indication": {"type": "string"},
+        "intent": {"type": "string"},
+        "adherence": {"type": "string"},
+    },
+}
+
+_ONCOLOGY_WIRE_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "line_label": {"type": "string"},
+        "regimen": {"type": "array", "items": {"type": "string"}},
+        "cycle": {"type": "string"},
+        "dose": {"type": "string"},
+        "modification": {"type": "string"},
+        "toxicity": {"type": "string"},
+        "response": {"type": "string"},
+        "setting": {"type": "string"},
+        "intent": {"type": "string"},
+        "indication": {"type": "string"},
+    },
+}
+
+_PAYLOAD_FIELD_DESCRIPTIONS = {
+    "modality": (
+        "Solo tecnica/modalità (es. TC, RM, PET, ecografia); non inserire "
+        "sede, morfologia o descrizione del reperto."
+    ),
+    "body_region": "Regione anatomica esaminata.",
+    "measurement": "Misura completa del reperto con unità.",
+    "morphology": "Forma, margini e caratteristiche morfologiche.",
+    "signal_characteristics": "Segnale, densità, diffusione o captazione.",
+    "enhancement": "Caratteristiche del potenziamento contrastografico.",
+    "distribution": "Distribuzione spaziale del reperto.",
+    "relation_to_adjacent_structures": (
+        "Rapporto, contiguità, invasione o piano di clivaggio con strutture "
+        "adiacenti."
+    ),
+}
+_WIRE_MISSING_TEXT = {
+    "n.d.", "nd", "n/a", "na", "non disponibile", "non documentato",
+    "non documentata", "non specificato", "non specificata",
+    "non specificato nel testo", "non specificata nel testo", "unknown",
+    "sconosciuto", "sconosciuta",
+}
+
+
+def _wire_item_schema(fact_type: str) -> dict[str, Any]:
+    """Schema whose optional fields exactly match the semantic validator."""
+    properties = copy.deepcopy(_WIRE_COMMON_PROPERTIES)
+    payload_fields = _TYPED_PAYLOAD_FIELDS.get(fact_type, set())
+    if payload_fields:
+        properties["payload"] = {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                field: (
+                    {"type": "array", "items": {"type": "string"}}
+                    if field == "biomarkers" else {
+                        "type": "string",
+                        **(
+                            {"description": _PAYLOAD_FIELD_DESCRIPTIONS[field]}
+                            if field in _PAYLOAD_FIELD_DESCRIPTIONS else {}
+                        ),
+                    }
+                )
+                for field in sorted(payload_fields)
+            },
+        }
+    if fact_type == "medication":
+        properties["medication"] = copy.deepcopy(_MEDICATION_WIRE_SCHEMA)
+        properties["oncology"] = copy.deepcopy(_ONCOLOGY_WIRE_SCHEMA)
+    return {
+        "type": "object", "additionalProperties": False,
+        "properties": properties,
+        "required": ["concept", "polarity", "source_refs"],
+    }
+
+
+def build_atomic_evidence_schema(
+    sentence_count: int | None = None,
+    *,
+    fact_types: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Build a compact category-bucket schema for one source chunk.
+
+    The decoder can only emit citation identifiers that actually occur in the
+    prompt.  This removes the most frequent post-validation failure before a
+    token is sampled instead of paying for a full corrective generation.
+    """
+    selected = tuple(
+        fact_type for fact_type in (fact_types or LLM_ATOMIC_FACT_TYPES)
+        if fact_type in LLM_ATOMIC_FACT_TYPES
+    )
+    properties: dict[str, Any] = {}
+    for fact_type in selected:
+        item_schema = _wire_item_schema(fact_type)
+        if sentence_count is not None and sentence_count > 0:
+            refs = item_schema["properties"]["source_refs"]
+            refs["items"] = {
+                "type": "integer", "enum": list(range(1, sentence_count + 1)),
+            }
+        properties[fact_type] = {
+            "type": "array", "items": item_schema,
+            # A single sentence can contain a treatment list, but an unlimited
+            # array invites attribute-level atom explosion.
+            "maxItems": max(4, min(32, (sentence_count or 8) * 3)),
+        }
+    return {
+        "type": "object", "additionalProperties": False,
+        "properties": properties,
+    }
+
+
+ATOMIC_EVIDENCE_SCHEMA = build_atomic_evidence_schema()
+
+ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v8"
 ATOMIC_PROMPT_DIGEST = hashlib.sha256(
     (
         _ATOMIC_SYSTEM_PROMPT
@@ -233,11 +336,46 @@ class SentenceSpan:
     text: str
 
 
+@dataclass(frozen=True, slots=True)
+class WireValidationIssue:
+    """One object that could not be made canonical without guessing."""
+
+    item_index: int
+    fact_type: str | None
+    reasons: tuple[str, ...]
+    raw: object
+
+    def for_prompt(self) -> dict[str, Any]:
+        return {
+            "item_index": self.item_index,
+            "fact_type": self.fact_type,
+            "errors": list(self.reasons),
+            "invalid_item": self.raw,
+        }
+
+
+@dataclass(slots=True)
+class WireValidationResult:
+    items: list[dict[str, Any]]
+    issues: list[WireValidationIssue]
+    normalized_items: int = 0
+
+
+class AtomicExtractionCancelled(RuntimeError):
+    """Raised at a safe document/chunk boundary after a stop request."""
+
+
 class AtomicEvidenceExtractor:
     """Extract every observation before any deduplication or synthesis."""
 
-    def __init__(self, llm_client):
+    def __init__(
+        self,
+        llm_client,
+        *,
+        policy: ClinicalPipelinePolicy | None = None,
+    ):
         self.llm = llm_client
+        self.policy = policy or ClinicalPipelinePolicy()
         # One extractor instance is shared by all registry workers.  Keep
         # request counters thread-local so timings/tokens from simultaneous
         # documents can never contaminate one another.
@@ -276,27 +414,53 @@ class AtomicEvidenceExtractor:
         document_date: str | None,
         text: str,
         geometry_path: Path | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        chunk_progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[ClinicalEvidence]:
         self._metrics_local.value = {
             "llm_calls": 0,
             "output_limit_retries": 0,
+            "validation_retries": 0,
+            "invalid_items": 0,
+            "normalized_items": 0,
+            "unresolved_invalid_items": 0,
             "source_chunks": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
             "prompt_ms": 0.0,
             "predicted_ms": 0.0,
+            "prefiltered_nonclinical": 0,
         }
         geometry = self._load_geometry(geometry_path)
-        evidence: list[ClinicalEvidence] = []
+        text_for_llm, deterministic_nonclinical = _isolate_nonclinical_lines(
+            text,
+            patient_id=patient_id,
+            document_id=document_id,
+            document_date=document_date,
+            geometry=geometry,
+        )
+        evidence: list[ClinicalEvidence] = list(deterministic_nonclinical)
         position = 0
-        chunks = split_text_chunks(text, self._text_budget())
+        chunks = split_text_chunks(text_for_llm, self._text_budget())
         self._current_metrics()["source_chunks"] = len(chunks)
-        for chunk in chunks:
+        self._current_metrics()["prefiltered_nonclinical"] = len(
+            deterministic_nonclinical
+        )
+        for chunk_number, chunk in enumerate(chunks, start=1):
+            if cancel_check is not None and cancel_check():
+                raise AtomicExtractionCancelled(
+                    "Estrazione interrotta su richiesta dell'utente"
+                )
             extracted_chunks = self._extract_chunk_adaptive(
                 chunk, document_type=document_type,
                 document_date=document_date,
+                cancel_check=cancel_check,
             )
+            if cancel_check is not None and cancel_check():
+                raise AtomicExtractionCancelled(
+                    "Estrazione interrotta su richiesta dell'utente"
+                )
             for resolved_chunk, payload, sentence_spans, retry_depth in (
                 extracted_chunks
             ):
@@ -316,6 +480,8 @@ class AtomicEvidenceExtractor:
                     position += 1
                     if parsed is not None:
                         evidence.append(parsed)
+            if chunk_progress_callback is not None:
+                chunk_progress_callback(chunk_number, len(chunks))
         evidence.extend(_explicit_resolution_evidence(
             patient_id=patient_id,
             document_id=document_id,
@@ -340,8 +506,13 @@ class AtomicEvidenceExtractor:
         document_type: str,
         document_date: str | None,
         retry_depth: int = 0,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> list[tuple[TextChunk, list[dict[str, Any]], list[SentenceSpan], int]]:
         """Retry a dense chunk by deterministic bisection on output limit."""
+        if cancel_check is not None and cancel_check():
+            raise AtomicExtractionCancelled(
+                "Estrazione interrotta su richiesta dell'utente"
+            )
         try:
             payload, spans = self._extract_chunk(
                 chunk, document_type=document_type,
@@ -361,6 +532,7 @@ class AtomicEvidenceExtractor:
                     document_type=document_type,
                     document_date=document_date,
                     retry_depth=retry_depth + 1,
+                    cancel_check=cancel_check,
                 ))
             return extracted
 
@@ -387,26 +559,83 @@ class AtomicEvidenceExtractor:
                 for parameter in parameters.values()
             )
         )
-        try:
-            if supports_limit:
-                data = generator(
-                    prompt, _ATOMIC_SYSTEM_PROMPT, ATOMIC_EVIDENCE_SCHEMA,
-                    max_tokens=self._output_budget(sentence_spans),
-                )
-            else:  # compatibility clients used by integrations/tests
-                data = generator(
-                    prompt, _ATOMIC_SYSTEM_PROMPT, ATOMIC_EVIDENCE_SCHEMA
-                )
-        finally:
-            self._record_last_generation()
-        if not isinstance(data, dict) or not isinstance(data.get("evidence"), list):
-            return [], sentence_spans
-        items = []
-        for raw in data["evidence"]:
-            item = _normalize_atomic_wire_item(raw)
-            if item is not None:
-                items.append(item)
-        return _coalesce_adjacent_wire_items(items), sentence_spans
+        base_schema = build_atomic_evidence_schema(len(sentence_spans))
+
+        def generate(
+            system_prompt: str,
+            repair_note: str = "",
+            *,
+            schema: dict[str, Any] = base_schema,
+            output_budget: int | None = None,
+        ):
+            effective_prompt = prompt + repair_note
+            try:
+                if supports_limit:
+                    return generator(
+                        effective_prompt, system_prompt, schema,
+                        max_tokens=(
+                            output_budget or self._output_budget(sentence_spans)
+                        ),
+                    )
+                return generator(effective_prompt, system_prompt, schema)
+            finally:
+                self._record_last_generation()
+
+        data = generate(_ATOMIC_SYSTEM_PROMPT)
+        validation = _validate_wire_response(data, sentence_spans)
+        items = list(validation.items)
+        pending = list(validation.issues)
+        metrics = self._current_metrics()
+        metrics["invalid_items"] += len(pending)
+        metrics["normalized_items"] += validation.normalized_items
+        retries = (
+            self.policy.max_specialized_retries
+            if self.policy.adaptive_specialized_retry and pending else 0
+        )
+        for _attempt in range(retries):
+            metrics["validation_retries"] += 1
+            relevant_types = tuple(dict.fromkeys(
+                issue.fact_type for issue in pending
+                if issue.fact_type in LLM_ATOMIC_FACT_TYPES
+            ))
+            repair_schema = build_atomic_evidence_schema(
+                len(sentence_spans),
+                fact_types=relevant_types or LLM_ATOMIC_FACT_TYPES,
+            )
+            issue_payload = [issue.for_prompt() for issue in pending[:24]]
+            repaired = generate(
+                _ATOMIC_VALIDATION_REPAIR_SYSTEM_PROMPT,
+                repair_note=(
+                    "\n\nCORREZIONE_MIRATA:\n"
+                    + json.dumps(
+                        issue_payload, ensure_ascii=False, separators=(",", ":")
+                    )
+                    + "\nRestituisci soltanto i sostituti degli oggetti sopra; "
+                    "non ripetere le evidenze già valide."
+                ),
+                schema=repair_schema,
+                output_budget=min(
+                    self._output_budget(sentence_spans),
+                    max(768, 384 + len(pending) * 384),
+                ),
+            )
+            repaired_validation = _validate_wire_response(
+                repaired, sentence_spans
+            )
+            items.extend(repaired_validation.items)
+            metrics["invalid_items"] += len(repaired_validation.issues)
+            metrics["normalized_items"] += (
+                repaired_validation.normalized_items
+            )
+            pending = list(repaired_validation.issues)
+            if not pending:
+                break
+        metrics["unresolved_invalid_items"] += len(pending)
+        coalesced = _coalesce_adjacent_wire_items(items)
+        return (
+            _attach_referential_wire_continuations(coalesced, sentence_spans),
+            sentence_spans,
+        )
 
     def last_extraction_metrics(self) -> dict[str, int | float]:
         """Metrics for the document most recently handled by this thread."""
@@ -418,12 +647,17 @@ class AtomicEvidenceExtractor:
             metrics = {
                 "llm_calls": 0,
                 "output_limit_retries": 0,
+                "validation_retries": 0,
+                "invalid_items": 0,
+                "normalized_items": 0,
+                "unresolved_invalid_items": 0,
                 "source_chunks": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
                 "prompt_ms": 0.0,
                 "predicted_ms": 0.0,
+                "prefiltered_nonclinical": 0,
             }
             self._metrics_local.value = metrics
         return metrics
@@ -479,6 +713,10 @@ class AtomicEvidenceExtractor:
             category = "medication"
         if category not in EVENT_CATEGORIES:
             category = "other"
+        if category == "laboratory_finding":
+            # Laboratory atoms have a single authoritative path from parsed
+            # structured rows.  Never admit an LLM-produced duplicate.
+            return None
         assertion = str(item.get("assertion") or "present").strip().lower()
         if assertion not in ASSERTION_TYPES:
             assertion = "unknown"
@@ -487,6 +725,13 @@ class AtomicEvidenceExtractor:
             certainty = "unknown"
         quote_verified, matched_quote = locate_quote(source_quote, full_text)
         quote_folded = matched_quote.casefold()
+        entity, directly_negated = _ground_direct_negation(
+            entity, matched_quote
+        )
+        if directly_negated:
+            assertion = "absent"
+            certainty = "excluded"
+            item["polarity"] = "negated"
         if category == "symptom" and re.search(
             r"\b(?:riferisc|riferit|lament|segnal)\w*", quote_folded
         ):
@@ -565,6 +810,10 @@ class AtomicEvidenceExtractor:
                 "reference_range", "grade", "stage",
             },
         )
+        if item.get("wire_normalized"):
+            # Audit-only marker: the first response was repaired locally for a
+            # harmless representation mismatch, without another LLM call.
+            data["wire_normalized"] = True
         therapy = _sanitize_nested_payload(
             item.get("therapy"),
             allowed={
@@ -581,6 +830,12 @@ class AtomicEvidenceExtractor:
                 "indication",
             },
             list_fields={"regimen"},
+        )
+        fact_type = str(item.get("fact_type") or _fact_type_for_category(category))
+        typed = _sanitize_nested_payload(
+            item.get("typed_payload"),
+            allowed=_TYPED_PAYLOAD_FIELDS.get(fact_type, set()),
+            list_fields={"biomarkers"},
         )
         if category not in {
             "medication", "toxicity", "response", "progression"
@@ -623,19 +878,32 @@ class AtomicEvidenceExtractor:
         if oncology:
             data["oncology"] = oncology
         data.update({
+            "fact_type": fact_type,
+            "polarity": str(item.get("polarity") or _legacy_polarity(
+                assertion, certainty
+            )),
+            "report_date": document_date,
             "quote_verified": quote_verified,
             "date_original_text": temporal.original_text,
             "date_approximate": temporal.approximate,
             "chunk_index": chunk.index,
             "sentence_refs": refs,
             "adaptive_retry_depth": retry_depth,
+            "source_reference": {
+                "document_id": document_id,
+                "page": page,
+                "bbox": list(bbox) if bbox else None,
+                "passage": matched_quote,
+                "sentence_refs": refs,
+            },
         })
         if context_ref is not None and context_text:
             data["date_context_sentence_ref"] = context_ref
             data["date_context_text"] = context_text
         if item.get("confidence") is not None:
-            # Compatibility with evidence created by prompt v2. Prompt v3 no
-            # longer asks the model for an uncalibrated self-assessment.
+            # Compatibility with evidence created by older prompts. The
+            # current prompt no longer asks the model for an uncalibrated
+            # self-assessment.
             data["llm_confidence_uncalibrated"] = _bounded_float(
                 item.get("confidence"), 0.5
             )
@@ -680,6 +948,21 @@ class AtomicEvidenceExtractor:
             document_id=document_id,
             category=category,
             normalized_entity=entity,
+            fact_type=str(data.get("fact_type") or category),
+            concept_original=entity,
+            canonical_label=entity,
+            mapping_status="unmapped",
+            typed_payload={
+                key: value for key, value in (
+                    ("medication", therapy),
+                    ("oncology", oncology),
+                    (fact_type, typed),
+                    ("extra", {
+                        key: value for key, value in data.items()
+                        if key in {"reference_range", "grade", "stage"}
+                    }),
+                ) if value
+            },
             source_text=matched_quote,
             assertion=assertion,
             certainty=certainty,
@@ -709,7 +992,7 @@ class AtomicEvidenceExtractor:
             extraction_method="llm_atomic_v2",
             model_name=self.model_name,
             prompt_version=ATOMIC_PROMPT_VERSION,
-            schema_version="2.0",
+            schema_version="3.0",
             status="proposed" if quote_verified else "needs_review",
             data=data,
         )
@@ -720,10 +1003,10 @@ class AtomicEvidenceExtractor:
             256, int(getattr(self.llm, "max_output_tokens", 4096) or 4096)
         )
         source_chars = sum(len(span.text) for span in spans)
-        # JSON atoms repeat field names and can exceed their short source.
-        # Too small a cap is slower because it discards one generation and
-        # forces two retries. Dense outliers are still bisected safely.
-        estimated = max(1536, 512 + int(source_chars * 2.2))
+        # The category-bucket contract no longer repeats ``fact_type`` and
+        # null optionals for every item. A tighter cap prevents pathological
+        # verbosity; genuinely dense passages are still bisected safely.
+        estimated = max(1280, 384 + int(source_chars * 1.45))
         return min(configured, estimated)
 
     def _text_budget(self) -> int:
@@ -761,13 +1044,72 @@ def build_atomic_prompt(
     numbered_text = "\n".join(
         f"[S{span.sentence_id}] {span.text}" for span in spans
     )
+    inferred_type = infer_document_content_type(chunk.text)
     return (
-        f"CONTESTO: tipo={document_type or 'non classificato'}; "
+        f"CONTESTO: tipo_dichiarato={document_type or 'non classificato'}; "
+        f"contenuto_probabile={inferred_type}; "
         f"data_documento={document_date or 'non disponibile'}; "
         f"pagine={pages}\n"
         "In refs usa solo i numeri degli ID S seguenti.\n\n"
         f"TESTO:\n{numbered_text}"
     )
+
+
+def infer_document_content_type(text: str) -> str:
+    """Infer a broad content family when imported document labels are wrong."""
+    folded = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    signals = (
+        ("histopathology", (
+            r"\b(?:istologic|istopatologic|immunoistochimic|biopsi|"
+            r"materiale inviato|margini? di resezione)\w*\b",
+        )),
+        ("radiology", (
+            r"\b(?:tc|tac|rmn?|pet(?:/tc)?|ecografi|radiografi|rx)\b",
+            r"\b(?:18f[- ]?fdg|mezzo di contrasto|reperto radiologic)\w*\b",
+            r"\b(?:iperintensit|ipointensit|restrizione (?:del segnale )?"
+            r"in diffusione|potenziamento contrastografic|"
+            r"volume (?:di studio|in esame))\w*\b",
+        )),
+        ("laboratory", (
+            r"\b(?:emocromo|emoglobina|creatinina|transaminasi|tsh|"
+            r"piastrine|leucociti|esami ematochimici)\b",
+        )),
+        ("procedure", (
+            r"\b(?:intervento chirurgico|resezione|asportazione|"
+            r"endoscopia|broncoscopia|colonscopia)\b",
+        )),
+        ("clinical_note", (
+            r"\b(?:anamnesi|esame obiettivo|visita|terapia|"
+            r"diagnosi|piano terapeutico)\b",
+        )),
+    )
+    scores = {
+        label: sum(bool(re.search(pattern, folded)) for pattern in patterns)
+        for label, patterns in signals
+    }
+    best = max(scores, key=scores.get)
+    return best if scores[best] else "non_classificato"
+
+
+def _ground_direct_negation(concept: str, quote: str) -> tuple[str, bool]:
+    """Normalize a directly stated absence without semantic inference."""
+    entity = " ".join(str(concept or "").split()).strip()
+    concept_negative = re.match(
+        r"(?i)^(?:assenza di evidenza|non evidenza|assenza)\s+"
+        r"(?:di\s+)?(.+)$",
+        entity,
+    )
+    quote_negative = re.match(
+        r"(?i)^\s*(?:attualmente\s+)?(?:non\s+(?!si\s+esclud)|"
+        r"assenza\s+di|senza\s+evidenza\s+di)\b",
+        str(quote or ""),
+    )
+    if not concept_negative and not quote_negative:
+        return entity, False
+    if concept_negative:
+        entity = concept_negative.group(1).strip(" .,:;-")
+        entity = re.sub(r"(?i)^ulterior[ie]\s+", "", entity)
+    return entity or str(concept or ""), True
 
 
 def split_sentence_spans(text: str, maximum_chars: int = 1200) -> list[SentenceSpan]:
@@ -810,6 +1152,82 @@ def split_sentence_spans(text: str, maximum_chars: int = 1200) -> list[SentenceS
         SentenceSpan(index, start, end, value[start:end])
         for index, (start, end) in enumerate(raw_ranges, start=1)
     ]
+
+
+def _isolate_nonclinical_lines(
+    text: str,
+    *,
+    patient_id: str,
+    document_id: str,
+    document_date: str | None,
+    geometry,
+) -> tuple[str, list[ClinicalEvidence]]:
+    """Archive obvious boilerplate deterministically and omit it from prompts."""
+    page_pattern = re.compile(
+        r"(?i)^\s*(?:---\s*PAGINA\s+(\d+)\s*---|"
+        r"\[PAGINA\s*:?\s*(\d+)\]|"
+        r"<!--\s*page\s*:\s*(\d+)\s*-->)\s*$"
+    )
+    current_page = None
+    retained = []
+    excluded = []
+    for line_number, raw in enumerate(str(text or "").splitlines(True), start=1):
+        passage = raw.strip()
+        marker = page_pattern.match(passage)
+        if marker:
+            current_page = int(next(value for value in marker.groups() if value))
+            retained.append(raw)
+            continue
+        disposition = classify_nonclinical_passage(passage)
+        if disposition is None:
+            retained.append(raw)
+            continue
+        page, bbox = current_page, None
+        if geometry is not None and passage:
+            page, bbox = geometry.locate_source(passage, current_page)
+        evidence_id = "EVD_" + uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{document_id}:{page}:{line_number}:{passage.casefold()}",
+        ).hex
+        excluded.append(ClinicalEvidence(
+            evidence_id=evidence_id,
+            patient_id=patient_id,
+            document_id=document_id,
+            category="other",
+            normalized_entity=passage[:300] or disposition.reason,
+            source_text=passage,
+            fact_type=None,
+            concept_original=None,
+            canonical_label=None,
+            clinical_relevance=(
+                "excluded_administrative"
+                if disposition.reason == "scheduling"
+                else "excluded_methodological"
+                if disposition.reason in {
+                    "diagnostic_method", "diagnostic_tracer_administration",
+                }
+                else "excluded_boilerplate"
+            ),
+            document_date=document_date,
+            date_precision="unknown",
+            source_page=page,
+            bbox=bbox,
+            confidence=1.0,
+            extraction_method="deterministic_nonclinical",
+            prompt_version=ATOMIC_PROMPT_VERSION,
+            schema_version="3.0",
+            status="auto",
+            data={
+                "registry_role": disposition.role,
+                "registry_role_reason": disposition.reason,
+                "classification_method": "deterministic_prefilter",
+                "source_line": line_number,
+            },
+        ))
+        # Preserve line count/page structure while preventing this passage
+        # from consuming tokens or being hallucinated back as a clinical fact.
+        retained.append("\n" if raw.endswith("\n") else "")
+    return "".join(retained), excluded
 
 
 def bisect_text_chunk(chunk: TextChunk) -> list[TextChunk]:
@@ -969,7 +1387,41 @@ def locate_quote(quote: str, full_text: str) -> tuple[bool, str]:
 
 
 def _expand_atomic_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Map compact v4/v5 wire payloads to the stable internal fields."""
+    """Map the v8 contract and legacy wire payloads to internal fields."""
+    if "fact_type" in item:
+        polarity = str(item.get("polarity") or "").strip().casefold()
+        assertion, certainty = {
+            "present": ("present", "confirmed"),
+            "negated": ("absent", "excluded"),
+            "suspected": ("present", "suspected"),
+        }.get(polarity, ("unknown", "unknown"))
+        return {
+            "fact_type": item.get("fact_type"),
+            "polarity": polarity,
+            "category": ATOMIC_FACT_TYPE_TO_CATEGORY.get(
+                str(item.get("fact_type") or ""), "other"
+            ),
+            "normalized_entity": item.get("concept"),
+            "source_refs": item.get("source_refs"),
+            "assertion": assertion,
+            "certainty": certainty,
+            "clinical_status": item.get("clinical_status"),
+            "observed_date": item.get("observation_date"),
+            "observed_date_end": item.get("observation_date_end"),
+            "date_precision": item.get("date_precision"),
+            "anatomical_site": item.get("anatomical_site"),
+            "laterality": item.get("laterality"),
+            "severity": item.get("severity"),
+            "significance": item.get("significance"),
+            "value_text": item.get("value_text"),
+            "numeric_value": item.get("numeric_value"),
+            "unit": item.get("unit"),
+            "therapy": item.get("medication") or {},
+            "oncology": item.get("oncology") or {},
+            "additional_data": item.get("extra") or {},
+            "typed_payload": item.get("payload") or {},
+            "wire_normalized": bool(item.get("_wire_normalized")),
+        }
     is_v5 = any(key in item for key in ("c", "e", "r"))
     is_v4 = "entity" in item or "refs" in item
     if not is_v5 and not is_v4:
@@ -1044,24 +1496,322 @@ def _expand_atomic_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_atomic_wire_item(value: object) -> dict[str, Any] | None:
-    """Normalize v5 tuples while accepting object payloads from v2-v4."""
+    """Normalize legacy tuple/object payloads kept for stored/test clients."""
     if isinstance(value, dict):
-        return value
+        return dict(value)
     if not isinstance(value, list) or len(value) != 7:
         return None
     category, entity, refs, assertion, certainty, significance, details = value
     if not isinstance(details, dict):
         return None
     item = {
-        "c": category,
-        "e": entity,
-        "r": refs,
-        "a": assertion,
-        "q": certainty,
-        "g": significance,
+        "c": category, "e": entity, "r": refs, "a": assertion,
+        "q": certainty, "g": significance,
     }
     item.update(details)
     return item
+
+
+def _validated_wire_items(
+    data: object, sentence_count: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Compatibility wrapper for older callers and unit tests."""
+    spans = [SentenceSpan(index, 0, 0, "") for index in range(
+        1, max(0, int(sentence_count)) + 1
+    )]
+    result = _validate_wire_response(data, spans)
+    return result.items, len(result.issues)
+
+
+def _validate_wire_response(
+    data: object,
+    sentence_spans: list[SentenceSpan],
+) -> WireValidationResult:
+    """Create canonical wire items and reject only clinically unsafe gaps.
+
+    Harmless representation differences (``S2`` instead of ``2``, null
+    optionals, numeric strings) are normalized locally.  Missing concepts,
+    ambiguous citations and unknown information-bearing fields remain hard
+    failures and are eligible for one small targeted repair.
+    """
+    if not isinstance(data, dict):
+        return WireValidationResult([], [WireValidationIssue(
+            -1, None, ("La risposta non è un oggetto JSON.",), data,
+        )])
+
+    valid: list[dict[str, Any]] = []
+    issues: list[WireValidationIssue] = []
+    normalized_items = 0
+
+    # Backward compatibility for v4-v7 and synthetic test clients.  Current
+    # requests receive category buckets and therefore do not pay for a repeated
+    # fact_type field in every object.
+    legacy = data.get("evidence")
+    if isinstance(legacy, list):
+        for index, raw in enumerate(legacy):
+            item = _normalize_atomic_wire_item(raw)
+            if item is None:
+                issues.append(WireValidationIssue(
+                    index, None, ("Formato legacy non riconosciuto.",), raw,
+                ))
+                continue
+            if "fact_type" not in item:
+                valid.append(item)
+                continue
+            normalized, reasons, changed = _canonical_wire_item(
+                item, str(item.get("fact_type") or ""), sentence_spans
+            )
+            if normalized is None:
+                issues.append(WireValidationIssue(
+                    index, str(item.get("fact_type") or "") or None,
+                    tuple(reasons), raw,
+                ))
+            else:
+                valid.append(normalized)
+                normalized_items += int(changed)
+        return WireValidationResult(valid, issues, normalized_items)
+
+    item_index = 0
+    known_buckets = set(LLM_ATOMIC_FACT_TYPES)
+    unknown_buckets = set(data) - known_buckets
+    if unknown_buckets:
+        issues.append(WireValidationIssue(
+            -1, None,
+            ("Chiavi di primo livello non ammesse: "
+             + ", ".join(sorted(unknown_buckets)),),
+            {key: data.get(key) for key in sorted(unknown_buckets)},
+        ))
+    for fact_type in LLM_ATOMIC_FACT_TYPES:
+        bucket = data.get(fact_type)
+        if bucket is None:
+            continue
+        if not isinstance(bucket, list):
+            issues.append(WireValidationIssue(
+                item_index, fact_type,
+                (f"{fact_type} deve essere un array.",), bucket,
+            ))
+            item_index += 1
+            continue
+        for raw in bucket:
+            normalized, reasons, changed = _canonical_wire_item(
+                raw, fact_type, sentence_spans
+            )
+            if normalized is None:
+                issues.append(WireValidationIssue(
+                    item_index, fact_type, tuple(reasons), raw,
+                ))
+            else:
+                valid.append(normalized)
+                normalized_items += int(changed)
+            item_index += 1
+    return WireValidationResult(valid, issues, normalized_items)
+
+
+def _canonical_wire_item(
+    raw: object,
+    fact_type: str,
+    sentence_spans: list[SentenceSpan],
+) -> tuple[dict[str, Any] | None, list[str], bool]:
+    """Normalize one v8/v7 object without discarding clinical information."""
+    if fact_type not in LLM_ATOMIC_FACT_TYPES:
+        return None, [f"fact_type non ammesso: {fact_type!r}."], False
+    if not isinstance(raw, dict):
+        return None, ["L'item deve essere un oggetto JSON."], False
+
+    value = dict(raw)
+    value.pop("fact_type", None)
+    allowed = set(_wire_item_schema(fact_type)["properties"])
+    # ``extra`` existed in v7. Accept it as a canonical compatibility field;
+    # current v8 schemas no longer offer it to the model.
+    compatibility = {"extra"}
+    unknown = set(value) - allowed - compatibility
+    if unknown:
+        return None, [
+            "Campi non ammessi per " + fact_type + ": "
+            + ", ".join(sorted(unknown)) + "."
+        ], False
+
+    changed = False
+    for key in list(value):
+        if value[key] in (None, "", [], {}):
+            value.pop(key)
+            changed = True
+
+    concept = value.get("concept")
+    if not isinstance(concept, str) and concept is not None:
+        concept = str(concept)
+        changed = True
+    concept = " ".join(str(concept or "").split()).strip()
+    if not concept:
+        return None, ["concept mancante o vuoto."], changed
+    value["concept"] = concept
+
+    polarity_aliases = {
+        "present": "present", "presente": "present", "positive": "present",
+        "negated": "negated", "negato": "negated", "absent": "negated",
+        "suspected": "suspected", "sospetto": "suspected",
+        "possible": "suspected", "probable": "suspected",
+    }
+    original_polarity = str(value.get("polarity") or "").strip().casefold()
+    polarity = polarity_aliases.get(original_polarity)
+    if polarity is None:
+        return None, ["polarity mancante o non ammessa."], changed
+    changed = changed or polarity != original_polarity
+    value["polarity"] = polarity
+
+    raw_refs = value.get("source_refs")
+    refs = _safe_sentence_refs(raw_refs, sentence_spans)
+    supplied_refs = len(raw_refs) if isinstance(raw_refs, list) else 0
+    if not refs:
+        inferred = _infer_wire_refs(concept, sentence_spans)
+        if not inferred:
+            return None, [
+                "source_refs assenti, fuori intervallo o ambigui."
+            ], changed
+        refs = inferred
+        changed = True
+    elif len(refs) != supplied_refs or refs != raw_refs:
+        changed = True
+    value["source_refs"] = refs
+
+    string_fields = {
+        "value_text", "unit", "observation_date", "observation_date_end",
+        "clinical_status", "anatomical_site", "laterality", "severity",
+    }
+    for key in string_fields:
+        if key not in value:
+            continue
+        if isinstance(value[key], (dict, list, bool)):
+            return None, [f"{key} deve essere una stringa o null."], changed
+        cleaned = " ".join(str(value[key]).split()).strip()
+        if cleaned:
+            changed = changed or cleaned != value[key]
+            value[key] = cleaned
+        else:
+            value.pop(key, None)
+            changed = True
+
+    if "numeric_value" in value:
+        numeric = _safe_float(str(value["numeric_value"]).replace(",", "."))
+        if numeric is None:
+            return None, ["numeric_value non è numerico."], changed
+        changed = changed or numeric != value["numeric_value"]
+        value["numeric_value"] = numeric
+
+    precision = value.get("date_precision")
+    if precision not in (None, "day", "month", "year", "interval",
+                          "approximate", "unknown"):
+        value.pop("date_precision", None)
+        changed = True
+    significance = value.get("significance")
+    if significance not in (
+        None, "critical", "high", "clinically_relevant",
+        "potentially_relevant", "uncertain",
+    ):
+        value.pop("significance", None)
+        changed = True
+
+    nested_specs = {
+        "payload": (
+            _TYPED_PAYLOAD_FIELDS.get(fact_type, set()), {"biomarkers"}
+        ),
+        "medication": (
+            set(_MEDICATION_WIRE_SCHEMA["properties"]), set()
+        ),
+        "oncology": (set(_ONCOLOGY_WIRE_SCHEMA["properties"]), {"regimen"}),
+        "extra": ({"reference_range", "grade", "stage"}, set()),
+    }
+    for key, (fields, list_fields) in nested_specs.items():
+        if key not in value:
+            continue
+        if key in {"medication", "oncology"} and fact_type != "medication":
+            return None, [f"{key} non è ammesso per {fact_type}."], changed
+        normalized, nested_changed, nested_error = _canonical_wire_mapping(
+            value[key], fields=fields, list_fields=list_fields
+        )
+        if nested_error:
+            return None, [f"{key}: {nested_error}"], changed
+        changed = changed or nested_changed
+        if normalized:
+            value[key] = normalized
+        else:
+            value.pop(key, None)
+
+    value["fact_type"] = fact_type
+    if changed:
+        value["_wire_normalized"] = True
+    return value, [], changed
+
+
+def _canonical_wire_mapping(
+    raw: object,
+    *,
+    fields: set[str],
+    list_fields: set[str],
+) -> tuple[dict[str, Any], bool, str | None]:
+    if raw is None:
+        return {}, True, None
+    if not isinstance(raw, dict):
+        return {}, False, "deve essere un oggetto."
+    unknown = set(raw) - fields
+    if unknown:
+        return {}, False, (
+            "campi non ammessi: " + ", ".join(sorted(unknown)) + "."
+        )
+    normalized: dict[str, Any] = {}
+    changed = False
+    for key, item in raw.items():
+        if item in (None, "", [], {}):
+            changed = True
+            continue
+        if key in list_fields:
+            values = item if isinstance(item, list) else [item]
+            cleaned = [
+                " ".join(str(value).split()).strip() for value in values
+                if not isinstance(value, (dict, list))
+                and " ".join(str(value).split()).strip()
+            ]
+            if cleaned:
+                normalized[key] = list(dict.fromkeys(cleaned))
+            changed = changed or not isinstance(item, list) or cleaned != item
+            continue
+        if isinstance(item, (dict, list, bool)):
+            return {}, changed, f"{key} deve essere una stringa o null."
+        cleaned = " ".join(str(item).split()).strip()
+        if cleaned and cleaned.casefold().strip(" .") not in _WIRE_MISSING_TEXT:
+            normalized[key] = cleaned
+        elif cleaned:
+            changed = True
+        changed = changed or cleaned != item
+    return normalized, changed, None
+
+
+def _infer_wire_refs(
+    concept: str,
+    sentence_spans: list[SentenceSpan],
+) -> list[int]:
+    """Infer a citation only when the mapping is deterministic."""
+    if len(sentence_spans) == 1:
+        return [1]
+    needle = _identity_text(concept)
+    if not needle:
+        return []
+    exact = [
+        span.sentence_id for span in sentence_spans
+        if needle in _identity_text(span.text)
+    ]
+    return exact if len(exact) == 1 else []
+
+
+def _validate_v6_atomic_item(value: dict[str, Any]) -> dict[str, Any] | None:
+    """Compatibility helper retained for external/test callers."""
+    fact_type = str(value.get("fact_type") or "")
+    maximum = max(_wire_refs(value), default=1)
+    spans = [SentenceSpan(index, 0, 0, "") for index in range(1, maximum + 1)]
+    normalized, _reasons, _changed = _canonical_wire_item(
+        value, fact_type, spans
+    )
+    return normalized
 
 
 def stable_evidence_id(
@@ -1143,7 +1893,12 @@ def _coalesce_adjacent_wire_items(items: list[dict[str, Any]]) -> list[dict[str,
             and refs[0] <= previous_refs[-1] + 1
             and len(set(previous_refs + refs)) <= 6
         )
-        refs_key = "r" if "r" in item or "r" in previous else "refs"
+        if "source_refs" in item or "source_refs" in previous:
+            refs_key = "source_refs"
+        elif "r" in item or "r" in previous:
+            refs_key = "r"
+        else:
+            refs_key = "refs"
         merged = (
             _merge_wire_values(previous, item, ignored={refs_key})
             if same_concept and adjacent else None
@@ -1156,8 +1911,105 @@ def _coalesce_adjacent_wire_items(items: list[dict[str, Any]]) -> list[dict[str,
     return result
 
 
+def _attach_referential_wire_continuations(
+    items: list[dict[str, Any]],
+    spans: list[SentenceSpan],
+) -> list[dict[str, Any]]:
+    """Attach explicit pronoun continuations to the preceding imaging atom.
+
+    A sentence such as ``Essa è in rapporto di contiguità...`` describes an
+    attribute of the lesion in the immediately preceding sentence. Treating
+    that relationship as a second clinical finding creates artificial events.
+    The source IDs remain combined, so the resulting atom cites both claims.
+    """
+    result: list[dict[str, Any]] = []
+    continuation = re.compile(
+        r"(?i)^\s*(?:essa|esso|questa|questo|la (?:lesione|formazione)|"
+        r"il reperto)\b"
+    )
+    relation = re.compile(
+        r"(?i)\b(?:rapport\w*|contiguit|clivaggio|impront\w*|"
+        r"adiacent\w*|invasion\w*|infiltr\w*)\b"
+    )
+    for raw in items:
+        item = copy.deepcopy(raw)
+        refs = _wire_refs(item)
+        source = (
+            spans[refs[0] - 1].text
+            if refs and refs[0] <= len(spans) else ""
+        )
+        if not (
+            result and refs and continuation.search(source)
+            and relation.search(source)
+            and str(item.get("fact_type") or "") == "radiology_finding"
+        ):
+            result.append(item)
+            continue
+        previous = result[-1]
+        previous_refs = _wire_refs(previous)
+        if (
+            str(previous.get("fact_type") or "") != item.get("fact_type")
+            or not previous_refs or refs[0] != previous_refs[-1] + 1
+            or len(set(previous_refs + refs)) > 6
+        ):
+            result.append(item)
+            continue
+        payload = dict(previous.get("payload") or {})
+        details = [str(item.get("concept") or "").strip()]
+        for value in (item.get("payload") or {}).values():
+            cleaned = str(value or "").strip()
+            if cleaned and cleaned not in details:
+                details.append(cleaned)
+        existing = str(payload.get("relation_to_adjacent_structures") or "")
+        combined = "; ".join(value for value in (existing, *details) if value)
+        payload["relation_to_adjacent_structures"] = combined[:1000]
+        previous["payload"] = payload
+        previous["source_refs"] = sorted(set(previous_refs + refs))
+    # The model can correctly avoid creating a second object yet forget to
+    # cite the continuation. Extend the immediately preceding atom directly
+    # from the numbered source when the anaphoric relationship is explicit.
+    claimed_refs = {
+        ref for result_item in result for ref in _wire_refs(result_item)
+    }
+    for item in result:
+        if str(item.get("fact_type") or "") != "radiology_finding":
+            continue
+        refs = _wire_refs(item)
+        while refs and len(refs) < 6:
+            next_ref = refs[-1] + 1
+            if next_ref > len(spans) or next_ref in claimed_refs:
+                break
+            continuation_text = spans[next_ref - 1].text
+            if not (
+                continuation.search(continuation_text)
+                and relation.search(continuation_text)
+            ):
+                break
+            payload = dict(item.get("payload") or {})
+            existing = str(
+                payload.get("relation_to_adjacent_structures") or ""
+            ).strip()
+            literal = " ".join(continuation_text.split()).strip()
+            payload["relation_to_adjacent_structures"] = "; ".join(
+                value for value in (existing, literal) if value
+            )[:1000]
+            item["payload"] = payload
+            refs.append(next_ref)
+            item["source_refs"] = refs
+            claimed_refs.add(next_ref)
+    return result
+
+
 def _wire_value(item: dict[str, Any], short: str, long: str) -> object:
-    return item.get(short) if short in item else item.get(long)
+    if short in item:
+        return item.get(short)
+    if long in item:
+        return item.get(long)
+    return {
+        "category": item.get("fact_type"),
+        "entity": item.get("concept"),
+        "refs": item.get("source_refs"),
+    }.get(long)
 
 
 def _wire_refs(item: dict[str, Any]) -> list[int]:
@@ -1283,11 +2135,21 @@ def _explicit_resolution_evidence(
                 ):
                     continue
                 data: dict[str, Any] = {
+                    "fact_type": "symptom",
+                    "polarity": "negated",
+                    "report_date": document_date,
                     "quote_verified": True,
                     "date_original_text": temporal.original_text,
                     "date_approximate": temporal.approximate,
                     "sentence_refs": [span.sentence_id],
                     "deterministic_explicit_resolution": True,
+                    "source_reference": {
+                        "document_id": document_id,
+                        "page": page,
+                        "bbox": list(bbox) if bbox else None,
+                        "passage": matched_quote,
+                        "sentence_refs": [span.sentence_id],
+                    },
                 }
                 if context_ref is not None and context_text:
                     data["date_context_sentence_ref"] = context_ref
@@ -1312,6 +2174,11 @@ def _explicit_resolution_evidence(
                     document_id=document_id,
                     category="symptom",
                     normalized_entity=entity,
+                    fact_type="symptom",
+                    concept_original=entity,
+                    canonical_label=entity,
+                    mapping_status="unmapped",
+                    clinical_relevance="accepted_low_relevance",
                     source_text=matched_quote,
                     assertion="absent",
                     certainty=certainty,
@@ -1330,7 +2197,7 @@ def _explicit_resolution_evidence(
                     extraction_method="llm_atomic_v2",
                     model_name=model_name,
                     prompt_version=ATOMIC_PROMPT_VERSION,
-                    schema_version="2.0",
+                    schema_version="3.0",
                     status="proposed",
                     data=data,
                 ))
@@ -1559,6 +2426,28 @@ def _safe_int(value: object) -> int | None:
         return parsed if parsed and parsed > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _legacy_polarity(assertion: str, certainty: str) -> str:
+    """Project legacy assertion/certainty fields onto the v6 polarity enum."""
+    if str(certainty or "").casefold() == "suspected":
+        return "suspected"
+    if (
+        str(assertion or "").casefold() == "absent"
+        or str(certainty or "").casefold() == "excluded"
+    ):
+        return "negated"
+    return "present"
+
+
+def _fact_type_for_category(category: str) -> str:
+    preferred = {
+        "laboratory_finding": "laboratory_test",
+        "imaging_finding": "radiology_finding",
+        "care_plan": "clinical_decision",
+        "recommendation": "clinical_decision",
+    }
+    return preferred.get(str(category or ""), str(category or "other"))
 
 
 def _bounded_float(value: object, default: float) -> float:

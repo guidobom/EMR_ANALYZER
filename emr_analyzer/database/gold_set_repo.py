@@ -26,8 +26,10 @@ from ..models.gold_set import (
     GOLD_REVIEWER_SLOTS,
     GOLD_SPLITS,
     GoldAnnotation,
+    GoldAtomicAnnotation,
     GoldSetCase,
 )
+from ..models.clinical_pipeline import ATOMIC_FACT_TYPES, EVIDENCE_DISPOSITIONS
 
 
 def _now() -> str:
@@ -192,6 +194,147 @@ class GoldSetRepository:
             (annotation_id,),
         ).fetchone()
         return self._row_to_annotation(row) if row else None
+
+    def list_atomic_annotations(
+        self, patient_id: str, reviewer_slot: str
+    ) -> list[GoldAtomicAnnotation]:
+        self._validate_slot(reviewer_slot)
+        rows = self.db.execute(
+            """SELECT * FROM gold_atomic_annotations
+               WHERE patient_id=? AND reviewer_slot=?
+               ORDER BY document_id, source_page, annotation_id""",
+            (patient_id, reviewer_slot),
+        ).fetchall()
+        return [self._row_to_atomic_annotation(row) for row in rows]
+
+    def save_atomic_annotation(
+        self, annotation: GoldAtomicAnnotation
+    ) -> GoldAtomicAnnotation:
+        self._validate_slot(annotation.reviewer_slot)
+        case = self.ensure_case(annotation.patient_id)
+        self._assert_editable(case, annotation.reviewer_slot)
+        self._assert_assigned_reviewer(case, annotation)
+        if annotation.annotation_kind not in {
+            "evidence", "exclusion", "duplicate", "invalid"
+        }:
+            raise ValueError("Tipo di annotazione atomica non valido")
+        if annotation.disposition not in EVIDENCE_DISPOSITIONS:
+            raise ValueError("Disposizione atomica non valida")
+        if annotation.fact_type and annotation.fact_type not in ATOMIC_FACT_TYPES:
+            raise ValueError("Tipo di fatto atomico non valido")
+        if not annotation.source_text.strip():
+            raise ValueError("Il passaggio sorgente è obbligatorio")
+        if annotation.annotation_kind == "evidence" and (
+            not annotation.fact_type or not str(annotation.concept_original or "").strip()
+        ):
+            raise ValueError("Tipo di fatto e concetto sono obbligatori")
+        if annotation.annotation_kind in {"exclusion", "invalid"} and not (
+            annotation.exclusion_reason or ""
+        ).strip():
+            raise ValueError("Il motivo di esclusione è obbligatorio")
+        if annotation.annotation_kind == "duplicate":
+            duplicate_id = str(
+                annotation.duplicate_of_annotation_id or ""
+            ).strip()
+            if not duplicate_id or duplicate_id == annotation.annotation_id:
+                raise ValueError(
+                    "Una duplicazione deve indicare un'altra annotazione"
+                )
+            duplicate = self.db.execute(
+                """SELECT patient_id, reviewer_slot
+                   FROM gold_atomic_annotations WHERE annotation_id=?""",
+                (duplicate_id,),
+            ).fetchone()
+            if duplicate is None:
+                raise ValueError("Annotazione atomica originale non trovata")
+            if (
+                duplicate["patient_id"] != annotation.patient_id
+                or duplicate["reviewer_slot"] != annotation.reviewer_slot
+            ):
+                raise ValueError(
+                    "Il duplicato deve riferirsi allo stesso caso e revisore"
+                )
+        now = _now()
+        annotation.updated_at = now
+        with self.db:
+            self.db.execute(
+                """INSERT INTO gold_atomic_annotations
+                   (annotation_id, patient_id, document_id, reviewer_slot,
+                    reviewer_id, annotation_kind, fact_type, concept_original,
+                    canonical_label, observation_date, date_precision, polarity,
+                    disposition, exclusion_reason, source_page, bbox_json,
+                    sentence_refs_json, source_text, value_json,
+                    duplicate_of_annotation_id, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(annotation_id) DO UPDATE SET
+                     fact_type=excluded.fact_type,
+                     concept_original=excluded.concept_original,
+                     canonical_label=excluded.canonical_label,
+                     observation_date=excluded.observation_date,
+                     date_precision=excluded.date_precision,
+                     polarity=excluded.polarity,
+                     disposition=excluded.disposition,
+                     exclusion_reason=excluded.exclusion_reason,
+                     source_page=excluded.source_page,
+                     bbox_json=excluded.bbox_json,
+                     sentence_refs_json=excluded.sentence_refs_json,
+                     source_text=excluded.source_text,
+                     value_json=excluded.value_json,
+                     duplicate_of_annotation_id=excluded.duplicate_of_annotation_id,
+                     status=excluded.status,
+                     updated_at=excluded.updated_at""",
+                (
+                    annotation.annotation_id, annotation.patient_id,
+                    annotation.document_id, annotation.reviewer_slot,
+                    annotation.reviewer_id.strip(), annotation.annotation_kind,
+                    annotation.fact_type, annotation.concept_original,
+                    annotation.canonical_label, annotation.observation_date,
+                    annotation.date_precision, annotation.polarity,
+                    annotation.disposition, annotation.exclusion_reason,
+                    annotation.source_page,
+                    _json(annotation.bbox) if annotation.bbox else None,
+                    _json(annotation.sentence_refs), annotation.source_text.strip(),
+                    _json(annotation.value),
+                    annotation.duplicate_of_annotation_id, annotation.status,
+                    annotation.created_at, annotation.updated_at,
+                ),
+            )
+        self._audit(
+            annotation.patient_id, "gold_atomic_annotation_saved",
+            "gold_atomic_annotation", annotation.annotation_id,
+            {
+                "reviewer_slot": annotation.reviewer_slot,
+                "annotation_kind": annotation.annotation_kind,
+                "fact_type": annotation.fact_type,
+            },
+            actor_id=annotation.reviewer_id,
+            actor_role=annotation.reviewer_slot,
+        )
+        return annotation
+
+    def delete_atomic_annotation(
+        self, annotation_id: str, *, actor_id: str = "local_user"
+    ) -> None:
+        row = self.db.execute(
+            "SELECT * FROM gold_atomic_annotations WHERE annotation_id=?",
+            (annotation_id,),
+        ).fetchone()
+        if row is None:
+            return
+        annotation = self._row_to_atomic_annotation(row)
+        case = self.ensure_case(annotation.patient_id)
+        self._assert_editable(case, annotation.reviewer_slot)
+        with self.db:
+            self.db.execute(
+                "DELETE FROM gold_atomic_annotations WHERE annotation_id=?",
+                (annotation_id,),
+            )
+        self._audit(
+            annotation.patient_id, "gold_atomic_annotation_deleted",
+            "gold_atomic_annotation", annotation_id, {},
+            actor_id=actor_id, actor_role=annotation.reviewer_slot,
+        )
 
     def save_annotation(self, annotation: GoldAnnotation) -> GoldAnnotation:
         annotation.reviewer_id = annotation.reviewer_id.strip()
@@ -839,4 +982,33 @@ class GoldSetRepository:
                 row["source_annotation_ids_json"], []
             ),
             created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_atomic_annotation(row) -> GoldAtomicAnnotation:
+        bbox = _loads(row["bbox_json"], None)
+        return GoldAtomicAnnotation(
+            annotation_id=row["annotation_id"],
+            patient_id=row["patient_id"],
+            document_id=row["document_id"],
+            reviewer_slot=row["reviewer_slot"],
+            reviewer_id=row["reviewer_id"],
+            annotation_kind=row["annotation_kind"],
+            fact_type=row["fact_type"],
+            concept_original=row["concept_original"],
+            canonical_label=row["canonical_label"],
+            observation_date=row["observation_date"],
+            date_precision=row["date_precision"],
+            polarity=row["polarity"],
+            disposition=row["disposition"],
+            exclusion_reason=row["exclusion_reason"],
+            source_page=row["source_page"],
+            bbox=tuple(bbox) if bbox else None,
+            sentence_refs=_loads(row["sentence_refs_json"], []),
+            source_text=row["source_text"],
+            value=_loads(row["value_json"], {}),
+            duplicate_of_annotation_id=row["duplicate_of_annotation_id"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )

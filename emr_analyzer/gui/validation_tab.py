@@ -220,7 +220,9 @@ class ValidationTab(QWidget):
             )
             db.commit()
 
-            if row_data.get("item_type") == "clinical_event_v2":
+            if row_data.get("item_type") in {
+                "clinical_event_v2", "clinical_event_v3"
+            }:
                 review_repo = self._services.get("review_repo")
                 if review_repo:
                     review_repo.decide_event(
@@ -237,6 +239,19 @@ class ValidationTab(QWidget):
                         timeline_repo.set_golden(
                             str(row_data.get("item_id") or ""),
                             new_status == "accepted",
+                        )
+            elif row_data.get("item_type") in {
+                "atomic_duplicate_v3", "evidence_relation_v3"
+            } and new_status in {"accepted", "rejected"}:
+                repository = self._services.get("pipeline_repo")
+                if repository:
+                    if row_data.get("item_type") == "atomic_duplicate_v3":
+                        repository.review_duplicate_group(
+                            str(row_data.get("item_id") or ""), new_status
+                        )
+                    else:
+                        repository.review_evidence_relation(
+                            str(row_data.get("item_id") or ""), new_status
                         )
 
             # If accepted, also update the underlying item
@@ -350,6 +365,15 @@ class ValidationTab(QWidget):
                 return
             self._perform_reattribution(row_data, target, "corrected")
             return
+        if row_data.get("item_type") in {
+            "atomic_duplicate_v3", "evidence_relation_v3"
+        }:
+            QMessageBox.information(
+                self, "Decisione strutturata",
+                "Per questo elemento usa Accetta o Rifiuta; la correzione "
+                "testuale non modificherebbe la relazione sottostante."
+            )
+            return
 
         new_value, ok = QInputDialog.getText(
             self, "Correggi Valore",
@@ -367,7 +391,9 @@ class ValidationTab(QWidget):
                     (new_value, datetime.now().isoformat(), row_data.get("id")),
                 )
                 db.commit()
-            if row_data.get("item_type") == "clinical_event_v2":
+            if row_data.get("item_type") in {
+                "clinical_event_v2", "clinical_event_v3"
+            }:
                 review_repo = self._services.get("review_repo")
                 if review_repo:
                     review_repo.decide_event(

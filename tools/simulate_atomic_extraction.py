@@ -32,8 +32,22 @@ def main() -> int:
     parser.add_argument("--model", default="qwen3-14b")
     parser.add_argument("--context", type=int, default=8192)
     parser.add_argument("--max-output", type=int, default=2048)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--speculative", action="store_true")
+    parser.add_argument("--input", type=Path)
+    parser.add_argument("--document-type", default="visita_specialistica")
+    parser.add_argument("--date", default="2025-03-25")
+    parser.add_argument("--show-source", action="store_true")
     args = parser.parse_args()
+
+    source_text = (
+        args.input.read_text(encoding="utf-8")
+        if args.input is not None else SYNTHETIC_NOTE
+    )
+    if args.show_source:
+        print("--- TESTO SORGENTE ---", file=sys.stderr, flush=True)
+        print(source_text, file=sys.stderr, flush=True)
+        print("--- ESTRAZIONE ---", file=sys.stderr, flush=True)
 
     config = LLMRoleConfig(
         model=args.model,
@@ -43,7 +57,7 @@ def main() -> int:
         top_p=0.9,
         top_k=40,
         seed=42,
-        parallel_workers=1,
+        parallel_workers=max(1, args.workers),
         speculative_decoding=args.speculative,
     )
     client = LlmClient(config=config)
@@ -53,9 +67,13 @@ def main() -> int:
         evidence = extractor.extract_document(
             patient_id="P_SYNTHETIC",
             document_id="D_SYNTHETIC",
-            document_type="visita_specialistica",
-            document_date="2025-03-25",
-            text=SYNTHETIC_NOTE,
+            document_type=args.document_type,
+            document_date=args.date,
+            text=source_text,
+            chunk_progress_callback=lambda done, total: print(
+                f"Segmento {done}/{total} completato",
+                file=sys.stderr, flush=True,
+            ),
         )
         payload = {
             "model": args.model,

@@ -78,6 +78,24 @@ class ProcessingRepository:
         )
         self.db.commit()
 
+    def interrupt_run(self, run_id: str, message: str | None = None) -> None:
+        """Close a cooperatively cancelled run and its unfinished manifests."""
+        now = _now()
+        reason = message or "Esecuzione interrotta: ripresa necessaria"
+        self.db.execute(
+            """UPDATE processing_runs
+               SET status='interrupted', completed_at=?, error_message=?
+               WHERE run_id=?""",
+            (now, reason, run_id),
+        )
+        self.db.execute(
+            """UPDATE processing_manifest
+               SET status='failed', error_message=?, processed_at=?, updated_at=?
+               WHERE run_id=? AND status='running'""",
+            (reason, now, now, run_id),
+        )
+        self.db.commit()
+
     def is_current(
         self,
         document_id: str,

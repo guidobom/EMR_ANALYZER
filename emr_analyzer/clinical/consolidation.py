@@ -144,6 +144,16 @@ _HIGH_RISK_CATEGORIES = {
 }
 
 
+def _graph_anchor_rank(category: str) -> int:
+    return {
+        "diagnosis": 0, "histopathology": 1, "procedure": 2,
+        "hospitalization": 3, "surgery": 4, "symptom": 5,
+        "clinical_sign": 6, "imaging_finding": 7,
+        "instrumental_finding": 8, "medication": 9,
+        "laboratory_finding": 10,
+    }.get(category, 20)
+
+
 class ClinicalConsolidator:
     """Build episodes/events without deleting or rewriting source evidence."""
 
@@ -181,6 +191,99 @@ class ClinicalConsolidator:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             future_map = {
                 pool.submit(self._bundle, cluster): index
+                for index, cluster in enumerate(clusters)
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                ordered[future_map[future]] = future.result()
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, len(clusters))
+        return [bundle for bundle in ordered if bundle is not None]
+
+    def consolidate_graph_clusters(
+        self,
+        patient_id: str,
+        graph_clusters,
+        *,
+        evidence_by_id: dict[str, ClinicalEvidence],
+        num_workers: int = 1,
+        progress_callback=None,
+    ) -> list[ConsolidatedBundle]:
+        """Build events only from graph-derived memberships and exceptions."""
+        clusters: list[EvidenceCluster] = []
+        role_maps: list[dict[str, str]] = []
+        for graph_cluster in graph_clusters:
+            items = [
+                evidence_by_id[evidence_id]
+                for evidence_id in graph_cluster.evidence_ids
+                if evidence_id in evidence_by_id
+            ]
+            if not items:
+                continue
+            anchor = min(items, key=lambda item: (
+                _graph_anchor_rank(item.category),
+                date_sort_key(item.observed_date or item.document_date),
+                item.evidence_id,
+            ))
+            cluster = EvidenceCluster(
+                patient_id=patient_id,
+                category=_CATEGORY_ALIASES.get(anchor.category, anchor.category),
+                canonical_entity=(
+                    canonicalize_entity(
+                        anchor.canonical_label or anchor.normalized_entity
+                    ) or "evento"
+                ),
+                evidence=sorted(items, key=lambda item: (
+                    date_sort_key(item.observed_date or item.document_date),
+                    item.document_id, item.evidence_id,
+                )),
+            )
+            self._detect_conflicts(cluster)
+            clusters.append(cluster)
+            role_maps.append(dict(graph_cluster.roles))
+        clusters.sort(key=lambda cluster: (
+            date_sort_key(
+                cluster.evidence[0].observed_date
+                or cluster.evidence[0].document_date
+            ),
+            cluster.category, cluster.canonical_entity,
+        ))
+        # Role maps must follow the same deterministic order as clusters.
+        roles_by_membership = {
+            tuple(sorted(role_map)): role_map for role_map in role_maps
+        }
+        self._assign_stable_ids(clusters)
+
+        def build(cluster):
+            bundle = self._bundle(cluster)
+            role_map = roles_by_membership.get(tuple(sorted(
+                item.evidence_id for item in cluster.evidence
+            )), {})
+            for link in bundle.links:
+                link.role = role_map.get(link.evidence_id, "core")
+            bundle.event.structured_data["graph_relation_ids"] = next((
+                list(graph_cluster.relation_ids)
+                for graph_cluster in graph_clusters
+                if tuple(sorted(graph_cluster.evidence_ids)) == tuple(sorted(
+                    item.evidence_id for item in cluster.evidence
+                ))
+            ), [])
+            bundle.event.structured_data["evidence_roles"] = role_map
+            return bundle
+
+        workers = max(1, min(int(num_workers or 1), len(clusters) or 1))
+        if workers == 1:
+            result = []
+            for index, cluster in enumerate(clusters, start=1):
+                result.append(build(cluster))
+                if progress_callback:
+                    progress_callback(index, len(clusters))
+            return result
+        ordered: list[ConsolidatedBundle | None] = [None] * len(clusters)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {
+                pool.submit(build, cluster): index
                 for index, cluster in enumerate(clusters)
             }
             completed = 0

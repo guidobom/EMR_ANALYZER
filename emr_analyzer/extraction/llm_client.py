@@ -1,6 +1,6 @@
-"""Client for configurable local models served by llama.cpp.
+"""Client for configurable local models served by llama.cpp or vLLM.
 
-Generation goes through the app-managed llama-server backend
+Generation goes through an app-managed loopback server
 (:mod:`emr_analyzer.llm_backend`); no external Ollama service is involved.
 The document-normalization path uses ``generate_text``; the structured
 methods are retained only for the separate Clinical State layer.
@@ -47,6 +47,9 @@ class LlmClient:
         # callers; the llama.cpp backend owns its server URLs.
         self.base_url = str(base_url or "").rstrip("/")
         self.model = config.model if config is not None else model
+        self.backend_type = (
+            config.backend if config is not None else "llama_cpp"
+        )
         self.temperature = config.temperature if config is not None else 0.1
         self.context_length = (
             config.context_length if config is not None else 32768
@@ -68,7 +71,28 @@ class LlmClient:
         self.speculative_decoding = bool(
             config.speculative_decoding if config is not None else False
         )
-        self.backend = backend if backend is not None else get_backend()
+        self.vllm_dtype = (
+            config.vllm_dtype if config is not None else "auto"
+        )
+        self.vllm_gpu_memory_utilization = (
+            config.vllm_gpu_memory_utilization
+            if config is not None else 0.90
+        )
+        self.vllm_tensor_parallel_size = (
+            config.vllm_tensor_parallel_size if config is not None else 1
+        )
+        self.vllm_quantization = (
+            config.vllm_quantization if config is not None else ""
+        )
+        self.vllm_trust_remote_code = bool(
+            config.vllm_trust_remote_code if config is not None else False
+        )
+        self.vllm_enforce_eager = bool(
+            config.vllm_enforce_eager if config is not None else False
+        )
+        self.backend = (
+            backend if backend is not None else get_backend(self.backend_type)
+        )
         self._available = None  # Lazy check
         # Generation metadata is request-local: one LlmClient is deliberately
         # shared by the parallel registry workers.
@@ -79,13 +103,17 @@ class LlmClient:
         return f"{self.keep_alive_minutes}m"
 
     @classmethod
-    def list_available_models(cls, base_url: str | None = None) -> list[str]:
-        """Return the friendly names of the locally installed GGUF models."""
-        return get_backend().list_models()
+    def list_available_models(
+        cls,
+        base_url: str | None = None,
+        backend: str = "llama_cpp",
+    ) -> list[str]:
+        """Return models already installed for the selected local backend."""
+        return get_backend(backend).list_models()
 
     @property
     def is_available(self) -> bool:
-        """Check whether this model exists in the local GGUF index."""
+        """Check whether this model exists in the selected local store."""
         if self._available is None:
             try:
                 self._available = (
@@ -97,10 +125,10 @@ class LlmClient:
 
     @property
     def server_available(self) -> bool:
-        """Return whether the llama.cpp backend is usable.
+        """Return whether the selected local backend is usable.
 
-        True when the llama-server binary is installed and at least one
-        local model is registered; the server process itself is spawned
+        True when the selected engine is installed and at least one local
+        model is registered; the server process itself is spawned
         lazily, so it need not be running yet.
         """
         try:
@@ -122,10 +150,11 @@ class LlmClient:
         runtime["size"] = size
         runtime["size_vram"] = size
         runtime["expires_at"] = ""
+        runtime["backend"] = self.backend_type
         return runtime
 
-    def runtime_identity(self) -> tuple[str, int, int, str]:
-        """Return ``(GGUF path, context, slots, speculation)``."""
+    def runtime_identity(self) -> tuple:
+        """Return the stable physical-runtime identity for this client."""
         return self.backend.runtime_identity(self)
 
     @classmethod
@@ -133,24 +162,27 @@ class LlmClient:
         cls, configs: list[LLMRoleConfig] | tuple[LLMRoleConfig, ...]
     ) -> dict:
         """Stop exact configured runtimes without loading them first."""
-        backend = get_backend()
-        unique: dict[tuple[str, int, int], LLMRoleConfig] = {}
+        unique: dict[tuple[str, tuple], LLMRoleConfig] = {}
         errors: dict[str, str] = {}
         for config in configs:
             if not config.model:
                 continue
+            backend_name = getattr(config, "backend", "llama_cpp")
+            backend = get_backend(backend_name)
             try:
                 identity = backend.runtime_identity(config)
             except Exception as exc:
                 errors[config.model] = str(exc)
                 continue
-            unique.setdefault(identity, config)
+            unique.setdefault((backend_name, identity), config)
 
         unloaded = []
         not_loaded = []
-        for identity, config in unique.items():
+        for (backend_name, identity), config in unique.items():
+            backend = get_backend(backend_name)
             label = (
-                f"{config.model} · ctx {identity[1]} · {identity[2]} slot"
+                f"{config.model} · {backend_name} · ctx {identity[1]} · "
+                f"{identity[2]} slot"
             )
             try:
                 if backend.stop_config(config):
@@ -177,8 +209,19 @@ class LlmClient:
         process is stopped, so unloading means terminating the process.
         The method is idempotent and never loads a model merely to unload it.
         """
-        backend = get_backend()
-        loaded = backend.running_model_names()
+        backends = {
+            "llama_cpp": get_backend("llama_cpp"),
+            "vllm": get_backend("vllm"),
+        }
+        loaded_by_backend = {
+            name: backend.running_model_names()
+            for name, backend in backends.items()
+        }
+        loaded = sorted({
+            model
+            for models in loaded_by_backend.values()
+            for model in models
+        })
 
         if model_names is None:
             targets = loaded
@@ -195,13 +238,18 @@ class LlmClient:
         unloaded = []
         errors = {}
         for model_name in targets:
-            try:
-                if backend.stop_model(model_name):
-                    unloaded.append(model_name)
-                else:
-                    errors[model_name] = "processo già terminato"
-            except Exception as exc:
-                errors[model_name] = str(exc)
+            stopped = False
+            for backend_name, backend in backends.items():
+                if model_name not in loaded_by_backend[backend_name]:
+                    continue
+                try:
+                    stopped = backend.stop_model(model_name) or stopped
+                except Exception as exc:
+                    errors[f"{backend_name}:{model_name}"] = str(exc)
+            if stopped:
+                unloaded.append(model_name)
+            elif not any(key.endswith(f":{model_name}") for key in errors):
+                errors[model_name] = "processo già terminato"
 
         return {
             "unloaded": unloaded,
@@ -220,7 +268,7 @@ class LlmClient:
         }
 
     def model_capabilities(self) -> dict:
-        """Read model metadata from the local index (GGUF header info)."""
+        """Read metadata from the selected backend's local model store."""
         entry = self.backend.model_info(self.model) or {}
         return {
             "model": self.model,
@@ -369,7 +417,8 @@ class LlmClient:
             )
         except KeyError as exc:
             raise RuntimeError(
-                f"Modello locale non trovato tra i GGUF disponibili: {exc}"
+                f"Modello non trovato nell'archivio locale del backend "
+                f"{self.backend_type}: {exc}"
             ) from exc
         self._generation_local.metadata = {
             "finish_reason": result.get("finish_reason") or "stop",
@@ -384,16 +433,22 @@ class LlmClient:
     def generate_structured(self, prompt: str, system: str,
                             schema: dict,
                             *, max_tokens: int | None = None) -> dict:
-        """Generate locally with a llama.cpp-enforced JSON schema.
+        """Generate locally with a backend-enforced JSON schema.
 
         The request uses llama-server's ``json_object`` response format.
         Some server builds are known to silently ignore the schema, so a
         fence/brace JSON extraction is attempted before failing.
         """
 
+        formatter = getattr(self.backend, "structured_response_format", None)
+        response_format = (
+            formatter(schema)
+            if callable(formatter)
+            else {"type": "json_object", "schema": schema}
+        )
         response = self._generate(
             prompt, system,
-            response_format={"type": "json_object", "schema": schema},
+            response_format=response_format,
             max_tokens=max_tokens,
         )
         try:

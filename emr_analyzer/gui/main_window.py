@@ -14,6 +14,9 @@ from .patient_panel import PatientPanel
 from .workspace_tabs import WorkspaceTabs
 from .context_panel import ContextPanel
 from .llm_config_dialog import LLMConfigDialog
+from .pipeline_config_dialog import PipelineConfigDialog
+from .excluded_evidence_dialog import ExcludedEvidenceDialog
+from .hypothesis_dialog import HypothesisDialog
 from .styles import MAIN_STYLESHEET
 from ..clinical.atomic_evidence import AtomicEvidenceExtractor
 from ..config import APP_NAME, APP_VERSION, active_workspace
@@ -116,6 +119,24 @@ class MainWindow(QMainWindow):
         )
         registry_queue_action.triggered.connect(self._on_show_registry_queue)
         tools_menu.addAction(registry_queue_action)
+
+        pipeline_action = QAction("Configura &pipeline clinica...", self)
+        pipeline_action.setToolTip(
+            "Configura evidenze di laboratorio, retry adattivo, grafo e consenso"
+        )
+        pipeline_action.triggered.connect(self._open_pipeline_config)
+        tools_menu.addAction(pipeline_action)
+
+        exclusions_action = QAction("Rivedi evidenze &escluse...", self)
+        exclusions_action.triggered.connect(self._open_excluded_evidence)
+        tools_menu.addAction(exclusions_action)
+
+        hypotheses_action = QAction("Scopri e rivedi &ipotesi cliniche...", self)
+        hypotheses_action.setToolTip(
+            "Comando esplorativo separato: le ipotesi non entrano nel RAG"
+        )
+        hypotheses_action.triggered.connect(self._open_hypotheses)
+        tools_menu.addAction(hypotheses_action)
 
         tools_menu.addSeparator()
 
@@ -262,6 +283,40 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Event Handlers
     # ------------------------------------------------------------------
+    def _open_pipeline_config(self):
+        dialog = PipelineConfigDialog(
+            self, pipeline_repo=self._services.get("pipeline_repo")
+        )
+        if dialog.exec_() == QDialog.Accepted:
+            builder = self._services.get("registry_builder")
+            if builder is not None and hasattr(builder, "reload_policy"):
+                builder.reload_policy()
+            self.statusbar.showMessage(
+                "Configurazione della pipeline clinica aggiornata", 5000
+            )
+
+    def _open_excluded_evidence(self):
+        if not self._current_patient_id:
+            QMessageBox.information(
+                self, "Nessun paziente", "Seleziona prima un paziente."
+            )
+            return
+        dialog = ExcludedEvidenceDialog(
+            self._current_patient_id, self._services, self
+        )
+        dialog.exec_()
+
+    def _open_hypotheses(self):
+        if not self._current_patient_id:
+            QMessageBox.information(
+                self, "Nessun paziente", "Seleziona prima un paziente."
+            )
+            return
+        dialog = HypothesisDialog(
+            self._current_patient_id, self._services, self
+        )
+        dialog.exec_()
+
     def _on_new_patient(self):
         from .patient_panel import NewPatientDialog
         dialog = NewPatientDialog(self._services.get("patient_repo"), self)
@@ -530,7 +585,13 @@ class MainWindow(QMainWindow):
         configs = self._services.get("llm_configs") or load_llm_configs()
         try:
             available_models = LlmClient.list_available_models()
-            self._ollama_available = True
+            backend_availability = [LlmClient().server_available]
+            for config in configs.values():
+                if config.backend == "vllm" and config.model:
+                    backend_availability.append(
+                        LlmClient(config=config).server_available
+                    )
+            self._ollama_available = any(backend_availability)
         except Exception:
             available_models = []
             self._ollama_available = False
@@ -621,7 +682,10 @@ class MainWindow(QMainWindow):
         if propagate_events is not None:
             propagate_events(event_client)
         self._propagate_state_llm(state_client)
-        self._ollama_available = LlmClient().server_available
+        self._ollama_available = any(
+            client is not None and client.server_available
+            for client in clients.values()
+        )
         self._services["ollama_available"] = self._ollama_available
         self.update_model_status(self._ollama_available)
         self.statusbar.showMessage("Configurazione LLM salvata e applicata", 6000)
@@ -644,7 +708,7 @@ class MainWindow(QMainWindow):
                 self,
                 "Modelli non disponibili",
                 "Configurazione salvata, ma questi modelli non risultano "
-                "tra i GGUF locali (~/.emr_analyzer/models):\n- "
+                "nell'archivio locale del backend selezionato:\n- "
                 + "\n- ".join(unavailable),
             )
 
@@ -652,18 +716,18 @@ class MainWindow(QMainWindow):
         configs = self._services.get("llm_configs")
         if not configs:
             self._ollama_label.setToolTip(
-                "Motore locale (llama.cpp) pronto" if self._ollama_available
+                "Motore LLM locale pronto" if self._ollama_available
                 else "Motore locale non disponibile — esegui "
-                     "tools/setup_llama_backend.py"
+                     "lo strumento di setup llama.cpp/vLLM"
             )
             return
         configs = dict(configs)
         for role in ("atomic_evidence", "clinical_events"):
             configs.setdefault(role, configs["clinical_state"])
         connection = (
-            "Motore locale (llama.cpp) pronto" if self._ollama_available
+            "Motore LLM locale pronto" if self._ollama_available
             else "Motore locale non disponibile — esegui "
-                 "tools/setup_llama_backend.py"
+                 "lo strumento di setup llama.cpp/vLLM"
         )
         try:
             runtime_ids = {
@@ -693,7 +757,8 @@ class MainWindow(QMainWindow):
             "clinical_state": "Analisi e interrogazione",
         }
         role_lines = [
-            f"{labels[role]}: {configs[role].model or 'off'} — "
+            f"{labels[role]}: {configs[role].model or 'off'} "
+            f"[{configs[role].backend}] — "
             f"ctx {configs[role].context_length}, "
             f"{configs[role].parallel_workers} slot, "
             f"T {configs[role].temperature:g}"

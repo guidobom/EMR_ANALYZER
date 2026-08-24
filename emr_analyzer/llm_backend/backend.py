@@ -53,6 +53,8 @@ class LlamaBackend:
             )
         )
 
+    backend_name = "llama_cpp"
+
     # -- model directory ------------------------------------------------------
 
     def list_models(self) -> list[str]:
@@ -195,6 +197,10 @@ class LlamaBackend:
             pass
 
     # -- HTTP API ------------------------------------------------------------
+
+    @staticmethod
+    def structured_response_format(schema: dict) -> dict:
+        return {"type": "json_object", "schema": schema}
 
     def chat(
         self,

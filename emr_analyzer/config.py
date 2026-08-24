@@ -69,6 +69,17 @@ LLAMA_SERVER_LOAD_TIMEOUT = 180
 # load: 5 minutes proved too tight, so be generous (the old Ollama client
 # had no practical timeout at all).
 LLAMA_SERVER_HTTP_TIMEOUT = 1800
+
+# --- Optional vLLM backend (Linux / NVIDIA, app-managed) ---
+# vLLM is deliberately not a mandatory Python dependency: it is useful on
+# CUDA workstations such as DGX Spark but is not supported by the macOS/Metal
+# installation.  The executable is discovered at runtime when a role selects
+# the vLLM backend.
+VLLM_SERVER_BINARY = ""
+VLLM_SERVER_HOST = "127.0.0.1"
+VLLM_SERVER_BASE_PORT = 11535
+VLLM_SERVER_LOAD_TIMEOUT = 900
+VLLM_SERVER_HTTP_TIMEOUT = 1800
 # GGUF models directory and its metadata index (see llm_backend/model_store.py).
 LLM_MODELS_DIR = BASE_DIR / "models"
 LLM_MODEL_INDEX_PATH = LLM_MODELS_DIR / "index.json"

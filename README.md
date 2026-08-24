@@ -33,8 +33,9 @@ della pratica clinica.
 
 L’applicazione è progettata per funzionare senza servizi cloud. PDF, database,
 testi estratti, chiavi di identità e modelli locali rimangono sul computer.
-Il motore LLM è llama.cpp: l’applicazione avvia e ferma da sé il proprio
-processo `llama-server`, senza alcun servizio esterno da tenere in vita.
+I motori LLM locali sono llama.cpp e, opzionalmente su Linux/NVIDIA, vLLM:
+l’applicazione avvia e ferma da sé i propri processi, senza alcun servizio
+esterno da tenere in vita.
 
 Il repository non deve contenere dati sanitari reali. La `.gitignore` esclude
 per impostazione predefinita:
@@ -51,16 +52,17 @@ Usare nei test pubblicabili esclusivamente documenti sintetici.
 - macOS o Linux;
 - Python 3.12;
 - ambiente Conda consigliato;
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) installato
-  (`brew install llama.cpp` su macOS; build CUDA su Linux, vedi sotto);
-- modelli GGUF locali per le funzioni LLM che si desidera utilizzare.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) con modelli GGUF
+  (`brew install llama.cpp` su macOS; build CUDA su Linux), oppure vLLM con
+  modelli Hugging Face già locali su Linux/NVIDIA.
 
 La configurazione dei modelli, della temperatura, del contesto e dell’output
 avviene dall’interfaccia tramite **Configura LLM**.
 
-I ruoli condividono un solo processo `llama-server` e una sola copia dei pesi
-quando usano lo stesso GGUF con uguale contesto per richiesta e uguale numero
-di slot. Temperatura, top-p/top-k, seed e limite di output restano
+I ruoli condividono un solo processo e una sola copia dei pesi quando usano lo
+stesso backend e modello con uguali parametri motore (contesto e concorrenza;
+per vLLM anche precisione, quota GPU e tensor parallel). Temperatura,
+top-p/top-k, seed e limite di output restano
 indipendenti perché sono parametri della singola richiesta. La finestra mostra
 se i server fisici sono condivisi o distinti, gli slot realmente caricati e
 una stima complessiva della memoria; cambiando contesto o slot, **Salva e
@@ -97,6 +99,17 @@ python run.py
 ```
 
 ### Linux / NVIDIA DGX Spark
+
+Su DGX Spark è possibile scegliere per ogni ruolo sia llama.cpp sia vLLM.
+Per vLLM, eseguire prima la diagnostica non invasiva:
+
+```bash
+python tools/setup_vllm_backend.py
+```
+
+L'installazione esplicita (`--install`), la preparazione offline dei modelli e
+i parametri consigliati sono descritti in
+[docs/VLLM_DGX_SPARK.md](docs/VLLM_DGX_SPARK.md).
 
 Il backend llama.cpp dell’app è indipendente dalla piattaforma: la gestione
 dei processi, le porte, il parallelismo multi-slot e i modelli GGUF sono
@@ -161,7 +174,8 @@ emr_analyzer/
 
 ## Modelli e riproducibilità
 
-I modelli locali (GGUF serviti da llama-server) sono configurabili
+I modelli locali (GGUF tramite llama.cpp oppure checkpoint Hugging Face tramite
+vLLM) sono configurabili
 separatamente per:
 
 1. isolamento del testo clinico dai singoli documenti;

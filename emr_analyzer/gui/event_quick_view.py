@@ -87,6 +87,16 @@ class EventQuickViewDialog(QDialog):
         detail_text = event.get("summary_detail") or ""
         if detail_text and detail_text != event.get("summary_short"):
             lines.append(f"<p>{html.escape(str(detail_text))}</p>")
+        claims = self._detail.get("claims") or []
+        if claims:
+            lines.append("<p><b>Claim e citazioni:</b></p><ol>")
+            for claim in claims:
+                sources = claim.get("sources") or []
+                lines.append(
+                    f"<li>{html.escape(str(claim.get('text') or ''))} "
+                    f"<small>[{len(sources)} fonti]</small></li>"
+                )
+            lines.append("</ol>")
         if episode.get("recurrence_index", 1) > 1:
             lines.append(f"<p><b>Ricorrenza:</b> {episode['recurrence_index']}</p>")
         if relations:
@@ -121,6 +131,7 @@ class EventQuickViewDialog(QDialog):
             self._evidence_tree.addTopLevelItem(root)
             for evidence in evidences:
                 relation = evidence.get("relation") or "supports"
+                role = evidence.get("role") or "core"
                 if relation == "duplicate_source":
                     included = "copia · solo fonte"
                     relation_label = "copia documentale"
@@ -129,7 +140,7 @@ class EventQuickViewDialog(QDialog):
                         "in sintesi"
                         if evidence.get("included_in_summary") else "contesto"
                     )
-                    relation_label = relation
+                    relation_label = f"{relation} / {role}"
                 child = QTreeWidgetItem([
                     str(evidence.get("observed_date") or evidence.get("source_document_date") or "n.d."),
                     f"{relation_label} · {included}",

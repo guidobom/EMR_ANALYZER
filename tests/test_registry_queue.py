@@ -39,7 +39,7 @@ class FakeBuilder:
         }
 
     def build_incremental(self, patient_id, *, progress_callback,
-                          generate_narrative):
+                          generate_narrative, cancel_check=None):
         self.calls.append(("incremental", patient_id, generate_narrative))
         progress_callback(25, "estrazione")
         progress_callback(100, "completato")
@@ -47,7 +47,7 @@ class FakeBuilder:
 
     def build_from_documents_parallel(
         self, patient_id, *, num_workers, progress_callback,
-        generate_narrative,
+        generate_narrative, cancel_check=None,
     ):
         self.calls.append((
             "rebuild", patient_id, num_workers, generate_narrative,

@@ -12,6 +12,7 @@ from emr_analyzer.config import (
 from emr_analyzer.settings import (
     LLMRoleConfig,
     load_chat_preferences,
+    default_llm_configs,
     load_llm_configs,
     load_model_assignments,
     save_chat_preferences,
@@ -45,6 +46,11 @@ class ModelSettingsTest(unittest.TestCase):
             self.assertEqual(
                 assignments["clinical_events"],
                 CLINICAL_STATE_LLM_MODEL_NAME,
+            )
+            configs = default_llm_configs()
+            self.assertEqual(configs["atomic_evidence"].temperature, 0.0)
+            self.assertFalse(
+                configs["atomic_evidence"].speculative_decoding
             )
 
     def test_assignments_persist_independently_and_allow_disabled_model(self):
@@ -138,6 +144,36 @@ class ModelSettingsTest(unittest.TestCase):
                 self.assertEqual(configs[role].temperature, 0.37)
                 self.assertEqual(configs[role].context_length, 49152)
                 self.assertEqual(configs[role].parallel_workers, 3)
+
+    def test_vllm_parameters_roundtrip_and_legacy_defaults_to_llama(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            configs = {
+                "document": LLMRoleConfig(model="qwen3-14b"),
+                "atomic_evidence": LLMRoleConfig(
+                    model="Qwen/Clinical",
+                    backend="vllm",
+                    vllm_dtype="bfloat16",
+                    vllm_gpu_memory_utilization=0.85,
+                    vllm_tensor_parallel_size=2,
+                    vllm_quantization="awq",
+                    vllm_enforce_eager=True,
+                ),
+                "clinical_events": LLMRoleConfig(model="qwen3-14b"),
+                "clinical_state": LLMRoleConfig(model="qwen3-14b"),
+            }
+            save_llm_configs(configs, path)
+            loaded = load_llm_configs(path)
+            self.assertEqual(loaded, configs)
+
+            path.write_text(
+                '{"llm":{"document":{"model":"legacy"},'
+                '"clinical_state":{"model":"legacy"}}}',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                load_llm_configs(path)["document"].backend, "llama_cpp"
+            )
 
 
 class ChatPreferencesTest(unittest.TestCase):

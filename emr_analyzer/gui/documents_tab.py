@@ -1650,64 +1650,15 @@ class DocumentsTab(QWidget):
     @staticmethod
     def _lab_values_to_evidence(doc, lab_values: list,
                                 parsing_result=None) -> list:
-        from ..models.clinical_evidence import ClinicalEvidence
+        from ..clinical.lab_evidence import abnormal_lab_evidence
 
-        evidence = []
-        for lab in lab_values:
-            page = lab.page
-            bbox = None
-            if parsing_result and hasattr(parsing_result, "locate_source"):
-                located_page, bbox = parsing_result.locate_source(
-                    lab.source_text, page
-                )
-                page = located_page or page
-            if lab.is_abnormal:
-                clinical_status = "abnormal"
-            elif lab.reference_low is None and lab.reference_high is None:
-                clinical_status = "not_assessable"
-            else:
-                clinical_status = "within_range"
-            evidence.append(ClinicalEvidence(
-                patient_id=doc.patient_id,
-                document_id=doc.id,
-                category="laboratory_finding",
-                normalized_entity=lab.normalized_name,
-                assertion="observed",
-                temporality="current",
-                clinical_status=clinical_status,
-                observed_date=lab.sample_date or doc.document_date,
-                value_text=(
-                    lab.value_text
-                    if lab.value_text is not None
-                    else (str(lab.value) if lab.value is not None else "")
-                ),
-                numeric_value=lab.value,
-                unit=lab.unit,
-                source_page=page,
-                source_text=lab.source_text,
-                bbox=bbox,
-                confidence=lab.confidence,
-                extraction_method="deterministic_lab",
-                document_date=doc.document_date,
-                date_precision=(
-                    "day" if len(str(lab.sample_date or doc.document_date or "")) == 10
-                    else "month" if len(str(lab.sample_date or doc.document_date or "")) == 7
-                    else "unknown"
-                ),
-                date_source=(
-                    "sample_date" if lab.sample_date else "document_date"
-                ),
-                prompt_version=None,
-                schema_version="2.0",
-                status="auto",
-                data={
-                    "reference_low": lab.reference_low,
-                    "reference_high": lab.reference_high,
-                    "reference_text": lab.reference_text,
-                    "flag": lab.flag,
-                },
-            ))
-        return evidence
+        return abnormal_lab_evidence(
+            patient_id=doc.patient_id,
+            document_id=doc.id,
+            document_date=doc.document_date,
+            lab_values=lab_values,
+            geometry=parsing_result,
+        )
 
     def _extract_document_date(self, text: str) -> str | None:
         """

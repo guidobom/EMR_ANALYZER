@@ -49,6 +49,7 @@ class ClinicalHistoryBuilder:
         patient_id: str,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         generate_narrative: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> dict:
         """Run the full pipeline and persist the result.
 
@@ -62,6 +63,7 @@ class ClinicalHistoryBuilder:
             result = self._registry_builder.build(
                 patient_id, incremental=False, num_workers=1,
                 progress_callback=progress_callback,
+                cancel_check=cancel_check,
             )
             if generate_narrative:
                 self.generate_narrative(patient_id)
@@ -209,6 +211,7 @@ class ClinicalHistoryBuilder:
         patient_id: str,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         generate_narrative: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> dict:
         """Process only NEW documents and merge with the existing registry.
 
@@ -227,6 +230,7 @@ class ClinicalHistoryBuilder:
             result = self._registry_builder.build(
                 patient_id, incremental=True, num_workers=workers,
                 progress_callback=progress_callback,
+                cancel_check=cancel_check,
             )
             if generate_narrative:
                 self.generate_narrative(patient_id)
@@ -377,6 +381,7 @@ class ClinicalHistoryBuilder:
         num_workers: int = 4,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         generate_narrative: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> dict:
         """Parallel version — extracts from every document concurrently.
 
@@ -390,6 +395,7 @@ class ClinicalHistoryBuilder:
             result = self._registry_builder.build(
                 patient_id, incremental=False, num_workers=num_workers,
                 progress_callback=progress_callback,
+                cancel_check=cancel_check,
             )
             if generate_narrative:
                 self.generate_narrative(patient_id)

@@ -44,6 +44,7 @@ from ..models.clinical_registry import (
     SIGNIFICANCE_LEVELS,
 )
 from ..models.gold_set import GoldAnnotation
+from .atomic_gold_widget import AtomicGoldWidget
 
 
 _ROLE_LABELS = {
@@ -80,6 +81,12 @@ class GoldSetTab(QWidget):
         )
         self._workflow_tabs.addTab(
             self._build_adjudication_page(), "2. Confronto e adjudication"
+        )
+        self._atomic_gold = AtomicGoldWidget(
+            lambda: str(self._role.currentData() or "")
+        )
+        self._workflow_tabs.addTab(
+            self._atomic_gold, "3. Evidenze atomiche"
         )
         root.addWidget(self._workflow_tabs, stretch=1)
 
@@ -377,11 +384,25 @@ class GoldSetTab(QWidget):
 
     def set_services(self, services: dict) -> None:
         self._services = services
+        self._atomic_gold.set_services(services)
+        current = self._category.currentText()
+        categories = list(EVENT_CATEGORIES)
+        repository = services.get("pipeline_repo")
+        if repository is not None:
+            categories.extend(
+                item["category"] for item in repository.list_categories("event")
+            )
+        self._category.clear()
+        self._category.addItems(list(dict.fromkeys(categories)))
+        index = self._category.findText(current)
+        if index >= 0:
+            self._category.setCurrentIndex(index)
         if self._current_patient_id:
             self.load_patient(self._current_patient_id)
 
     def load_patient(self, patient_id: str) -> None:
         self._current_patient_id = patient_id or None
+        self._atomic_gold.load_patient(patient_id)
         self._current_annotation = None
         self._source_refs = []
         repository = self._services.get("gold_set_repo")
@@ -469,6 +490,7 @@ class GoldSetTab(QWidget):
         self._current_annotation = None
         self._clear_form()
         self._refresh_annotations()
+        self._atomic_gold.role_changed()
         self._update_controls()
 
     def _refresh_annotations(self) -> None:

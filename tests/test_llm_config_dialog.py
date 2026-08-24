@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -80,6 +81,47 @@ class LLMConfigDialogTest(unittest.TestCase):
         )
         self.assertEqual(
             dialog._acceleration_probe_button.text(), "Verifica di nuovo"
+        )
+        dialog._runtime_timer.stop()
+        dialog.deleteLater()
+
+    def test_dialog_exposes_vllm_engine_parameters_per_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = os.path.join(tmp, "clinical-model")
+            os.mkdir(model_dir)
+            with open(
+                os.path.join(model_dir, "config.json"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write(
+                    '{"architectures":["TestForCausalLM"],'
+                    '"max_position_embeddings":65536}'
+                )
+            with open(
+                os.path.join(model_dir, "model.safetensors"), "wb"
+            ) as handle:
+                handle.write(b"fake-weights")
+            configs = {
+                "document": LLMRoleConfig(
+                    model=model_dir,
+                    backend="vllm",
+                    vllm_dtype="bfloat16",
+                    vllm_gpu_memory_utilization=0.85,
+                    vllm_tensor_parallel_size=1,
+                ),
+                "clinical_state": LLMRoleConfig(model=""),
+            }
+            with patch.object(LlmClient, "loaded_model_info", return_value=None):
+                dialog = LLMConfigDialog(configs, [])
+
+        widgets = dialog._widgets["document"]
+        self.assertEqual(widgets["backend"].currentData(), "vllm")
+        self.assertFalse(widgets["vllm_group"].isHidden())
+        self.assertTrue(widgets["speculative_decoding"].isHidden())
+        collected = dialog._collect_config("document")
+        self.assertEqual(collected.backend, "vllm")
+        self.assertEqual(collected.vllm_dtype, "bfloat16")
+        self.assertAlmostEqual(
+            collected.vllm_gpu_memory_utilization, 0.85
         )
         dialog._runtime_timer.stop()
         dialog.deleteLater()

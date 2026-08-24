@@ -1,4 +1,4 @@
-"""Single configuration dialog for independent local llama.cpp roles."""
+"""Configuration dialog for independent llama.cpp and vLLM roles."""
 
 from __future__ import annotations
 
@@ -68,10 +68,25 @@ class LLMConfigDialog(QDialog):
         for role in ("atomic_evidence", "clinical_events"):
             configs.setdefault(role, configs["clinical_state"])
         self._initial_configs = dict(configs)
-        self._installed_models = set(available_models)
+        self._installed_models = set(available_models)  # GGUF / llama.cpp
+        try:
+            self._vllm_models = set(
+                LlmClient.list_available_models(backend="vllm")
+            )
+        except Exception:
+            self._vllm_models = set()
+        configured_by_backend = {"llama_cpp": set(), "vllm": set()}
+        for config in configs.values():
+            if config.model:
+                configured_by_backend.setdefault(config.backend, set()).add(
+                    config.model
+                )
+        self._model_choices = {
+            "llama_cpp": self._installed_models | configured_by_backend["llama_cpp"],
+            "vllm": self._vllm_models | configured_by_backend["vllm"],
+        }
         self._models = sorted(
-            self._installed_models
-            | {config.model for config in configs.values() if config.model}
+            self._model_choices["llama_cpp"] | self._model_choices["vllm"]
         )
         self._widgets: dict[str, dict] = {}
         self._capability_cache: dict[str, dict] = {}
@@ -88,7 +103,7 @@ class LLMConfigDialog(QDialog):
             intro = QLabel(
                 "Le quattro funzioni hanno modelli e parametri indipendenti. "
                 "Quando modello, contesto e slot coincidono condividono un "
-                "solo processo llama.cpp e una sola copia dei pesi. "
+                "solo processo locale e una sola copia dei pesi. "
                 "Temperatura e token di risposta possono invece differire "
                 "senza duplicare il modello."
             )
@@ -101,7 +116,7 @@ class LLMConfigDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        acceleration_box = QGroupBox("Accelerazione CUDA / Metal")
+        acceleration_box = QGroupBox("Accelerazione CUDA / Metal e vLLM")
         acceleration_layout = QHBoxLayout(acceleration_box)
         self._acceleration_status = QLabel(
             "Accelerazione non ancora verificata. Il controllo non carica "
@@ -111,11 +126,11 @@ class LLMConfigDialog(QDialog):
         self._acceleration_status.setStyleSheet("color: #5d6d7e;")
         acceleration_layout.addWidget(self._acceleration_status, stretch=1)
         self._acceleration_probe_button = QPushButton(
-            "Verifica CUDA / Metal"
+            "Verifica CUDA / Metal / vLLM"
         )
         self._acceleration_probe_button.setToolTip(
-            "Chiede al binario llama-server configurato di elencare i "
-            "dispositivi disponibili, senza caricare alcun GGUF."
+            "Verifica llama-server, vLLM e i dispositivi disponibili senza "
+            "caricare modelli o interrompere server."
         )
         self._acceleration_probe_button.clicked.connect(
             self._start_acceleration_probe
@@ -149,7 +164,7 @@ class LLMConfigDialog(QDialog):
             )
         layout.addWidget(self._role_tabs, stretch=1)
 
-        runtime_box = QGroupBox("Server llama.cpp fisici")
+        runtime_box = QGroupBox("Server LLM locali fisici")
         runtime_layout = QHBoxLayout(runtime_box)
         self._runtime_summary = QLabel("Verifica runtime in corso…")
         self._runtime_summary.setWordWrap(True)
@@ -169,7 +184,7 @@ class LLMConfigDialog(QDialog):
         gpu_actions.addStretch()
         self._unload_all_button = QPushButton("■ Libera tutti i modelli")
         self._unload_all_button.setToolTip(
-            "Ferma i processi llama-server avviati dall'applicazione, "
+            "Ferma i processi llama-server e vLLM avviati dall'applicazione, "
             "scaricando dalla memoria unificata/GPU tutti i modelli residenti."
         )
         self._unload_all_button.clicked.connect(self._unload_all_models)
@@ -207,7 +222,7 @@ class LLMConfigDialog(QDialog):
         ):
             return
         self._acceleration_status.setText(
-            "Verifica del backend effettivo di llama-server in corso…"
+            "Verifica dei backend locali llama.cpp e vLLM in corso…"
         )
         self._acceleration_status.setStyleSheet(
             "color: #2980b9; font-weight: bold;"
@@ -267,14 +282,19 @@ class LLMConfigDialog(QDialog):
             for role, widgets in self._widgets.items()
         }
         self._installed_models.add(clean_name)
-        self._models = sorted(self._installed_models)
-        self._capability_cache.pop(clean_name, None)
+        self._model_choices["llama_cpp"].add(clean_name)
+        self._models = sorted(
+            self._model_choices["llama_cpp"] | self._model_choices["vllm"]
+        )
+        self._capability_cache.pop(("llama_cpp", clean_name), None)
         for role, widgets in self._widgets.items():
+            if widgets["backend"].currentData() != "llama_cpp":
+                continue
             combo = widgets["model"]
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("(nessun modello)", "")
-            for model_name in self._models:
+            for model_name in sorted(self._model_choices["llama_cpp"]):
                 combo.addItem(model_name, model_name)
             index = combo.findData(selections[role])
             combo.setCurrentIndex(index if index >= 0 else 0)
@@ -285,7 +305,8 @@ class LLMConfigDialog(QDialog):
     def _update_model_count_label(self) -> None:
         count = len(self._installed_models)
         self._model_count_label.setText(
-            f"Modelli GGUF registrati: {count} · ~/.emr_analyzer/models/"
+            f"GGUF registrati: {count} · modelli vLLM locali: "
+            f"{len(self._vllm_models)}"
         )
 
     def _build_role_group(
@@ -298,12 +319,27 @@ class LLMConfigDialog(QDialog):
         description_label.setWordWrap(True)
         grid.addWidget(description_label, 0, 0, 1, 6)
 
+        backend = QComboBox()
+        backend.addItem("llama.cpp · GGUF (macOS / CUDA)", "llama_cpp")
+        backend.addItem("vLLM · CUDA (DGX / Linux)", "vllm")
+        backend_index = backend.findData(config.backend)
+        backend.setCurrentIndex(backend_index if backend_index >= 0 else 0)
+        backend.setToolTip(
+            "llama.cpp usa GGUF ed è compatibile con Metal e CUDA; vLLM "
+            "usa modelli Hugging Face già locali ed è destinato a CUDA."
+        )
+
         model = QComboBox()
+        # Create the line editor even when the initial backend is llama.cpp;
+        # it will become visible if the user later switches this role to
+        # vLLM and wants to enter an explicit local model directory.
+        model.setEditable(True)
         model.addItem("(nessun modello)", "")
-        for name in self._models:
+        for name in sorted(self._model_choices.get(config.backend, set())):
             model.addItem(name, name)
         index = model.findData(config.model)
         model.setCurrentIndex(index if index >= 0 else 0)
+        model.setEditable(config.backend == "vllm")
 
         status = QLabel("● verifica…")
         status.setMinimumWidth(112)
@@ -316,15 +352,17 @@ class LLMConfigDialog(QDialog):
         unload_button = QPushButton("■ Scarica dalla memoria")
         unload_button.setEnabled(False)
 
-        grid.addWidget(QLabel("Modello:"), 1, 0)
-        grid.addWidget(model, 1, 1, 1, 3)
-        grid.addWidget(status, 1, 4)
-        grid.addWidget(test_button, 1, 5)
-        grid.addWidget(optimize_button, 1, 6)
+        grid.addWidget(QLabel("Backend:"), 1, 0)
+        grid.addWidget(backend, 1, 1, 1, 3)
+        grid.addWidget(QLabel("Modello:"), 2, 0)
+        grid.addWidget(model, 2, 1, 1, 3)
+        grid.addWidget(status, 2, 4)
+        grid.addWidget(test_button, 2, 5)
+        grid.addWidget(optimize_button, 2, 6)
 
         max_context = QLabel("Contesto massimo: verifica in corso…")
         max_context.setStyleSheet("color: #5d6d7e;")
-        grid.addWidget(max_context, 2, 1, 1, 5)
+        grid.addWidget(max_context, 3, 1, 1, 5)
 
         temperature = QDoubleSpinBox()
         temperature.setRange(0.0, 2.0)
@@ -376,18 +414,18 @@ class LLMConfigDialog(QDialog):
             "Seed fisso per favorire la riproducibilità; -1 usa un seed casuale."
         )
 
-        grid.addWidget(QLabel("Temperatura:"), 3, 0)
-        grid.addWidget(temperature, 3, 1)
-        grid.addWidget(QLabel("Contesto:"), 3, 3)
-        grid.addWidget(context, 3, 4, 1, 2)
-        grid.addWidget(QLabel("Token risposta (massimo):"), 4, 0)
-        grid.addWidget(output, 4, 1)
-        grid.addWidget(QLabel("Top-p:"), 4, 3)
-        grid.addWidget(top_p, 4, 4, 1, 2)
-        grid.addWidget(QLabel("Top-k:"), 5, 0)
-        grid.addWidget(top_k, 5, 1)
-        grid.addWidget(QLabel("Seed:"), 5, 3)
-        grid.addWidget(seed, 5, 4, 1, 2)
+        grid.addWidget(QLabel("Temperatura:"), 4, 0)
+        grid.addWidget(temperature, 4, 1)
+        grid.addWidget(QLabel("Contesto:"), 4, 3)
+        grid.addWidget(context, 4, 4, 1, 2)
+        grid.addWidget(QLabel("Token risposta (massimo):"), 5, 0)
+        grid.addWidget(output, 5, 1)
+        grid.addWidget(QLabel("Top-p:"), 5, 3)
+        grid.addWidget(top_p, 5, 4, 1, 2)
+        grid.addWidget(QLabel("Top-k:"), 6, 0)
+        grid.addWidget(top_k, 6, 1)
+        grid.addWidget(QLabel("Seed:"), 6, 3)
+        grid.addWidget(seed, 6, 4, 1, 2)
         output_warning = QLabel("")
         output_warning.setWordWrap(True)
         output_warning.setStyleSheet(
@@ -395,15 +433,15 @@ class LLMConfigDialog(QDialog):
             "border: 1px solid #e5c365; border-radius: 4px; padding: 4px;"
         )
         output_warning.setVisible(False)
-        grid.addWidget(output_warning, 6, 0, 1, 7)
+        grid.addWidget(output_warning, 7, 0, 1, 7)
 
         resident_note = QLabel(
             "Il server resta residente finché non viene scaricato. Se è "
             "condiviso, lo scaricamento interessa tutti i ruoli associati."
         )
         resident_note.setStyleSheet("color: #5d6d7e;")
-        grid.addWidget(resident_note, 7, 0, 1, 3)
-        grid.addWidget(unload_button, 7, 4, 1, 2)
+        grid.addWidget(resident_note, 8, 0, 1, 3)
+        grid.addWidget(unload_button, 8, 4, 1, 2)
 
         # Worker selector — parallel document/text processing
         workers_combo = None
@@ -421,9 +459,9 @@ class LLMConfigDialog(QDialog):
             workers_info = QLabel("")
             workers_info.setWordWrap(True)
             workers_info.setStyleSheet("color: #5d6d7e; font-size: 11px;")
-            grid.addWidget(QLabel("Richieste parallele (slot):"), 8, 0)
-            grid.addWidget(workers_combo, 8, 1)
-            grid.addWidget(workers_info, 8, 3, 1, 3)
+            grid.addWidget(QLabel("Richieste parallele (slot):"), 9, 0)
+            grid.addWidget(workers_combo, 9, 1)
+            grid.addWidget(workers_info, 9, 3, 1, 3)
 
         speculative = QCheckBox(
             "Decodifica speculativa n-gram (sperimentale)"
@@ -434,7 +472,51 @@ class LLMConfigDialog(QDialog):
             "verifica ogni token prima di accettarlo. Può accelerare il JSON "
             "clinico, ma va misurato sul computer locale."
         )
-        grid.addWidget(speculative, 9, 0, 1, 6)
+        grid.addWidget(speculative, 10, 0, 1, 6)
+
+        vllm_group = QGroupBox("Parametri motore vLLM")
+        vllm_grid = QGridLayout(vllm_group)
+        vllm_dtype = QComboBox()
+        for value in ("auto", "bfloat16", "float16", "float32"):
+            vllm_dtype.addItem(value, value)
+        dtype_index = vllm_dtype.findData(config.vllm_dtype)
+        vllm_dtype.setCurrentIndex(dtype_index if dtype_index >= 0 else 0)
+        vllm_gpu_memory = QDoubleSpinBox()
+        vllm_gpu_memory.setRange(0.05, 0.99)
+        vllm_gpu_memory.setDecimals(2)
+        vllm_gpu_memory.setSingleStep(0.05)
+        vllm_gpu_memory.setValue(config.vllm_gpu_memory_utilization)
+        vllm_tensor_parallel = QSpinBox()
+        vllm_tensor_parallel.setRange(1, 16)
+        vllm_tensor_parallel.setValue(config.vllm_tensor_parallel_size)
+        vllm_quantization = QComboBox()
+        vllm_quantization.setEditable(True)
+        for value in ("", "awq", "gptq", "bitsandbytes", "fp8", "compressed-tensors"):
+            vllm_quantization.addItem(value or "auto / dal modello", value)
+        quant_index = vllm_quantization.findData(config.vllm_quantization)
+        if quant_index >= 0:
+            vllm_quantization.setCurrentIndex(quant_index)
+        elif config.vllm_quantization:
+            vllm_quantization.setEditText(config.vllm_quantization)
+        vllm_trust_remote_code = QCheckBox("Consenti codice remoto già locale")
+        vllm_trust_remote_code.setChecked(config.vllm_trust_remote_code)
+        vllm_trust_remote_code.setToolTip(
+            "Abilitare solo per modelli verificati: permette al repository "
+            "locale di eseguire codice Python personalizzato."
+        )
+        vllm_enforce_eager = QCheckBox("Forza modalità eager")
+        vllm_enforce_eager.setChecked(config.vllm_enforce_eager)
+        vllm_grid.addWidget(QLabel("Precisione:"), 0, 0)
+        vllm_grid.addWidget(vllm_dtype, 0, 1)
+        vllm_grid.addWidget(QLabel("Quota memoria GPU:"), 0, 2)
+        vllm_grid.addWidget(vllm_gpu_memory, 0, 3)
+        vllm_grid.addWidget(QLabel("Tensor parallel GPU:"), 1, 0)
+        vllm_grid.addWidget(vllm_tensor_parallel, 1, 1)
+        vllm_grid.addWidget(QLabel("Quantizzazione:"), 1, 2)
+        vllm_grid.addWidget(vllm_quantization, 1, 3)
+        vllm_grid.addWidget(vllm_trust_remote_code, 2, 0, 1, 2)
+        vllm_grid.addWidget(vllm_enforce_eager, 2, 2, 1, 2)
+        grid.addWidget(vllm_group, 11, 0, 1, 7)
 
         # Recommendation label (shown below the parameter grid)
         rec_label = QLabel("")
@@ -445,9 +527,10 @@ class LLMConfigDialog(QDialog):
             "padding: 6px; margin-top: 4px;"
         )
         rec_label.setVisible(False)
-        grid.addWidget(rec_label, 10, 0, 1, 7)
+        grid.addWidget(rec_label, 12, 0, 1, 7)
 
         self._widgets[role] = {
+            "backend": backend,
             "model": model,
             "status": status,
             "test": test_button,
@@ -465,9 +548,26 @@ class LLMConfigDialog(QDialog):
             "workers_combo": workers_combo,
             "workers_info": workers_info,
             "speculative_decoding": speculative,
+            "vllm_group": vllm_group,
+            "vllm_dtype": vllm_dtype,
+            "vllm_gpu_memory_utilization": vllm_gpu_memory,
+            "vllm_tensor_parallel_size": vllm_tensor_parallel,
+            "vllm_quantization": vllm_quantization,
+            "vllm_trust_remote_code": vllm_trust_remote_code,
+            "vllm_enforce_eager": vllm_enforce_eager,
         }
+        backend.currentIndexChanged.connect(
+            lambda _index, selected_role=role: self._on_backend_changed(
+                selected_role
+            )
+        )
         model.currentIndexChanged.connect(
             lambda _index, selected_role=role: self._on_model_changed(
+                selected_role
+            )
+        )
+        model.editTextChanged.connect(
+            lambda _text, selected_role=role: self._on_model_changed(
                 selected_role
             )
         )
@@ -506,6 +606,26 @@ class LLMConfigDialog(QDialog):
                 self._refresh_output_guidance(selected_role)
             )
         )
+        for vllm_widget in (
+            vllm_dtype,
+            vllm_gpu_memory,
+            vllm_tensor_parallel,
+            vllm_quantization,
+            vllm_trust_remote_code,
+            vllm_enforce_eager,
+        ):
+            signal = getattr(vllm_widget, "currentIndexChanged", None)
+            if signal is None:
+                signal = getattr(vllm_widget, "valueChanged", None)
+            if signal is None:
+                signal = getattr(vllm_widget, "stateChanged", None)
+            if signal is not None:
+                signal.connect(
+                    lambda _value, selected_role=role: (
+                        self._refresh_worker_info(selected_role),
+                        self._refresh_runtime_statuses(),
+                    )
+                )
         return group
 
     def configurations(self) -> dict[str, LLMRoleConfig]:
@@ -513,14 +633,25 @@ class LLMConfigDialog(QDialog):
             role: self._collect_config(role) for role in self._widgets
         }
 
+    @staticmethod
+    def _selected_model(widgets: dict) -> str:
+        combo = widgets["model"]
+        data = combo.currentData()
+        if data not in (None, ""):
+            return str(data).strip()
+        text = str(combo.currentText() or "").strip()
+        return "" if text == "(nessun modello)" else text
+
     def _collect_config(self, role: str) -> LLMRoleConfig:
         widgets = self._widgets[role]
+        backend = str(widgets["backend"].currentData() or "llama_cpp")
         workers = 1
         if widgets.get("workers_combo") is not None:
             workers_data = widgets["workers_combo"].currentData()
             workers = int(workers_data) if workers_data is not None else 1
         return LLMRoleConfig(
-            model=str(widgets["model"].currentData() or ""),
+            model=self._selected_model(widgets),
+            backend=backend,
             temperature=widgets["temperature"].value(),
             context_length=widgets["context_length"].value(),
             max_output_tokens=widgets["max_output_tokens"].value(),
@@ -530,12 +661,58 @@ class LLMConfigDialog(QDialog):
             # Deprecated with the llama.cpp backend; kept for compatibility.
             keep_alive_minutes=10,
             parallel_workers=workers,
-            speculative_decoding=widgets["speculative_decoding"].isChecked(),
+            speculative_decoding=(
+                widgets["speculative_decoding"].isChecked()
+                if backend == "llama_cpp" else False
+            ),
+            vllm_dtype=str(widgets["vllm_dtype"].currentData() or "auto"),
+            vllm_gpu_memory_utilization=(
+                widgets["vllm_gpu_memory_utilization"].value()
+            ),
+            vllm_tensor_parallel_size=(
+                widgets["vllm_tensor_parallel_size"].value()
+            ),
+            vllm_quantization=str(
+                widgets["vllm_quantization"].currentData()
+                if widgets["vllm_quantization"].currentData() is not None
+                else widgets["vllm_quantization"].currentText()
+            ).strip(),
+            vllm_trust_remote_code=(
+                widgets["vllm_trust_remote_code"].isChecked()
+            ),
+            vllm_enforce_eager=(
+                widgets["vllm_enforce_eager"].isChecked()
+            ),
         )
+
+    def _on_backend_changed(self, role: str) -> None:
+        """Swap the selector between GGUF and cached Hugging Face models."""
+        widgets = self._widgets[role]
+        backend = str(widgets["backend"].currentData() or "llama_cpp")
+        combo = widgets["model"]
+        previous = self._selected_model(widgets)
+        choices = sorted(self._model_choices.get(backend, set()))
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("(nessun modello)", "")
+        for name in choices:
+            combo.addItem(name, name)
+        index = combo.findData(previous)
+        if index < 0 and choices:
+            index = 1
+        combo.setCurrentIndex(max(0, index))
+        combo.setEditable(backend == "vllm")
+        combo.blockSignals(False)
+        widgets["vllm_group"].setVisible(backend == "vllm")
+        widgets["speculative_decoding"].setVisible(backend == "llama_cpp")
+        self._on_model_changed(role)
 
     def _on_model_changed(self, role: str, initial: bool = False) -> None:
         widgets = self._widgets[role]
-        model = str(widgets["model"].currentData() or "")
+        backend = str(widgets["backend"].currentData() or "llama_cpp")
+        widgets["vllm_group"].setVisible(backend == "vllm")
+        widgets["speculative_decoding"].setVisible(backend == "llama_cpp")
+        model = self._selected_model(widgets)
         if not model:
             widgets["max_context"].setText("Contesto massimo: —")
             widgets["context_length"].setMaximum(2_000_000)
@@ -548,7 +725,12 @@ class LLMConfigDialog(QDialog):
             self._refresh_output_guidance(role)
             self._refresh_runtime_statuses()
             return
-        if model not in self._installed_models:
+        config = self._collect_config(role)
+        try:
+            model_available = LlmClient(config=config).is_available
+        except Exception:
+            model_available = False
+        if not model_available:
             widgets["max_context"].setText(
                 "Contesto massimo: modello non installato"
             )
@@ -557,20 +739,27 @@ class LLMConfigDialog(QDialog):
             widgets["optimize"].setEnabled(False)
             widgets["unload"].setEnabled(False)
             widgets["rec_label"].setVisible(False)
-            self._set_status(role, "errore", "Modello non installato")
+            location = (
+                "cache Hugging Face locale"
+                if backend == "vllm" else "archivio GGUF locale"
+            )
+            self._set_status(
+                role, "errore", f"Modello non presente nella {location}"
+            )
             self._refresh_worker_options(role)
             self._refresh_output_guidance(role)
             self._refresh_runtime_statuses()
             return
 
         widgets["test"].setEnabled(role not in self._workers)
-        widgets["optimize"].setEnabled(True)
+        widgets["optimize"].setEnabled(backend == "llama_cpp")
         widgets["unload"].setEnabled(False)
         try:
-            capabilities = self._capability_cache.get(model)
+            cache_key = (backend, model)
+            capabilities = self._capability_cache.get(cache_key)
             if capabilities is None:
-                capabilities = LlmClient(model=model).model_capabilities()
-                self._capability_cache[model] = capabilities
+                capabilities = LlmClient(config=config).model_capabilities()
+                self._capability_cache[cache_key] = capabilities
             maximum = capabilities.get("max_context_length")
             if maximum:
                 widgets["context_length"].setMaximum(int(maximum))
@@ -600,7 +789,7 @@ class LLMConfigDialog(QDialog):
 
         # Auto-optimize when a model is first selected (only if the user
         # hasn't already manually changed parameters).
-        if not initial and model:
+        if not initial and model and backend == "llama_cpp":
             self._optimize_params(role, silent=True)
 
     def _refresh_worker_options(self, role: str) -> None:
@@ -614,7 +803,7 @@ class LLMConfigDialog(QDialog):
         if combo is None:
             return
 
-        model = str(widgets["model"].currentData() or "")
+        model = self._selected_model(widgets)
         context = widgets["context_length"].value()
 
         from ..utils.hardware import (
@@ -628,6 +817,16 @@ class LLMConfigDialog(QDialog):
 
         if not model:
             combo.addItem("1 (nessun modello)", 1)
+            combo.blockSignals(False)
+            self._refresh_worker_info(role)
+            return
+
+        backend = str(widgets["backend"].currentData() or "llama_cpp")
+        if backend == "vllm":
+            for n in range(1, 9):
+                combo.addItem(str(n), n)
+            idx = combo.findData(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
             combo.blockSignals(False)
             self._refresh_worker_info(role)
             return
@@ -660,12 +859,32 @@ class LLMConfigDialog(QDialog):
         combo = widgets.get("workers_combo")
         if info_label is None or combo is None:
             return
-        model = str(widgets["model"].currentData() or "")
+        model = self._selected_model(widgets)
         if not model:
             info_label.setText("")
             return
         context = widgets["context_length"].value()
         workers = int(combo.currentData() or 1)
+        backend = str(widgets["backend"].currentData() or "llama_cpp")
+        runtime = getattr(self, "_last_runtime_by_role", {}).get(role)
+        if backend == "vllm":
+            text = (
+                f"vLLM gestirà fino a {workers} richieste concorrenti · "
+                f"quota memoria GPU "
+                f"{widgets['vllm_gpu_memory_utilization'].value():.0%} · "
+                f"tensor parallel {widgets['vllm_tensor_parallel_size'].value()}"
+            )
+            if runtime:
+                text += (
+                    f"\nRuntime caricato: {runtime.get('slots') or '?'} "
+                    "sequenze massime"
+                )
+            info_label.setText(text)
+            info_label.setToolTip(
+                "vLLM pianifica dinamicamente le sequenze entro la quota di "
+                "memoria GPU configurata."
+            )
+            return
         from ..utils.hardware import (
             estimate_server_ram_gb,
             get_available_ram_gb,
@@ -677,7 +896,6 @@ class LLMConfigDialog(QDialog):
         available = get_available_ram_gb()
         model_size = get_model_size_gb(model)
         estimated = estimate_server_ram_gb(model, context, workers)
-        runtime = getattr(self, "_last_runtime_by_role", {}).get(role)
         text = (
             f"Capacità {total:.1f} GiB · liberi/reclamabili ora "
             f"{available:.1f} GiB (dopo i processi residenti)"
@@ -708,7 +926,7 @@ class LLMConfigDialog(QDialog):
         """Warn visibly when likely long outputs have too little headroom."""
         widgets = self._widgets[role]
         warning = widgets["output_warning"]
-        model = str(widgets["model"].currentData() or "")
+        model = self._selected_model(widgets)
         if not model:
             warning.setVisible(False)
             return
@@ -746,8 +964,13 @@ class LLMConfigDialog(QDialog):
         except Exception:
             # Keeps the dialog usable for a configured but missing model.
             return (
-                config.model, config.context_length, config.parallel_workers,
-                "ngram-cache" if config.speculative_decoding else "none",
+                f"{config.backend}:{config.model}",
+                config.context_length,
+                config.parallel_workers,
+                (
+                    "ngram-cache" if config.speculative_decoding else
+                    ("vllm" if config.backend == "vllm" else "none")
+                ),
             )
 
     def _runtime_snapshot(self) -> tuple[dict[str, tuple], dict[str, dict | None]]:
@@ -756,7 +979,12 @@ class LLMConfigDialog(QDialog):
         runtime_by_role: dict[str, dict | None] = {}
         for role in self._widgets:
             config = self._collect_config(role)
-            if not config.model or config.model not in self._installed_models:
+            if not config.model:
+                continue
+            try:
+                if not LlmClient(config=config).is_available:
+                    continue
+            except Exception:
                 continue
             identity = self._runtime_identity(config)
             identities[role] = identity
@@ -784,11 +1012,15 @@ class LLMConfigDialog(QDialog):
         for config in (configs or self.configurations()).values():
             if config.model:
                 unique.setdefault(self._runtime_identity(config), config)
+        # The GGUF estimator cannot infer VRAM requirements for arbitrary
+        # Hugging Face checkpoints.  vLLM enforces its configured GPU quota
+        # itself; only llama.cpp runtimes participate in this RAM warning.
         llm_ram = sum(
             estimate_runtime_ram_gb(
                 config.model, identity[1], identity[2]
             )
             for identity, config in unique.items()
+            if config.backend == "llama_cpp"
         )
         return llm_ram, get_system_ram_reserve_gb(), get_total_ram_gb()
 
@@ -807,7 +1039,11 @@ class LLMConfigDialog(QDialog):
         actual_slot_parts = []
         for identity, roles in groups.items():
             runtime = runtime_by_role.get(roles[0])
-            model = self._collect_config(roles[0]).model
+            group_config = self._collect_config(roles[0])
+            model = group_config.model
+            backend_label = (
+                "vLLM" if group_config.backend == "vllm" else "llama.cpp"
+            )
             shared = len(roles) > 1
             slots = int(runtime.get("slots") or identity[2]) if runtime else identity[2]
             context = int(
@@ -821,7 +1057,7 @@ class LLMConfigDialog(QDialog):
                 if len(identity) > 3 and identity[3] == "ngram-cache" else ""
             )
             lines.append(
-                f"<b>{model}</b>: {sharing}, {slots} slot × "
+                f"<b>{model}</b> [{backend_label}]: {sharing}, {slots} slot × "
                 f"{self._format_integer(context)} token, {state}{speculation}"
                 + (f", {active} in uso" if active else "")
                 + " — " + ", ".join(role_label[role] for role in roles)
@@ -910,8 +1146,17 @@ class LLMConfigDialog(QDialog):
             )
             color = "#8b1e1e; background:#fdecec; border:1px solid #e5a5a5;"
         elif same_weights_duplicated:
+            duplicated_kind = (
+                "GGUF"
+                if all(
+                    self._collect_config(role).backend == "llama_cpp"
+                    for roles in groups.values() for role in roles
+                )
+                else "modello"
+            )
             heading = (
-                "⚠️ <b>Lo stesso GGUF richiede più server fisici</b>: contesto "
+                f"⚠️ <b>Lo stesso {duplicated_kind} richiede più server "
+                "fisici</b>: contesto "
                 "o slot non coincidono e i pesi verrebbero caricati più volte."
             )
             color = "#7f6000; background:#fff4ce; border:1px solid #e5c365;"
@@ -981,7 +1226,7 @@ class LLMConfigDialog(QDialog):
         a popup dialog (used on initial model selection).
         """
         widgets = self._widgets[role]
-        model = str(widgets["model"].currentData() or "")
+        model = self._selected_model(widgets)
         if not model:
             return
 
@@ -1087,7 +1332,7 @@ class LLMConfigDialog(QDialog):
         for role, identity in identities.items():
             groups.setdefault(identity, []).append(role)
         for role, widgets in self._widgets.items():
-            model = str(widgets["model"].currentData() or "")
+            model = self._selected_model(widgets)
             unload_button = widgets["unload"]
             test_button = widgets["test"]
             if not model:
@@ -1095,7 +1340,12 @@ class LLMConfigDialog(QDialog):
                 unload_button.setEnabled(False)
                 self._set_status(role, "non_selezionato")
                 continue
-            if model not in self._installed_models:
+            config = self._collect_config(role)
+            try:
+                available = LlmClient(config=config).is_available
+            except Exception:
+                available = False
+            if not available:
                 test_button.setEnabled(False)
                 unload_button.setEnabled(False)
                 self._set_status(role, "errore", "Modello non installato")
@@ -1377,7 +1627,9 @@ class LLMConfigDialog(QDialog):
 
     def _validate_role(self, role: str, config: LLMRoleConfig) -> bool:
         maximum = (
-            self._capability_cache.get(config.model, {}).get(
+            self._capability_cache.get(
+                (config.backend, config.model), {}
+            ).get(
                 "max_context_length"
             )
             if config.model else None
@@ -1471,7 +1723,7 @@ class LLMConfigDialog(QDialog):
         if duplicate_weights and QMessageBox.question(
             self,
             "Duplicazione del modello",
-            "Lo stesso file GGUF è configurato con contesto o slot diversi. "
+            "Lo stesso modello è configurato con parametri motore diversi. "
             "Verranno quindi avviati più server e i pesi saranno caricati "
             "più volte in memoria.\n\nVuoi salvare comunque?",
             QMessageBox.Yes | QMessageBox.No,
@@ -1575,7 +1827,9 @@ class LLMConfigDialog(QDialog):
 
     @classmethod
     def _runtime_tooltip(cls, runtime: dict) -> str:
-        lines = ["Modello caricato nel server llama.cpp dell'applicazione"]
+        backend = str(runtime.get("backend") or "llama_cpp")
+        engine = "vLLM" if backend == "vllm" else "llama.cpp"
+        lines = [f"Modello caricato nel server {engine} dell'applicazione"]
         memory = cls._format_bytes(runtime.get("size_vram"))
         if memory:
             lines.append(f"Memoria acceleratore/unificata: {memory}")
@@ -1598,14 +1852,14 @@ class LLMConfigDialog(QDialog):
 
 
 class _AccelerationProbeWorker(QThread):
-    """Probe llama.cpp devices without loading or stopping a model."""
+    """Probe local engines without loading or stopping a model."""
 
     completed = pyqtSignal(object)
 
     def run(self) -> None:
-        from ..llm_backend.diagnostics import diagnose_llama_acceleration
+        from ..llm_backend.diagnostics import diagnose_local_acceleration
 
-        self.completed.emit(diagnose_llama_acceleration())
+        self.completed.emit(diagnose_local_acceleration())
 
 
 class _ModelWarmupWorker(QThread):
@@ -1628,7 +1882,7 @@ class _ModelWarmupWorker(QThread):
 
 
 class _ModelUnloadWorker(QThread):
-    """Unload selected or all resident llama.cpp models without blocking Qt."""
+    """Unload selected or all resident local models without blocking Qt."""
 
     succeeded = pyqtSignal(str, object)
     failed = pyqtSignal(str, str)

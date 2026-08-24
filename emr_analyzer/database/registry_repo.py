@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import uuid
 from typing import Iterable, Optional
 
 from .engine import DatabaseEngine
@@ -225,15 +226,17 @@ class ClinicalRegistryRepository:
         self.db.execute(
             """INSERT INTO clinical_event_evidence
                (link_id, event_id, evidence_id, relation,
-                relation_confidence, rationale, included_in_summary, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                role, relation_confidence, rationale, included_in_summary,
+                created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(event_id, evidence_id, relation) DO UPDATE SET
                  relation_confidence=excluded.relation_confidence,
+                 role=excluded.role,
                  rationale=excluded.rationale,
                  included_in_summary=excluded.included_in_summary""",
             (
                 link.link_id, link.event_id, link.evidence_id, link.relation,
-                link.relation_confidence, link.rationale,
+                link.role, link.relation_confidence, link.rationale,
                 1 if link.included_in_summary else 0, link.created_at,
             ),
         )
@@ -289,6 +292,247 @@ class ClinicalRegistryRepository:
                     ),
                 )
 
+    def merge_events_manual(
+        self,
+        patient_id: str,
+        survivor_event_id: str,
+        absorbed_event_id: str,
+        *,
+        summary_short: str,
+    ) -> None:
+        """Merge two events without deleting either audit identity."""
+        if survivor_event_id == absorbed_event_id:
+            raise ValueError("Seleziona due eventi diversi")
+        rows = self.db.execute(
+            """SELECT * FROM clinical_events
+               WHERE patient_id=? AND event_id IN (?, ?)""",
+            (patient_id, survivor_event_id, absorbed_event_id),
+        ).fetchall()
+        if len(rows) != 2:
+            raise ValueError("Uno degli eventi da unire non esiste")
+        survivor = next(row for row in rows if row["event_id"] == survivor_event_id)
+        data = _loads(survivor["structured_data_json"], {})
+        merged = list(dict.fromkeys([
+            *(data.get("manually_merged_event_ids") or []), absorbed_event_id,
+        ]))
+        data["manually_merged_event_ids"] = merged
+        now = datetime.now(timezone.utc).isoformat()
+        with self.db:
+            links = self.db.execute(
+                """SELECT * FROM clinical_event_evidence WHERE event_id=?""",
+                (absorbed_event_id,),
+            ).fetchall()
+            for link in links:
+                self.db.execute(
+                    """INSERT OR IGNORE INTO clinical_event_evidence
+                       (link_id,event_id,evidence_id,relation,role,
+                        relation_confidence,rationale,included_in_summary,created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        "LNK_" + uuid.uuid4().hex, survivor_event_id,
+                        link["evidence_id"], link["relation"], link["role"],
+                        link["relation_confidence"],
+                        link["rationale"] or "Unione manuale di eventi",
+                        link["included_in_summary"], now,
+                    ),
+                )
+            evidence_ids = [
+                row["evidence_id"] for row in self.db.execute(
+                    """SELECT evidence_id FROM clinical_event_evidence
+                       WHERE event_id=?""", (survivor_event_id,)
+                ).fetchall()
+            ]
+            data["evidence_ids"] = list(dict.fromkeys(evidence_ids))
+            self.db.execute(
+                """UPDATE clinical_events SET summary_short=?, summary_detail=?,
+                   structured_data_json=?, review_status='corrected',
+                   version=version+1, updated_at=? WHERE event_id=?""",
+                (
+                    summary_short.strip(), summary_short.strip(), _json(data),
+                    now, survivor_event_id,
+                ),
+            )
+            self.db.execute(
+                """UPDATE clinical_events SET review_status='rejected',
+                   version=version+1, updated_at=? WHERE event_id=?""",
+                (now, absorbed_event_id),
+            )
+            self._replace_manual_claim(
+                survivor_event_id, summary_short, evidence_ids, now
+            )
+
+    def split_event_manual(
+        self,
+        patient_id: str,
+        event_id: str,
+        evidence_ids: list[str],
+        *,
+        original_summary: str,
+        new_summary: str,
+    ) -> str:
+        """Split selected evidence into a new locked event and episode."""
+        row = self.db.execute(
+            "SELECT * FROM clinical_events WHERE patient_id=? AND event_id=?",
+            (patient_id, event_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Evento da dividere non trovato")
+        all_links = self.db.execute(
+            "SELECT * FROM clinical_event_evidence WHERE event_id=?",
+            (event_id,),
+        ).fetchall()
+        selected = set(evidence_ids)
+        available = {link["evidence_id"] for link in all_links}
+        if not selected or not selected < available:
+            raise ValueError(
+                "Lo split richiede almeno una evidenza per ciascun nuovo evento"
+            )
+        if not selected <= available:
+            raise ValueError("Una evidenza selezionata non appartiene all'evento")
+        new_event_id = "EVT_" + uuid.uuid4().hex
+        new_episode_id = "EPI_" + uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        selected_rows = [link for link in all_links if link["evidence_id"] in selected]
+        evidence_dates = self.db.execute(
+            """SELECT observed_date, document_date FROM clinical_evidence
+               WHERE evidence_id IN ({})""".format(
+                ",".join("?" for _ in selected)
+            ), tuple(sorted(selected)),
+        ).fetchall()
+        selected_date = min((
+            value for evidence in evidence_dates
+            for value in (evidence["observed_date"] or evidence["document_date"],)
+            if value
+        ), default=row["first_evidence_date"])
+        structured = _loads(row["structured_data_json"], {})
+        structured.update({
+            "evidence_ids": sorted(selected),
+            "manual_split_from_event_id": event_id,
+            "claims": [],
+        })
+        original_data = _loads(row["structured_data_json"], {})
+        original_data.update({
+            "evidence_ids": sorted(available - selected),
+            "manual_split_event_ids": list(dict.fromkeys([
+                *(original_data.get("manual_split_event_ids") or []), new_event_id,
+            ])),
+            "claims": [],
+        })
+        with self.db:
+            self.db.execute(
+                """INSERT INTO clinical_episodes
+                   (episode_id,patient_id,category,canonical_entity,onset_date,
+                    onset_date_end,onset_precision,first_documented_date,
+                    resolution_date,status,recurrence_index,previous_episode_id,
+                    data_json,created_at,updated_at)
+                   VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, 1, NULL, '{}', ?, ?)""",
+                (
+                    new_episode_id, patient_id, row["category"],
+                    row["canonical_entity"], selected_date,
+                    row["date_precision"], row["first_documented_date"],
+                    row["status"], now, now,
+                ),
+            )
+            self.db.execute(
+                """INSERT INTO clinical_events
+                   (event_id,patient_id,episode_id,category,canonical_entity,
+                    summary_short,summary_detail,anatomical_site,laterality,
+                    severity,significance,status,certainty,assertion,
+                    first_evidence_date,first_documented_date,date_end,
+                    date_precision,confidence,review_status,structured_data_json,
+                    model_name,prompt_version,schema_version,version,created_at,updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, 'corrected', ?, ?, ?, ?, 1, ?, ?)""",
+                (
+                    new_event_id, patient_id, new_episode_id, row["category"],
+                    row["canonical_entity"], new_summary.strip(),
+                    new_summary.strip(), row["anatomical_site"], row["laterality"],
+                    row["severity"], row["significance"], row["status"],
+                    row["certainty"], row["assertion"], selected_date,
+                    row["first_documented_date"], row["date_end"],
+                    row["date_precision"], row["confidence"], _json(structured),
+                    row["model_name"], row["prompt_version"],
+                    row["schema_version"], now, now,
+                ),
+            )
+            for link in selected_rows:
+                self.db.execute(
+                    """INSERT INTO clinical_event_evidence
+                       (link_id,event_id,evidence_id,relation,role,
+                        relation_confidence,rationale,included_in_summary,created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        "LNK_" + uuid.uuid4().hex, new_event_id,
+                        link["evidence_id"], link["relation"], link["role"],
+                        link["relation_confidence"], "Split manuale",
+                        link["included_in_summary"], now,
+                    ),
+                )
+            self.db.execute(
+                """DELETE FROM clinical_event_evidence WHERE event_id=? AND
+                   evidence_id IN ({})""".format(
+                    ",".join("?" for _ in selected)
+                ), (event_id, *sorted(selected)),
+            )
+            self.db.execute(
+                "DELETE FROM clinical_event_claims WHERE event_id IN (?, ?)",
+                (event_id, new_event_id),
+            )
+            self.db.execute(
+                """UPDATE clinical_events SET summary_short=?, summary_detail=?,
+                   structured_data_json=?, review_status='corrected',
+                   version=version+1, updated_at=? WHERE event_id=?""",
+                (
+                    original_summary.strip(), original_summary.strip(),
+                    _json(original_data), now, event_id,
+                ),
+            )
+            self._replace_manual_claim(
+                event_id, original_summary, sorted(available - selected), now
+            )
+            self._replace_manual_claim(
+                new_event_id, new_summary, sorted(selected), now
+            )
+        return new_event_id
+
+    def _replace_manual_claim(
+        self,
+        event_id: str,
+        text: str,
+        evidence_ids: Iterable[str],
+        now: str,
+    ) -> None:
+        """Create a fully cited claim after a human structural correction."""
+        source_ids = list(dict.fromkeys(str(item) for item in evidence_ids))
+        self.db.execute(
+            "DELETE FROM clinical_event_claims WHERE event_id=?", (event_id,)
+        )
+        claim_text = " ".join(str(text or "").split())
+        if not claim_text or not source_ids:
+            return
+        claim_id = "CLM_" + uuid.uuid4().hex
+        self.db.execute(
+            """INSERT INTO clinical_event_claims
+               (claim_id,event_id,claim_type,text,certainty,review_status,
+                position,created_at,updated_at)
+               VALUES (?, ?, 'clinical_observation', ?, 'confirmed',
+                       'corrected', 0, ?, ?)""",
+            (claim_id, event_id, claim_text, now, now),
+        )
+        for evidence_id in source_ids:
+            exists = self.db.execute(
+                "SELECT 1 FROM clinical_evidence WHERE evidence_id=?",
+                (evidence_id,),
+            ).fetchone()
+            if exists is None:
+                continue
+            self.db.execute(
+                """INSERT INTO clinical_event_claim_sources
+                   (claim_id,source_type,source_id,source_role,created_at)
+                   VALUES (?, 'evidence', ?, 'supports', ?)""",
+                (claim_id, evidence_id, now),
+            )
+
     def get_events(
         self,
         patient_id: str,
@@ -332,7 +576,7 @@ class ClinicalRegistryRepository:
                 episode = dict(episode_row)
                 episode["data"] = _loads(episode.pop("data_json"), {})
         evidence_rows = self.db.execute(
-            """SELECT l.link_id, l.relation, l.relation_confidence,
+            """SELECT l.link_id, l.relation, l.role, l.relation_confidence,
                       l.rationale, l.included_in_summary,
                       e.*, d.document_date AS source_document_date
                FROM clinical_event_evidence l
@@ -348,6 +592,17 @@ class ClinicalRegistryRepository:
             item = dict(evidence_row)
             item["data"] = _loads(item.pop("data_json"), {})
             item["bbox"] = _loads(item.pop("bbox_json"), None)
+            source_rows = self.db.execute(
+                """SELECT * FROM evidence_source_refs WHERE evidence_id=?
+                   ORDER BY CASE source_role WHEN 'primary' THEN 0 ELSE 1 END,
+                            document_id, source_page""",
+                (item["evidence_id"],),
+            ).fetchall()
+            item["source_refs"] = [{
+                **dict(source),
+                "bbox": _loads(source["bbox_json"], None),
+                "sentence_refs": _loads(source["sentence_refs_json"], []),
+            } for source in source_rows]
             evidences.append(item)
         update_rows = self.db.execute(
             """SELECT * FROM clinical_event_updates WHERE event_id=?
@@ -393,6 +648,22 @@ class ClinicalRegistryRepository:
                 item.pop("corrected_value_json"), {}
             )
             reviews.append(item)
+        claim_rows = self.db.execute(
+            """SELECT * FROM clinical_event_claims WHERE event_id=?
+               ORDER BY position, claim_id""",
+            (event_id,),
+        ).fetchall()
+        claims = []
+        for claim in claim_rows:
+            sources = self.db.execute(
+                """SELECT source_type, source_id, source_role
+                   FROM clinical_event_claim_sources WHERE claim_id=?
+                   ORDER BY source_type, source_id""",
+                (claim["claim_id"],),
+            ).fetchall()
+            claims.append({
+                **dict(claim), "sources": [dict(source) for source in sources]
+            })
         return {
             "event": event,
             "episode": episode,
@@ -400,6 +671,7 @@ class ClinicalRegistryRepository:
             "updates": updates,
             "relations": [dict(item) for item in relation_rows],
             "reviews": reviews,
+            "claims": claims,
         }
 
     def search_events(
