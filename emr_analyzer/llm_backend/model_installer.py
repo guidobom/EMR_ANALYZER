@@ -23,13 +23,20 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import unquote, urlparse
 
-from ..config import LLM_MODEL_INDEX_PATH, LLM_MODELS_DIR
+from ..config import (
+    LLM_MODEL_CATALOG_CACHE_PATH,
+    LLM_MODEL_CATALOG_URL,
+    LLM_MODEL_INDEX_PATH,
+    LLM_MODELS_DIR,
+)
 from . import model_store
+from .model_catalog import cache_catalog_manifest
 
 
 MODEL_LAYER_TYPE = "application/vnd.ollama.image.model"
 _COPY_CHUNK_SIZE = 4 * 1024 * 1024
 _MIN_FREE_SPACE = 512 * 1024 * 1024
+_MAX_CATALOG_BYTES = 2 * 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 ProgressCallback = Callable[[int, int | None, str], None]
@@ -215,6 +222,62 @@ def cleanup_abandoned_partials(
         except OSError:
             continue
     return removed
+
+
+def update_model_catalog(
+    *,
+    url: str = LLM_MODEL_CATALOG_URL,
+    cache_path: str | Path = LLM_MODEL_CATALOG_CACHE_PATH,
+    progress: ProgressCallback | None = None,
+) -> dict:
+    """Download, validate and atomically cache the curated model manifest."""
+    parsed = _validate_catalog_url(url)
+    request = urllib.request.Request(
+        parsed.geturl(),
+        headers={"User-Agent": "EMR-Analyzer-catalog-updater/1.0"},
+    )
+    try:
+        opener = urllib.request.build_opener(_CatalogHTTPSRedirectHandler())
+        with opener.open(request, timeout=30) as response:
+            _validate_catalog_url(response.geturl())
+            raw_total = response.headers.get("Content-Length")
+            total = int(raw_total) if raw_total and raw_total.isdigit() else None
+            if total is not None and total > _MAX_CATALOG_BYTES:
+                raise ModelInstallError(
+                    "Il manifesto remoto supera il limite di 2 MiB."
+                )
+            _emit(progress, 0, total, "Download catalogo consigliato…")
+            payload = bytearray()
+            while True:
+                chunk = response.read(min(_COPY_CHUNK_SIZE, 256 * 1024))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) > _MAX_CATALOG_BYTES:
+                    raise ModelInstallError(
+                        "Il manifesto remoto supera il limite di 2 MiB."
+                    )
+                _emit(
+                    progress, len(payload), total,
+                    "Validazione catalogo consigliato…",
+                )
+        snapshot = cache_catalog_manifest(bytes(payload), cache_path)
+        return {
+            "catalog_version": snapshot.catalog_version,
+            "review_date": snapshot.review_date,
+            "model_count": len(snapshot.models),
+            "source": parsed.geturl(),
+        }
+    except ModelInstallError:
+        raise
+    except ValueError as exc:
+        raise ModelInstallError(
+            f"Catalogo remoto rifiutato: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise ModelInstallError(
+            f"Aggiornamento catalogo non riuscito: {exc}"
+        ) from exc
 
 
 def install_from_ollama(
@@ -567,9 +630,33 @@ def _validate_https_url(url: str):
     return parsed
 
 
+def _validate_catalog_url(url: str):
+    parsed = _validate_https_url(url)
+    if (
+        parsed.hostname != "raw.githubusercontent.com"
+        or parsed.path != (
+            "/guidobom/EMR_ANALYZER/main/"
+            "emr_analyzer/resources/model_catalog.json"
+        )
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ModelInstallError(
+            "La sorgente del catalogo non coincide con il repository "
+            "ufficiale EMR Analyzer."
+        )
+    return parsed
+
+
 class _HTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _validate_https_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _CatalogHTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_catalog_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 

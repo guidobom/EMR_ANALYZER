@@ -367,7 +367,13 @@ class TestServerManager(unittest.TestCase):
         self.assertNotIn("-rea", spawn_calls[1])
 
     def test_binary_missing_raises(self):
-        manager = ServerManager(binary=None)
+        # ``None`` normally triggers auto-discovery.  Make the missing-binary
+        # condition independent from what happens to be installed on the host.
+        with mock.patch(
+            "emr_analyzer.llm_backend.server_manager.find_server_binary",
+            return_value=None,
+        ):
+            manager = ServerManager(binary=None)
         with self.assertRaises(BackendError):
             manager.ensure(self.key, load_timeout=1)
 

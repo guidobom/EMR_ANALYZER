@@ -11,6 +11,7 @@ from .engine import DatabaseEngine
 from ..models.clinical_registry import (
     ClinicalEpisode,
     ClinicalEvent,
+    ClinicalEventRelation,
     EventEvidenceLink,
     EventUpdate,
     LabTrend,
@@ -251,6 +252,43 @@ class ClinicalRegistryRepository:
             ),
         )
 
+    def replace_generated_relations(
+        self,
+        patient_id: str,
+        relations: Iterable[ClinicalEventRelation],
+    ) -> None:
+        """Replace automatic episode links while preserving reviewed links."""
+        relations = list(relations)
+        with self.db:
+            self.db.execute(
+                """DELETE FROM clinical_event_relations
+                   WHERE patient_id=?
+                     AND review_status NOT IN ('accepted','corrected','rejected')""",
+                (patient_id,),
+            )
+            for relation in relations:
+                self.db.execute(
+                    """INSERT INTO clinical_event_relations
+                       (relation_id, patient_id, source_event_id,
+                        target_event_id, relation_type, confidence, rationale,
+                        review_status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(source_event_id, target_event_id,
+                                   relation_type) DO UPDATE SET
+                         confidence=excluded.confidence,
+                         rationale=excluded.rationale,
+                         review_status=excluded.review_status
+                       WHERE clinical_event_relations.review_status
+                         NOT IN ('accepted','corrected','rejected')""",
+                    (
+                        relation.relation_id, relation.patient_id,
+                        relation.source_event_id, relation.target_event_id,
+                        relation.relation_type, relation.confidence,
+                        relation.rationale, relation.review_status,
+                        relation.created_at,
+                    ),
+                )
+
     def get_events(
         self,
         patient_id: str,
@@ -325,9 +363,18 @@ class ClinicalRegistryRepository:
             )
             updates.append(item)
         relation_rows = self.db.execute(
-            """SELECT * FROM clinical_event_relations
-               WHERE source_event_id=? OR target_event_id=?
-               ORDER BY created_at, relation_id""",
+            """SELECT r.*,
+                      source.summary_short AS source_summary,
+                      target.summary_short AS target_summary,
+                      source.category AS source_category,
+                      target.category AS target_category
+               FROM clinical_event_relations r
+               JOIN clinical_events source
+                 ON source.event_id=r.source_event_id
+               JOIN clinical_events target
+                 ON target.event_id=r.target_event_id
+               WHERE r.source_event_id=? OR r.target_event_id=?
+               ORDER BY r.created_at, r.relation_id""",
             (event_id, event_id),
         ).fetchall()
         review_rows = self.db.execute(

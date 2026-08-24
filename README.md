@@ -53,15 +53,14 @@ Usare nei test pubblicabili esclusivamente documenti sintetici.
 - ambiente Conda consigliato;
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) installato
   (`brew install llama.cpp` su macOS; build CUDA su Linux, vedi sotto);
-- almeno un modello documentale e un modello per il Clinical State in
-  formato GGUF.
+- modelli GGUF locali per le funzioni LLM che si desidera utilizzare.
 
 La configurazione dei modelli, della temperatura, del contesto e dell’output
 avviene dall’interfaccia tramite **Configura LLM**.
 
-I due ruoli condividono un solo processo `llama-server` e una sola copia dei
-pesi quando usano lo stesso GGUF con uguale contesto per richiesta e uguale
-numero di slot. Temperatura, top-p/top-k, seed e limite di output restano
+I ruoli condividono un solo processo `llama-server` e una sola copia dei pesi
+quando usano lo stesso GGUF con uguale contesto per richiesta e uguale numero
+di slot. Temperatura, top-p/top-k, seed e limite di output restano
 indipendenti perché sono parametri della singola richiesta. La finestra mostra
 se i server fisici sono condivisi o distinti, gli slot realmente caricati e
 una stima complessiva della memoria; cambiando contesto o slot, **Salva e
@@ -166,7 +165,13 @@ I modelli locali (GGUF serviti da llama-server) sono configurabili
 separatamente per:
 
 1. isolamento del testo clinico dai singoli documenti;
-2. costruzione e interrogazione del Clinical State.
+2. estrazione delle evidenze atomiche;
+3. fusione e assemblaggio degli eventi/episodi clinici;
+4. analisi e interrogazione longitudinale del registro.
+
+Le impostazioni precedenti a quattro ruoli vengono migrate automaticamente:
+il vecchio modello Clinical State è assegnato inizialmente a evidenze, eventi
+e analisi, senza invalidare i checkpoint atomici già compatibili.
 
 Da **Configura LLM → Scarica o importa modelli** è possibile:
 

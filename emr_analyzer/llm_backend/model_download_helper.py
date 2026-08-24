@@ -15,6 +15,7 @@ from emr_analyzer.llm_backend.model_installer import (  # noqa: E402
     ModelInstallError,
     install_from_ollama,
     install_from_url,
+    update_model_catalog,
 )
 
 
@@ -39,11 +40,16 @@ def main(argv: list[str] | None = None) -> int:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--ollama-tag")
     source.add_argument("--url")
+    source.add_argument("--update-catalog", action="store_true")
     parser.add_argument("--name", default="")
     parser.add_argument("--sha256", default="")
     arguments = parser.parse_args(argv)
 
     try:
+        if arguments.update_catalog:
+            result = update_model_catalog(progress=_progress)
+            _event("catalog_success", **result)
+            return 0
         if arguments.ollama_tag:
             name, entry = install_from_ollama(
                 arguments.ollama_tag,

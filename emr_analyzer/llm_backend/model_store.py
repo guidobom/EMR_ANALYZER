@@ -1,6 +1,6 @@
 """Local GGUF model directory and its JSON index.
 
-The setup script (``scripts/setup_llama_backend.py``) copies GGUF files into
+The setup script (``tools/setup_llama_backend.py``) copies GGUF files into
 ``~/.emr_analyzer/models/`` and writes ``index.json`` with the metadata the
 runtime needs (file path, size, architecture, maximum context).  The runtime
 never parses GGUF files nor shells out for metadata: everything it needs is a

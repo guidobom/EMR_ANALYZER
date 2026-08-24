@@ -107,9 +107,8 @@ class RecommendedParams:
     ) -> "RecommendedParams":
         """Compute recommended parameters for *model* running on *hw*.
 
-        *role* is ``"document"`` (text normalization) or
-        ``"clinical_state"`` (structured extraction plus potentially long
-        registry and irAE reports).
+        *role* distinguishes document normalization, atomic extraction,
+        event/episode synthesis and longitudinal analysis.
         """
         # ---- context_length ------------------------------------------------
         context, context_rationale = _recommend_context(hw, model)
@@ -363,10 +362,18 @@ def _recommend_output(
     if role == "document":
         # Document filtering can produce output up to ~50 % of source
         ratio = 0.30
+        workload = "Filtraggio testo"
+    elif role == "atomic_evidence":
+        # Per-chunk JSON is relatively compact and is validated downstream.
+        ratio = 0.18
+        workload = "Evidenze atomiche JSON"
+    elif role == "clinical_events":
+        ratio = 0.22
+        workload = "Fusione eventi/episodi"
     else:
-        # Structured extraction is compact, but full-registry and irAE
-        # reports need more headroom than the former 20% recommendation.
+        # Full-registry and irAE reports need the most response headroom.
         ratio = 0.25
+        workload = "Analisi clinica longitudinale"
 
     recommended = max(4096, int(context * ratio))
     # Round to the nearest nice boundary
@@ -375,7 +382,7 @@ def _recommend_output(
     chosen = max(4096, chosen)
 
     rationale = (
-        f"{'Filtraggio testo' if role == 'document' else 'Registro/analisi clinica'}: "
+        f"{workload}: "
         f"{int(ratio * 100)}% del contesto di {_fmt_tokens(context)} "
         f"→ {_fmt_tokens(chosen)} token"
     )

@@ -62,17 +62,19 @@ class _ServerInstance:
 
 
 def find_server_binary() -> str | None:
-    """Locate the llama-server binary (PATH, then common brew prefixes)."""
+    """Locate the llama-server binary (PATH, then common install prefixes)."""
     configured = str(LLAMA_SERVER_BINARY or "").strip()
     if configured and os.path.isfile(configured):
         return configured
     found = shutil.which("llama-server")
     if found:
         return found
+    home = os.path.expanduser("~")
     for prefix in ("/opt/homebrew/opt/llama.cpp/bin",
                    "/usr/local/opt/llama.cpp/bin",
                    "/opt/homebrew/bin",
-                   "/usr/local/bin"):
+                   "/usr/local/bin",
+                   os.path.join(home, ".local", "bin")):
         candidate = os.path.join(prefix, "llama-server")
         if os.path.isfile(candidate):
             return candidate
@@ -146,7 +148,7 @@ class ServerManager:
         if self._binary is None:
             raise BackendError(
                 "llama-server non trovato: installa llama.cpp "
-                "(brew install llama.cpp) o esegui scripts/setup_llama_backend.py"
+                "(brew install llama.cpp) o esegui tools/setup_llama_backend.py"
             )
         if not os.path.isfile(key.gguf_path):
             raise BackendError(

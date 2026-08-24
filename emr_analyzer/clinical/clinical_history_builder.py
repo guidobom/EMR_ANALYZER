@@ -218,7 +218,12 @@ class ClinicalHistoryBuilder:
         batch has been successfully saved.
         """
         if self._registry_builder is not None:
-            workers = max(1, int(getattr(self._llm, "parallel_workers", 1) or 1))
+            atomic_llm = getattr(
+                self._registry_builder, "atomic_llm", None
+            )
+            workers = max(1, int(getattr(
+                atomic_llm, "parallel_workers", 1
+            ) or 1))
             result = self._registry_builder.build(
                 patient_id, incremental=True, num_workers=workers,
                 progress_callback=progress_callback,

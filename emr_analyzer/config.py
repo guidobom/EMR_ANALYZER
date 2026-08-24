@@ -72,6 +72,11 @@ LLAMA_SERVER_HTTP_TIMEOUT = 1800
 # GGUF models directory and its metadata index (see llm_backend/model_store.py).
 LLM_MODELS_DIR = BASE_DIR / "models"
 LLM_MODEL_INDEX_PATH = LLM_MODELS_DIR / "index.json"
+LLM_MODEL_CATALOG_CACHE_PATH = LLM_MODELS_DIR / "catalog.json"
+LLM_MODEL_CATALOG_URL = (
+    "https://raw.githubusercontent.com/guidobom/EMR_ANALYZER/"
+    "main/emr_analyzer/resources/model_catalog.json"
+)
 
 # The document model can be smaller/faster; the Clinical State model can be
 # larger because it is used after the evidence has already been normalized.

@@ -251,7 +251,10 @@ class ClinicalHistoryQueryWorker(QThread):
                 "Sei un assistente clinico esperto. Rispondi alla domanda "
                 "basandoti ESCLUSIVAMENTE sui dati clinici forniti. "
                 "Se un dato non e' disponibile, dichiaralo esplicitamente. "
-                "Cita le date quando disponibili. Non inventare informazioni."
+                "Cita le date quando disponibili. Non inventare informazioni. "
+                "Date di appuntamenti, prenotazioni, tecnica di esecuzione, "
+                "dose e somministrazione di traccianti eventualmente presenti "
+                "nelle citazioni non sono eventi clinici e vanno ignorate."
             )
 
             if self.registry_repo is not None and self.patient_id:

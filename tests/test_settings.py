@@ -38,6 +38,14 @@ class ModelSettingsTest(unittest.TestCase):
             self.assertEqual(
                 assignments["clinical_state"], CLINICAL_STATE_LLM_MODEL_NAME
             )
+            self.assertEqual(
+                assignments["atomic_evidence"],
+                CLINICAL_STATE_LLM_MODEL_NAME,
+            )
+            self.assertEqual(
+                assignments["clinical_events"],
+                CLINICAL_STATE_LLM_MODEL_NAME,
+            )
 
     def test_assignments_persist_independently_and_allow_disabled_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -46,6 +54,8 @@ class ModelSettingsTest(unittest.TestCase):
             save_model_assignment("clinical_state", "qwen3:14b", path)
             self.assertEqual(load_model_assignments(path), {
                 "document": "gemma3:12b",
+                "atomic_evidence": "qwen3-14b",
+                "clinical_events": "qwen3-14b",
                 "clinical_state": "qwen3:14b",
             })
 
@@ -72,6 +82,16 @@ class ModelSettingsTest(unittest.TestCase):
                     keep_alive_minutes=30,
                     speculative_decoding=True,
                 ),
+                "atomic_evidence": LLMRoleConfig(
+                    model="atomic-model", temperature=0.0,
+                    context_length=32768, max_output_tokens=4096,
+                    parallel_workers=4,
+                ),
+                "clinical_events": LLMRoleConfig(
+                    model="event-model", temperature=0.1,
+                    context_length=49152, max_output_tokens=6144,
+                    parallel_workers=2,
+                ),
             }
 
             save_llm_configs(configs, path)
@@ -79,6 +99,8 @@ class ModelSettingsTest(unittest.TestCase):
             self.assertEqual(load_llm_configs(path), configs)
             self.assertEqual(load_model_assignments(path), {
                 "document": "gemma3:12b",
+                "atomic_evidence": "atomic-model",
+                "clinical_events": "event-model",
                 "clinical_state": "qwen3:14b",
             })
 
@@ -95,7 +117,27 @@ class ModelSettingsTest(unittest.TestCase):
 
             self.assertEqual(configs["document"].model, "legacy-doc")
             self.assertEqual(configs["clinical_state"].model, "legacy-state")
+            self.assertEqual(configs["atomic_evidence"].model, "legacy-state")
+            self.assertEqual(configs["clinical_events"].model, "legacy-state")
             self.assertGreater(configs["document"].context_length, 0)
+
+    def test_two_role_llm_payload_clones_full_state_config_on_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text(
+                '{"llm":{"document":{"model":"doc"},'
+                '"clinical_state":{"model":"state","temperature":0.37,'
+                '"context_length":49152,"parallel_workers":3}}}',
+                encoding="utf-8",
+            )
+
+            configs = load_llm_configs(path)
+
+            for role in ("atomic_evidence", "clinical_events"):
+                self.assertEqual(configs[role].model, "state")
+                self.assertEqual(configs[role].temperature, 0.37)
+                self.assertEqual(configs[role].context_length, 49152)
+                self.assertEqual(configs[role].parallel_workers, 3)
 
 
 class ChatPreferencesTest(unittest.TestCase):

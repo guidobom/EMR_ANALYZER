@@ -11,8 +11,10 @@ from pathlib import Path
 import re
 import threading
 from typing import Any, Iterable
+import unicodedata
 import uuid
 
+from .evidence_relevance import annotate_evidence_disposition
 from .temporal import normalize_clinical_date
 from ..extraction.llm_client import OutputLimitError
 from ..models.clinical_evidence import ClinicalEvidence
@@ -323,7 +325,13 @@ class AtomicEvidenceExtractor:
             model_name=self.model_name,
             existing=evidence,
         ))
-        return _deduplicate_atomic(evidence)
+        evidence = deduplicate_atomic_evidence(evidence)
+        # Keep every extracted atom immutable and auditable.  Administrative
+        # and methodological atoms are labelled here, then excluded only from
+        # downstream registry projections.
+        for item in evidence:
+            annotate_evidence_disposition(item)
+        return evidence
 
     def _extract_chunk_adaptive(
         self,
@@ -1329,22 +1337,196 @@ def _explicit_resolution_evidence(
     return result
 
 
+def deduplicate_atomic_evidence(
+    evidence: Iterable[ClinicalEvidence],
+) -> list[ClinicalEvidence]:
+    """Return one clinical atom for repeated source evidence.
+
+    ``document_id`` and page coordinates deliberately do not participate in
+    the identity.  Near-verbatim evidence copied into later reports is one
+    clinical fact, not a new occurrence.  Every physical occurrence is kept
+    in ``data['source_occurrences']`` so provenance/Quick View remain lossless.
+
+    A changed clinical date, value, treatment state, site, side or severity is
+    a different atom.  This prevents a true follow-up measurement or therapy
+    transition from being swallowed by copy-and-paste suppression.
+    """
+    grouped: dict[tuple, list[ClinicalEvidence]] = {}
+    for item in evidence:
+        grouped.setdefault(_atomic_identity_key(item), []).append(item)
+
+    result: list[ClinicalEvidence] = []
+    for items in grouped.values():
+        # Prefer a grounded first occurrence.  The earliest source is the
+        # canonical one so a copied historical statement cannot move its
+        # first-documentation date forward in the registry.
+        canonical = copy.deepcopy(min(items, key=_canonical_source_key))
+        richest = max(items, key=_atomic_quality_key)
+        _enrich_canonical_atom(canonical, richest)
+
+        occurrences = []
+        seen_ids: set[str] = set()
+        for occurrence in sorted(items, key=_canonical_source_key):
+            if occurrence.evidence_id in seen_ids:
+                continue
+            seen_ids.add(occurrence.evidence_id)
+            occurrences.append({
+                "evidence_id": occurrence.evidence_id,
+                "document_id": occurrence.document_id,
+                "document_date": occurrence.document_date,
+                "observed_date": occurrence.observed_date,
+                "source_page": occurrence.source_page,
+                "bbox": list(occurrence.bbox) if occurrence.bbox else None,
+                "source_text": occurrence.source_text,
+            })
+        duplicate_ids = [
+            occurrence["evidence_id"] for occurrence in occurrences
+            if occurrence["evidence_id"] != canonical.evidence_id
+        ]
+        canonical.data["atomic_duplicate_count"] = len(duplicate_ids)
+        if duplicate_ids:
+            canonical.data["duplicate_source_evidence_ids"] = duplicate_ids
+            canonical.data["source_occurrences"] = occurrences
+        else:
+            canonical.data.pop("duplicate_source_evidence_ids", None)
+            canonical.data.pop("source_occurrences", None)
+        result.append(canonical)
+    return result
+
+
+def _atomic_identity_key(item: ClinicalEvidence) -> tuple:
+    """Clinical identity independent of the report containing the quote."""
+    therapy = item.data.get("therapy") or {}
+    oncology = item.data.get("oncology") or {}
+    if item.date_source == "retrospective_duration":
+        # Recomputing "da due mesi" against the date of every copied report
+        # creates artificial dates.  Its literal relative expression, not the
+        # recalculated value, identifies a repeated fact.
+        date_key = (
+            "relative",
+            _identity_text(item.data.get("date_original_text")),
+        )
+        date_end_key = None
+    else:
+        date_key = item.observed_date
+        date_end_key = item.observed_date_end
+    return (
+        item.patient_id,
+        _identity_text(item.category),
+        _identity_text(item.normalized_entity),
+        _identity_text(item.source_text),
+        date_key,
+        date_end_key,
+        _identity_text(item.assertion),
+        _identity_text(item.value_text),
+        _identity_number(item.numeric_value),
+        _identity_text(item.unit),
+        _identity_text(item.anatomical_site),
+        _identity_text(item.laterality),
+        _identity_text(item.severity),
+        _identity_text(item.clinical_status),
+        _identity_text(therapy.get("lifecycle_status")),
+        _identity_text(therapy.get("dose")),
+        _identity_text(therapy.get("route")),
+        _identity_text(therapy.get("frequency")),
+        _identity_text(oncology.get("line_label") or oncology.get("line")),
+        _identity_json(oncology.get("regimen")),
+        _identity_text(oncology.get("cycle")),
+        _identity_text(oncology.get("modification")),
+    )
+
+
+def _identity_text(value: object) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or "").casefold())
+    without_marks = "".join(
+        char for char in normalized if not unicodedata.combining(char)
+    )
+    return " ".join(
+        "".join(char if char.isalnum() else " " for char in without_marks)
+        .split()
+    )
+
+
+def _identity_number(value: object) -> str:
+    parsed = _safe_float(value)
+    return "" if parsed is None else format(parsed, ".12g")
+
+
+def _identity_json(value: object) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, list):
+        value = [_identity_text(item) for item in value]
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _canonical_source_key(item: ClinicalEvidence) -> tuple:
+    verified = bool(item.data.get("quote_verified"))
+    return (
+        0 if verified else 1,
+        item.document_date or "9999-99-99",
+        item.document_id,
+        item.source_page or 10**9,
+        item.evidence_id,
+    )
+
+
+def _atomic_quality_key(item: ClinicalEvidence) -> tuple:
+    populated = sum(value not in (None, "", [], {}) for value in (
+        item.observed_date, item.observed_date_end, item.clinical_status,
+        item.anatomical_site, item.laterality, item.severity, item.value_text,
+        item.numeric_value, item.unit, item.data,
+    ))
+    certainty_rank = {
+        "confirmed": 5, "patient_reported": 4, "suspected": 3,
+        "inferred": 2, "excluded": 1, "unknown": 0,
+    }.get(str(item.certainty or "").casefold(), 0)
+    significance_rank = {
+        "critical": 5, "high": 4, "clinically_relevant": 3,
+        "potentially_relevant": 2, "uncertain": 1,
+    }.get(str(item.significance or "").casefold(), 0)
+    return (
+        1 if item.data.get("quote_verified") else 0,
+        populated, float(item.confidence or 0.0), certainty_rank,
+        significance_rank, item.evidence_id,
+    )
+
+
+def _enrich_canonical_atom(
+    canonical: ClinicalEvidence,
+    richest: ClinicalEvidence,
+) -> None:
+    """Keep first-source provenance while adopting stronger metadata."""
+    canonical.confidence = max(
+        float(canonical.confidence or 0.0), float(richest.confidence or 0.0)
+    )
+    if _atomic_quality_key(richest) > _atomic_quality_key(canonical):
+        canonical.certainty = richest.certainty
+        canonical.significance = richest.significance
+        if canonical.status == "needs_review" and richest.status != "needs_review":
+            canonical.status = richest.status
+    canonical.data = _merge_missing_evidence_data(
+        copy.deepcopy(canonical.data), richest.data
+    )
+
+
+def _merge_missing_evidence_data(left: dict, right: dict) -> dict:
+    for key, value in right.items():
+        if value in (None, "", [], {}):
+            continue
+        current = left.get(key)
+        if current in (None, "", [], {}):
+            left[key] = copy.deepcopy(value)
+        elif isinstance(current, dict) and isinstance(value, dict):
+            left[key] = _merge_missing_evidence_data(current, value)
+    return left
+
+
 def _deduplicate_atomic(
     evidence: Iterable[ClinicalEvidence],
 ) -> list[ClinicalEvidence]:
-    """Remove only exact same-document extraction duplicates."""
-    unique: dict[tuple, ClinicalEvidence] = {}
-    for item in evidence:
-        key = (
-            item.document_id, item.category,
-            item.normalized_entity.casefold(),
-            " ".join(item.source_text.casefold().split()),
-            item.observed_date, item.assertion, item.certainty,
-        )
-        current = unique.get(key)
-        if current is None or item.confidence > current.confidence:
-            unique[key] = item
-    return list(unique.values())
+    """Compatibility alias for callers/tests predating patient-wide dedup."""
+    return deduplicate_atomic_evidence(evidence)
 
 
 def content_hash(*values: object) -> str:

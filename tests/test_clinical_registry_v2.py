@@ -18,6 +18,7 @@ from emr_analyzer.clinical.atomic_evidence import (
     AtomicEvidenceExtractor,
     TextChunk,
     build_atomic_prompt,
+    deduplicate_atomic_evidence,
     split_sentence_spans,
     split_text_chunks,
 )
@@ -40,6 +41,7 @@ from emr_analyzer.clinical.registry_builder import ClinicalRegistryBuilder
 from emr_analyzer.clinical.temporal import normalize_clinical_date
 from emr_analyzer.config import active_workspace
 from emr_analyzer.database.audit_repo import AuditRepository
+from emr_analyzer.database.clinical_state_repo import ClinicalStateRepository
 from emr_analyzer.database.document_repo import DocumentRepository
 from emr_analyzer.database.engine import DatabaseEngine
 from emr_analyzer.database.evidence_repo import EvidenceRepository
@@ -52,8 +54,11 @@ from emr_analyzer.database.review_repo import ReviewDecisionRepository
 from emr_analyzer.database.timeline_repo import TimelineRepository
 from emr_analyzer.export.registry_export import ClinicalRegistryExporter
 from emr_analyzer.models.clinical_evidence import ClinicalEvidence
+from emr_analyzer.models.clinical_state import ClinicalState
 from emr_analyzer.models.clinical_registry import (
     ClinicalEvent,
+    ClinicalEventRelation,
+    EventEvidenceLink,
     ProcessingManifestItem,
     ProcessingRun,
 )
@@ -193,6 +198,86 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertEqual(evidence[0].source_page, 2)
         self.assertTrue(evidence[0].data["quote_verified"])
         self.assertIn("dispnea da sforzo", evidence[0].source_text)
+
+    def test_atomic_dedup_collapses_same_fact_across_documents(self):
+        quote = "Pregresso melanoma metastatico con localizzazioni polmonari."
+        first = ClinicalEvidence(
+            evidence_id="E_FIRST", patient_id="P001", document_id="D1",
+            category="diagnosis", normalized_entity="Melanoma_metastatico",
+            source_text=quote, document_date="2025-01-10",
+            assertion="present", certainty="suspected", confidence=0.7,
+            data={"quote_verified": True},
+        )
+        copied = ClinicalEvidence(
+            evidence_id="E_COPY", patient_id="P001", document_id="D2",
+            category="diagnosis", normalized_entity="melanoma metastatico",
+            source_text=quote.lower(), document_date="2025-01-12",
+            assertion="present", certainty="confirmed", confidence=0.9,
+            data={"quote_verified": True},
+        )
+
+        unique = deduplicate_atomic_evidence([copied, first])
+
+        self.assertEqual(len(unique), 1)
+        self.assertEqual(unique[0].evidence_id, "E_FIRST")
+        self.assertEqual(unique[0].document_id, "D1")
+        self.assertEqual(unique[0].certainty, "confirmed")
+        self.assertEqual(
+            unique[0].data["duplicate_source_evidence_ids"], ["E_COPY"]
+        )
+        self.assertEqual(len(unique[0].data["source_occurrences"]), 2)
+
+    def test_atomic_dedup_preserves_true_new_occurrences(self):
+        common = dict(
+            patient_id="P001", category="laboratory_finding",
+            normalized_entity="tsh", source_text="TSH rilevato al controllo",
+            assertion="present", unit="mUI/L",
+            data={"quote_verified": True},
+        )
+        evidence = [
+            ClinicalEvidence(
+                evidence_id="E_DATE_1", document_id="D1",
+                observed_date="2025-01-10", numeric_value=4.2, **common,
+            ),
+            ClinicalEvidence(
+                evidence_id="E_DATE_2", document_id="D2",
+                observed_date="2025-02-10", numeric_value=4.2, **common,
+            ),
+            ClinicalEvidence(
+                evidence_id="E_VALUE", document_id="D2",
+                observed_date="2025-01-10", numeric_value=7.8, **common,
+            ),
+        ]
+
+        self.assertEqual(len(deduplicate_atomic_evidence(evidence)), 3)
+
+    def test_atomic_dedup_does_not_redate_copied_relative_history(self):
+        common = dict(
+            patient_id="P001", category="symptom",
+            normalized_entity="tosse", source_text="Tosse da circa due mesi",
+            assertion="present", certainty="patient_reported",
+            date_precision="approximate",
+            date_source="retrospective_duration",
+            data={
+                "quote_verified": True,
+                "date_original_text": "da circa due mesi",
+            },
+        )
+        first = ClinicalEvidence(
+            evidence_id="E_REL_1", document_id="D1",
+            document_date="2025-01-10", observed_date="2024-11-10",
+            **common,
+        )
+        copied = ClinicalEvidence(
+            evidence_id="E_REL_2", document_id="D2",
+            document_date="2025-03-10", observed_date="2025-01-10",
+            **common,
+        )
+
+        unique = deduplicate_atomic_evidence([first, copied])
+
+        self.assertEqual(len(unique), 1)
+        self.assertEqual(unique[0].observed_date, "2024-11-10")
 
     def test_atomic_v5_prompt_is_compact_and_schema_constrains_core_fields(self):
         prompt = build_atomic_prompt(
@@ -716,6 +801,17 @@ class ClinicalRegistryV2Test(unittest.TestCase):
             if item.normalized_entity == "melanoma metastatico"
         ]
         self.assertEqual({item.document_id for item in evidence}, {"D1", "D2"})
+        self.assertEqual(result["atomic_duplicates_suppressed"], 1)
+        self.assertEqual(result["total_entries"], 1)
+        self.assertGreaterEqual(result["duplicate_source_links"], 1)
+        registry_repo = ClinicalRegistryRepository(self.db)
+        events = registry_repo.get_events("P001")
+        self.assertTrue(events)
+        detail = registry_repo.get_event_detail(events[0].event_id)
+        relations = {
+            item["relation"] for item in (detail or {}).get("evidence", [])
+        }
+        self.assertIn("duplicate_source", relations)
         self.assertEqual(result["unique_reuse_blocks_verified"], 1)
         self.assertGreaterEqual(result["reused_evidence"], 1)
         self.assertEqual(result["targeted_reuse_verifications"], 0)
@@ -1232,6 +1328,70 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         )
         self.assertEqual(persisted["event"]["review_status"], "corrected")
         self.assertEqual(len(persisted["reviews"]), 1)
+
+    def test_reviewed_event_relation_survives_automatic_rebuild(self):
+        repo = ClinicalRegistryRepository(self.db)
+        for event_id in ("EVT_SOURCE", "EVT_TARGET"):
+            repo.save_event(ClinicalEvent(
+                event_id=event_id, patient_id="P001", category="diagnosis",
+                canonical_entity=event_id.casefold(),
+                summary_short=event_id,
+            ))
+        original = ClinicalEventRelation(
+            relation_id="REL_REVIEWED", patient_id="P001",
+            source_event_id="EVT_SOURCE", target_event_id="EVT_TARGET",
+            relation_type="related_episode", confidence=0.95,
+            rationale="Collegamento confermato", review_status="accepted",
+        )
+        repo.replace_generated_relations("P001", [original])
+        replacement = ClinicalEventRelation(
+            relation_id="REL_AUTO", patient_id="P001",
+            source_event_id="EVT_SOURCE", target_event_id="EVT_TARGET",
+            relation_type="related_episode", confidence=0.4,
+            rationale="Nuova ipotesi automatica", review_status="auto",
+        )
+        repo.replace_generated_relations("P001", [replacement])
+        relation = repo.get_event_detail("EVT_SOURCE")["relations"][0]
+        self.assertEqual(relation["relation_id"], "REL_REVIEWED")
+        self.assertEqual(relation["review_status"], "accepted")
+        self.assertEqual(relation["rationale"], "Collegamento confermato")
+
+    def test_changed_registry_invalidates_only_stale_narrative_profile(self):
+        state_repo = ClinicalStateRepository(self.db)
+        state_repo.save(ClinicalState(
+            patient_id="P001", clinical_profile="Vecchio profilo",
+            open_problems=["problema preservato"],
+        ))
+        builder = object.__new__(ClinicalRegistryBuilder)
+        builder.db = self.db
+        self.assertTrue(builder._invalidate_clinical_profile("P001"))
+        updated = state_repo.load("P001")
+        self.assertEqual(updated.clinical_profile, "")
+        self.assertEqual(updated.open_problems, ["problema preservato"])
+
+    def test_legacy_timeline_sync_excludes_administrative_only_event(self):
+        evidence = ClinicalEvidence(
+            evidence_id="E_APPOINTMENT", patient_id="P001",
+            document_id="D1", category="follow_up",
+            normalized_entity="PET FDG",
+            source_text="Prossimi appuntamenti: PET il 26/09 ore 09:00",
+        )
+        EvidenceRepository(self.db).insert_batch([evidence])
+        event = ClinicalEvent(
+            event_id="EVT_APPOINTMENT", patient_id="P001",
+            category="follow_up", canonical_entity="pet_fdg",
+            summary_short="Prossimo appuntamento PET",
+        )
+        registry_repo = ClinicalRegistryRepository(self.db)
+        registry_repo.save_event(event, [EventEvidenceLink(
+            link_id="LNK_APPOINTMENT", event_id=event.event_id,
+            evidence_id=evidence.evidence_id,
+        )])
+        builder = object.__new__(ClinicalRegistryBuilder)
+        builder.registry_repo = registry_repo
+        builder.timeline_repo = TimelineRepository(self.db)
+        builder._sync_legacy_timeline("P001", [], [])
+        self.assertEqual(builder.timeline_repo.count_by_patient("P001"), 0)
 
     def test_cross_document_thyroid_and_respiratory_correlations_are_cautious(self):
         thyroid = [

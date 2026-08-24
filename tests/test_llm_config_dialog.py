@@ -10,7 +10,8 @@ from PyQt5.QtWidgets import QApplication
 
 from emr_analyzer.extraction.llm_client import LlmClient
 from emr_analyzer.gui.llm_config_dialog import LLMConfigDialog
-from emr_analyzer.settings import LLMRoleConfig
+from emr_analyzer.llm_backend.diagnostics import AccelerationDiagnostic
+from emr_analyzer.settings import LLMRoleConfig, MODEL_ROLES
 
 
 class LLMConfigDialogTest(unittest.TestCase):
@@ -39,6 +40,7 @@ class LLMConfigDialogTest(unittest.TestCase):
             dialog._widgets["document"]["unload"].text(),
             "■ Scarica dalla memoria",
         )
+        self.assertEqual(tuple(dialog._widgets), MODEL_ROLES)
         self.assertEqual(
             dialog._widgets["clinical_state"]["unload"].text(),
             "■ Scarica dalla memoria",
@@ -47,6 +49,38 @@ class LLMConfigDialogTest(unittest.TestCase):
             dialog._unload_all_button.text(), "■ Libera tutti i modelli"
         )
         self.assertFalse(dialog._widgets["document"]["unload"].isEnabled())
+        dialog._runtime_timer.stop()
+        dialog.deleteLater()
+
+    def test_dialog_displays_acceleration_diagnostic(self):
+        configs = {
+            "document": LLMRoleConfig(model=""),
+            "clinical_state": LLMRoleConfig(model=""),
+        }
+        dialog = LLMConfigDialog(configs, [])
+        diagnostic = AccelerationDiagnostic(
+            status="accelerated",
+            expected_backend="CUDA",
+            runtime_backend="CUDA",
+            compiled_backends=("CUDA",),
+            devices=("CUDA0: NVIDIA GB10",),
+            binary_path="/opt/llama-server",
+            system="Linux",
+            machine="aarch64",
+            gpu_name="NVIDIA GB10",
+            summary="Accelerazione CUDA disponibile: CUDA0: NVIDIA GB10.",
+            details="Dettagli diagnostici",
+        )
+
+        dialog._show_acceleration_diagnostic(diagnostic)
+
+        self.assertIn("CUDA disponibile", dialog._acceleration_status.text())
+        self.assertEqual(
+            dialog._acceleration_status.toolTip(), "Dettagli diagnostici"
+        )
+        self.assertEqual(
+            dialog._acceleration_probe_button.text(), "Verifica di nuovo"
+        )
         dialog._runtime_timer.stop()
         dialog.deleteLater()
 

@@ -175,51 +175,42 @@ class EMRAnalyzerApp:
 
         # ---- Function-specific local llama.cpp models ----
         ollama_ok = False
-        document_config = self._llm_configs["document"]
-        state_config = self._llm_configs["clinical_state"]
-        document_model_name = document_config.model
-        state_model_name = state_config.model
         try:
-            probe_model = (
-                document_model_name or state_model_name
-                or DOCUMENT_LLM_MODEL_NAME
+            probe_model = next(
+                (
+                    config.model for config in self._llm_configs.values()
+                    if config.model
+                ),
+                DOCUMENT_LLM_MODEL_NAME,
             )
             ollama_ok = LlmClient(model=probe_model).server_available
-            document_llm = (
-                LlmClient(config=document_config)
-                if document_model_name else None
-            )
-            clinical_state_llm = (
-                LlmClient(config=state_config) if state_model_name else None
-            )
-            active_document_llm = (
-                document_llm
-                if document_llm is not None and document_llm.is_available
-                else None
-            )
-            active_clinical_state_llm = (
-                clinical_state_llm
-                if clinical_state_llm is not None and clinical_state_llm.is_available
-                else None
-            )
+            clients = {}
+            for role, config in self._llm_configs.items():
+                client = LlmClient(config=config) if config.model else None
+                clients[role] = (
+                    client
+                    if client is not None and client.is_available else None
+                )
             self._services.update({
-                "document_llm_client": active_document_llm,
-                "clinical_state_llm_client": active_clinical_state_llm,
+                "document_llm_client": clients["document"],
+                "atomic_evidence_llm_client": clients["atomic_evidence"],
+                "clinical_events_llm_client": clients["clinical_events"],
+                "clinical_state_llm_client": clients["clinical_state"],
                 "ollama_available": ollama_ok,
                 "llm_configs": self._llm_configs,
             })
             if ollama_ok:
                 print(
                     "  ✓ LLM locale (llama.cpp): "
-                    f"document={active_document_llm.model if active_document_llm else 'off'}, "
-                    "clinical-state="
-                    f"{active_clinical_state_llm.model if active_clinical_state_llm else 'off'}"
+                    + ", ".join(
+                        f"{role}={client.model if client else 'off'}"
+                        for role, client in clients.items()
+                    )
                 )
-                # Eager background start: the model load (seconds on this
-                # hardware) hides behind the normal startup flow.
-                self._eager_start_llm_servers([
-                    active_document_llm, active_clinical_state_llm,
-                ])
+                # Only the document model is warmed at startup.  Registry and
+                # analysis models stay lazy so selecting different GGUFs does
+                # not make all of them resident at the same time.
+                self._eager_start_llm_servers([clients["document"]])
             else:
                 print(
                     "  ⚠ Motore locale non disponibile — esegui "
@@ -229,6 +220,8 @@ class EMRAnalyzerApp:
             print(f"  ⚠ Motore locale (llama.cpp): {e}")
             self._services.update({
                 "document_llm_client": None,
+                "atomic_evidence_llm_client": None,
+                "clinical_events_llm_client": None,
                 "clinical_state_llm_client": None,
                 "ollama_available": False,
                 "llm_configs": self._llm_configs,
@@ -271,7 +264,12 @@ class EMRAnalyzerApp:
             document_repo=doc_repo,
             lab_repo=lab_repo,
             overlay_repo=overlay_repo,
-            llm_client=self._services.get("clinical_state_llm_client"),
+            atomic_llm_client=self._services.get(
+                "atomic_evidence_llm_client"
+            ),
+            event_llm_client=self._services.get(
+                "clinical_events_llm_client"
+            ),
             audit_repo=audit_repo,
             db=db,
         )

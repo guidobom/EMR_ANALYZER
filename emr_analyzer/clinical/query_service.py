@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
+from .evidence_relevance import is_administrative_mapping
+
 
 _INTENT_CATEGORIES = {
     "oncology": {
@@ -61,7 +63,12 @@ class ClinicalQueryService:
         details = []
         for event in ranked:
             detail = self.registry_repo.get_event_detail(event.event_id)
-            if detail:
+            evidence = detail.get("evidence", []) if detail else []
+            if detail and not (
+                evidence and all(
+                    is_administrative_mapping(item) for item in evidence
+                )
+            ):
                 details.append(detail)
         details.sort(key=lambda item: (
             item["event"].get("first_evidence_date") or "9999",
@@ -138,6 +145,11 @@ def format_event_detail(detail: dict) -> str:
             )
     lines.append("Fonti verificabili:")
     for evidence in detail.get("evidence", []):
+        if (
+            is_administrative_mapping(evidence)
+            or evidence.get("relation") == "duplicate_source"
+        ):
+            continue
         page = evidence.get("source_page") or "n.d."
         relation = evidence.get("relation") or "supports"
         lines.append(

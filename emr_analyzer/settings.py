@@ -15,7 +15,18 @@ from .config import (
 
 
 SETTINGS_PATH = BASE_DIR / "settings.json"
-MODEL_ROLES = {"document", "clinical_state"}
+
+# Keep a stable order: it is also the order shown in the configuration UI.
+# ``clinical_state`` remains the analysis/query role for backward
+# compatibility.  Older settings containing only that role are migrated by
+# cloning it into the two new registry-specific roles.
+MODEL_ROLES = (
+    "document",
+    "atomic_evidence",
+    "clinical_events",
+    "clinical_state",
+)
+REGISTRY_MODEL_ROLES = ("atomic_evidence", "clinical_events")
 
 
 @dataclass(frozen=True)
@@ -124,6 +135,13 @@ def default_llm_configs() -> dict[str, LLMRoleConfig]:
     cs_cfg = LLMRoleConfig(model=CLINICAL_STATE_LLM_MODEL_NAME)
     doc_workers = _auto_workers(doc_cfg.model, doc_cfg.context_length)
     cs_workers = _auto_workers(cs_cfg.model, cs_cfg.context_length)
+    clinical_config = LLMRoleConfig(
+        model=cs_cfg.model,
+        context_length=cs_cfg.context_length,
+        max_output_tokens=cs_cfg.max_output_tokens,
+        temperature=cs_cfg.temperature,
+        parallel_workers=cs_workers,
+    )
     return {
         "document": LLMRoleConfig(
             model=doc_cfg.model,
@@ -132,13 +150,9 @@ def default_llm_configs() -> dict[str, LLMRoleConfig]:
             temperature=doc_cfg.temperature,
             parallel_workers=doc_workers,
         ),
-        "clinical_state": LLMRoleConfig(
-            model=cs_cfg.model,
-            context_length=cs_cfg.context_length,
-            max_output_tokens=cs_cfg.max_output_tokens,
-            temperature=cs_cfg.temperature,
-            parallel_workers=cs_workers,
-        ),
+        "atomic_evidence": clinical_config,
+        "clinical_events": clinical_config,
+        "clinical_state": clinical_config,
     }
 
 
@@ -169,18 +183,31 @@ def load_llm_configs(
     if not isinstance(llm_payload, dict):
         llm_payload = {}
 
+    # Migration from the former two-role layout.  A deliberately configured
+    # empty model must also be cloned, so use presence of the mapping rather
+    # than truthiness of its values.
+    legacy_state_payload = llm_payload.get("clinical_state", {})
+    if not isinstance(legacy_state_payload, dict):
+        legacy_state_payload = {}
+
     result = {}
     for role in MODEL_ROLES:
         default = defaults[role]
-        role_payload = llm_payload.get(role, {})
+        if role in REGISTRY_MODEL_ROLES and role not in llm_payload:
+            role_payload = dict(legacy_state_payload)
+        else:
+            role_payload = llm_payload.get(role, {})
         if not isinstance(role_payload, dict):
             role_payload = {}
+        legacy_role = (
+            "clinical_state" if role in REGISTRY_MODEL_ROLES else role
+        )
         if "model" not in role_payload and isinstance(
-            legacy_models.get(role), str
+            legacy_models.get(legacy_role), str
         ):
             role_payload = {
                 **role_payload,
-                "model": legacy_models[role],
+                "model": legacy_models[legacy_role],
             }
         config = LLMRoleConfig.from_dict(role_payload, default)
         config = replace(
@@ -204,20 +231,32 @@ def save_llm_configs(
     configs: dict[str, LLMRoleConfig],
     path: str | Path = SETTINGS_PATH,
 ) -> None:
-    """Atomically persist both role configurations and legacy model names."""
-    if set(configs) != MODEL_ROLES:
-        raise ValueError("Sono richieste le configurazioni document e clinical_state")
-    if not all(isinstance(configs[role], LLMRoleConfig) for role in MODEL_ROLES):
+    """Atomically persist role configurations and legacy model names.
+
+    Two-role callers are accepted as a compatibility bridge and are upgraded
+    by assigning their Clinical State configuration to both registry stages.
+    """
+    unknown = set(configs) - set(MODEL_ROLES)
+    if unknown or "document" not in configs or "clinical_state" not in configs:
+        raise ValueError(
+            "Sono richieste almeno le configurazioni document e clinical_state"
+        )
+    normalized = dict(configs)
+    for role in REGISTRY_MODEL_ROLES:
+        normalized.setdefault(role, normalized["clinical_state"])
+    if not all(
+        isinstance(normalized[role], LLMRoleConfig) for role in MODEL_ROLES
+    ):
         raise TypeError("Configurazione LLM non valida")
 
     settings_path = Path(path)
     payload = _read_payload(settings_path)
     payload["llm"] = {
-        role: configs[role].to_dict() for role in sorted(MODEL_ROLES)
+        role: normalized[role].to_dict() for role in MODEL_ROLES
     }
     # Keep compatibility with older application builds.
     payload["models"] = {
-        role: configs[role].model for role in sorted(MODEL_ROLES)
+        role: normalized[role].model for role in MODEL_ROLES
     }
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = settings_path.with_suffix(settings_path.suffix + ".tmp")

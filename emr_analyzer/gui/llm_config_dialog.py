@@ -1,4 +1,4 @@
-"""Single configuration dialog for the two local llama.cpp roles."""
+"""Single configuration dialog for independent local llama.cpp roles."""
 
 from __future__ import annotations
 
@@ -16,11 +16,12 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
 )
 
 from ..extraction.llm_client import LlmClient
-from ..settings import LLMRoleConfig
+from ..settings import LLMRoleConfig, MODEL_ROLES
 
 
 ROLE_DEFINITIONS = {
@@ -28,15 +29,30 @@ ROLE_DEFINITIONS = {
         "LLM per i documenti",
         "Isola e normalizza il contenuto clinico estratto dai singoli PDF.",
     ),
-    "clinical_state": (
-        "LLM per il Clinical State",
-        "Ricostruisce e interroga la storia clinica longitudinale.",
+    "atomic_evidence": (
+        "LLM per le evidenze atomiche",
+        "Estrae fatti clinici aderenti al testo, citati e strutturati in JSON.",
     ),
+    "clinical_events": (
+        "LLM per gli eventi clinici",
+        "Fonde, deduplica e assembla le evidenze in problemi ed episodi.",
+    ),
+    "clinical_state": (
+        "LLM per analisi e interrogazione",
+        "Interroga il registro e genera analisi longitudinali, incluso irAE.",
+    ),
+}
+
+ROLE_TAB_LABELS = {
+    "document": "Documenti",
+    "atomic_evidence": "Evidenze atomiche",
+    "clinical_events": "Eventi clinici",
+    "clinical_state": "Analisi",
 }
 
 
 class LLMConfigDialog(QDialog):
-    """Edit, validate and test both model assignments in one place."""
+    """Edit, validate and test all model assignments in one place."""
 
     def __init__(
         self,
@@ -46,7 +62,11 @@ class LLMConfigDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Configura LLM locali")
-        self.setMinimumWidth(860)
+        self.setMinimumWidth(900)
+        self.resize(980, 850)
+        configs = dict(configs)
+        for role in ("atomic_evidence", "clinical_events"):
+            configs.setdefault(role, configs["clinical_state"])
         self._initial_configs = dict(configs)
         self._installed_models = set(available_models)
         self._models = sorted(
@@ -66,7 +86,7 @@ class LLMConfigDialog(QDialog):
         layout = QVBoxLayout(self)
         if self._models:
             intro = QLabel(
-                "Le due funzioni hanno parametri di generazione indipendenti. "
+                "Le quattro funzioni hanno modelli e parametri indipendenti. "
                 "Quando modello, contesto e slot coincidono condividono un "
                 "solo processo llama.cpp e una sola copia dei pesi. "
                 "Temperatura e token di risposta possono invece differire "
@@ -80,6 +100,29 @@ class LLMConfigDialog(QDialog):
             )
         intro.setWordWrap(True)
         layout.addWidget(intro)
+
+        acceleration_box = QGroupBox("Accelerazione CUDA / Metal")
+        acceleration_layout = QHBoxLayout(acceleration_box)
+        self._acceleration_status = QLabel(
+            "Accelerazione non ancora verificata. Il controllo non carica "
+            "modelli e non interrompe i server in esecuzione."
+        )
+        self._acceleration_status.setWordWrap(True)
+        self._acceleration_status.setStyleSheet("color: #5d6d7e;")
+        acceleration_layout.addWidget(self._acceleration_status, stretch=1)
+        self._acceleration_probe_button = QPushButton(
+            "Verifica CUDA / Metal"
+        )
+        self._acceleration_probe_button.setToolTip(
+            "Chiede al binario llama-server configurato di elencare i "
+            "dispositivi disponibili, senza caricare alcun GGUF."
+        )
+        self._acceleration_probe_button.clicked.connect(
+            self._start_acceleration_probe
+        )
+        acceleration_layout.addWidget(self._acceleration_probe_button)
+        layout.addWidget(acceleration_box)
+        self._acceleration_worker: _AccelerationProbeWorker | None = None
 
         model_actions = QHBoxLayout()
         self._model_count_label = QLabel()
@@ -98,8 +141,13 @@ class LLMConfigDialog(QDialog):
         layout.addLayout(model_actions)
         self._update_model_count_label()
 
-        for role in ("document", "clinical_state"):
-            layout.addWidget(self._build_role_group(role, configs[role]))
+        self._role_tabs = QTabWidget()
+        for role in MODEL_ROLES:
+            self._role_tabs.addTab(
+                self._build_role_group(role, configs[role]),
+                ROLE_TAB_LABELS[role],
+            )
+        layout.addWidget(self._role_tabs, stretch=1)
 
         runtime_box = QGroupBox("Server llama.cpp fisici")
         runtime_layout = QHBoxLayout(runtime_box)
@@ -108,7 +156,8 @@ class LLMConfigDialog(QDialog):
         runtime_layout.addWidget(self._runtime_summary, stretch=1)
         self._align_runtime_button = QPushButton("Allinea e condividi runtime")
         self._align_runtime_button.setToolTip(
-            "Usa per entrambi i ruoli il contesto e il numero di slot più "
+            "Usa per i ruoli con lo stesso modello il contesto e il numero "
+            "di slot più "
             "capienti, mantenendo indipendenti i parametri di generazione."
         )
         self._align_runtime_button.clicked.connect(self._align_shared_runtime)
@@ -150,6 +199,50 @@ class LLMConfigDialog(QDialog):
         self._runtime_timer.setInterval(5000)
         self._runtime_timer.timeout.connect(self._refresh_runtime_statuses)
         self._runtime_timer.start()
+
+    def _start_acceleration_probe(self) -> None:
+        if (
+            self._acceleration_worker is not None
+            and self._acceleration_worker.isRunning()
+        ):
+            return
+        self._acceleration_status.setText(
+            "Verifica del backend effettivo di llama-server in corso…"
+        )
+        self._acceleration_status.setStyleSheet(
+            "color: #2980b9; font-weight: bold;"
+        )
+        self._acceleration_probe_button.setEnabled(False)
+        worker = _AccelerationProbeWorker(self)
+        self._acceleration_worker = worker
+        worker.completed.connect(self._show_acceleration_diagnostic)
+        worker.finished.connect(self._release_acceleration_worker)
+        worker.start()
+
+    def _show_acceleration_diagnostic(self, diagnostic) -> None:
+        colors = {
+            "accelerated": "#1e8449",
+            "cpu_only": "#d68910",
+            "binary_missing": "#c0392b",
+            "backend_missing": "#c0392b",
+            "backend_unavailable": "#c0392b",
+            "probe_unsupported": "#d68910",
+            "error": "#c0392b",
+        }
+        self._acceleration_status.setText(diagnostic.summary)
+        self._acceleration_status.setStyleSheet(
+            f"color: {colors.get(diagnostic.status, '#5d6d7e')}; "
+            "font-weight: bold;"
+        )
+        self._acceleration_status.setToolTip(diagnostic.details)
+        self._acceleration_probe_button.setText("Verifica di nuovo")
+
+    def _release_acceleration_worker(self) -> None:
+        worker = self._acceleration_worker
+        self._acceleration_worker = None
+        self._acceleration_probe_button.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
 
     def _open_model_manager(self) -> None:
         from .model_manager_dialog import ModelManagerDialog
@@ -306,7 +399,7 @@ class LLMConfigDialog(QDialog):
 
         resident_note = QLabel(
             "Il server resta residente finché non viene scaricato. Se è "
-            "condiviso, lo scaricamento interessa entrambi i ruoli."
+            "condiviso, lo scaricamento interessa tutti i ruoli associati."
         )
         resident_note.setStyleSheet("color: #5d6d7e;")
         grid.addWidget(resident_note, 7, 0, 1, 3)
@@ -315,7 +408,7 @@ class LLMConfigDialog(QDialog):
         # Worker selector — parallel document/text processing
         workers_combo = None
         workers_info = None
-        if role in ("document", "clinical_state"):
+        if role in MODEL_ROLES:
             workers_combo = QComboBox()
             workers_combo.setToolTip(
                 "Numero di richieste simultanee gestibili dal server. "
@@ -628,11 +721,12 @@ class LLMConfigDialog(QDialog):
         if configured >= recommended:
             warning.setVisible(False)
             return
-        workload = (
-            "normalizzazioni documentali lunghe"
-            if role == "document"
-            else "registri estesi e analisi irAE complete"
-        )
+        workload = {
+            "document": "normalizzazioni documentali lunghe",
+            "atomic_evidence": "estrazioni JSON con molte evidenze",
+            "clinical_events": "fusioni e assemblaggi di episodi complessi",
+            "clinical_state": "registri estesi e analisi irAE complete",
+        }[role]
         warning.setText(
             f"⚠ Limite inferiore al valore consigliato "
             f"({self._format_integer(recommended)} token): {workload} "
@@ -708,7 +802,7 @@ class LLMConfigDialog(QDialog):
         groups: dict[tuple, list[str]] = {}
         for role, identity in identities.items():
             groups.setdefault(identity, []).append(role)
-        role_label = {"document": "Documenti", "clinical_state": "Clinical State"}
+        role_label = ROLE_TAB_LABELS
         lines = []
         actual_slot_parts = []
         for identity, roles in groups.items():
@@ -1153,7 +1247,7 @@ class LLMConfigDialog(QDialog):
             "Server condiviso",
             "Questo è un unico server condiviso da:\n- "
             + "\n- ".join(ROLE_DEFINITIONS[item][0] for item in sorted(affected))
-            + "\n\nScaricandolo entrambi i ruoli risulteranno non caricati. "
+            + "\n\nScaricandolo tutti questi ruoli risulteranno non caricati. "
               "Continuare?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1308,6 +1402,17 @@ class LLMConfigDialog(QDialog):
         return True
 
     def accept(self) -> None:
+        if (
+            self._acceleration_worker is not None
+            and self._acceleration_worker.isRunning()
+        ):
+            QMessageBox.information(
+                self,
+                "Diagnostica in corso",
+                "Attendi pochi secondi il completamento della verifica "
+                "CUDA/Metal.",
+            )
+            return
         if self._workers or self._unload_worker is not None:
             QMessageBox.information(
                 self,
@@ -1412,6 +1517,17 @@ class LLMConfigDialog(QDialog):
         super().accept()
 
     def reject(self) -> None:
+        if (
+            self._acceleration_worker is not None
+            and self._acceleration_worker.isRunning()
+        ):
+            QMessageBox.information(
+                self,
+                "Diagnostica in corso",
+                "Attendi pochi secondi il completamento della verifica "
+                "CUDA/Metal.",
+            )
+            return
         if self._workers or self._unload_worker is not None:
             QMessageBox.information(
                 self,
@@ -1479,6 +1595,17 @@ class LLMConfigDialog(QDialog):
         if runtime.get("expires_at"):
             lines.append(f"Scadenza: {runtime['expires_at']}")
         return "\n".join(lines)
+
+
+class _AccelerationProbeWorker(QThread):
+    """Probe llama.cpp devices without loading or stopping a model."""
+
+    completed = pyqtSignal(object)
+
+    def run(self) -> None:
+        from ..llm_backend.diagnostics import diagnose_llama_acceleration
+
+        self.completed.emit(diagnose_llama_acceleration())
 
 
 class _ModelWarmupWorker(QThread):

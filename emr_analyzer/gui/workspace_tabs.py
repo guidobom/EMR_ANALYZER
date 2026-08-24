@@ -369,17 +369,22 @@ class WorkspaceTabs(QTabWidget):
             return
 
         builder = self._services.get("clinical_history_builder")
-        llm = self._services.get("clinical_state_llm_client")
-        if builder is None or llm is None or not llm.is_available:
+        atomic_llm = self._services.get("atomic_evidence_llm_client")
+        event_llm = self._services.get("clinical_events_llm_client")
+        if (
+            builder is None
+            or atomic_llm is None or not atomic_llm.is_available
+            or event_llm is None or not event_llm.is_available
+        ):
             QMessageBox.warning(
                 self, "LLM non disponibile",
-                "Il modello Clinical State o il generatore dei registri "
-                "non è disponibile.",
+                "I modelli per evidenze atomiche ed eventi clinici, oppure "
+                "il generatore dei registri, non sono disponibili.",
             )
             return
 
         configs = self._services.get("llm_configs") or {}
-        state_config = configs.get("clinical_state")
+        state_config = configs.get("atomic_evidence")
         num_workers = max(
             1, int(getattr(state_config, "parallel_workers", 1) or 1)
         )

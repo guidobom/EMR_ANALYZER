@@ -17,6 +17,7 @@ from .atomic_evidence import (
     ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS,
     AtomicEvidenceExtractor,
     content_hash,
+    deduplicate_atomic_evidence,
     locate_quote,
 )
 from .block_reuse import (
@@ -26,11 +27,23 @@ from .block_reuse import (
     plan_exact_block_reuse,
     plan_reuse_verification_batches,
 )
-from .consolidation import ClinicalConsolidator
+from .consolidation import ClinicalConsolidator, stable_id
 from .correlation import ClinicalCorrelationBuilder
+from .episode_assembler import (
+    attach_contextual_evidence,
+    build_event_relations,
+)
+from .episode_synthesis import ClinicalEpisodeSynthesizer
+from .event_dedup import deduplicate_bundles
+from .evidence_relevance import (
+    is_administrative_mapping,
+    partition_evidence,
+)
 from .projections import LabTrendBuilder, TherapyProjectionBuilder
 from ..config import active_workspace
+from ..database.clinical_state_repo import ClinicalStateRepository
 from ..models.clinical_registry import (
+    EventEvidenceLink,
     ProcessingManifestItem,
     ProcessingRun,
 )
@@ -50,7 +63,9 @@ class ClinicalRegistryBuilder:
         document_repo,
         lab_repo,
         overlay_repo,
-        llm_client,
+        llm_client=None,
+        atomic_llm_client=None,
+        event_llm_client=None,
         audit_repo=None,
         db=None,
     ):
@@ -61,11 +76,22 @@ class ClinicalRegistryBuilder:
         self.document_repo = document_repo
         self.lab_repo = lab_repo
         self.overlay_repo = overlay_repo
-        self.llm = llm_client
+        # ``llm_client`` is the compatibility path for callers created before
+        # the registry had independent extraction and event models.
+        self.atomic_llm = (
+            atomic_llm_client if atomic_llm_client is not None else llm_client
+        )
+        self.event_llm = (
+            event_llm_client if event_llm_client is not None else llm_client
+        )
+        # Public compatibility alias: historically ``llm`` drove both stages;
+        # it now denotes the event/episode model only.
+        self.llm = self.event_llm
         self.audit = audit_repo
         self.db = db or timeline_repo.db
         self.atomic_extractor = (
-            AtomicEvidenceExtractor(llm_client) if llm_client else None
+            AtomicEvidenceExtractor(self.atomic_llm)
+            if self.atomic_llm else None
         )
 
     def has_atomic_checkpoint(self, patient_id: str) -> bool:
@@ -113,6 +139,8 @@ class ClinicalRegistryBuilder:
                 "requested_workers": num_workers,
                 "document_count": len(documents),
                 "atomic_prompt_digest": ATOMIC_PROMPT_DIGEST,
+                "atomic_model": getattr(self.atomic_llm, "model", None),
+                "event_model": getattr(self.event_llm, "model", None),
             },
         )
         self.processing_repo.start_run(run)
@@ -158,11 +186,15 @@ class ClinicalRegistryBuilder:
                     continue
                 tasks.append((doc, effective_text, input_hash))
 
-            llm_available = bool(
-                self.atomic_extractor is not None and self.llm
-                and getattr(self.llm, "is_available", False)
+            atomic_llm_available = bool(
+                self.atomic_extractor is not None and self.atomic_llm
+                and getattr(self.atomic_llm, "is_available", False)
             )
-            model_unavailable = bool(tasks) and not llm_available
+            event_llm_available = bool(
+                self.event_llm
+                and getattr(self.event_llm, "is_available", False)
+            )
+            model_unavailable = bool(tasks) and not atomic_llm_available
             if model_unavailable:
                 message = (
                     "Modello locale non disponibile: consolidate le evidenze "
@@ -189,6 +221,9 @@ class ClinicalRegistryBuilder:
             )
 
             configured_workers = max(1, int(num_workers or 1))
+            event_workers = max(1, int(getattr(
+                self.event_llm, "parallel_workers", configured_workers
+            ) or configured_workers))
             actual_workers = max(1, min(configured_workers, len(tasks) or 1))
             if progress_callback:
                 progress_callback(
@@ -415,9 +450,9 @@ class ClinicalRegistryBuilder:
                     if not clones:
                         unresolved_links.append(link)
                         continue
-                    before = len({item.evidence_id for item in combined})
-                    combined.extend(clones)
-                    after = len({item.evidence_id for item in combined})
+                    before = len(deduplicate_atomic_evidence(combined))
+                    combined = deduplicate_atomic_evidence((*combined, *clones))
+                    after = len(combined)
                     reused_evidence_count += max(0, after - before)
                 combined_by_doc[doc.id] = combined
                 if unresolved_links:
@@ -535,9 +570,9 @@ class ClinicalRegistryBuilder:
                 stored_additions.extend(additions)
                 doc_stats.append({
                     "document_id": batch.source_document_id,
-                    "evidence_count": len({
-                        item.evidence_id: item for item in additions
-                    }),
+                    "evidence_count": len(
+                        deduplicate_atomic_evidence(additions)
+                    ),
                     "elapsed_seconds": duration,
                     "status": "reuse_source_verification",
                     **metrics,
@@ -583,10 +618,9 @@ class ClinicalRegistryBuilder:
                         source_doc_id
                     ) if item.extraction_method == "llm_atomic_v2"
                 ]
-                merged = {
-                    item.evidence_id: item for item in (*current, *additions)
-                }
-                merged_items = list(merged.values())
+                merged_items = deduplicate_atomic_evidence(
+                    (*current, *additions)
+                )
                 self.evidence_repo.replace_document_method(
                     source_doc_id, "llm_atomic_v2", merged_items
                 )
@@ -597,12 +631,11 @@ class ClinicalRegistryBuilder:
                         partial[3], partial[4],
                     )
                 if source_doc_id in combined_by_doc:
-                    combined_by_doc[source_doc_id] = list({
-                        item.evidence_id: item
-                        for item in (
+                    combined_by_doc[source_doc_id] = (
+                        deduplicate_atomic_evidence((
                             *combined_by_doc[source_doc_id], *additions,
-                        )
-                    }.values())
+                        ))
+                    )
                 elif (
                     source_doc_id in manifests
                     and source_doc_id not in forced_full_doc_ids
@@ -639,9 +672,10 @@ class ClinicalRegistryBuilder:
                     if not clones:
                         target_checks.setdefault(doc_id, []).append(link)
                         continue
-                    before = len({item.evidence_id for item in combined})
-                    combined.extend(clones)
-                    after = len({item.evidence_id for item in combined})
+                    before = len(deduplicate_atomic_evidence(combined))
+                    combined = deduplicate_atomic_evidence((*combined, *clones))
+                    combined_by_doc[doc_id] = combined
+                    after = len(combined)
                     reused_evidence_count += max(0, after - before)
 
             def merge_metrics(*payloads):
@@ -689,12 +723,9 @@ class ClinicalRegistryBuilder:
                     for item in grounded:
                         item.data["reuse_block_target_verification"] = True
                     partial = partial_results[doc.id]
-                    final_items = list({
-                        item.evidence_id: item
-                        for item in (
-                            *combined_by_doc[doc.id], *grounded,
-                        )
-                    }.values())
+                    final_items = deduplicate_atomic_evidence((
+                        *combined_by_doc[doc.id], *grounded,
+                    ))
                     return "targeted", (
                         doc, final_items, input_hash,
                         partial[3] + round(
@@ -759,9 +790,7 @@ class ClinicalRegistryBuilder:
                 if doc_id in pending_target_ids:
                     continue
                 partial = partial_results[doc_id]
-                final_evidence = list({
-                    item.evidence_id: item for item in combined
-                }.values())
+                final_evidence = deduplicate_atomic_evidence(combined)
                 persist_success((
                     partial[0], final_evidence, partial[2],
                     partial[3], partial[4],
@@ -770,9 +799,9 @@ class ClinicalRegistryBuilder:
             if progress_callback:
                 progress_callback(60, "Ricostruzione eventi ed episodi...")
 
-            all_evidence = self.evidence_repo.get_by_patient(patient_id)
+            stored_evidence = self.evidence_repo.get_by_patient(patient_id)
             document_dates = {doc.id: doc.document_date for doc in documents}
-            for item in all_evidence:
+            for item in stored_evidence:
                 if not item.document_date:
                     item.document_date = document_dates.get(item.document_id)
                 if not item.date_precision and item.observed_date:
@@ -783,12 +812,37 @@ class ClinicalRegistryBuilder:
                         else "unknown"
                     )
 
+            # One clinical fact can be printed verbatim in many subsequent
+            # reports.  Collapse those document occurrences before *any*
+            # event, trend, episode or LLM projection sees them.  The raw rows
+            # remain immutable and are reattached later only as source copies.
+            source_evidence = deduplicate_atomic_evidence(stored_evidence)
+            atomic_duplicates_suppressed = max(
+                0, len(stored_evidence) - len(source_evidence)
+            )
+
+            # The source layer is immutable: classification affects only the
+            # registry projection.  Contextual normal/negative observations
+            # can be linked to an existing episode but cannot anchor a new row.
+            primary_evidence, contextual_evidence, excluded_evidence = (
+                partition_evidence(source_evidence)
+            )
+            evidence_by_id = {
+                item.evidence_id: item for item in stored_evidence
+            }
+            evidence_by_id.update({
+                item.evidence_id: item for item in source_evidence
+            })
+
             existing_events = self.registry_repo.get_events(
                 patient_id, include_rejected=True
             )
+            self._release_atomic_runtime_before_events(
+                enabled=event_llm_available
+            )
             consolidator = ClinicalConsolidator(
                 fusion_llm=(
-                    self.llm if llm_available else None
+                    self.event_llm if event_llm_available else None
                 ),
                 existing_events=existing_events,
             )
@@ -801,31 +855,90 @@ class ClinicalRegistryBuilder:
 
             bundles = consolidator.consolidate(
                 patient_id,
-                all_evidence,
-                num_workers=configured_workers,
+                primary_evidence,
+                num_workers=event_workers,
                 progress_callback=fusion_progress,
             )
 
             if progress_callback:
                 progress_callback(72, "Correlazioni cliniche prudenti...")
             correlation_bundles = ClinicalCorrelationBuilder().build(
-                patient_id, all_evidence
+                patient_id, primary_evidence
             )
 
             if progress_callback:
                 progress_callback(78, "Trend di laboratorio e terapie...")
             trends, trend_bundles = LabTrendBuilder(self.db).build(
-                patient_id, all_evidence
+                patient_id, primary_evidence + contextual_evidence
             )
             medications, oncology_lines, oncology_bundles = (
-                TherapyProjectionBuilder().build(patient_id, all_evidence)
+                TherapyProjectionBuilder().build(patient_id, primary_evidence)
             )
             all_bundles = _unique_bundles(
                 bundles + trend_bundles + oncology_bundles + correlation_bundles
             )
 
+            # Clean summaries (headers/measurement tables) then merge bundles
+            # that describe the same event across documents/dates.  Cleaning
+            # before dedup keeps distinct measurement parameters distinguishable.
+            contextual_linked, contextual_unassigned = (
+                attach_contextual_evidence(
+                    all_bundles,
+                    contextual_evidence,
+                    evidence_by_id=evidence_by_id,
+                )
+            )
+            all_bundles, bundles_merged = deduplicate_bundles(
+                all_bundles,
+                evidence_by_id=evidence_by_id,
+                persisted_review_status={
+                    e.event_id: e.review_status for e in existing_events
+                },
+            )
+
             if progress_callback:
-                progress_callback(86, "Salvataggio registro versionato...")
+                progress_callback(
+                    82, "Assemblaggio LLM dei problemi/episodi clinici..."
+                )
+            synthesizer = ClinicalEpisodeSynthesizer(
+                self.event_llm if event_llm_available else None,
+                existing_events=existing_events,
+            )
+
+            def assembly_progress(completed: int, total: int) -> None:
+                if progress_callback:
+                    progress_callback(
+                        82 + int(4 * completed / max(total, 1)),
+                        f"Assemblaggio episodi {completed}/{total}",
+                    )
+
+            all_bundles, semantic_relations, assembly_stats = (
+                synthesizer.synthesize(
+                    patient_id,
+                    all_bundles,
+                    evidence_by_id=evidence_by_id,
+                    num_workers=event_workers,
+                    progress_callback=assembly_progress,
+                )
+            )
+            duplicate_source_links = _attach_duplicate_source_links(
+                all_bundles, evidence_by_id
+            )
+            relation_map = {
+                (
+                    relation.source_event_id,
+                    relation.target_event_id,
+                    relation.relation_type,
+                ): relation
+                for relation in (
+                    build_event_relations(patient_id, all_bundles)
+                    + semantic_relations
+                )
+            }
+            event_relations = list(relation_map.values())
+
+            if progress_callback:
+                progress_callback(88, "Salvataggio registro versionato...")
             self.registry_repo.replace_generated_registry(
                 patient_id,
                 [bundle.episode for bundle in all_bundles],
@@ -834,6 +947,9 @@ class ClinicalRegistryBuilder:
                     for bundle in all_bundles
                 ],
             )
+            self.registry_repo.replace_generated_relations(
+                patient_id, event_relations
+            )
             self.registry_repo.save_lab_trends(patient_id, trends)
             self.registry_repo.save_medication_courses(
                 patient_id, medications
@@ -841,7 +957,12 @@ class ClinicalRegistryBuilder:
             self.registry_repo.save_oncology_lines(
                 patient_id, oncology_lines
             )
-            self._sync_legacy_timeline(patient_id, all_bundles, all_evidence)
+            timeline_changed = self._sync_legacy_timeline(
+                patient_id, all_bundles, source_evidence
+            )
+            profile_invalidated = self._invalidate_clinical_profile(
+                patient_id
+            ) if timeline_changed else False
             self._sync_review_queue(patient_id, all_bundles)
 
             elapsed = round(time.monotonic() - started, 2)
@@ -857,6 +978,12 @@ class ClinicalRegistryBuilder:
                         "documents_processed": processed,
                         "documents_skipped": skipped,
                         "documents_failed": len(failures),
+                        "atomic_model": getattr(
+                            self.atomic_llm, "model", None
+                        ),
+                        "event_model": getattr(
+                            self.event_llm, "model", None
+                        ),
                         "atomic_evidence_extracted": extracted_count,
                         "exact_blocks_reused": reused_blocks,
                         "exact_reused_characters": reused_chars,
@@ -885,8 +1012,36 @@ class ClinicalRegistryBuilder:
                             int(item.get("completion_tokens", 0))
                             for item in doc_stats
                         ),
-                        "evidence_total": len(all_evidence),
+                        "evidence_stored_occurrences": len(stored_evidence),
+                        "evidence_total": len(source_evidence),
+                        "atomic_duplicates_suppressed": (
+                            atomic_duplicates_suppressed
+                        ),
+                        "duplicate_source_links": duplicate_source_links,
+                        "evidence_primary": len(primary_evidence),
+                        "evidence_contextual": len(contextual_evidence),
+                        "evidence_administrative_or_methodological": len(
+                            excluded_evidence
+                        ),
+                        "contextual_evidence_linked": contextual_linked,
+                        "contextual_evidence_unassigned": contextual_unassigned,
                         "events_total": len(all_bundles),
+                        "bundles_merged": bundles_merged,
+                        "episode_candidate_groups": (
+                            assembly_stats.candidate_groups
+                        ),
+                        "episode_assembly_llm_calls": assembly_stats.llm_calls,
+                        "episode_assembly_cached_groups": (
+                            assembly_stats.cached_groups
+                        ),
+                        "episode_observations_absorbed": (
+                            assembly_stats.episodes_absorbed
+                        ),
+                        "episode_autonomous_links": (
+                            assembly_stats.autonomous_links
+                        ),
+                        "event_relations": len(event_relations),
+                        "clinical_profile_invalidated": profile_invalidated,
                         "episodes_total": len({
                             bundle.episode.episode_id for bundle in all_bundles
                         }),
@@ -902,8 +1057,30 @@ class ClinicalRegistryBuilder:
             if progress_callback:
                 progress_callback(100, "Registro clinico v2 completato")
             return {
-                "total_entries": len(all_evidence),
-                "deduplicated": max(0, len(all_evidence) - len(all_bundles)),
+                "total_entries": len(source_evidence),
+                "stored_evidence_occurrences": len(stored_evidence),
+                "atomic_duplicates_suppressed": (
+                    atomic_duplicates_suppressed
+                ),
+                "duplicate_source_links": duplicate_source_links,
+                "registry_primary_evidence": len(primary_evidence),
+                "registry_contextual_evidence": len(contextual_evidence),
+                "registry_excluded_evidence": len(excluded_evidence),
+                "contextual_evidence_linked": contextual_linked,
+                "contextual_evidence_unassigned": contextual_unassigned,
+                "deduplicated": max(
+                    0, len(primary_evidence) - len(all_bundles)
+                ),
+                "bundles_merged": bundles_merged,
+                "episode_candidate_groups": assembly_stats.candidate_groups,
+                "episode_assembly_llm_calls": assembly_stats.llm_calls,
+                "episode_assembly_cached_groups": assembly_stats.cached_groups,
+                "episode_observations_absorbed": (
+                    assembly_stats.episodes_absorbed
+                ),
+                "episode_autonomous_links": assembly_stats.autonomous_links,
+                "event_relations": len(event_relations),
+                "clinical_profile_invalidated": profile_invalidated,
                 "final_entries": len(all_bundles),
                 "documents_processed": processed,
                 "documents_skipped": skipped,
@@ -943,6 +1120,8 @@ class ClinicalRegistryBuilder:
                 "oncology_lines": len(oncology_lines),
                 "incremental": incremental,
                 "registry_version": 2,
+                "atomic_model": getattr(self.atomic_llm, "model", None),
+                "event_model": getattr(self.event_llm, "model", None),
                 "run_id": run.run_id,
                 "elapsed_seconds": elapsed,
             }
@@ -961,6 +1140,27 @@ class ClinicalRegistryBuilder:
             progress_callback=progress_callback,
         )
 
+    def _release_atomic_runtime_before_events(self, *, enabled: bool) -> None:
+        """Release distinct extraction weights before event synthesis.
+
+        llama.cpp starts clients lazily.  When the two stages use different
+        runtime identities, keeping the extraction server resident would make
+        the event model an avoidable second copy in RAM/GPU memory.  Failures
+        are intentionally non-fatal: the backend can still try to load the
+        event model and report an actionable error from the generation call.
+        """
+        if not enabled or not self.atomic_llm or not self.event_llm:
+            return
+        try:
+            if (
+                self.atomic_llm.runtime_identity()
+                == self.event_llm.runtime_identity()
+            ):
+                return
+            self.atomic_llm.backend.stop_config(self.atomic_llm)
+        except Exception:
+            return
+
     @staticmethod
     def _normalized_text_path(
         patient_id: str, document_id: str
@@ -978,8 +1178,7 @@ class ClinicalRegistryBuilder:
         patient_id: str,
         bundles,
         all_evidence,
-    ) -> None:
-        by_id = {item.evidence_id: item for item in all_evidence}
+    ) -> bool:
         # Read the persisted projection back: reviewed/corrected/rejected rows
         # may intentionally differ from the newly generated bundle.
         persisted_events = self.registry_repo.get_events(patient_id)
@@ -987,6 +1186,10 @@ class ClinicalRegistryBuilder:
         for event in persisted_events:
             detail = self.registry_repo.get_event_detail(event.event_id) or {}
             evidence_rows = detail.get("evidence", [])
+            if evidence_rows and all(
+                is_administrative_mapping(item) for item in evidence_rows
+            ):
+                continue
             entries.append(ClinicalTimelineEntry(
                 entry_id=event.event_id,
                 patient_id=patient_id,
@@ -1008,7 +1211,27 @@ class ClinicalRegistryBuilder:
                     "accepted", "corrected"
                 } else 0,
             ))
+        previous = self.timeline_repo.get_by_patient(patient_id)
+
+        def signature(rows) -> list[tuple]:
+            return [(
+                row.entry_id, row.date_observed, row.date_resolved,
+                row.category, row.description, row.status,
+            ) for row in rows]
+
+        changed = signature(previous) != signature(entries)
         self.timeline_repo.replace_all_for_patient(patient_id, entries)
+        return changed
+
+    def _invalidate_clinical_profile(self, patient_id: str) -> bool:
+        """Clear a narrative derived from a registry projection that changed."""
+        repository = ClinicalStateRepository(self.db)
+        state = repository.load(patient_id)
+        if state is None or not state.clinical_profile:
+            return False
+        state.clinical_profile = ""
+        repository.save(state)
+        return True
 
     def _sync_review_queue(self, patient_id: str, bundles) -> None:
         pending = [
@@ -1033,6 +1256,8 @@ class ClinicalRegistryBuilder:
                     reasons.append("sintesi non verificata completamente")
                 if data.get("unit_compatible") is False:
                     reasons.append("unità laboratoristiche incompatibili")
+                if data.get("merged_into_ids"):
+                    reasons.append("duplicati unificati — verifica")
                 issue = ", ".join(reasons) or "evidenza da revisionare"
                 self.db.execute(
                     """INSERT INTO validation_queue
@@ -1054,6 +1279,44 @@ class ClinicalRegistryBuilder:
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
+
+
+def _attach_duplicate_source_links(bundles, evidence_by_id: dict) -> int:
+    """Expose copied report occurrences without treating them as new facts."""
+    added = 0
+    for bundle in bundles:
+        linked_ids = {link.evidence_id for link in bundle.links}
+        aliases: list[str] = []
+        for link in list(bundle.links):
+            canonical = evidence_by_id.get(link.evidence_id)
+            if canonical is None:
+                continue
+            aliases.extend(
+                str(evidence_id) for evidence_id in
+                canonical.data.get("duplicate_source_evidence_ids", [])
+                if evidence_id
+            )
+        for evidence_id in dict.fromkeys(aliases):
+            if evidence_id in linked_ids or evidence_id not in evidence_by_id:
+                continue
+            bundle.links.append(EventEvidenceLink(
+                link_id=stable_id(
+                    "LNK", bundle.event.event_id, evidence_id,
+                    "duplicate_source",
+                ),
+                event_id=bundle.event.event_id,
+                evidence_id=evidence_id,
+                relation="duplicate_source",
+                relation_confidence=1.0,
+                rationale=(
+                    "Occorrenza documentale ripetuta della stessa evidenza; "
+                    "esclusa da sintesi e analisi"
+                ),
+                included_in_summary=False,
+            ))
+            linked_ids.add(evidence_id)
+            added += 1
+    return added
 
 
 def _evidence_hash(evidence) -> str:

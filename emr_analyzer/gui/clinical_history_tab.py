@@ -182,6 +182,7 @@ class ClinicalHistoryTab(QWidget):
         self._tree.setAlternatingRowColors(True)
         self._tree.setRootIsDecorated(True)
         self._tree.itemExpanded.connect(self._on_event_expanded)
+        self._tree.itemDoubleClicked.connect(self._open_event_quick_view)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(
             self._on_tree_context_menu
@@ -525,10 +526,14 @@ class ClinicalHistoryTab(QWidget):
             if evidence.get("source_page"):
                 citation += f", p. {evidence['source_page']}"
             included = "in sintesi" if evidence.get("included_in_summary") else "esclusa dalla sintesi"
-            evidence_root.addChild(QTreeWidgetItem([
+            evidence_item = QTreeWidgetItem([
                 str(date), relation,
                 f"[{citation}; {included}] {source}",
-            ]))
+            ])
+            evidence_item.setData(
+                0, Qt.UserRole + 3, evidence.get("evidence_id")
+            )
+            evidence_root.addChild(evidence_item)
         item.addChild(evidence_root)
 
         updates = detail.get("updates", [])
@@ -576,6 +581,38 @@ class ClinicalHistoryTab(QWidget):
     # Context menu & deletion
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _event_root_item(item):
+        """Return the top-level event row for any expanded child item."""
+        current = item
+        while current is not None and current.parent() is not None:
+            current = current.parent()
+        return current
+
+    def _open_event_quick_view(self, item, _column=0):
+        """Open event → atomic evidence → highlighted source on double-click."""
+        root = self._event_root_item(item)
+        event_id = root.data(0, Qt.UserRole) if root else None
+        if not str(event_id or "").startswith("EVT_"):
+            return
+        registry_repo = self._services.get("registry_repo")
+        detail = registry_repo.get_event_detail(event_id) if registry_repo else None
+        if not detail:
+            QMessageBox.information(
+                self, "Quick View", "Dettaglio dell'evento non disponibile."
+            )
+            return
+        selected_evidence_id = item.data(0, Qt.UserRole + 3)
+        from .event_quick_view import EventQuickViewDialog
+
+        dialog = EventQuickViewDialog(
+            detail,
+            self._services,
+            self,
+            selected_evidence_id=selected_evidence_id,
+        )
+        dialog.exec_()
+
     def _on_tree_context_menu(self, pos):
         """Right-click menu to confirm, edit or delete a timeline entry."""
         item = self._tree.itemAt(pos)
@@ -588,6 +625,14 @@ class ClinicalHistoryTab(QWidget):
         is_golden = bool(item.data(0, Qt.UserRole + 1))
 
         menu = QMenu(self)
+
+        if str(entry_id).startswith("EVT_"):
+            quick_view_action = QAction("📖 Quick View evento e referti", self)
+            quick_view_action.triggered.connect(
+                lambda: self._open_event_quick_view(item)
+            )
+            menu.addAction(quick_view_action)
+            menu.addSeparator()
 
         if is_golden:
             confirm_action = QAction("⭐ Rimuovi conferma golden", self)
@@ -753,11 +798,11 @@ class ClinicalHistoryTab(QWidget):
         if not builder:
             return
 
-        llm = self._services.get("clinical_state_llm_client")
+        llm = self._services.get("clinical_events_llm_client")
         if not llm or not llm.is_available:
             QMessageBox.warning(
                 self, "LLM non disponibile",
-                "Il modello Clinical State non e' disponibile."
+                "Il modello per gli eventi clinici non e' disponibile."
             )
             return
 
@@ -834,12 +879,17 @@ class ClinicalHistoryTab(QWidget):
             )
             return
 
-        llm = self._services.get("clinical_state_llm_client")
-        if not llm or not llm.is_available:
+        atomic_llm = self._services.get("atomic_evidence_llm_client")
+        event_llm = self._services.get("clinical_events_llm_client")
+        if (
+            not atomic_llm or not atomic_llm.is_available
+            or not event_llm or not event_llm.is_available
+        ):
             QMessageBox.warning(
                 self, "LLM non disponibile",
-                "Il modello LLM per il Clinical State non e' disponibile. "
-                "Configuralo in Strumenti → Configura LLM."
+                "I modelli per le evidenze atomiche e gli eventi clinici "
+                "devono essere entrambi disponibili. Configurali in "
+                "Strumenti → Configura LLM."
             )
             return
 
@@ -853,13 +903,16 @@ class ClinicalHistoryTab(QWidget):
 
         from .workers import ClinicalHistoryWorker
 
-        # Read parallel_workers from the persisted LLM config
+        # Atomic extraction fans out by document.  Event fusion reads its own
+        # independent slot count directly inside ClinicalRegistryBuilder.
         num_workers = 1
         llm_configs = self._services.get("llm_configs")
         if llm_configs:
-            cs_config = llm_configs.get("clinical_state")
-            if cs_config:
-                num_workers = getattr(cs_config, "parallel_workers", 1)
+            atomic_config = llm_configs.get("atomic_evidence")
+            if atomic_config:
+                num_workers = getattr(
+                    atomic_config, "parallel_workers", 1
+                )
 
         self._worker = ClinicalHistoryWorker(
             builder, self._current_patient_id,

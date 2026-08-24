@@ -18,7 +18,7 @@ from .styles import MAIN_STYLESHEET
 from ..clinical.atomic_evidence import AtomicEvidenceExtractor
 from ..config import APP_NAME, APP_VERSION, active_workspace
 from ..extraction.llm_client import LlmClient
-from ..settings import load_llm_configs, save_llm_configs
+from ..settings import MODEL_ROLES, load_llm_configs, save_llm_configs
 from ..utils.file_utils import supported_file_dialog_filter
 
 
@@ -200,7 +200,7 @@ class MainWindow(QMainWindow):
         # All model assignments and generation parameters live in one dialog.
         self._configure_llm_action = QAction("⚙ Configura LLM", self)
         self._configure_llm_action.setToolTip(
-            "Configura i modelli e i parametri per documenti e Clinical State"
+            "Configura i modelli per documenti, evidenze, eventi e analisi"
         )
         self._configure_llm_action.triggered.connect(self._open_llm_config)
         toolbar.addAction(self._configure_llm_action)
@@ -424,10 +424,19 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if self._services.get("clinical_state_llm_client") is None:
+        missing_registry_models = [
+            label for key, label in (
+                ("atomic_evidence_llm_client", "evidenze atomiche"),
+                ("clinical_events_llm_client", "eventi clinici"),
+            )
+            if self._services.get(key) is None
+        ]
+        if missing_registry_models:
             QMessageBox.warning(
                 self, "LLM non configurato",
-                "Configura e carica il modello LLM per il Clinical State.",
+                "Configura e carica i modelli LLM per: "
+                + ", ".join(missing_registry_models)
+                + ".",
             )
             return
 
@@ -508,7 +517,7 @@ class MainWindow(QMainWindow):
         self._update_llm_summary()
 
     def _open_llm_config(self) -> None:
-        """Open the single configuration surface for both local LLMs."""
+        """Open the single configuration surface for all local LLM roles."""
         if self.workspace_tabs.llm_operation_running():
             QMessageBox.information(
                 self,
@@ -540,12 +549,17 @@ class MainWindow(QMainWindow):
             )
 
     def _apply_llm_configs(self, configs) -> None:
-        """Persist settings and replace both live clients atomically."""
+        """Persist settings and replace all live clients atomically."""
+        # Compatibility for programmatic callers still passing the former
+        # document/Clinical-State pair.
+        configs = dict(configs)
+        for role in ("atomic_evidence", "clinical_events"):
+            configs.setdefault(role, configs["clinical_state"])
         old_configs = self._services.get("llm_configs") or {}
         save_llm_configs(configs)
 
         # A server is keyed by GGUF path, context and slot count. Stop only
-        # old shapes no longer referenced by either role. Request-scoped
+        # old shapes no longer referenced by any role. Request-scoped
         # changes such as temperature and output length keep the shared
         # process alive.
         new_runtime_ids = set()
@@ -580,7 +594,7 @@ class MainWindow(QMainWindow):
 
         clients = {}
         unavailable = []
-        for role in ("document", "clinical_state"):
+        for role in MODEL_ROLES:
             config = configs[role]
             client = LlmClient(config=config) if config.model else None
             if client is not None and not client.is_available:
@@ -589,13 +603,23 @@ class MainWindow(QMainWindow):
             clients[role] = client
 
         document_client = clients["document"]
+        atomic_client = clients["atomic_evidence"]
+        event_client = clients["clinical_events"]
         state_client = clients["clinical_state"]
         self._services.update({
             "llm_configs": configs,
             "document_llm_client": document_client,
+            "atomic_evidence_llm_client": atomic_client,
+            "clinical_events_llm_client": event_client,
             "clinical_state_llm_client": state_client,
         })
         self._propagate_document_llm(document_client)
+        propagate_atomic = getattr(self, "_propagate_atomic_llm", None)
+        if propagate_atomic is not None:
+            propagate_atomic(atomic_client)
+        propagate_events = getattr(self, "_propagate_event_llm", None)
+        if propagate_events is not None:
+            propagate_events(event_client)
         self._propagate_state_llm(state_client)
         self._ollama_available = LlmClient().server_available
         self._services["ollama_available"] = self._ollama_available
@@ -633,40 +657,49 @@ class MainWindow(QMainWindow):
                      "tools/setup_llama_backend.py"
             )
             return
-        document = configs["document"]
-        state = configs["clinical_state"]
+        configs = dict(configs)
+        for role in ("atomic_evidence", "clinical_events"):
+            configs.setdefault(role, configs["clinical_state"])
         connection = (
             "Motore locale (llama.cpp) pronto" if self._ollama_available
             else "Motore locale non disponibile — esegui "
                  "tools/setup_llama_backend.py"
         )
         try:
-            document_runtime = (
-                LlmClient(config=document).runtime_identity()
-                if document.model else None
-            )
-            state_runtime = (
-                LlmClient(config=state).runtime_identity()
-                if state.model else None
-            )
+            runtime_ids = {
+                role: (
+                    LlmClient(config=config).runtime_identity()
+                    if config.model else None
+                )
+                for role, config in configs.items()
+            }
         except Exception:
-            document_runtime = state_runtime = None
-        if document_runtime is not None and document_runtime == state_runtime:
+            runtime_ids = {}
+        physical_runtimes = {
+            identity for identity in runtime_ids.values()
+            if identity is not None
+        }
+        configured_count = sum(bool(config.model) for config in configs.values())
+        if len(physical_runtimes) == 1 and configured_count > 1:
             runtime_note = "Un solo server fisico condiviso"
-        elif document_runtime is not None or state_runtime is not None:
-            runtime_note = "Server fisici distinti"
+        elif physical_runtimes:
+            runtime_note = f"{len(physical_runtimes)} server fisici configurati"
         else:
             runtime_note = "Nessun server configurato"
-        details = (
-            f"{connection}\n"
-            f"{runtime_note}\n"
-            f"Documenti: {document.model or 'off'} — "
-            f"ctx {document.context_length}, {document.parallel_workers} slot, "
-            f"T {document.temperature:g}\n"
-            f"Clinical State: {state.model or 'off'} — "
-            f"ctx {state.context_length}, {state.parallel_workers} slot, "
-            f"T {state.temperature:g}"
-        )
+        labels = {
+            "document": "Documenti",
+            "atomic_evidence": "Evidenze atomiche",
+            "clinical_events": "Eventi clinici",
+            "clinical_state": "Analisi e interrogazione",
+        }
+        role_lines = [
+            f"{labels[role]}: {configs[role].model or 'off'} — "
+            f"ctx {configs[role].context_length}, "
+            f"{configs[role].parallel_workers} slot, "
+            f"T {configs[role].temperature:g}"
+            for role in MODEL_ROLES
+        ]
+        details = "\n".join([connection, runtime_note, *role_lines])
         self._ollama_label.setToolTip(details)
         self._configure_llm_action.setToolTip(details)
 
@@ -676,17 +709,27 @@ class MainWindow(QMainWindow):
         if isolator is not None:
             isolator.llm = client
 
-    def _propagate_state_llm(self, client):
-        """Update services that operate on the longitudinal state."""
-        history_builder = self._services.get("clinical_history_builder")
-        if history_builder is not None:
-            history_builder._llm = client
+    def _propagate_atomic_llm(self, client):
+        """Update the immutable evidence-extraction stage only."""
         registry_builder = self._services.get("registry_builder")
         if registry_builder is not None:
-            registry_builder.llm = client
+            registry_builder.atomic_llm = client
             registry_builder.atomic_extractor = (
                 AtomicEvidenceExtractor(client) if client is not None else None
             )
+
+    def _propagate_event_llm(self, client):
+        """Update event fusion and clinical-episode synthesis only."""
+        registry_builder = self._services.get("registry_builder")
+        if registry_builder is not None:
+            registry_builder.event_llm = client
+            registry_builder.llm = client
+
+    def _propagate_state_llm(self, client):
+        """Update analysis, narrative and longitudinal-query services."""
+        history_builder = self._services.get("clinical_history_builder")
+        if history_builder is not None:
+            history_builder._llm = client
 
     def closeEvent(self, event):
         """Never tear down the LLM client while clinical work is running."""

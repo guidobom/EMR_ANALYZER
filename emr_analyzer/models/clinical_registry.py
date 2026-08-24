@@ -101,6 +101,7 @@ EVIDENCE_RELATIONS = (
     "excluded",
     "correlated",
     "updates",
+    "duplicate_source",
 )
 
 EVENT_RELATIONS = (
@@ -109,6 +110,13 @@ EVENT_RELATIONS = (
     "correlated",
     "contradicts",
     "distinct_episode",
+    "aggregates",
+    "component_of",
+    "possibly_related_to",
+    "has_possible_toxicity",
+    "updates_problem",
+    "evaluates_or_treats",
+    "related_episode",
 )
 
 REVIEW_STATUSES = (
@@ -201,6 +209,19 @@ class EventUpdate:
     status_after: Optional[str] = None
     evidence_ids: list[str] = field(default_factory=list)
     structured_data: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=_now)
+
+
+@dataclass(slots=True)
+class ClinicalEventRelation:
+    patient_id: str
+    source_event_id: str
+    target_event_id: str
+    relation_type: str
+    relation_id: str = field(default_factory=lambda: _stable_id("REL"))
+    confidence: Optional[float] = None
+    rationale: str = ""
+    review_status: str = "auto"
     created_at: str = field(default_factory=_now)
 
 

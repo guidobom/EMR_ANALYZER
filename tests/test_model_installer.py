@@ -22,6 +22,7 @@ from emr_analyzer.llm_backend.model_installer import (
     model_name_from_ollama_tag,
     model_name_from_url,
     normalize_model_name,
+    update_model_catalog,
     _ollama_models_roots,
     _pull_with_ollama,
 )
@@ -279,6 +280,13 @@ class _FakeOpener:
         return _FakeHTTPSResponse(self.payload, self.url)
 
 
+class _FakeCatalogOpener(_FakeOpener):
+    def open(self, request, timeout):
+        assert request.full_url == self.url
+        assert timeout == 30
+        return _FakeHTTPSResponse(self.payload, self.url)
+
+
 def test_https_download_validates_and_registers_the_file(tmp_path):
     payload = _minimal_gguf(b"downloaded")
     url = "https://example.org/model.gguf"
@@ -300,3 +308,70 @@ def test_https_download_validates_and_registers_the_file(tmp_path):
     assert name == "model"
     assert Path(entry["file"]).read_bytes() == payload
     assert progress[-1][:2] == (len(payload), len(payload))
+
+
+def test_catalog_update_downloads_validates_and_caches_manifest(tmp_path):
+    from emr_analyzer.config import LLM_MODEL_CATALOG_URL
+    from emr_analyzer.llm_backend.model_catalog import builtin_catalog_manifest
+
+    manifest = builtin_catalog_manifest()
+    manifest["catalog_version"] = 2
+    manifest["review_date"] = "2026-09-01"
+    payload = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    cache = tmp_path / "catalog.json"
+    progress = []
+    with patch(
+        "urllib.request.build_opener",
+        return_value=_FakeCatalogOpener(payload, LLM_MODEL_CATALOG_URL),
+    ):
+        result = update_model_catalog(
+            cache_path=cache,
+            progress=lambda completed, total, message: progress.append(
+                (completed, total, message)
+            ),
+        )
+
+    assert result["catalog_version"] == 2
+    assert result["model_count"] == len(manifest["models"])
+    assert cache.read_bytes() == payload
+    assert progress[-1][:2] == (len(payload), len(payload))
+
+
+def test_catalog_update_rejects_untrusted_source_and_invalid_manifest(tmp_path):
+    from emr_analyzer.config import LLM_MODEL_CATALOG_URL
+
+    with pytest.raises(ModelInstallError, match="repository ufficiale"):
+        update_model_catalog(
+            url="https://raw.githubusercontent.com/attacker/repo/main/catalog.json",
+            cache_path=tmp_path / "catalog.json",
+        )
+
+    payload = b'{"schema_version": 1, "models": []}'
+    with (
+        patch(
+            "urllib.request.build_opener",
+            return_value=_FakeCatalogOpener(payload, LLM_MODEL_CATALOG_URL),
+        ),
+        pytest.raises(ModelInstallError, match="rifiutato"),
+    ):
+        update_model_catalog(cache_path=tmp_path / "catalog.json")
+    assert not (tmp_path / "catalog.json").exists()
+
+
+def test_download_helper_emits_catalog_success(capsys):
+    from emr_analyzer.llm_backend import model_download_helper
+
+    result = {
+        "catalog_version": 3,
+        "review_date": "2026-10-01",
+        "model_count": 9,
+        "source": "official",
+    }
+    with patch.object(
+        model_download_helper, "update_model_catalog", return_value=result
+    ):
+        return_code = model_download_helper.main(["--update-catalog"])
+
+    event = json.loads(capsys.readouterr().out)
+    assert return_code == 0
+    assert event == {"type": "catalog_success", **result}

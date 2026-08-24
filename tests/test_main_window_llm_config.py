@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, patch
 
 from emr_analyzer.clinical.atomic_evidence import AtomicEvidenceExtractor
+from emr_analyzer.clinical.registry_builder import ClinicalRegistryBuilder
 from emr_analyzer.extraction.llm_client import LlmClient
 from emr_analyzer.gui.main_window import MainWindow
 from emr_analyzer.settings import LLMRoleConfig
@@ -17,23 +18,63 @@ def _config(*, context=32768, workers=3, temperature=0.1, output=6144):
     )
 
 
-def test_propagate_state_llm_updates_registry_extractor_too():
+def test_each_live_client_is_propagated_only_to_its_pipeline_stage():
     history = SimpleNamespace(_llm=None)
-    registry = SimpleNamespace(llm=None, atomic_extractor=None)
+    registry = SimpleNamespace(
+        llm=None, atomic_llm=None, event_llm=None, atomic_extractor=None
+    )
     window = SimpleNamespace(
         _services={
             "clinical_history_builder": history,
             "registry_builder": registry,
         }
     )
-    client = SimpleNamespace(model="qwen3-14b")
+    atomic = SimpleNamespace(model="atomic-model")
+    events = SimpleNamespace(model="event-model")
+    analysis = SimpleNamespace(model="analysis-model")
 
-    MainWindow._propagate_state_llm(window, client)
+    MainWindow._propagate_atomic_llm(window, atomic)
+    MainWindow._propagate_event_llm(window, events)
+    MainWindow._propagate_state_llm(window, analysis)
 
-    assert history._llm is client
-    assert registry.llm is client
+    assert history._llm is analysis
+    assert registry.atomic_llm is atomic
+    assert registry.event_llm is events
+    assert registry.llm is events
     assert isinstance(registry.atomic_extractor, AtomicEvidenceExtractor)
-    assert registry.atomic_extractor.llm is client
+    assert registry.atomic_extractor.llm is atomic
+
+
+def test_registry_builder_keeps_atomic_and_event_models_independent():
+    atomic_backend = SimpleNamespace(stop_config=Mock())
+    atomic = SimpleNamespace(
+        model="atomic-model", backend=atomic_backend,
+        runtime_identity=lambda: ("atomic.gguf", 32768, 4),
+    )
+    events = SimpleNamespace(
+        model="event-model",
+        runtime_identity=lambda: ("events.gguf", 65536, 2),
+    )
+    builder = ClinicalRegistryBuilder(
+        registry_repo=None,
+        evidence_repo=None,
+        processing_repo=None,
+        timeline_repo=None,
+        document_repo=None,
+        lab_repo=None,
+        overlay_repo=None,
+        atomic_llm_client=atomic,
+        event_llm_client=events,
+        db=object(),
+    )
+
+    assert builder.atomic_extractor.llm is atomic
+    assert builder.event_llm is events
+    assert builder.llm is events
+
+    builder._release_atomic_runtime_before_events(enabled=True)
+
+    atomic_backend.stop_config.assert_called_once_with(atomic)
 
 
 def test_apply_stops_only_obsolete_physical_runtime_shapes():
@@ -85,7 +126,10 @@ def test_apply_stops_only_obsolete_physical_runtime_shapes():
     obsolete = unload.call_args.args[0]
     assert len(obsolete) == 1
     assert obsolete[0].context_length == 16384
-    assert window._services["llm_configs"] == new
+    assert window._services["llm_configs"]["document"] == new["document"]
+    assert window._services["llm_configs"]["clinical_state"] == new["clinical_state"]
+    assert window._services["llm_configs"]["atomic_evidence"] == new["clinical_state"]
+    assert window._services["llm_configs"]["clinical_events"] == new["clinical_state"]
 
 
 def test_request_only_changes_keep_shared_runtime_loaded():
