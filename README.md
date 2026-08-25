@@ -76,6 +76,13 @@ conda activate emr-analyzer
 pip install -r requirements.txt
 ```
 
+Su DGX OS/Ubuntu possono servire anche le librerie di sistema Qt/XCB:
+
+```bash
+sudo apt update
+sudo apt install -y libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0
+```
+
 La compilazione e l'importazione del runtime `llama-server` gestito sono
 descritte in
 [docs/LLAMA_SERVER_RUNTIME.md](docs/LLAMA_SERVER_RUNTIME.md). Non affidarsi a
@@ -102,6 +109,10 @@ Avvio:
 python run.py
 ```
 
+Anche `./run.sh` è multipiattaforma: usa il `python3` dell'ambiente attivo.
+Per un launcher desktop è possibile fissare l'interprete con
+`EMR_ANALYZER_PYTHON=/percorso/env/bin/python3 ./run.sh`.
+
 ### Linux / NVIDIA DGX Spark
 
 Su DGX Spark è possibile scegliere per ogni ruolo sia llama.cpp sia vLLM.
@@ -117,15 +128,17 @@ i parametri consigliati sono descritti in
 
 Il backend llama.cpp dell’app è indipendente dalla piattaforma: la gestione
 dei processi, le porte, il parallelismo multi-slot e i modelli GGUF sono
-identici su macOS e Linux. Su DGX Spark (DGX OS, arm64, Blackwell Ultra /
-sm_100, 128 GB di memoria unificata):
+identici su macOS e Linux. Su DGX Spark (DGX OS, Linux `aarch64`, Grace
+Blackwell GB10 / compute capability 12.1, `sm_121`, 128 GB di memoria
+coerente unificata):
 
 1. compila una build CUDA autosufficiente di llama.cpp:
 
    ```bash
    git clone --depth 1 https://github.com/ggml-org/llama.cpp
    cd llama.cpp
-   cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF
+   cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121 \
+     -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF
    cmake --build build --config Release -j
    python tools/setup_llama_backend.py --server-binary build/bin/llama-server
    ```
@@ -138,9 +151,12 @@ sm_100, 128 GB di memoria unificata):
 3. `python tools/setup_llama_backend.py` stampa le stesse istruzioni quando
    il binario manca.
 
-Il dimensionamento dei worker è automatico e basato sulla RAM. Il limite reale
-va confermato con il benchmark e con dossier rappresentativi, perché contesto,
-quantizzazione e cache del modello incidono sulla memoria per slot.
+Il dimensionamento dei worker riconosce DGX Spark e usa la RAM di sistema,
+non il contatore VRAM di `nvidia-smi` (che su GB10 può risultare non
+supportato). Conserva almeno il 10%/12 GiB per sistema, applicazione e CUDA;
+il limite reale va confermato con il benchmark e con dossier rappresentativi,
+perché contesto, quantizzazione e cache del modello incidono sulla memoria per
+slot.
 
 I dati runtime vengono salvati fuori dal repository in:
 

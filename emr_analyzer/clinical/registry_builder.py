@@ -22,6 +22,10 @@ from .atomic_evidence import (
     deduplicate_atomic_evidence,
     locate_quote,
 )
+from .aggregate_v4 import (
+    AggregateV4CandidateBuilder,
+    build_coverage_ledger,
+)
 from .block_reuse import (
     build_targeted_reuse_text,
     clone_reused_evidence,
@@ -31,8 +35,14 @@ from .block_reuse import (
 )
 from .consolidation import ClinicalConsolidator, stable_id
 from .evidence_graph import EvidenceGraphBuilder, EvidenceGraphCancelled
-from .episode_assembler import build_event_relations
-from .episode_synthesis import EpisodeSynthesisStats
+from .episode_assembler import (
+    attach_contextual_evidence,
+    build_event_relations,
+)
+from .episode_synthesis import (
+    ClinicalEpisodeSynthesizer,
+    EpisodeSynthesisStats,
+)
 from .event_dedup import deduplicate_bundles
 from .evidence_relevance import (
     annotate_evidence_disposition,
@@ -204,6 +214,7 @@ class ClinicalRegistryBuilder:
                 "atomic_prompt_digest": ATOMIC_PROMPT_DIGEST,
                 "atomic_model": getattr(self.atomic_llm, "model", None),
                 "event_model": getattr(self.event_llm, "model", None),
+                "aggregation_engine": self.pipeline_policy.aggregation_engine,
             },
         )
         self.processing_repo.start_run(run)
@@ -1176,6 +1187,9 @@ class ClinicalRegistryBuilder:
                     policy=self.pipeline_policy,
                 ).build(
                     patient_id, primary_evidence + contextual_evidence,
+                    anchor_evidence_ids={
+                        item.evidence_id for item in primary_evidence
+                    },
                     reviewed_relations=(
                         self.pipeline_repo.list_evidence_relations(patient_id)
                         if self.pipeline_repo is not None else ()
@@ -2342,7 +2356,13 @@ def _claims_for_bundle(bundle, evidence_by_id: dict) -> list[EventClaim]:
             source_id for source_id in (raw.get("evidence_ids") or [])
             if source_id in known_ids
         ))
-        if not text_value or not source_ids:
+        lab_source_ids = list(dict.fromkeys(
+            int(source_id) for source_id in (
+                raw.get("lab_observation_ids") or []
+            )
+            if str(source_id).isdigit()
+        ))
+        if not text_value or (not source_ids and not lab_source_ids):
             continue
         claims.append(EventClaim(
             claim_id=stable_id(
@@ -2353,6 +2373,7 @@ def _claims_for_bundle(bundle, evidence_by_id: dict) -> list[EventClaim]:
             text=text_value,
             claim_type="clinical_observation",
             evidence_ids=source_ids,
+            lab_observation_ids=lab_source_ids,
             certainty=str(raw.get("certainty") or bundle.event.certainty),
             review_status=bundle.event.review_status,
             position=position,
@@ -2362,8 +2383,14 @@ def _claims_for_bundle(bundle, evidence_by_id: dict) -> list[EventClaim]:
     # Derived projections and legacy deterministic bundles may not carry the
     # normalized claim array yet. They still receive one fully cited claim.
     source_ids = sorted(known_ids)
+    lab_source_ids = list(dict.fromkeys(
+        int(source_id) for source_id in (
+            bundle.event.structured_data.get("lab_value_ids") or []
+        )
+        if str(source_id).isdigit()
+    ))
     text_value = " ".join(str(bundle.event.summary_short or "").split())
-    if not source_ids or not text_value:
+    if (not source_ids and not lab_source_ids) or not text_value:
         return []
     return [EventClaim(
         claim_id=stable_id(
@@ -2373,6 +2400,7 @@ def _claims_for_bundle(bundle, evidence_by_id: dict) -> list[EventClaim]:
         text=text_value,
         claim_type="clinical_observation",
         evidence_ids=source_ids,
+        lab_observation_ids=lab_source_ids,
         certainty=bundle.event.certainty,
         review_status=bundle.event.review_status,
         position=0,

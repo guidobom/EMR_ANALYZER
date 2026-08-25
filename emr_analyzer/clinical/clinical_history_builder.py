@@ -19,6 +19,7 @@ from ..config import (
     GOLDEN_FEWSHOT_MAX_EXAMPLES,
 )
 from ..models.clinical_timeline import ClinicalTimelineEntry
+from ..prompt_catalog import load_prompt
 
 
 class ClinicalHistoryBuilder:
@@ -737,23 +738,13 @@ class ClinicalHistoryBuilder:
                 )
             narrative = "\n".join(lines)
         else:
-            system_prompt = (
-                "Sei un medico che redige una storia clinica sintetica. "
-                "Basandoti ESCLUSIVAMENTE sulle osservazioni fornite, produci "
-                "un profilo clinico narrativo in italiano, organizzato "
-                "cronologicamente. Non aggiungere informazioni non presenti. "
-                "Usa un linguaggio clinico professionale ma chiaro."
+            system_prompt = load_prompt("narrative_profile_system")
+            user_prompt = (
+                load_prompt("narrative_profile_task")
+                + "\n\nOSSERVAZIONI CLINICHE:\n"
+                + json.dumps(entries_data, ensure_ascii=False, indent=2)
+                + "\n"
             )
-
-            user_prompt = f"""Redigi un profilo clinico narrativo basato sulle seguenti osservazioni cliniche in ordine cronologico.
-
-Non inventare nulla. Se un dato non e' presente, non menzionarlo.
-Organizza il testo in paragrafi cronologici coerenti.
-Cita le date quando disponibili.
-
-OSSERVAZIONI CLINICHE:
-{json.dumps(entries_data, ensure_ascii=False, indent=2)}
-"""
             try:
                 narrative = self._llm.generate_text(user_prompt, system_prompt)
             except Exception:

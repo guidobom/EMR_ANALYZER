@@ -8,12 +8,12 @@ import json
 import re
 from typing import Iterable
 
+from ..prompt_catalog import load_prompt, prompts_digest
 from ..pipeline.sensitive_data import (
     DEIDENTIFICATION_VERSION,
     SensitiveDataSanitizer,
 )
 
-PROMPT_VERSION = "clinical_text_isolation_v5"
 DEFAULT_CONTEXT_LENGTH = 16_384
 DEFAULT_MAX_OUTPUT_TOKENS = 4_096
 PROMPT_TOKEN_RESERVE = 1_000
@@ -44,13 +44,14 @@ _NUMERIC_LITERAL_RE = re.compile(
     re.IGNORECASE,
 )
 
-_SYSTEM_PROMPT = (
-    "Sei un estrattore clinico conservativo. Filtra il testo supportato dalla "
-    "sorgente mantenendo rigorosamente ordine, paragrafi e associazioni "
-    "originali. Non riorganizzare, parafrasare, interpretare o inferire. "
-    "Restituisci esclusivamente testo clinico in italiano; non produrre JSON, "
-    "spiegazioni o commenti."
+_SYSTEM_PROMPT = load_prompt("clinical_text_system")
+_PROMPT_INSTRUCTIONS = load_prompt(
+    "clinical_text_instructions",
+    required_markers=("[[VALORE_X]]", "[[PAGINA_X]]"),
+    minimum_length=500,
 )
+PROMPT_DIGEST = prompts_digest(_SYSTEM_PROMPT, _PROMPT_INSTRUCTIONS)
+PROMPT_VERSION = "clinical_text_isolation_v6-" + PROMPT_DIGEST[:12]
 
 
 @dataclass
@@ -88,9 +89,23 @@ class ClinicalTextValidationError(ValueError):
 class ClinicalTextIsolator:
     """Produce one normalized clinical text, never a structured payload."""
 
-    def __init__(self, llm_client=None, sanitizer=None):
+    def __init__(
+        self,
+        llm_client=None,
+        sanitizer=None,
+        *,
+        system_prompt: str | None = None,
+        instructions_prompt: str | None = None,
+    ):
         self.llm = llm_client
         self.sanitizer = sanitizer or SensitiveDataSanitizer()
+        # Per-instance overrides are used by the non-destructive Prompt
+        # Manager preview. Production instances keep the active catalog
+        # versions loaded at application startup.
+        self._system_prompt = system_prompt or _SYSTEM_PROMPT
+        self._prompt_instructions = (
+            instructions_prompt or _PROMPT_INSTRUCTIONS
+        )
 
     def isolate(
         self,
@@ -215,7 +230,7 @@ class ClinicalTextIsolator:
                         document_date,
                         corrective_instruction=correction,
                     ),
-                    _SYSTEM_PROMPT,
+                    self._system_prompt,
                     **overrides,
                 )
             except RuntimeError as exc:
@@ -261,8 +276,8 @@ class ClinicalTextIsolator:
             validation_details, validation_categories
         )
 
-    @staticmethod
     def _prompt(
+        self,
         text: str,
         document_date: str | None,
         corrective_instruction: str | None = None,
@@ -273,43 +288,13 @@ class ClinicalTextIsolator:
             f"{corrective_instruction}\n"
             if corrective_instruction else ""
         )
-        return f"""Filtra dal documento seguente il contenuto clinicamente rilevante conservando l'ordine originale.
-
-REGOLE OBBLIGATORIE:
-- restituisci soltanto il testo clinico, senza JSON, premesse, conclusioni o
-  commenti sul lavoro svolto;
-- elimina anagrafica, intestazioni amministrative, recapiti, codici, firme,
-  prenotazioni, privacy e piè di pagina, anche quando nome del paziente,
-  telefono, e-mail, indirizzo o identificativi compaiono nel corpo del referto;
-- conserva integralmente diagnosi, anamnesi, sintomi, negazioni, esame
-  obiettivo, valutazioni specialistiche, terapie con dose/via/frequenza e
-  relative modifiche, procedure, ricoveri, radiologia, laboratorio,
-  biomarcatori, eventi avversi, risposta/progressione e piani di cura;
-- non parafrasare, non riassumere, non correggere, non interpretare, non
-  classificare e non dedurre;
-- conserva rigorosamente la sequenza dei paragrafi e delle osservazioni così
-  come appare nella sorgente;
-- non raggruppare informazioni simili, non costruire una nuova cronologia,
-  non spostare contenuti tra sezioni e non ripetere paragrafi;
-- non aggiungere diagnosi, causalità, grading, criteri RECIST/CTCAE o date;
-- conserva letteralmente le formulazioni cliniche, le unità, le negazioni e
-  le espressioni temporali originali;
-- ogni token [[VALORE_X]] rappresenta una data o un numero: copialo
-  esattamente, senza modificarlo, duplicarlo o sostituirlo e senza scrivere
-  cifre direttamente; ogni segnaposto [[VALORE_X]] deve comparire
-  ESATTAMENTE UNA VOLTA nella risposta;
-- ogni token [[PAGINA_X]] delimita internamente una pagina della sorgente:
-  non riportarlo nella risposta;
-- conserva l'ordine originale dei segnaposto [[VALORE_X]];
-- puoi soltanto regolarizzare spazi e interruzioni di riga, senza creare o
-  rinominare titoli di sezione;
-- se non esiste contenuto clinico, restituisci soltanto:
-  [NESSUN CONTENUTO CLINICO]
-{retry_instruction}
-
-TESTO SORGENTE:
-{text}
-"""
+        return (
+            self._prompt_instructions
+            + retry_instruction
+            + "\n\nTESTO SORGENTE:\n"
+            + text
+            + "\n"
+        )
 
     @staticmethod
     def _validation_category(error: Exception) -> str:

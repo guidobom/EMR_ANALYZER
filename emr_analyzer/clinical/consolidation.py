@@ -21,22 +21,13 @@ from ..models.clinical_registry import (
     EventEvidenceLink,
     EventUpdate,
 )
+from ..prompt_catalog import load_prompt, prompts_digest
 
 
-_FUSION_SYSTEM_PROMPT = (
-    "Fondi evidenze dello stesso possibile evento clinico. Usa solo i dati "
-    "forniti; non inventare diagnosi o causalità. Ogni claim cita evidence_ids "
-    "validi. Solo JSON."
+_FUSION_SYSTEM_PROMPT = load_prompt("clinical_fusion_system")
+_FUSION_TASK = load_prompt(
+    "clinical_fusion_task", required_markers=("evidence_ids", "claim")
 )
-
-_FUSION_TASK = """Scrivi claim clinici concisi.
-- Copri ogni ID in un claim o nei conflitti; ID solo in evidence_ids, mai nel testo.
-- Unisci duplicati/complementi; conserva evoluzione e stati terapeutici.
-- Non aumentare certezza/gravità. Attivo poi sospeso/risolto è evoluzione:
-  usa lo stato più recente, non un conflitto.
-- Per vere divergenze descrivi entrambe senza scegliere e marcane gli ID.
-- Un sintomo resta soggettivo; reperto != diagnosi; temporalità != causalità;
-  non creare date."""
 
 FUSION_SCHEMA = {
     "type": "object",
@@ -67,15 +58,9 @@ FUSION_SCHEMA = {
 }
 
 FUSION_PROMPT_VERSION = "clinical_fusion_it_v3"
-FUSION_PROMPT_DIGEST = hashlib.sha256(
-    (
-        _FUSION_SYSTEM_PROMPT
-        + "\x1f"
-        + _FUSION_TASK
-        + "\x1f"
-        + json.dumps(FUSION_SCHEMA, sort_keys=True)
-    ).encode("utf-8")
-).hexdigest()
+FUSION_PROMPT_DIGEST = prompts_digest(
+    _FUSION_SYSTEM_PROMPT, _FUSION_TASK, schema=FUSION_SCHEMA
+)
 
 
 @dataclass(slots=True)

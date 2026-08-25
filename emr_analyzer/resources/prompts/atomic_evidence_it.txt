@@ -1,0 +1,80 @@
+Estrai tutti i fatti clinici espliciti dal TESTO numerato e inseriscili nel
+contenitore previsto dallo schema. Esegui internamente una sola scansione,
+frase per frase: prima identifica i fatti, poi controlla che ciascuno abbia un
+oggetto valido. Restituisci soltanto JSON, senza spiegazioni né checklist.
+
+Vincoli obbligatori:
+- restituisci una volta ciascuna chiave di primo livello presente nello schema;
+  la chiave determina il fact_type. Usa [] se la categoria non ha fatti e
+  ometti soltanto i campi interni non documentati;
+- un oggetto rappresenta un solo concetto in un singolo stato, data o valore.
+  Se una frase contiene più fatti, parametri o farmaci, crea più oggetti. Non
+  fondere stati successivi dello stesso fatto;
+- concept è il nome clinico essenziale e specifico, senza data, stato, sede,
+  valore o spiegazioni. Non usare etichette generiche quali terapia, esame,
+  visita, controllo, reperto o procedura;
+- source_refs contiene da 1 a 6 INTERI: per [S3] usa 3, mai "S3". Cita ogni
+  frase che prova concept, stato, valore e data. Per espressioni anaforiche
+  come "nella stessa data" cita anche la frase che contiene la data antecedente;
+- observation_date/observation_date_end riportano l'espressione temporale
+  riferita al fatto, non la data del referto. Non inventare date. Usa la
+  precisione massima documentata: day, month, year, interval, approximate;
+- polarity è present per un fatto, risultato o transizione documentati,
+  suspected per ipotesi/possibilità e negated soltanto per assenza o esclusione
+  esplicita. Un risultato negativo o non mutato è present con value_text;
+- numeric_value è solo il numero e unit la sua unità; value_text conserva un
+  risultato qualitativo. Per ogni misura numerica usa numeric_value+unit, non
+  value_text. Sede, lateralità, gravità e stato vanno nei rispettivi campi;
+- non dedurre diagnosi, causalità, grading o relazioni. Conserva la prudenza
+  della fonte e non fondere o deduplicare informazioni del documento.
+
+Copertura clinica:
+- diagnosis: diagnosi, comorbilità, tossicità, complicanze, risposta,
+  progressione, recidiva, allergie, familiarità e fattori di rischio espliciti;
+- symptom e clinical_sign: ogni sintomo riferito e ogni segno obiettivo
+  clinicamente rilevante, separandoli anche se elencati nella stessa frase;
+- vital_sign: un oggetto per ogni parametro fisiologico nominato, con valore e
+  unità quando presenti; non classificare qui dimensioni di lesioni;
+- radiology_finding e instrumental_finding: un oggetto per ciascun reperto
+  patologico, potenzialmente patologico, evolutivo o negativo rilevante. Usa
+  payload per modalità, sede, confronto, morfologia e misure dello stesso
+  reperto, senza creare frammenti separati per i suoi attributi;
+- histopathology e biomarker: conserva tipo di campione, istotipo, ulcerazione,
+  grado, margini, invasione, misure e ogni risultato molecolare/proteico,
+  positivo, negativo o non mutato;
+- medication: un oggetto per ogni farmaco o schema e per ogni distinta
+  transizione documentata (proposto, prescritto, iniziato, assunto,
+  somministrato, proseguito, modificato, interrotto, sospeso, ripreso,
+  completato). Compila medication con nome, principio attivo, lifecycle_status,
+  dose, via, frequenza, indicazione e aderenza; oncology solo se esplicito;
+  non mettere mai due transizioni dello stesso farmaco nello stesso oggetto o
+  nelle stesse source_refs: inizio, sospensione e ripresa sono item separati;
+- procedure: ogni procedura diagnostica, terapeutica o chirurgica e il suo
+  esito/complicanza espliciti; clinical_decision: decisioni, piani e follow-up
+  clinicamente significativi, marcando planned/proposed quando pertinente;
+- hospitalization: ogni ricovero/accesso con motivo, intervallo ed esito;
+  discharge: ogni dimissione con condizioni, destinazione o istruzioni.
+
+Aggiornamenti obbligatori:
+- miglioramento, peggioramento, stabilità, persistenza e risoluzione sono nuove
+  osservazioni dello stesso concept, con un oggetto distinto e clinical_status
+  appropriato; una risoluzione/scomparsa esplicita è polarity=negated e
+  clinical_status=resolved;
+- sospensione o interruzione di un farmaco è polarity=present e
+  medication.lifecycle_status=suspended o interrupted, non negated;
+- un esame può generare sia la procedura sia più reperti o esclusioni, purché
+  ciascun oggetto sia direttamente sostenuto dalle proprie source_refs;
+- in radiologia riduzione/regressione di un reperto è polarity=present e
+  clinical_status=improved; scomparsa è present+resolved. Se la stessa frase
+  documenta un reperto presente e ne esclude un altro, crea due oggetti;
+- conserva negazioni soltanto se modificano diagnosi differenziale, stadiazione,
+  sicurezza, risposta, follow-up o documentano la risoluzione di un problema.
+
+Non estrarre valori degli esami ematochimici: una pipeline deterministica li
+registra separatamente usando intervalli e flag del laboratorio. Non estrarre
+anatomia normale incidentale, tecnica senza risultato, amministrazione,
+prenotazioni, intestazioni, date isolate o informazioni non verificabili.
+
+Prima di chiudere il JSON verifica silenziosamente ogni frase S: nessun fatto
+clinico esplicito deve essere rimasto senza oggetto e ogni oggetto deve avere
+concept, polarity e source_refs validi.

@@ -1,0 +1,12 @@
+Per ogni gruppo candidato:
+- tratta ogni candidate_group_id come un blocco indipendente: non collegare e non fondere mai eventi appartenenti a gruppi diversi;
+- scegli come anchor un problema/episodio clinico; puoi usare sintomo, segno, diagnosi, tossicità, sindrome o un reperto clinicamente significativo;
+- absorbed_event_ids contiene soltanto osservazioni necessarie a descrivere lo stesso episodio (sintomi, segni, laboratorio, imaging, istologia);
+- farmaci, linee oncologiche, procedure, chirurgia, ricoveri, dimissioni, risposta e progressione restano episodi autonomi: inseriscili eventualmente in related_event_ids, mai in absorbed_event_ids;
+- non unire reperti solo perché vicini nel tempo o presenti nello stesso referto; non trasformare correlazione temporale in causalità;
+- una negazione successiva può documentare miglioramento/risoluzione; una negazione contemporanea discordante resta un conflitto da non risolvere;
+- usa formulazioni prudenti ("quadro compatibile con", "possibile relazione") quando sintomi, laboratorio e imaging sono coerenti ma la diagnosi o la causalità non sono documentate;
+- ignora date di appuntamenti, prenotazioni, tecnica di acquisizione, somministrazione del tracciante e indicazioni di dose eventualmente presenti incidentalmente nelle citazioni: non sono claim clinici;
+- ogni claim deve citare evidence_ids validi che lo sostengono;
+- se il collegamento è incerto, lascia gli eventi separati.
+Ometti gli eventi che devono restare invariati.

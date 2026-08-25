@@ -79,6 +79,48 @@ def normalize_clinical_date(
     start, precision = _parse_single_date(original)
     end, end_precision = _parse_single_date(str(date_end or "").strip())
 
+    # Clinical notes often omit the year for dates inside a document. Resolve
+    # only explicit Italian day+month expressions against the report year;
+    # never assign the report date to a fact lacking its own date expression.
+    reference_year = re.match(r"((?:19|20)\d{2})", str(document_date or ""))
+    compact_interval = re.fullmatch(
+        r"(?i)dal\s+(\d{1,2})\s+al\s+(\d{1,2})\s+"
+        r"(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|"
+        r"settembre|ottobre|novembre|dicembre)(?:\s+((?:19|20)\d{2}))?",
+        original,
+    )
+    if compact_interval:
+        year = compact_interval.group(4) or (
+            reference_year.group(1) if reference_year else None
+        )
+        if year:
+            start, _ = _parse_single_date(
+                f"{compact_interval.group(1)} {compact_interval.group(3)} {year}"
+            )
+            end, _ = _parse_single_date(
+                f"{compact_interval.group(2)} {compact_interval.group(3)} {year}"
+            )
+            precision = end_precision = "interval"
+    if start is None and reference_year and re.fullmatch(
+        r"(?i)(?:il\s+|dal\s+|del\s+)?\d{1,2}\s+"
+        r"(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|"
+        r"settembre|ottobre|novembre|dicembre)",
+        original.strip(),
+    ):
+        start, precision = _parse_single_date(
+            f"{original} {reference_year.group(1)}"
+        )
+    raw_end = str(date_end or "").strip()
+    if end is None and reference_year and re.fullmatch(
+        r"(?i)(?:il\s+|al\s+|del\s+)?\d{1,2}\s+"
+        r"(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|"
+        r"settembre|ottobre|novembre|dicembre)",
+        raw_end,
+    ):
+        end, end_precision = _parse_single_date(
+            f"{raw_end} {reference_year.group(1)}"
+        )
+
     if start is None and original:
         interval = _parse_interval(original)
         if interval:

@@ -1,0 +1,16 @@
+Filtra dal documento seguente il contenuto clinicamente rilevante conservando l'ordine originale.
+
+REGOLE OBBLIGATORIE:
+- restituisci soltanto il testo clinico, senza JSON, premesse, conclusioni o commenti sul lavoro svolto;
+- elimina anagrafica, intestazioni amministrative, recapiti, codici, firme, prenotazioni, privacy e piè di pagina, anche quando nome del paziente, telefono, e-mail, indirizzo o identificativi compaiono nel corpo del referto;
+- conserva integralmente diagnosi, anamnesi, sintomi, negazioni, esame obiettivo, valutazioni specialistiche, terapie con dose/via/frequenza e relative modifiche, procedure, ricoveri, radiologia, laboratorio, biomarcatori, eventi avversi, risposta/progressione e piani di cura;
+- non parafrasare, non riassumere, non correggere, non interpretare, non classificare e non dedurre;
+- conserva rigorosamente la sequenza dei paragrafi e delle osservazioni così come appare nella sorgente;
+- non raggruppare informazioni simili, non costruire una nuova cronologia, non spostare contenuti tra sezioni e non ripetere paragrafi;
+- non aggiungere diagnosi, causalità, grading, criteri RECIST/CTCAE o date;
+- conserva letteralmente le formulazioni cliniche, le unità, le negazioni e le espressioni temporali originali;
+- ogni token [[VALORE_X]] rappresenta una data o un numero: copialo esattamente, senza modificarlo, duplicarlo o sostituirlo e senza scrivere cifre direttamente; ogni segnaposto [[VALORE_X]] deve comparire ESATTAMENTE UNA VOLTA nella risposta;
+- ogni token [[PAGINA_X]] delimita internamente una pagina della sorgente: non riportarlo nella risposta;
+- conserva l'ordine originale dei segnaposto [[VALORE_X]];
+- puoi soltanto regolarizzare spazi e interruzioni di riga, senza creare o rinominare titoli di sezione;
+- se non esiste contenuto clinico, restituisci soltanto: [NESSUN CONTENUTO CLINICO]

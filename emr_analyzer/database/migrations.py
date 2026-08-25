@@ -5,7 +5,7 @@ import re
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -629,6 +629,23 @@ CREATE_TABLES_SQL = [
         UNIQUE(source_evidence_id, target_evidence_id, relation_type)
     )
     """,
+    # Per-run coverage ledger for the aggregate-v4 projection.  It proves
+    # whether every registry-eligible atom reached an event or remained an
+    # explicit, inspectable residual without altering the source evidence.
+    """
+    CREATE TABLE IF NOT EXISTS clinical_aggregation_coverage (
+        run_id TEXT NOT NULL,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        evidence_id TEXT NOT NULL REFERENCES clinical_evidence(evidence_id)
+            ON DELETE CASCADE,
+        disposition TEXT NOT NULL,
+        status TEXT NOT NULL,
+        event_ids_json TEXT NOT NULL DEFAULT '[]',
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, evidence_id)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS evidence_relation_adjudication_cache (
         patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
@@ -829,6 +846,7 @@ INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_mapping_lookup ON terminology_mappings(normalized_concept, fact_type)",
     "CREATE INDEX IF NOT EXISTS idx_duplicate_patient ON evidence_duplicate_groups(patient_id, review_status)",
     "CREATE INDEX IF NOT EXISTS idx_evidence_relation_patient ON evidence_relations(patient_id, cluster_effect)",
+    "CREATE INDEX IF NOT EXISTS idx_aggregation_coverage_patient ON clinical_aggregation_coverage(patient_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_relation_cache_patient ON evidence_relation_adjudication_cache(patient_id, namespace)",
     "CREATE INDEX IF NOT EXISTS idx_claim_event ON clinical_event_claims(event_id, position)",
     "CREATE INDEX IF NOT EXISTS idx_claim_source ON clinical_event_claim_sources(source_type, source_id)",
@@ -1098,6 +1116,7 @@ def drop_all_tables(db: DatabaseEngine) -> None:
         "clinical_events_fts", "clinical_event_relations",
         "clinical_event_claim_sources", "clinical_event_claims",
         "clinical_hypotheses", "evidence_relations",
+        "clinical_aggregation_coverage",
         "evidence_relation_adjudication_cache",
         "evidence_duplicate_members", "evidence_duplicate_groups",
         "evidence_source_refs", "excluded_evidence",

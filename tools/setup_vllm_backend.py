@@ -24,6 +24,7 @@ from emr_analyzer.llm_backend.vllm_backend import (
     list_cached_vllm_models,
     resolve_vllm_model,
 )
+from emr_analyzer.utils.nvidia import probe_nvidia_gpu
 
 VLLM_ENV_DIR = Path.home() / ".emr_analyzer" / "vllm-env"
 
@@ -116,6 +117,18 @@ def main() -> int:
         return 2
     if not shutil.which("nvidia-smi"):
         print("AVVISO: nvidia-smi non trovato; CUDA non è verificabile.")
+    gpu = probe_nvidia_gpu(system_name=system, machine=machine)
+    if gpu.is_dgx_spark:
+        print(
+            "Piattaforma: NVIDIA DGX Spark / GB10 · memoria coerente "
+            f"unificata · compute capability {gpu.compute_capability or '12.1'}"
+        )
+        print(
+            "Nota: Memory-Usage N/A/Not Supported in nvidia-smi è normale "
+            "su DGX Spark e non indica l'assenza della GPU."
+        )
+    elif gpu.available:
+        print(f"GPU CUDA: {gpu.name}")
 
     if args.install and not _install():
         print(

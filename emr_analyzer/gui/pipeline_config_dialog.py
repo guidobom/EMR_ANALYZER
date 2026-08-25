@@ -126,6 +126,24 @@ class PipelineConfigDialog(QDialog):
     def _graph_page(self) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
+        self._aggregation_engine = QComboBox()
+        self._aggregation_engine.addItem(
+            "v3 — grafo di coppie (compatibilità)", "v3"
+        )
+        self._aggregation_engine.addItem(
+            "v4 — gruppi clinici compatti (sperimentale)", "v4"
+        )
+        self._aggregation_engine.setCurrentIndex(max(
+            0,
+            self._aggregation_engine.findData(
+                self._policy.aggregation_engine
+            ),
+        ))
+        self._aggregation_engine.setToolTip(
+            "v4 evita la valutazione LLM di tutte le coppie, conserva ogni "
+            "evidenza eleggibile e usa il modello soltanto sui gruppi "
+            "multimodali plausibili."
+        )
         self._consensus = QComboBox()
         for label, value in (
             ("Veloce — una valutazione per candidato", "fast"),
@@ -151,7 +169,8 @@ class PipelineConfigDialog(QDialog):
         self._top_k.setValue(self._policy.semantic_top_k)
         self._cohesive = self._probability(self._policy.cohesive_threshold)
         self._split = self._probability(self._policy.bridge_split_threshold)
-        form.addRow("Profilo di consenso", self._consensus)
+        form.addRow("Motore di aggregazione", self._aggregation_engine)
+        form.addRow("Profilo di consenso v3", self._consensus)
         form.addRow("Finestra locale", self._local_window)
         form.addRow("Finestra longitudinale", self._long_window)
         form.addRow("Passo longitudinale", self._long_step)
@@ -257,6 +276,9 @@ class PipelineConfigDialog(QDialog):
             if not isinstance(rules, dict):
                 raise ValueError("Le regole di laboratorio devono essere un oggetto JSON")
             policy = ClinicalPipelinePolicy(
+                aggregation_engine=str(
+                    self._aggregation_engine.currentData()
+                ),
                 adaptive_specialized_retry=self._adaptive_retry.isChecked(),
                 max_specialized_retries=self._max_retries.value(),
                 consensus_profile=str(self._consensus.currentData()),

@@ -277,6 +277,13 @@ class ClinicalHistoryTab(QWidget):
         self._atomic_evidence_tree.setColumnWidth(1, 125)
         self._atomic_evidence_tree.setColumnWidth(2, 380)
         self._atomic_evidence_tree.setColumnWidth(3, 150)
+        self._atomic_evidence_tree.setToolTip(
+            "Doppio clic su un fatto o su una fonte fusa per aprire il "
+            "referto e mettere in evidenza il passaggio sorgente."
+        )
+        self._atomic_evidence_tree.itemDoubleClicked.connect(
+            self._open_atomic_evidence_source
+        )
         evidence_layout.addWidget(self._atomic_evidence_tree)
         self._evidence_page_index = self._clinical_data_tabs.addTab(
             evidence_page, "Evidenze atomiche"
@@ -714,8 +721,17 @@ class ClinicalHistoryTab(QWidget):
                 "document_date": evidence.document_date,
                 "observed_date": evidence.observed_date,
                 "source_page": evidence.source_page,
+                "bbox": list(evidence.bbox) if evidence.bbox else None,
                 "source_text": evidence.source_text,
             }]
+        occurrences = [
+            {
+                **occurrence,
+                "normalized_entity": entity,
+                "canonical_evidence_id": evidence.evidence_id,
+            }
+            for occurrence in occurrences
+        ]
         source_label = self._atomic_source_label(occurrences[0])
         if len(occurrences) > 1:
             source_label = f"{len(occurrences)} fonti fuse"
@@ -724,6 +740,7 @@ class ClinicalHistoryTab(QWidget):
             date_text, str(category), description, source_label,
         ])
         item.setData(0, Qt.UserRole, evidence.evidence_id)
+        item.setData(0, Qt.UserRole + 1, occurrences[0])
         item.setToolTip(2, evidence.source_text or description)
         item.setToolTip(
             3,
@@ -752,9 +769,55 @@ class ClinicalHistoryTab(QWidget):
                 child.setData(
                     0, Qt.UserRole, occurrence.get("evidence_id")
                 )
+                child.setData(0, Qt.UserRole + 1, occurrence)
                 child.setToolTip(2, source_text)
+                child.setToolTip(
+                    3,
+                    self._atomic_source_label(occurrence)
+                    + " — doppio clic per Quick View",
+                )
                 item.addChild(child)
         self._atomic_evidence_tree.addTopLevelItem(item)
+
+    def _open_atomic_evidence_source(self, item, _column=0) -> None:
+        """Open one physical source occurrence with its quote highlighted."""
+        source = item.data(0, Qt.UserRole + 1) if item is not None else None
+        if not isinstance(source, dict):
+            return
+        document_id = str(source.get("document_id") or "")
+        document_repo = self._services.get("document_repo")
+        document = (
+            document_repo.get_by_id(document_id)
+            if document_repo is not None and document_id else None
+        )
+        if document is None:
+            QMessageBox.information(
+                self,
+                "Quick View fonte",
+                "Il documento sorgente non è disponibile nel progetto attivo.",
+            )
+            return
+
+        highlight = {
+            "evidence_id": (
+                source.get("evidence_id")
+                or source.get("canonical_evidence_id")
+            ),
+            "page_number": source.get("source_page"),
+            "bbox": source.get("bbox"),
+            "source_text": source.get("source_text"),
+            "normalized_entity": source.get("normalized_entity"),
+        }
+        from .pdf_viewer import PDFViewerDialog
+
+        dialog = PDFViewerDialog(
+            document.to_dict(), self._services, self, highlight=highlight
+        )
+        dialog.setWindowTitle(
+            "Quick View fonte evidenza — "
+            + str(getattr(document, "filename", None) or document_id)
+        )
+        dialog.exec_()
 
     @staticmethod
     def _atomic_source_label(source: dict) -> str:

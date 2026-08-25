@@ -7,6 +7,11 @@ motori locali:
 - `vllm`: checkpoint Hugging Face, supportato su Linux/NVIDIA CUDA e pensato
   per DGX Spark.
 
+DGX Spark è una piattaforma Linux `aarch64` con GPU Grace Blackwell GB10
+(`sm_121`) e 128 GB di memoria coerente condivisa. Perciò il valore VRAM di
+`nvidia-smi` può essere `N/A`/`Not Supported`: la diagnostica dell'app verifica
+nome GPU, CUDA e backend, ma dimensiona il lavoro usando la RAM di sistema.
+
 I processi sono gestiti dall'applicazione e ascoltano soltanto su
 `127.0.0.1`. Quando avvia vLLM, l'app imposta `HF_HUB_OFFLINE=1` e
 `TRANSFORMERS_OFFLINE=1`: un'inferenza non può scaricare pesi mancanti.
@@ -65,10 +70,16 @@ In **Configura LLM**, per ogni ruolo:
 4. premere **Carica e testa**.
 
 Valori iniziali prudenti per una DGX Spark a GPU singola sono `bfloat16` o
-`auto`, quota memoria GPU `0,85–0,90`, tensor parallel `1` e quantizzazione
-lasciata al modello. Il numero di richieste parallele diventa
+`auto`, quota memoria motore `0,85`, tensor parallel `1`, CUDA Graph abilitate
+(non selezionare `enforce eager`) e quantizzazione lasciata al modello. Il 15%
+residuo resta disponibile a sistema, applicazione e strutture CUDA nello stesso
+pool coerente. Il numero di richieste parallele diventa
 `--max-num-seqs`; aumentarlo solo dopo una prova reale con i documenti più
 lunghi.
+
+L'ottimizzatore applicativo usa 8 sequenze soltanto per checkpoint piccoli;
+riduce automaticamente a 4/2/1 al crescere dei pesi. Su DGX Spark una singola
+GB10 non è un sistema multi-GPU: `tensor parallel` deve rimanere 1.
 
 `Consenti codice remoto già locale` corrisponde a `--trust-remote-code` e va
 abilitato solo per repository verificati. Non è necessario per la maggior
@@ -85,3 +96,9 @@ identificano invece un processo fisico condivisibile fra ruoli.
 llama.cpp e vLLM possono essere usati contemporaneamente da ruoli diversi.
 **Libera tutti i modelli** arresta soltanto i processi figli avviati
 dall'applicazione e non tocca container o servizi esterni.
+
+## Riferimenti della piattaforma
+
+- [NVIDIA DGX Spark — hardware](https://docs.nvidia.com/dgx/dgx-spark/hardware.html)
+- [NVIDIA DGX Spark — problemi noti](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html)
+- [vLLM — installazione GPU](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/)

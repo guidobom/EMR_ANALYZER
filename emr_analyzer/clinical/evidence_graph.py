@@ -12,7 +12,7 @@ import re
 import unicodedata
 import uuid
 
-from .temporal import temporal_distance_days
+from .temporal import date_bounds, temporal_distance_days
 from ..models.clinical_pipeline import (
     CLUSTER_EFFECTS,
     EVIDENCE_RELATION_TYPES,
@@ -20,12 +20,13 @@ from ..models.clinical_pipeline import (
     EvidenceRelation,
 )
 from ..settings import ClinicalPipelinePolicy
+from ..prompt_catalog import load_prompt, prompts_digest
 
 
-_RELATION_SYSTEM_PROMPT = (
-    "Valuta se coppie di evidenze cliniche appartengono allo stesso processo "
-    "o episodio. Usa solo i dati forniti; prossimità temporale e plausibilità "
-    "non dimostrano causalità. Rispondi solo con JSON conforme allo schema."
+_RELATION_SYSTEM_PROMPT = load_prompt("evidence_relations_system")
+_RELATION_TASK = load_prompt(
+    "evidence_relations_task",
+    required_markers=("must_link", "context_only", "cannot_link"),
 )
 
 RELATION_PROMPT_VERSION = "evidence-relations-v2"
@@ -60,6 +61,9 @@ _RELATION_SCHEMA = {
     },
     "required": ["decisions"],
 }
+RELATION_PROMPT_DIGEST = prompts_digest(
+    _RELATION_SYSTEM_PROMPT, _RELATION_TASK, schema=_RELATION_SCHEMA
+)
 
 _STOPWORDS = {
     "della", "delle", "dello", "degli", "alla", "alle", "con", "per",
@@ -124,6 +128,7 @@ class EvidenceGraphBuilder:
         evidence,
         *,
         reviewed_relations=(),
+        anchor_evidence_ids: set[str] | None = None,
         num_workers: int = 1,
         cancel_check=None,
         progress_callback=None,
@@ -148,7 +153,14 @@ class EvidenceGraphBuilder:
         relations = _apply_reviewed_relations(
             patient_id, relations, reviewed_relations, set(by_id)
         )
-        clusters, split_count = self._clusters(items, relations)
+        clusters, split_count = self._clusters(
+            items,
+            relations,
+            anchor_evidence_ids=(
+                set(by_id) if anchor_evidence_ids is None
+                else set(anchor_evidence_ids) & set(by_id)
+            ),
+        )
         return EvidenceGraphResult(
             relations=relations,
             clusters=clusters,
@@ -272,9 +284,17 @@ class EvidenceGraphBuilder:
         effect = "uncertain"
         weight = 0.5
         rationale = "Candidato generato a due scale"
-        if same_entity and opposite:
+        if same_entity and opposite and _is_later_resolution(left, right):
+            relation_type, effect, weight = (
+                "documents_resolution", "context_only", 0.94
+            )
+            rationale = (
+                "Negazione o normalizzazione successiva compatibile con "
+                "la risoluzione del concetto precedente"
+            )
+        elif same_entity and opposite:
             relation_type, effect, weight = "contradicts", "cannot_link", 0.98
-            rationale = "Stesso concetto con polarità incompatibile"
+            rationale = "Stesso concetto con polarità temporalmente incompatibile"
         elif same_entity and different_side:
             relation_type, effect, weight = "contradicts", "cannot_link", 0.92
             rationale = "Stesso concetto con lateralità incompatibile"
@@ -297,12 +317,17 @@ class EvidenceGraphBuilder:
             rationale = "Manifestazione e reperto obiettivo candidati"
         elif "medication" in {left.category, right.category}:
             relation_type = "treats"
-            effect = "cohesive" if "local" in pair.scales else "context_only"
-            weight = 0.77 if effect == "cohesive" else 0.66
-            rationale = "Terapia candidata per lo stesso contesto clinico"
+            effect = "context_only"
+            weight = 0.72 if "local" in pair.scales else 0.62
+            rationale = (
+                "Terapia autonoma potenzialmente collegata al contesto clinico"
+            )
         elif "procedure" in {left.category, right.category}:
-            relation_type, effect, weight = "evaluates", "cohesive", 0.76
-            rationale = "Procedura candidata per diagnosi o monitoraggio"
+            relation_type, effect = "evaluates", "context_only"
+            weight = 0.72 if "local" in pair.scales else 0.62
+            rationale = (
+                "Procedura autonoma potenzialmente collegata al contesto clinico"
+            )
         elif pair.shared_terms and "local" in pair.scales:
             relation_type, effect, weight = (
                 "temporally_associated_with", "uncertain", 0.64
@@ -562,10 +587,7 @@ class EvidenceGraphBuilder:
     def _classify_batch(self, batch, by_id) -> list[dict]:
         rows = [_candidate_prompt_row(pair, by_id) for pair in batch]
         prompt = (
-            "Per ogni candidato stabilisci linked. Usa cohesive/must_link solo "
-            "se le evidenze possono descrivere uno stesso episodio; usa "
-            "context_only per contesto utile ma non aggregabile, cannot_link "
-            "per incompatibilità e uncertain se insufficiente.\n\nCANDIDATI:\n"
+            _RELATION_TASK + "\n\nCANDIDATI:\n"
             + json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
         )
         try:
@@ -590,7 +612,7 @@ class EvidenceGraphBuilder:
 
     # ------------------------------------------------------- cluster stage
 
-    def _clusters(self, items, relations):
+    def _clusters(self, items, relations, *, anchor_evidence_ids: set[str]):
         by_id = {item.evidence_id: item for item in items}
         cannot = {
             frozenset((rel.source_evidence_id, rel.target_evidence_id))
@@ -634,11 +656,16 @@ class EvidenceGraphBuilder:
                 relation_ids=sorted(relation_ids),
             ))
 
-        # Accepted single-atom exceptions remain explicit and reviewable.
+        # Every clinically eligible primary atom must remain visible even when
+        # it has no accepted graph edge.  Contextual normal/negative atoms are
+        # deliberately omitted here and may only attach to an existing event.
         for item in items:
             if item.evidence_id in assigned_core:
                 continue
-            if item.category in _SINGLE_EVENT_EXCEPTIONS:
+            if (
+                item.evidence_id in anchor_evidence_ids
+                or item.category in _SINGLE_EVENT_EXCEPTIONS
+            ):
                 clusters.append(EvidenceGraphCluster(
                     evidence_ids=[item.evidence_id],
                     roles={item.evidence_id: "core"},
@@ -657,11 +684,31 @@ class EvidenceGraphBuilder:
                 if present.count(True) != 1:
                     continue
                 missing = endpoints[0] if not present[0] else endpoints[1]
+                # A primary medication/procedure/clinical fact retains its own
+                # autonomous event.  context_only is allowed to absorb only a
+                # non-anchoring observation such as a later negative finding.
+                if missing in anchor_evidence_ids:
+                    continue
                 cluster.evidence_ids.append(missing)
                 cluster.evidence_ids = sorted(set(cluster.evidence_ids))
                 cluster.roles[missing] = _role_for(by_id[missing], core=False)
                 cluster.relation_ids.append(relation.relation_id)
         return clusters, split_count
+
+
+def _is_later_resolution(left, right) -> bool:
+    """True only for an unambiguously later absent/resolved observation."""
+    absent = left if left.assertion == "absent" else right
+    present = right if absent is left else left
+    if absent.assertion != "absent" or present.assertion != "present":
+        return False
+    absent_bounds = date_bounds(_clinical_date(absent))
+    present_bounds = date_bounds(_clinical_date(present))
+    if not absent_bounds or not present_bounds:
+        return False
+    if absent_bounds[0] <= present_bounds[1]:
+        return False
+    return True
 
 
 def _apply_reviewed_relations(
@@ -965,7 +1012,7 @@ def _relation_cache_namespace(llm) -> str:
         model_info = None
     payload = {
         "prompt_version": RELATION_PROMPT_VERSION,
-        "system_prompt": _RELATION_SYSTEM_PROMPT,
+        "prompt_digest": RELATION_PROMPT_DIGEST,
         "schema": _RELATION_SCHEMA,
         "llm_class": (
             f"{llm.__class__.__module__}.{llm.__class__.__qualname__}"

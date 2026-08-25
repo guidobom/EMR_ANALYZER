@@ -8,11 +8,10 @@ parallel workers) based on hardware profiling.
 
 from __future__ import annotations
 
-import json
 import os
+import platform
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
 
 import psutil
 
@@ -29,7 +28,7 @@ MAX_WORKERS = 8
 # hardware policy instead of duplicating them in the GUI.
 ATOMIC_EVIDENCE_CONTEXT_TARGET = 8_192
 ATOMIC_EVIDENCE_OUTPUT_TARGET = 6_144
-ATOMIC_EVIDENCE_WORKER_CAP = 4
+ATOMIC_EVIDENCE_WORKER_CAP = 8
 
 # Empirical KV-cache + working-memory overhead per token of context.
 # llama-server runs the KV cache in q8_0: ~80 KB per token for a ~14B
@@ -38,6 +37,7 @@ _BYTES_PER_CONTEXT_TOKEN = 100_000  # ~100 KB per token (KV cache dominant)
 
 # RAM reserved for the OS and non-LLM application processes.
 _OS_RESERVE_GB = 2.0
+_DGX_SPARK_MIN_RESERVE_GB = 12.0
 
 # ---------------------------------------------------------------------------
 # Hardware profile
@@ -54,18 +54,43 @@ class HardwareProfile:
     cpu_cores_logical: int
     has_apple_silicon: bool
     gpu_name: str = ""
+    system: str = ""
+    machine: str = ""
+    has_nvidia_cuda: bool = False
+    is_dgx_spark: bool = False
+    unified_memory: bool = False
+    cuda_compute_capability: str = ""
+    cuda_version: str = ""
+    nvidia_driver_version: str = ""
+    gpu_total_memory_gb: float | None = None
+    nvidia_gpu_count: int = 0
 
     @classmethod
     def capture(cls) -> "HardwareProfile":
         """Collect a snapshot of the current host hardware."""
+        from .nvidia import cached_nvidia_gpu
+
         vm = psutil.virtual_memory()
+        system = platform.system()
+        machine = platform.machine()
+        nvidia = cached_nvidia_gpu(system, machine)
         return cls(
             total_ram_gb=vm.total / (1024**3),
             available_ram_gb=vm.available / (1024**3),
             cpu_cores_physical=psutil.cpu_count(logical=False) or 1,
             cpu_cores_logical=psutil.cpu_count(logical=True) or 1,
             has_apple_silicon=_detect_apple_silicon(),
-            gpu_name=_detect_gpu_name(),
+            gpu_name=nvidia.name or _detect_gpu_name(),
+            system=system,
+            machine=machine,
+            has_nvidia_cuda=nvidia.available,
+            is_dgx_spark=nvidia.is_dgx_spark,
+            unified_memory=nvidia.unified_memory,
+            cuda_compute_capability=nvidia.compute_capability,
+            cuda_version=nvidia.cuda_version,
+            nvidia_driver_version=nvidia.driver_version,
+            gpu_total_memory_gb=nvidia.memory_total_gb,
+            nvidia_gpu_count=nvidia.gpu_count,
         )
 
 
@@ -79,8 +104,25 @@ class ModelProfile:
     architecture: str = ""
 
     @classmethod
-    def capture(cls, model_name: str) -> "ModelProfile":
-        """Read model metadata from the local GGUF index."""
+    def capture(
+        cls, model_name: str, backend: str = "llama_cpp"
+    ) -> "ModelProfile":
+        """Read metadata from the selected local backend without a load."""
+        if backend == "vllm":
+            from ..llm_backend.vllm_backend import resolve_vllm_model
+
+            info = resolve_vllm_model(model_name) or {}
+            size_bytes = info.get("size_bytes")
+            return cls(
+                model_name=model_name,
+                size_gb=(
+                    float(size_bytes) / (1024 ** 3)
+                    if size_bytes is not None else None
+                ),
+                max_context_length=info.get("max_context_length"),
+                architecture=str(info.get("architecture") or ""),
+            )
+
         from ..extraction.llm_client import LlmClient
 
         size = get_model_size_gb(model_name)
@@ -114,6 +156,7 @@ class RecommendedParams:
         hw: HardwareProfile,
         model: ModelProfile,
         role: str = "document",
+        backend: str = "llama_cpp",
     ) -> "RecommendedParams":
         """Compute recommended parameters for *model* running on *hw*.
 
@@ -130,7 +173,7 @@ class RecommendedParams:
 
         # ---- parallel_workers ----------------------------------------------
         workers, workers_rationale = _recommend_workers(
-            hw, model, context, role
+            hw, model, context, role, backend
         )
 
         return cls(
@@ -182,7 +225,7 @@ def estimate_server_ram_gb(
     """Conservative machine requirement for one llama-server runtime."""
     return (
         estimate_runtime_ram_gb(model_name, context_length, workers)
-        + _OS_RESERVE_GB
+        + get_system_ram_reserve_gb()
     )
 
 
@@ -197,8 +240,19 @@ def estimate_runtime_ram_gb(
     )
 
 
-def get_system_ram_reserve_gb() -> float:
+def get_system_ram_reserve_gb(
+    profile: HardwareProfile | None = None,
+) -> float:
     """RAM excluded from LLM sizing for the OS and the application."""
+    try:
+        hw = profile or HardwareProfile.capture()
+    except Exception:
+        return _OS_RESERVE_GB
+    if hw.is_dgx_spark:
+        # GB10 shares the same 128 GB pool among OS, CUDA, weights and KV.
+        # A percentage prevents the optimizer from consuming the memory that
+        # the desktop, application and CUDA graphs still need.
+        return max(_DGX_SPARK_MIN_RESERVE_GB, hw.total_ram_gb * 0.10)
     return _OS_RESERVE_GB
 
 
@@ -224,7 +278,7 @@ def calculate_max_workers(
     if per_request <= 0:
         return MAX_WORKERS
 
-    headroom = capacity - model_size - _OS_RESERVE_GB
+    headroom = capacity - model_size - get_system_ram_reserve_gb()
     if headroom <= 0:
         return MIN_WORKERS
 
@@ -260,6 +314,7 @@ def get_safe_max_workers(
 def recommend_all(
     model_name: str,
     role: str = "document",
+    backend: str = "llama_cpp",
 ) -> RecommendedParams | None:
     """One-shot: profile hardware + model and return recommended parameters.
 
@@ -267,12 +322,12 @@ def recommend_all(
     """
     try:
         hw = HardwareProfile.capture()
-        model = ModelProfile.capture(model_name)
+        model = ModelProfile.capture(model_name, backend=backend)
     except Exception:
         return None
     if model.max_context_length is None:
         return None
-    return RecommendedParams.compute(hw, model, role)
+    return RecommendedParams.compute(hw, model, role, backend)
 
 
 def recommend_output_tokens(context_length: int, role: str) -> tuple[int, str]:
@@ -290,15 +345,13 @@ def recommend_output_tokens(context_length: int, role: str) -> tuple[int, str]:
 
 
 def _detect_apple_silicon() -> bool:
-    """Return True when running on Apple Silicon (M1/M2/M3/M4)."""
-    import platform
+    """Return True when running on an Apple Silicon Mac."""
     return platform.machine() in ("arm64", "aarch64") and platform.system() == "Darwin"
 
 
 def _detect_gpu_name() -> str:
     """Best-effort GPU name on macOS or Linux."""
     try:
-        import platform
         if platform.system() == "Darwin":
             result = subprocess.run(
                 ["system_profiler", "SPDisplaysDataType"],
@@ -345,7 +398,7 @@ def _recommend_context(
 
     # Configuration describes a cold server. Use total capacity rather than
     # a volatile post-load snapshot that already excludes resident weights.
-    available_for_llm = hw.total_ram_gb - _OS_RESERVE_GB
+    available_for_llm = hw.total_ram_gb - get_system_ram_reserve_gb(hw)
     kv_per_token_gb = _BYTES_PER_CONTEXT_TOKEN / (1024**3)
     ram_budget_tokens = max(
         2048,
@@ -430,12 +483,14 @@ def _recommend_workers(
     model: ModelProfile,
     context: int,
     role: str = "document",
+    backend: str = "llama_cpp",
 ) -> tuple[int, str]:
     """Recommend parallel workers based on RAM headroom."""
     capacity = hw.total_ram_gb
     model_size = model.size_gb or 4.0
     per_request = estimate_per_request_ram_gb(context)
-    headroom = capacity - model_size - _OS_RESERVE_GB
+    reserve = get_system_ram_reserve_gb(hw)
+    headroom = capacity - model_size - reserve
 
     if headroom <= 0:
         workers = 1
@@ -445,30 +500,48 @@ def _recommend_workers(
         )
     else:
         theoretical = int(headroom / per_request) if per_request > 0 else MAX_WORKERS
-        # Large models rarely gain useful throughput from very high
-        # concurrency on a workstation even when the KV cache technically
-        # fits. Keep automatic recommendations conservative; advanced users
-        # can still select any capacity-safe value manually.
-        performance_cap = 3 if model_size >= 8 else 4 if model_size >= 4 else 6
-        if role == "atomic_evidence":
-            # Memory capacity alone is not proof that more simultaneous decodes
-            # increase aggregate throughput.  Four is a conservative preset;
-            # a separate measured benchmark may later select a higher value.
-            performance_cap = min(
-                performance_cap, ATOMIC_EVIDENCE_WORKER_CAP
+        accelerated = hw.has_apple_silicon or hw.has_nvidia_cuda
+        if backend == "vllm" and hw.is_dgx_spark:
+            # vLLM continuously batches sequences. On one GB10, small models
+            # can use all eight application tasks, whereas large models must
+            # keep the batch deliberately small to protect the unified pool.
+            performance_cap = (
+                8 if model_size < 10 else
+                4 if model_size < 24 else
+                2 if model_size < 55 else 1
             )
+        elif accelerated:
+            performance_cap = (
+                8 if model_size < 4 else
+                6 if model_size < 8 else
+                3 if model_size < 24 else 2
+            )
+        else:
+            performance_cap = (
+                4 if model_size < 4 else
+                3 if model_size < 8 else 2
+            )
+        if role == "atomic_evidence":
+            performance_cap = min(performance_cap, ATOMIC_EVIDENCE_WORKER_CAP)
         workers = max(
             MIN_WORKERS,
             min(MAX_WORKERS, theoretical, performance_cap),
         )
         hw_desc = (
+            f"DGX Spark ({hw.gpu_name or 'NVIDIA GB10'}, memoria unificata)"
+            if hw.is_dgx_spark
+            else f"NVIDIA CUDA ({hw.gpu_name})"
+            if hw.has_nvidia_cuda and hw.gpu_name
+            else "NVIDIA CUDA"
+            if hw.has_nvidia_cuda
+            else
             f"Apple Silicon ({hw.gpu_name})"
             if hw.has_apple_silicon and hw.gpu_name
             else "Apple Silicon"
             if hw.has_apple_silicon
             else f"{hw.cpu_cores_physical} core CPU"
         )
-        est_total = model_size + (per_request * workers) + _OS_RESERVE_GB
+        est_total = model_size + (per_request * workers) + reserve
         rationale = (
             f"{hw_desc} — "
             f"RAM: {capacity:.1f} GiB totali, "
@@ -478,8 +551,10 @@ def _recommend_workers(
         )
         if role == "atomic_evidence":
             rationale += (
-                "; limite prudenziale di 4 slot per i chunk atomici, in attesa "
-                "di un benchmark di throughput specifico della macchina"
+                f"; limite prudenziale controllato di "
+                f"{ATOMIC_EVIDENCE_WORKER_CAP} slot "
+                "per i chunk atomici; il benchmark locale può confermare "
+                "4/6/8 sulla macchina"
             )
     return workers, rationale
 

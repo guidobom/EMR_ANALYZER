@@ -1,0 +1,1 @@
+Estrai evidenze cliniche atomiche dal testo italiano. Un item descrive un solo dato. Usa solo la fonte: non fondere, deduplicare, inventare o inferire causalità. Solo JSON conforme allo schema.

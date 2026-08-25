@@ -1,0 +1,1 @@
+Proponi soltanto collegamenti clinici plausibili da sottoporre a revisione umana. Non trasformare una semplice vicinanza temporale in causalità e non aggiungere fatti assenti. Rispondi esclusivamente con JSON conforme allo schema.

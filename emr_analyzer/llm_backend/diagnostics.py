@@ -35,6 +35,11 @@ class AccelerationDiagnostic:
     summary: str
     details: str
     raw_output: str = ""
+    is_dgx_spark: bool = False
+    unified_memory: bool = False
+    compute_capability: str = ""
+    cuda_version: str = ""
+    driver_version: str = ""
 
     @property
     def accelerated(self) -> bool:
@@ -343,6 +348,13 @@ def diagnose_vllm_acceleration(
 
 def diagnose_local_acceleration() -> AccelerationDiagnostic:
     """Combine non-invasive llama.cpp and vLLM diagnostics for the GUI."""
+    # This action is explicitly a fresh verification from the GUI.
+    try:
+        from ..utils.nvidia import cached_nvidia_gpu
+
+        cached_nvidia_gpu.cache_clear()
+    except Exception:
+        pass
     llama = diagnose_llama_acceleration()
 
     # vLLM is not a macOS backend.  Reporting its expected absence beside a
@@ -366,6 +378,11 @@ def diagnose_local_acceleration() -> AccelerationDiagnostic:
                 "richiede Linux/CUDA."
             ),
             raw_output=llama.raw_output,
+            is_dgx_spark=llama.is_dgx_spark,
+            unified_memory=llama.unified_memory,
+            compute_capability=llama.compute_capability,
+            cuda_version=llama.cuda_version,
+            driver_version=llama.driver_version,
         )
 
     vllm = diagnose_vllm_acceleration()
@@ -397,6 +414,13 @@ def diagnose_local_acceleration() -> AccelerationDiagnostic:
             + "\n\n=== vLLM ===\n" + vllm.details
         ),
         raw_output=(llama.raw_output + "\n" + vllm.raw_output)[-6000:],
+        is_dgx_spark=llama.is_dgx_spark or vllm.is_dgx_spark,
+        unified_memory=llama.unified_memory or vllm.unified_memory,
+        compute_capability=(
+            vllm.compute_capability or llama.compute_capability
+        ),
+        cuda_version=vllm.cuda_version or llama.cuda_version,
+        driver_version=vllm.driver_version or llama.driver_version,
     )
 
 
@@ -414,6 +438,27 @@ def _result(
     summary: str,
     raw_output: str = "",
 ) -> AccelerationDiagnostic:
+    nvidia = None
+    if system.casefold() == "linux":
+        try:
+            from ..utils.nvidia import cached_nvidia_gpu
+
+            nvidia = cached_nvidia_gpu(system, machine)
+        except Exception:
+            nvidia = None
+    is_dgx = bool(
+        (nvidia and nvidia.is_dgx_spark)
+        or (
+            machine.casefold() in {"arm64", "aarch64"}
+            and "gb10" in gpu_name.casefold()
+        )
+    )
+    compute = (
+        (nvidia.compute_capability if nvidia else "")
+        or ("12.1" if is_dgx else "")
+    )
+    cuda_version = nvidia.cuda_version if nvidia else ""
+    driver_version = nvidia.driver_version if nvidia else ""
     compiled_text = ", ".join(compiled) if compiled else "non rilevato"
     device_text = "; ".join(devices) if devices else "nessuno"
     details = "\n".join((
@@ -425,8 +470,22 @@ def _result(
         f"Backend utilizzabile: {runtime}",
         f"Dispositivi esposti dal backend: {device_text}",
     ))
+    if is_dgx:
+        details += (
+            "\nProfilo: NVIDIA DGX Spark / GB10, memoria coerente unificata"
+            "\nNota memoria: la VRAM può risultare N/A in nvidia-smi; "
+            "il dimensionamento usa la RAM di sistema"
+        )
+    if compute:
+        details += f"\nCompute capability: {compute} (sm_{compute.replace('.', '')})"
+    if cuda_version:
+        details += f"\nCUDA dichiarata dal driver: {cuda_version}"
+    if driver_version:
+        details += f"\nDriver NVIDIA: {driver_version}"
     if raw_output:
         details += "\n\nOutput llama-server:\n" + raw_output[-6000:]
+    if is_dgx and "dgx spark" not in summary.casefold():
+        summary = f"DGX Spark / GB10 — {summary}"
     return AccelerationDiagnostic(
         status=status,
         expected_backend=expected,
@@ -440,6 +499,11 @@ def _result(
         summary=summary,
         details=details,
         raw_output=raw_output[-6000:],
+        is_dgx_spark=is_dgx,
+        unified_memory=is_dgx,
+        compute_capability=compute,
+        cuda_version=cuda_version,
+        driver_version=driver_version,
     )
 
 

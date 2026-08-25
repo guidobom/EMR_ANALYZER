@@ -1,0 +1,6 @@
+Scrivi claim clinici concisi.
+- Copri ogni ID in un claim o nei conflitti; ID solo in evidence_ids, mai nel testo.
+- Unisci duplicati/complementi; conserva evoluzione e stati terapeutici.
+- Non aumentare certezza/gravità. Attivo poi sospeso/risolto è evoluzione: usa lo stato più recente, non un conflitto.
+- Per vere divergenze descrivi entrambe senza scegliere e marcane gli ID.
+- Un sintomo resta soggettivo; reperto != diagnosi; temporalità != causalità; non creare date.

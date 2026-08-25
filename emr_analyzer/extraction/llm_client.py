@@ -14,6 +14,7 @@ import time
 from ..config import DEFAULT_LLM_MODEL_NAME
 from ..llm_backend import get_backend
 from ..settings import LLMRoleConfig
+from ..prompt_catalog import load_prompt
 from .golden_fewshot import (
     DISCHARGE_ALLOWED_CATEGORIES,
     format_examples_section,
@@ -76,7 +77,7 @@ class LlmClient:
         )
         self.vllm_gpu_memory_utilization = (
             config.vllm_gpu_memory_utilization
-            if config is not None else 0.90
+            if config is not None else 0.85
         )
         self.vllm_tensor_parallel_size = (
             config.vllm_tensor_parallel_size if config is not None else 1
@@ -490,28 +491,13 @@ class LlmClient:
             },
             "required": ["name", "birth_date", "fiscal_code"],
         }
-        system_prompt = (
-            "Sei un assistente che estrae l'identità anagrafica del paziente "
-            "da un documento clinico. Rispondi SOLO con JSON valido, senza "
-            "altro testo."
+        system_prompt = load_prompt("patient_identity_system")
+        user_prompt = (
+            load_prompt("patient_identity_task")
+            + "\n\nTESTO:\n"
+            + text[:4000]
+            + "\n"
         )
-        user_prompt = f"""Estrai l'identità del PAZIENTE a cui si riferisce il documento.
-
-Campi:
-- name: nome e cognome completi del paziente, come scritti nel documento
-- birth_date: data di nascita in formato YYYY-MM-DD, se presente
-- fiscal_code: codice fiscale a 16 caratteri, se presente; altrimenti stringa vuota
-- confidence: la tua confidenza (0.0-1.0)
-
-Regole:
-- È rilevante SOLO il paziente: ignora medici, infermieri, referenti e
-  ogni altra persona citata nel testo.
-- Se non puoi determinare il paziente con sicurezza, lascia i campi vuoti.
-- Non inventare o correggere alcun valore.
-
-TESTO:
-{text[:4000]}
-"""
         try:
             data = self.generate_structured(
                 user_prompt, system_prompt, schema

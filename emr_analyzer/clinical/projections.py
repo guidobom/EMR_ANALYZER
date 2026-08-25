@@ -65,6 +65,10 @@ class LabTrendBuilder:
             compatible_units = len(units) <= 1
             numeric = [row for row in values if row["value"] is not None]
             direction = _numeric_direction(numeric) if compatible_units else "incompatibile"
+            phases = (
+                segment_lab_phases(numeric)
+                if compatible_units else []
+            )
             first_date = next(
                 (row["sample_date"] for row in abnormal if row["sample_date"]),
                 None,
@@ -72,7 +76,7 @@ class LabTrendBuilder:
             end_date = last["sample_date"]
             summary = _lab_summary(
                 parameter, values, direction=direction, resolved=resolved,
-                compatible_units=compatible_units,
+                compatible_units=compatible_units, phases=phases,
             )
             trend_id = stable_id("TRD", patient_id, parameter, first_date or "unknown")
             event_id = stable_id(
@@ -95,6 +99,8 @@ class LabTrendBuilder:
                     "unit_compatible": compatible_units,
                     "abnormal_count": len(abnormal),
                     "value_count": len(values),
+                    "lab_value_ids": [int(row["id"]) for row in values],
+                    "phases": phases,
                 },
             )
             trends.append(trend)
@@ -125,7 +131,19 @@ class LabTrendBuilder:
                 date_precision=episode.onset_precision,
                 confidence=0.85 if compatible_units else 0.55,
                 review_status="auto" if compatible_units else "pending",
-                structured_data=trend.data,
+                structured_data={
+                    **trend.data,
+                    "claims": [{
+                        "text": summary,
+                        "evidence_ids": [
+                            item.evidence_id for item in relevant_evidence
+                        ],
+                        "lab_observation_ids": [
+                            int(row["id"]) for row in values
+                        ],
+                        "certainty": "confirmed",
+                    }],
+                },
             )
             links = [
                 EventEvidenceLink(
@@ -389,6 +407,95 @@ def _numeric_direction(rows: list) -> str:
     return "stabile"
 
 
+def segment_lab_phases(
+    rows: list,
+    *,
+    hysteresis_relative: float = 0.15,
+) -> list[dict]:
+    """Compress a numeric series into reversible longitudinal phases.
+
+    This is a prompt/display projection only: it never replaces individual
+    laboratory observations.  Every phase retains the original row IDs.
+    Hysteresis suppresses small analytical oscillations; reference intervals
+    from each report determine the explicit normalization phase.
+    """
+    points = [row for row in rows if row["value"] is not None]
+    if len(points) < 2:
+        return []
+    threshold = max(0.0, float(hysteresis_relative))
+
+    def edge_direction(left, right) -> str:
+        first, second = float(left["value"]), float(right["value"])
+        scale = max(abs(first), abs(second), 1e-9)
+        relative = abs(second - first) / scale
+        if relative < threshold:
+            return "stable"
+        return "increasing" if second > first else "decreasing"
+
+    directions = [
+        edge_direction(points[index - 1], points[index])
+        for index in range(1, len(points))
+    ]
+    ranges: list[tuple[int, int, str]] = []
+    start = 0
+    active = directions[0]
+    for edge_index, direction in enumerate(directions[1:], start=2):
+        if direction == "stable":
+            continue
+        if active == "stable":
+            active = direction
+            continue
+        if direction != active:
+            ranges.append((start, edge_index - 1, active))
+            start = edge_index - 1
+            active = direction
+    ranges.append((start, len(points) - 1, active))
+
+    # A return inside the report-specific range is a clinically meaningful
+    # phase boundary, not merely the tail of a decreasing/increasing segment.
+    last_abnormal = max(
+        (index for index, row in enumerate(points) if bool(row["is_abnormal"])),
+        default=None,
+    )
+    normalization_index = None
+    if last_abnormal is not None:
+        normalization_index = next((
+            index for index in range(last_abnormal + 1, len(points))
+            if not bool(points[index]["is_abnormal"])
+        ), None)
+    if normalization_index is not None:
+        trimmed = []
+        for phase_start, phase_end, direction in ranges:
+            if phase_start >= normalization_index:
+                continue
+            trimmed.append((
+                phase_start,
+                min(phase_end, last_abnormal),
+                direction,
+            ))
+        ranges = [item for item in trimmed if item[1] >= item[0]]
+        ranges.append((last_abnormal, len(points) - 1, "normalized"))
+
+    phases = []
+    for index, (phase_start, phase_end, direction) in enumerate(ranges, start=1):
+        first, last = points[phase_start], points[phase_end]
+        phases.append({
+            "phase_index": index,
+            "direction": direction,
+            "start_date": first["sample_date"],
+            "end_date": last["sample_date"],
+            "start_value": float(first["value"]),
+            "end_value": float(last["value"]),
+            "unit": last["unit"] or first["unit"],
+            "normalized": direction == "normalized",
+            "lab_value_ids": [
+                int(points[row_index]["id"])
+                for row_index in range(phase_start, phase_end + 1)
+            ],
+        })
+    return phases
+
+
 def _lab_summary(
     parameter: str,
     values: list,
@@ -396,6 +503,7 @@ def _lab_summary(
     direction: str,
     resolved: bool,
     compatible_units: bool,
+    phases: list[dict] | None = None,
 ) -> str:
     abnormal = [row for row in values if row["is_abnormal"]]
     first = abnormal[0]
@@ -405,13 +513,31 @@ def _lab_summary(
     status = "con successiva normalizzazione" if resolved else "persistente"
     if not compatible_units:
         status = "con unità non direttamente confrontabili"
-    return (
+    summary = (
         f"{display_entity(parameter)}: alterazione {status}; "
         f"prima evidenza {first['sample_date'] or 'data n.d.'} "
         f"({first_value}), ultimo controllo "
         f"{last['sample_date'] or 'data n.d.'} ({last_value}); "
         f"andamento {direction}."
     )
+    if phases:
+        labels = {
+            "increasing": "aumento",
+            "decreasing": "riduzione",
+            "stable": "stabilità",
+            "normalized": "normalizzazione",
+        }
+        rendered = []
+        for phase in phases:
+            unit = f" {phase['unit']}" if phase.get("unit") else ""
+            rendered.append(
+                f"{labels.get(phase['direction'], phase['direction'])} "
+                f"{phase['start_value']:g}→{phase['end_value']:g}{unit} "
+                f"({phase.get('start_date') or 'n.d.'}–"
+                f"{phase.get('end_date') or 'n.d.'})"
+            )
+        summary += " Fasi: " + "; ".join(rendered) + "."
+    return summary
 
 
 def _format_lab_value(row) -> str:

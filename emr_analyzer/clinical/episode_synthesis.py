@@ -22,34 +22,19 @@ from .correlation import clinical_system
 from .temporal import date_sort_key, temporal_distance_days
 from ..models.clinical_evidence import ClinicalEvidence
 from ..models.clinical_registry import ClinicalEventRelation, EventEvidenceLink
+from ..prompt_catalog import load_prompt, prompts_digest
 
 
-EPISODE_ASSEMBLY_PROMPT_VERSION = "episode_assembly_it_v2"
+EPISODE_ASSEMBLY_PROMPT_VERSION = "episode_assembly_it_v3"
 
-_SYSTEM_PROMPT = (
-    "Sei un medico esperto nella ricostruzione longitudinale della storia "
-    "clinica. Raggruppa osservazioni soltanto quando descrivono lo stesso "
-    "problema o episodio. Usa esclusivamente gli ID forniti e rispondi in JSON."
+_SYSTEM_PROMPT = load_prompt("episode_assembly_system")
+_TASK = load_prompt(
+    "episode_assembly_task",
+    required_markers=(
+        "candidate_group_id", "absorbed_event_ids", "related_event_ids",
+        "evidence_ids",
+    ),
 )
-
-_TASK = """Per ogni gruppo candidato:
-- tratta ogni candidate_group_id come un blocco indipendente: non collegare e
-  non fondere mai eventi appartenenti a gruppi diversi;
-- scegli come anchor un problema/episodio clinico; puoi usare sintomo, segno,
-  diagnosi, tossicità, sindrome o un reperto clinicamente significativo;
-- absorbed_event_ids contiene soltanto osservazioni necessarie a descrivere
-  lo stesso episodio (sintomi, segni, laboratorio, imaging, istologia);
-- farmaci, linee oncologiche, procedure, chirurgia, ricoveri, dimissioni,
-  risposta e progressione restano episodi autonomi: inseriscili eventualmente
-  in related_event_ids, mai in absorbed_event_ids;
-- non unire reperti solo perché vicini nel tempo o presenti nello stesso
-  referto; non trasformare correlazione temporale in causalità;
-- ignora date di appuntamenti, prenotazioni, tecnica di acquisizione,
-  somministrazione del tracciante e indicazioni di dose eventualmente presenti
-  incidentalmente nelle citazioni: non sono claim clinici;
-- ogni claim deve citare evidence_ids validi che lo sostengono;
-- se il collegamento è incerto, lascia gli eventi separati.
-Ometti gli eventi che devono restare invariati."""
 
 _SCHEMA = {
     "type": "object",
@@ -104,6 +89,9 @@ _SCHEMA = {
     },
     "required": ["drafts"],
 }
+EPISODE_ASSEMBLY_PROMPT_DIGEST = prompts_digest(
+    _SYSTEM_PROMPT, _TASK, schema=_SCHEMA
+)
 
 _AUTONOMOUS_CATEGORIES = {
     "medication", "oncology_treatment_line", "procedure", "surgery",
@@ -117,6 +105,19 @@ _ANCHOR_CATEGORIES = {
     "laboratory_trend", "imaging_finding", "histopathology", "biomarker",
 }
 _HUMAN_LOCKED = {"accepted", "corrected", "rejected"}
+
+_SYSTEM_WINDOWS = {
+    "respiratorio": 21,
+    "tiroideo": 60,
+    "epatico": 30,
+    "renale": 30,
+    "ematologico": 45,
+    "gastrointestinale": 21,
+    "neurologico": 21,
+    "cardiovascolare": 14,
+    "cutaneo": 21,
+    "non_classificato": 30,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +158,8 @@ def plan_candidate_groups(
     *,
     evidence_by_id: dict[str, ClinicalEvidence],
     maximum_group_size: int = 24,
-    window_days: int = 45,
+    window_days: int | None = None,
+    maximum_span_days: int = 180,
 ) -> list[list]:
     """Create disjoint clinical/time blocks; unrelated events never reach LLM."""
     by_system: dict[str, list] = defaultdict(list)
@@ -174,20 +176,33 @@ def plan_candidate_groups(
         ))
         current: list = []
         anchor_date: str | None = None
+        last_date: str | None = None
         documents: set[str] = set()
+        system_window = int(
+            window_days
+            if window_days is not None
+            else _SYSTEM_WINDOWS.get(
+                _bundle_system(related[0], evidence_by_id), 30
+            )
+        )
         for bundle in related:
             date = (
                 bundle.event.first_evidence_date
                 or bundle.event.first_documented_date
             )
             bundle_docs = _bundle_documents(bundle, evidence_by_id)
-            gap = temporal_distance_days(anchor_date, date)
+            gap = temporal_distance_days(last_date, date)
+            span = temporal_distance_days(anchor_date, date)
             same_document = bool(documents & bundle_docs)
             must_split = bool(
                 current and (
                     len(current) >= maximum_group_size
                     or (
-                        gap is not None and gap > window_days
+                        gap is not None and gap > system_window
+                        and not same_document
+                    )
+                    or (
+                        span is not None and span > maximum_span_days
                         and not same_document
                     )
                 )
@@ -195,11 +210,15 @@ def plan_candidate_groups(
             if must_split:
                 if _useful_candidate_group(current):
                     result.append(current)
-                current, anchor_date, documents = [], None, set()
+                current, anchor_date, last_date, documents = (
+                    [], None, None, set()
+                )
             current.append(bundle)
             documents.update(bundle_docs)
             if anchor_date is None and date:
                 anchor_date = date
+            if date:
+                last_date = date
         if _useful_candidate_group(current):
             result.append(current)
     return result
@@ -236,15 +255,33 @@ def _candidate_payload(group: list, evidence_by_id) -> list[dict]:
             "date": bundle.event.first_evidence_date,
             "category": bundle.event.category,
             "entity": bundle.event.canonical_entity,
-            "summary": bundle.event.summary_short,
+            "summary": str(bundle.event.summary_short or "")[:240],
             "status": bundle.event.status,
             "assertion": bundle.event.assertion,
             "evidence": [{
                 "evidence_id": item.evidence_id,
                 "entity": item.normalized_entity,
                 "date": item.observed_date or item.document_date,
-                "source": " ".join(item.source_text.split())[:360],
+                "assertion": item.assertion,
+                "certainty": item.certainty,
+                "status": item.clinical_status,
+                "value": (
+                    item.value_text
+                    if item.value_text is not None else item.numeric_value
+                ),
+                "unit": item.unit,
+                "site": item.anatomical_site,
+                "side": item.laterality,
+                "source": " ".join(item.source_text.split())[:180],
             } for item in items],
+            "derived_features": {
+                "lab_phases": (
+                    bundle.event.structured_data.get("phases") or []
+                ),
+                "therapy_status_history": (
+                    bundle.event.structured_data.get("status_history") or []
+                ),
+            },
         })
     return payload
 
@@ -253,6 +290,7 @@ def _fingerprint(payload: list[dict], model_identity: str) -> str:
     return hashlib.sha256(json.dumps(
         {
             "prompt": EPISODE_ASSEMBLY_PROMPT_VERSION,
+            "prompt_digest": EPISODE_ASSEMBLY_PROMPT_DIGEST,
             "model": model_identity,
             "events": payload,
         },

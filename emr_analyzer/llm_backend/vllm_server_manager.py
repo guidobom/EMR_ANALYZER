@@ -43,7 +43,7 @@ class VllmServerKey:
     max_num_seqs: int
     tensor_parallel_size: int = 1
     dtype: str = "auto"
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.85
     quantization: str = ""
     trust_remote_code: bool = False
     enforce_eager: bool = False
@@ -102,7 +102,14 @@ class VllmServerManager:
         return self._binary
 
     def usable(self) -> bool:
-        return self._binary is not None and sys.platform.startswith("linux")
+        return (
+            self._binary is not None
+            and sys.platform.startswith("linux")
+            and (
+                shutil.which("nvidia-smi") is not None
+                or os.path.exists("/dev/nvidiactl")
+            )
+        )
 
     def status(self, key: VllmServerKey) -> str | None:
         instance = self._instances.get(key)
@@ -159,6 +166,16 @@ class VllmServerManager:
         detail = "".join(list(instance.stderr_lines)[-80:]).strip()
         if instance.proc.poll() is not None:
             detail = detail or f"exit code {instance.proc.poll()}"
+        if any(marker in detail.casefold() for marker in (
+            "no kernel image", "unsupported gpu architecture", "sm_121",
+            "not compiled with cuda", "cuda capability",
+        )):
+            detail += (
+                "\nLa build vLLM/PyTorch non è compatibile con GB10 "
+                "(compute capability 12.1 / sm_121). Installa una build "
+                "Linux aarch64/CUDA 13 compatibile seguendo "
+                "docs/VLLM_DGX_SPARK.md."
+            )
         raise BackendError(
             "vLLM non ha completato il caricamento del modello in tempo"
             + (f": {detail}" if detail else "")
@@ -218,6 +235,10 @@ class VllmServerManager:
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "HF_HUB_DISABLE_TELEMETRY": "1",
+            # vLLM/PyTorch worker forking after CUDA initialization is unsafe,
+            # particularly on Linux aarch64 (Grace/GB10).
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "TOKENIZERS_PARALLELISM": "false",
         })
         # When vLLM lives in the app-managed isolated environment, its
         # helper executables (notably ninja for FlashInfer JIT kernels) are

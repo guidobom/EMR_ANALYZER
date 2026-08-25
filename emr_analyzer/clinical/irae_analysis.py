@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..config import BASE_DIR
+from ..prompt_catalog import load_prompt as load_catalog_prompt
 
 IRAE_PROMPT_PATH = BASE_DIR / "irae_prompt.txt"
 
@@ -23,12 +24,7 @@ _CHUNK_CHARS = 12000
 # the chunk boundary is never lost.
 _OVERLAP_ENTRIES = 10
 
-SYSTEM_PROMPT = (
-    "Sei un oncologo medico esperto nella diagnosi, classificazione e "
-    "gestione delle tossicità immuno-correlate. Rispondi ESCLUSIVAMENTE "
-    "con la tabella Markdown richiesta dal protocollo, senza testo "
-    "prima o dopo."
-)
+SYSTEM_PROMPT = load_catalog_prompt("irae_system")
 
 
 def format_entry(entry: dict) -> str:

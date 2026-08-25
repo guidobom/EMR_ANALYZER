@@ -1,0 +1,1 @@
+Valuta i candidati seguenti. plausible=true anche per una relazione clinicamente plausibile ma non documentata, purché l'incertezza sia esplicita. Ogni output deve riusare esattamente un candidate_id fornito. Le ipotesi saranno escluse dal RAG fino alla revisione umana.

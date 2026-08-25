@@ -8,6 +8,8 @@ import threading
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from ..prompt_catalog import load_prompt
+
 from ..clinical.registry_builder import RegistryBuildCancelled
 
 
@@ -310,15 +312,7 @@ class ClinicalHistoryQueryWorker(QThread):
 
     def run(self):
         try:
-            system_prompt = (
-                "Sei un assistente clinico esperto. Rispondi alla domanda "
-                "basandoti ESCLUSIVAMENTE sui dati clinici forniti. "
-                "Se un dato non e' disponibile, dichiaralo esplicitamente. "
-                "Cita le date quando disponibili. Non inventare informazioni. "
-                "Date di appuntamenti, prenotazioni, tecnica di esecuzione, "
-                "dose e somministrazione di traccianti eventualmente presenti "
-                "nelle citazioni non sono eventi clinici e vanno ignorate."
-            )
+            system_prompt = load_prompt("clinical_query_system")
 
             if self.registry_repo is not None and self.patient_id:
                 answer = self._run_registry_query(system_prompt)

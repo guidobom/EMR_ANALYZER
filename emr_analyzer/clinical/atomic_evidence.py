@@ -28,66 +28,39 @@ from ..models.clinical_registry import (
 )
 from ..models.clinical_pipeline import ATOMIC_FACT_TYPES as CONTRACT_FACT_TYPES
 from ..settings import ClinicalPipelinePolicy
+from ..prompt_catalog import load_prompt, prompts_digest
 
 
-ATOMIC_PIPELINE_VERSION = "registry_pipeline_v7"
-# v7 changes the wire contract and the clinical granularity rules.  Stored
-# evidence keeps the same canonical schema, but old extraction checkpoints do
-# not prove that the new relevance/atomicity contract was applied.
+ATOMIC_PIPELINE_VERSION = "registry_pipeline_v9"
+# v9 adds explicit biomarker/hospitalization/discharge contracts and expands
+# source-coverage checks for symptoms and clinical state changes. Old
+# extraction checkpoints do not prove that this contract was applied.
 ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS: tuple[str, ...] = ()
 
-_ATOMIC_TASK = """Estrai i fatti clinici atomici nel contenitore della loro categoria.
-
-Vincoli obbligatori:
-- usa esclusivamente le chiavi di primo livello definite dallo schema e ometti
-  gli array vuoti; la chiave determina il fact_type;
-- un oggetto descrive un solo reperto, problema, trattamento o decisione;
-  sede, dimensioni, morfologia, andamento e altri attributi dello STESSO
-  reperto restano nello stesso oggetto e nel relativo payload;
-- concept è il concetto clinico essenziale, senza data, stato o valore nel nome;
-- polarity è present, negated o suspected e deve riflettere soltanto il testo;
-- observation_date è la data dell'osservazione/evento, NON la data del referto;
-  omettila quando il testo non documenta una data riferibile a quel fatto;
-- source_refs contiene 1-6 ID S consecutivi con la prova testuale esatta e il
-  referente esplicito; includi l'ID di una data-intestazione solo se governa il
-  fatto. Non generare o parafrasare la citazione: verrà risolta dagli ID;
-- usa numeric_value e unit per misure numeriche; value_text per valori testuali;
-- usa payload soltanto per gli attributi ammessi nella categoria scelta;
-- non fondere fatti, non deduplicare documenti, non inferire causalità o diagnosi;
-- i valori degli esami di laboratorio NON devono essere estratti dal modello:
-  vengono inseriti deterministicamente e soltanto quando fuori range;
-- una sospensione di farmaco è polarity=present con clinical_status=suspended;
-- per un sintomo negato usa negated; per un'ipotesi usa suspected;
-- conserva reperti negativi soltanto se informativi per stadiazione, diagnosi
-  differenziale, sicurezza, risposta o follow-up della patologia nota;
-  in un referto oncologico l'assenza di ulteriori metastasi o di
-  linfoadenomegalie è informativa, la normale anatomia incidentale non lo è;
-- non estrarre anatomia normale, dettagli tecnici/metodologici, appuntamenti,
-  intestazioni o date isolate;
-- il tipo documento nel contesto è soltanto un suggerimento: classifica il
-  contenuto effettivo del passaggio;
-- ometti nel wire i campi non documentati; l'applicazione li espande a null.
-
-Includi diagnosi, sintomi, segni/vitali, reperti radiologici e patologici,
-farmaci e trattamenti, decisioni/piani clinici, procedure, ricoveri, tossicità,
-risposta/progressione, allergie, rischi e follow-up clinicamente significativo.
-
-Esempio: "TC: nodulo polmonare destro di 8 mm" produce un solo oggetto in
-radiology_finding con concept "nodulo polmonare", source_refs, anatomical_site,
-laterality e payload.measurement; non creare oggetti separati per sede e misura."""
-
-_ATOMIC_SYSTEM_PROMPT = (
-    "Estrai evidenze cliniche atomiche dal testo italiano. Un item descrive "
-    "un solo dato. Usa solo la fonte: non fondere, deduplicare, inventare o "
-    "inferire causalità. Solo JSON conforme allo schema.\n\n" + _ATOMIC_TASK
+_ATOMIC_TASK = load_prompt(
+    "atomic_evidence_it",
+    required_markers=(
+        "source_refs", "medication", "radiology_finding", "vital_sign",
+    ),
+    minimum_length=200,
 )
 
+_ATOMIC_BASE_SYSTEM_PROMPT = load_prompt("atomic_evidence_system")
+_ATOMIC_REPAIR_BASE_SYSTEM_PROMPT = load_prompt(
+    "atomic_evidence_repair_system"
+)
+_ATOMIC_COVERAGE_BASE_SYSTEM_PROMPT = load_prompt(
+    "atomic_evidence_coverage_system"
+)
+
+_ATOMIC_SYSTEM_PROMPT = _ATOMIC_BASE_SYSTEM_PROMPT + "\n\n" + _ATOMIC_TASK
+
 _ATOMIC_VALIDATION_REPAIR_SYSTEM_PROMPT = (
-    "Correggi esclusivamente gli oggetti elencati come non validi. Usa il "
-    "testo sorgente numerato per verificarli e restituisci soltanto i loro "
-    "sostituti; non ripetere gli oggetti già validi. Non inventare campi, "
-    "concetti, date o citazioni. Solo JSON conforme allo schema.\n\n"
-    + _ATOMIC_TASK
+    _ATOMIC_REPAIR_BASE_SYSTEM_PROMPT + "\n\n" + _ATOMIC_TASK
+)
+
+_ATOMIC_COVERAGE_RECOVERY_SYSTEM_PROMPT = (
+    _ATOMIC_COVERAGE_BASE_SYSTEM_PROMPT + "\n\n" + _ATOMIC_TASK
 )
 
 _THERAPY_LIFECYCLE_STATUSES = (
@@ -117,6 +90,9 @@ ATOMIC_FACT_TYPE_TO_CATEGORY = {
     "clinical_sign": "clinical_sign",
     "vital_sign": "vital_sign",
     "histopathology": "histopathology",
+    "biomarker": "biomarker",
+    "hospitalization": "hospitalization",
+    "discharge": "discharge",
 }
 ATOMIC_FACT_TYPES = tuple(CONTRACT_FACT_TYPES)
 LLM_ATOMIC_FACT_TYPES = tuple(
@@ -137,14 +113,22 @@ _TYPED_PAYLOAD_FIELDS = {
     },
     "diagnosis": {"diagnostic_basis", "stage", "grade", "subtype"},
     "symptom": {"onset", "course", "frequency", "context"},
-    "clinical_decision": {"action", "target", "rationale", "urgency"},
+    "clinical_decision": {
+        "action", "target", "rationale", "urgency", "timing",
+    },
     "procedure": {"procedure_type", "intent", "outcome", "complication"},
     "clinical_sign": {"course", "context", "measurement_method"},
     "vital_sign": {"context", "measurement_method"},
     "histopathology": {
         "specimen", "morphology", "grade", "margins", "invasion",
-        "biomarkers",
+        "biomarkers", "measurement",
     },
+    "biomarker": {"method", "specimen", "interpretation"},
+    "hospitalization": {
+        "admission_type", "reason", "department", "outcome",
+        "disposition",
+    },
+    "discharge": {"destination", "condition", "instructions"},
 }
 _WIRE_COMMON_PROPERTIES = {
     "concept": {"type": "string", "minLength": 1},
@@ -225,7 +209,7 @@ _PAYLOAD_FIELD_DESCRIPTIONS = {
     ),
 }
 _WIRE_MISSING_TEXT = {
-    "n.d.", "nd", "n/a", "na", "non disponibile", "non documentato",
+    "n.d.", "n.d", "nd", "n/a", "na", "non disponibile", "non documentato",
     "non documentata", "non specificato", "non specificata",
     "non specificato nel testo", "non specificata nel testo", "unknown",
     "sconosciuto", "sconosciuta",
@@ -295,19 +279,22 @@ def build_atomic_evidence_schema(
     return {
         "type": "object", "additionalProperties": False,
         "properties": properties,
+        # Requiring every bucket costs only a handful of empty-array tokens,
+        # but prevents small models from closing the object after the first
+        # familiar categories and then triggering a much costlier recall pass.
+        "required": list(properties),
     }
 
 
 ATOMIC_EVIDENCE_SCHEMA = build_atomic_evidence_schema()
 
-ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v8"
-ATOMIC_PROMPT_DIGEST = hashlib.sha256(
-    (
-        _ATOMIC_SYSTEM_PROMPT
-        + "\x1f"
-        + json.dumps(ATOMIC_EVIDENCE_SCHEMA, sort_keys=True)
-    ).encode("utf-8")
-).hexdigest()
+ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v10"
+ATOMIC_PROMPT_DIGEST = prompts_digest(
+    _ATOMIC_SYSTEM_PROMPT,
+    _ATOMIC_VALIDATION_REPAIR_SYSTEM_PROMPT,
+    _ATOMIC_COVERAGE_RECOVERY_SYSTEM_PROMPT,
+    schema=ATOMIC_EVIDENCE_SCHEMA,
+)
 
 # This is deliberately an output-safety limit, not a context-window limit.
 # Clinical documents are often dense enough to produce more JSON than source
@@ -373,9 +360,32 @@ class AtomicEvidenceExtractor:
         llm_client,
         *,
         policy: ClinicalPipelinePolicy | None = None,
+        task_prompt: str | None = None,
+        system_prompt: str | None = None,
+        repair_system_prompt: str | None = None,
+        coverage_system_prompt: str | None = None,
     ):
         self.llm = llm_client
         self.policy = policy or ClinicalPipelinePolicy()
+        effective_task = task_prompt or _ATOMIC_TASK
+        self._system_prompt = (
+            (system_prompt or _ATOMIC_BASE_SYSTEM_PROMPT)
+            + "\n\n" + effective_task
+        )
+        self._repair_system_prompt = (
+            (
+                repair_system_prompt
+                or _ATOMIC_REPAIR_BASE_SYSTEM_PROMPT
+            )
+            + "\n\n" + effective_task
+        )
+        self._coverage_system_prompt = (
+            (
+                coverage_system_prompt
+                or _ATOMIC_COVERAGE_BASE_SYSTEM_PROMPT
+            )
+            + "\n\n" + effective_task
+        )
         # One extractor instance is shared by all registry workers.  Keep
         # request counters thread-local so timings/tokens from simultaneous
         # documents can never contaminate one another.
@@ -438,6 +448,8 @@ class AtomicEvidenceExtractor:
             "llm_calls": 0,
             "output_limit_retries": 0,
             "validation_retries": 0,
+            "coverage_retries": 0,
+            "uncovered_signal_groups": 0,
             "invalid_items": 0,
             "normalized_items": 0,
             "unresolved_invalid_items": 0,
@@ -499,6 +511,24 @@ class AtomicEvidenceExtractor:
                         evidence.append(parsed)
             if chunk_progress_callback is not None:
                 chunk_progress_callback(chunk_number, len(chunks))
+        evidence.extend(_explicit_performed_procedure_evidence(
+            patient_id=patient_id,
+            document_id=document_id,
+            document_date=document_date,
+            full_text=text,
+            geometry=geometry,
+            model_name=self.model_name,
+            existing=evidence,
+        ))
+        evidence.extend(_explicit_negated_imaging_evidence(
+            patient_id=patient_id,
+            document_id=document_id,
+            document_date=document_date,
+            full_text=text,
+            geometry=geometry,
+            model_name=self.model_name,
+            existing=evidence,
+        ))
         evidence.extend(_explicit_resolution_evidence(
             patient_id=patient_id,
             document_id=document_id,
@@ -576,8 +606,9 @@ class AtomicEvidenceExtractor:
             *,
             schema: dict[str, Any] = base_schema,
             output_budget: int | None = None,
+            source_prompt: str = prompt,
         ):
-            effective_prompt = prompt + repair_note
+            effective_prompt = source_prompt + repair_note
             try:
                 if self._supports_generation_limit:
                     return generator(
@@ -590,7 +621,7 @@ class AtomicEvidenceExtractor:
             finally:
                 self._record_last_generation()
 
-        data = generate(_ATOMIC_SYSTEM_PROMPT)
+        data = generate(self._system_prompt)
         validation = _validate_wire_response(data, sentence_spans)
         items = list(validation.items)
         pending = list(validation.issues)
@@ -613,7 +644,7 @@ class AtomicEvidenceExtractor:
             )
             issue_payload = [issue.for_prompt() for issue in pending[:24]]
             repaired = generate(
-                _ATOMIC_VALIDATION_REPAIR_SYSTEM_PROMPT,
+                self._repair_system_prompt,
                 repair_note=(
                     "\n\nCORREZIONE_MIRATA:\n"
                     + json.dumps(
@@ -640,7 +671,79 @@ class AtomicEvidenceExtractor:
             if not pending:
                 break
         metrics["unresolved_invalid_items"] += len(pending)
-        coalesced = _coalesce_adjacent_wire_items(items)
+        if self.policy.adaptive_specialized_retry:
+            recovery_spans, recovery_types = _coverage_recovery_plan(
+                sentence_spans, items
+            )
+            if recovery_spans and recovery_types:
+                metrics["coverage_retries"] += 1
+                metrics["uncovered_signal_groups"] += len(recovery_types)
+                compact_spans = [
+                    SentenceSpan(
+                        sentence_id=index,
+                        start=span.start,
+                        end=span.end,
+                        text=span.text,
+                    )
+                    for index, span in enumerate(recovery_spans, start=1)
+                ]
+                original_refs = {
+                    compact.sentence_id: original.sentence_id
+                    for compact, original in zip(compact_spans, recovery_spans)
+                }
+                recovery_chunk = TextChunk(
+                    index=chunk.index,
+                    text="\n".join(span.text for span in compact_spans),
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
+                )
+                recovery_prompt = build_atomic_prompt(
+                    recovery_chunk,
+                    document_type=document_type,
+                    document_date=document_date,
+                    sentence_spans=compact_spans,
+                )
+                recovery_schema = self._schema_for(
+                    len(compact_spans), fact_types=recovery_types
+                )
+                recovered = generate(
+                    self._coverage_system_prompt,
+                    repair_note=(
+                        "\n\nCATEGORIE_DA_RECUPERARE: "
+                        + ", ".join(recovery_types)
+                        + ". Restituisci tutti i fatti espliciti di questi "
+                        "tipi presenti nel TESTO."
+                    ),
+                    schema=recovery_schema,
+                    output_budget=min(
+                        self._output_budget(compact_spans),
+                        max(1024, 512 + len(compact_spans) * 320),
+                    ),
+                    source_prompt=recovery_prompt,
+                )
+                recovered_validation = _validate_wire_response(
+                    recovered, compact_spans
+                )
+                metrics["invalid_items"] += len(
+                    recovered_validation.issues
+                )
+                metrics["normalized_items"] += (
+                    recovered_validation.normalized_items
+                )
+                metrics["unresolved_invalid_items"] += len(
+                    recovered_validation.issues
+                )
+                for recovered_item in recovered_validation.items:
+                    recovered_item["source_refs"] = [
+                        original_refs[ref]
+                        for ref in _wire_refs(recovered_item)
+                        if ref in original_refs
+                    ]
+                    if recovered_item["source_refs"]:
+                        items.append(recovered_item)
+        coalesced = _split_multi_state_medication_items(
+            _coalesce_adjacent_wire_items(items), sentence_spans
+        )
         return (
             _attach_referential_wire_continuations(coalesced, sentence_spans),
             sentence_spans,
@@ -680,6 +783,8 @@ class AtomicEvidenceExtractor:
                 "llm_calls": 0,
                 "output_limit_retries": 0,
                 "validation_retries": 0,
+                "coverage_retries": 0,
+                "uncovered_signal_groups": 0,
                 "invalid_items": 0,
                 "normalized_items": 0,
                 "unresolved_invalid_items": 0,
@@ -757,9 +862,61 @@ class AtomicEvidenceExtractor:
             certainty = "unknown"
         quote_verified, matched_quote = locate_quote(source_quote, full_text)
         quote_folded = matched_quote.casefold()
-        entity, directly_negated = _ground_direct_negation(
-            entity, matched_quote
+        fact_type = str(
+            item.get("fact_type") or _fact_type_for_category(category)
         )
+        if (
+            fact_type in {"instrumental_finding", "clinical_sign", "vital_sign"}
+            and _LAB_ANALYTE_RE.fullmatch(entity.strip())
+            and re.search(
+                r"(?i)\b(?:esami|laboratorio|ematochimic\w*|"
+                r"range|intervallo\s+di\s+riferimento)\b",
+                matched_quote,
+            )
+        ):
+            # Parsed laboratory rows are the sole authoritative source for
+            # analytes and reference ranges. Never persist an LLM duplicate
+            # merely because the model chose another bucket.
+            return None
+        category = _specific_atomic_category(
+            category=category,
+            fact_type=fact_type,
+            concept=entity,
+            quote=matched_quote,
+        )
+        negative_instrumental_result = (
+            re.search(
+                r"(?i)\bnegativ\w*\s+per\s+(?P<target>[^,;:.]{2,100})",
+                matched_quote,
+            ) if fact_type == "instrumental_finding" else None
+        )
+        if negative_instrumental_result and re.search(
+            r"(?i)\b(?:broncoscopia|BAL|colonscopia|gastroscopia|EGDS)\b",
+            entity,
+        ):
+            entity = negative_instrumental_result.group("target").strip()
+            assertion = "absent"
+            certainty = "excluded"
+            item["polarity"] = "negated"
+        biomarker_result_match = (
+            re.search(
+                rf"(?i)\b{re.escape(entity)}\b\s*(?:[:=]\s*)?"
+                r"(?P<result>non\s+mutat\w*|negativ\w*|wild[- ]?type)\b",
+                matched_quote,
+            ) if fact_type == "biomarker" else None
+        )
+        negative_biomarker_result = bool(biomarker_result_match)
+        if negative_biomarker_result:
+            directly_negated = False
+            assertion = "present"
+            certainty = "confirmed"
+            item["polarity"] = "present"
+            if not _clean_optional(item.get("value_text"), 300):
+                item["value_text"] = biomarker_result_match.group("result")
+        else:
+            entity, directly_negated = _ground_direct_negation(
+                entity, matched_quote
+            )
         if directly_negated:
             assertion = "absent"
             certainty = "excluded"
@@ -863,12 +1020,55 @@ class AtomicEvidenceExtractor:
             },
             list_fields={"regimen"},
         )
-        fact_type = str(item.get("fact_type") or _fact_type_for_category(category))
         typed = _sanitize_nested_payload(
             item.get("typed_payload"),
             allowed=_TYPED_PAYLOAD_FIELDS.get(fact_type, set()),
             list_fields={"biomarkers"},
         )
+        if fact_type == "histopathology" and typed.get("biomarkers"):
+            measurements = [
+                value for value in typed["biomarkers"]
+                if re.search(r"(?i)\bBreslow\b", value)
+            ]
+            if measurements and not typed.get("measurement"):
+                typed["measurement"] = measurements[0]
+                typed["biomarkers"] = [
+                    value for value in typed["biomarkers"]
+                    if value not in measurements
+                ]
+                if not typed["biomarkers"]:
+                    typed.pop("biomarkers", None)
+        if fact_type == "biomarker":
+            source_identity = _identity_text(matched_quote)
+            for field in ("method", "specimen"):
+                value = typed.get(field)
+                if value and _identity_text(value) not in source_identity:
+                    typed.pop(field, None)
+        if category == "hospitalization" and not typed.get("reason"):
+            reason = re.search(
+                r"(?i)\b(?:ricoverat\w*|ospedalizzat\w*)\b[^.;]*?"
+                r"\bper\s+(?P<reason>[^.;]{2,160})",
+                matched_quote,
+            )
+            if reason:
+                typed["reason"] = reason.group("reason").strip(" .")
+        if category == "care_plan":
+            target = re.search(
+                r"(?i)\b(?:con|e)\s+(?P<target>nuov[oa]\s+"
+                r"(?:TC|TAC|RM|PET|ecografia|visita|valutazione))\b",
+                matched_quote,
+            )
+            timing = re.search(
+                r"(?i)\b(?:dopo|tra|entro)\s+(?:circa\s+)?"
+                r"(?:\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|"
+                r"otto|nove|dieci|undici|dodici)\s+"
+                r"(?:giorn\w*|settiman\w*|mes\w*)\b",
+                matched_quote,
+            )
+            if target and not typed.get("target"):
+                typed["target"] = target.group("target")
+            if timing and not typed.get("timing"):
+                typed["timing"] = timing.group(0)
         if category not in {
             "medication", "toxicity", "response", "progression"
         }:
@@ -878,6 +1078,12 @@ class AtomicEvidenceExtractor:
         severity = _clean_optional(item.get("severity"), 100)
         if severity is None and data.get("grade"):
             severity = f"grado {data['grade']}"
+        if severity is None and category in {"diagnosis", "toxicity"}:
+            grade = re.search(
+                r"(?i)\bgrado\s+([0-5]|I{1,3}|IV|V)\b", matched_quote
+            )
+            if grade:
+                severity = f"grado {grade.group(1)}"
         therapy, oncology = _enrich_medication_payload(
             category, entity, matched_quote, therapy, oncology
         )
@@ -902,6 +1108,43 @@ class AtomicEvidenceExtractor:
             ):
                 therapy.pop("lifecycle_status", None)
         clinical_status = _clean_optional(item.get("clinical_status"), 100)
+        if category == "care_plan" and re.search(
+            r"(?i)\b(?:programmat\w*|pianificat\w*|previst\w*)\b",
+            matched_quote,
+        ):
+            clinical_status = "planned"
+        if category == "imaging_finding" and re.search(
+            r"(?i)\b(?:riduzion\w*|regression\w*|miglior\w*)\b",
+            matched_quote,
+        ):
+            assertion = "present"
+            item["polarity"] = "present"
+            clinical_status = "improved"
+            evolution = typed.get("signal_characteristics")
+            if (
+                evolution
+                and re.search(
+                    r"(?i)\b(?:riduzion\w*|regression\w*|miglior\w*)\b",
+                    evolution,
+                )
+                and not typed.get("comparison")
+            ):
+                typed["comparison"] = evolution
+                typed.pop("signal_characteristics", None)
+        elif category == "imaging_finding" and re.search(
+            r"(?i)\b(?:scompars\w*|risolt\w*)\b", matched_quote
+        ):
+            assertion = "present"
+            item["polarity"] = "present"
+            clinical_status = "resolved"
+        if category == "hospitalization" and temporal.end:
+            clinical_status = "completed"
+        if category == "discharge":
+            if clinical_status and clinical_status not in {
+                "completed", "unknown"
+            } and not typed.get("condition"):
+                typed["condition"] = clinical_status
+            clinical_status = "completed"
         assertion, clinical_status, therapy = _medication_transition(
             category, matched_quote, assertion, clinical_status, therapy
         )
@@ -1397,6 +1640,16 @@ def _looks_like_temporal_heading(value: str) -> bool:
         len(text) <= 120
         and len(text.split()) <= 8
         and _explicit_date_expression(text)
+        and re.match(
+            r"(?i)^(?:(?:in\s+)?data\s+)?(?:"
+            r"\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})|"
+            r"(?:19|20)\d{2}-\d{1,2}-\d{1,2}|"
+            r"\d{1,2}\s+(?:gennaio|febbraio|marzo|aprile|maggio|giugno|"
+            r"luglio|agosto|settembre|ottobre|novembre|dicembre)|"
+            r"(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|"
+            r"settembre|ottobre|novembre|dicembre)\s+(?:19|20)\d{2})\b",
+            text,
+        )
     )
 
 
@@ -1706,6 +1959,17 @@ def _canonical_wire_item(
         changed = True
     value["source_refs"] = refs
 
+    fact_type, concept, semantic_changed, semantic_error = (
+        _normalize_wire_semantics(
+            fact_type, concept, refs, sentence_spans
+        )
+    )
+    if semantic_error:
+        return None, [semantic_error], changed or semantic_changed
+    if semantic_changed:
+        value["concept"] = concept
+        changed = True
+
     string_fields = {
         "value_text", "unit", "observation_date", "observation_date_end",
         "clinical_status", "anatomical_site", "laterality", "severity",
@@ -1773,6 +2037,293 @@ def _canonical_wire_item(
     if changed:
         value["_wire_normalized"] = True
     return value, [], changed
+
+
+_GENERIC_ATOMIC_CONCEPTS = {
+    "anamnesi", "conclusioni", "controllo", "esame", "esami",
+    "follow up", "follow-up", "procedura", "referto", "terapia",
+    "trattamento", "visita",
+}
+_ANATOMICAL_FRAGMENT_CONCEPTS = {
+    "a destra", "a sinistra", "bilaterale", "destra", "destro",
+    "dx", "inguinale", "laterale", "sinistra", "sinistro", "sn",
+}
+_IMAGING_CONTEXT_RE = re.compile(
+    r"(?i)(?:^|\W)(?:TC|TAC|RMN?|PET(?:[- /]?FDG|/TC)?|RX|"
+    r"ecografi\w*)(?:\W|$)"
+)
+_PATHOLOGY_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:istolog\w*|istopatolog\w*|citolog\w*|biops\w*|"
+    r"immunoistochim\w*|pezzo operatorio|campione tissutale|"
+    r"margini? di resezione)\b"
+)
+_VITAL_CONCEPT_RE = re.compile(
+    r"(?i)^(?:pa|pressione(?: arteriosa)?|fc|frequenza cardiaca|"
+    r"fr|frequenza respiratoria|spo2|saturazione(?: periferica)?|"
+    r"temperatura|febbre|peso|altezza|bmi|indice di massa corporea|"
+    r"ecog|performance status)$"
+)
+_LAB_ANALYTE_RE = re.compile(
+    r"(?i)^(?:TSH|FT3|FT4|emoglobina|Hb|leucociti|neutrofili|"
+    r"linfociti|piastrine|creatinina|azotemia|urea|AST|ALT|GOT|GPT|"
+    r"bilirubina|sodio|potassio|calcio|glicemia|PCR|VES|LDH|"
+    r"troponina|CK|CPK|amilasi|lipasi)$"
+)
+_DRUG_TOKEN_RE = re.compile(
+    r"(?i)\b([a-zà-öø-ÿ][a-zà-öø-ÿ0-9-]{2,}(?:mab|nib|ciclib|"
+    r"taxel|platin|otecan|trexed|cortene|prednisone|prednisolone|"
+    r"desametasone|metilprednisolone))\b"
+)
+
+
+def _semantic_source_for_refs(
+    refs: list[int], sentence_spans: list[SentenceSpan]
+) -> str:
+    """Return cited text plus a short preceding classification context."""
+    if not refs or not sentence_spans:
+        return ""
+    first = max(1, refs[0] - 2)
+    last = min(len(sentence_spans), refs[-1])
+    return " ".join(
+        sentence_spans[index - 1].text for index in range(first, last + 1)
+    )
+
+
+def _medication_name_from_text(text: str) -> str | None:
+    match = _DRUG_TOKEN_RE.search(str(text or ""))
+    if not match:
+        return None
+    token = match.group(1).strip(" .,:;()[]")
+    return token or None
+
+
+def _normalize_wire_semantics(
+    fact_type: str,
+    concept: str,
+    refs: list[int],
+    sentence_spans: list[SentenceSpan],
+) -> tuple[str, str, bool, str | None]:
+    """Repair only high-certainty type errors; reject unusable fragments.
+
+    This guard is intentionally deterministic. It does not create a clinical
+    fact: it verifies that the model-selected bucket is compatible with the
+    cited source and prevents labels such as ``terapia`` or ``3X`` from being
+    persisted as autonomous evidence.
+    """
+    source = _semantic_source_for_refs(refs, sentence_spans)
+    identity = _identity_text(concept)
+    changed = False
+    medication_name = _medication_name_from_text(concept)
+    source_medication = _medication_name_from_text(source)
+
+    if (
+        _VITAL_CONCEPT_RE.fullmatch(concept.strip())
+        and fact_type != "vital_sign"
+    ):
+        fact_type = "vital_sign"
+        changed = True
+
+    if (
+        identity in {"ricovero", "ospedalizzazione", "degenza"}
+        and _HOSPITALIZATION_SIGNAL_RE.search(source)
+        and fact_type != "hospitalization"
+    ):
+        fact_type = "hospitalization"
+        changed = True
+
+    if medication_name and fact_type != "medication":
+        fact_type = "medication"
+        changed = True
+    elif identity in _GENERIC_ATOMIC_CONCEPTS and source_medication:
+        fact_type = "medication"
+        concept = source_medication
+        identity = _identity_text(concept)
+        changed = True
+
+    if (
+        fact_type in {"histopathology", "clinical_sign", "vital_sign"}
+        and _IMAGING_CONTEXT_RE.search(source)
+        and not _PATHOLOGY_CONTEXT_RE.search(source)
+        and not medication_name
+        and not source_medication
+    ):
+        fact_type = "radiology_finding"
+        changed = True
+
+    if concept.casefold().strip(" .") in _WIRE_MISSING_TEXT:
+        return fact_type, concept, changed, "concept segnaposto non ammesso."
+    if identity in _GENERIC_ATOMIC_CONCEPTS:
+        return fact_type, concept, changed, (
+            "concept generico: usare il fatto clinico o il farmaco specifico."
+        )
+    if identity in _ANATOMICAL_FRAGMENT_CONCEPTS:
+        return fact_type, concept, changed, (
+            "una sede/lateralità isolata non è un'evidenza clinica."
+        )
+    if re.fullmatch(r"[\d.,x× ]+", concept.strip(), re.IGNORECASE):
+        return fact_type, concept, changed, (
+            "una misura isolata senza reperto non è un concept clinico."
+        )
+    if fact_type == "vital_sign" and not _VITAL_CONCEPT_RE.fullmatch(
+        concept.strip()
+    ):
+        return fact_type, concept, changed, (
+            "vital_sign ammette soltanto un parametro fisiologico nominato."
+        )
+    return fact_type, concept, changed, None
+
+
+_IMAGING_FINDING_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:evidenz\w*|mostra\w*|presenza|comparsa|increment\w*|"
+    r"riduz\w*|captazione|lesion\w*|nodul\w*|metastas\w*|edema|"
+    r"ispessimento|enhancement|ipodensit\w*|iperintensit\w*|"
+    r"pseudonodularit\w*|linfoaden\w*|repert\w*)\b"
+)
+_DIAGNOSIS_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:affett[oa]\s+da|diagnos\w*|melanoma|metastas\w*|"
+    r"progressione|risposta (?:metabolica )?(?:completa|parziale)|"
+    r"tossicit\w*|miocardite|polineuropatia|uveite|allerg\w*|"
+    r"familiarit\w*|compatibile\s+con|sospett\w*|probabil\w*)\b"
+)
+_SYMPTOM_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:dolor\w*|tosse|dispnea|affanno|astenia|fatigue|nausea|"
+    r"vomito|diarrea|stipsi|prurito|rash|eritema|cefalea|vertigin\w*|"
+    r"disfagia|disfonia|parestesi\w*|ipoestesia|debolezza|"
+    r"palpitazioni|sincope|brividi|calo ponderale)\b"
+)
+_PROCEDURE_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:sottopost[oa]\s+(?:ad?|a)|exeresi|resezione|"
+    r"asportazione|intervento chirurgico|radioterapia|RT\s+(?:su|alla)|"
+    r"biopsia|broncoscopia|colonscopia)\b"
+)
+_PERFORMED_PROCEDURE_RE = re.compile(
+    r"(?i)\b(?:eseguit|effettuat|praticat|sottopost)\w*\b[^.;]{0,90}?"
+    r"(?P<procedure>broncoscopia(?:\s+con\s+BAL)?|colonscopia|"
+    r"gastroscopia|EGDS|toracentesi|paracentesi|biopsia\w*|"
+    r"exeresi|resezione|asportazione)\b"
+)
+_VITAL_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:SpO2|saturazione|FC|frequenza cardiaca|PA|"
+    r"pressione arteriosa|temperatura|peso|BMI|ECOG|performance status)\b"
+)
+_DECISION_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:si (?:è )?concorda(?:to)?|si prescrive|in programma|"
+    r"si propone|indicat[oa]|soprassedere|monitoraggio|programmat\w*|"
+    r"rivalutazione|follow[- ]?up)\b"
+)
+_HOSPITALIZATION_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:ricover\w*|ospedalizz\w*|degenza|accesso\s+(?:in|al)\s+"
+    r"(?:pronto soccorso|PS))\b"
+)
+_DISCHARGE_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:dimess\w*|dimission\w*)\b"
+)
+_BIOMARKER_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:BRAF|NRAS|KRAS|EGFR|ALK|ROS1|HER2|ERBB2|PD[- ]?L1|"
+    r"MSI|dMMR|BRCA[12]?|KIT|RET|MET|NTRK|IDH[12]?|MGMT|"
+    r"mutat\w*|wild[- ]?type|amplificat\w*|espressione)\b"
+)
+
+
+def _coverage_signal_types(text: str) -> set[str]:
+    """High-precision source signals used only to detect omissions."""
+    source = str(text or "")
+    result: set[str] = set()
+    if _medication_name_from_text(source):
+        result.add("medication")
+    if (
+        _IMAGING_CONTEXT_RE.search(source)
+        and _IMAGING_FINDING_SIGNAL_RE.search(source)
+    ):
+        result.add("radiology_finding")
+    if _DIAGNOSIS_SIGNAL_RE.search(source):
+        result.add("diagnosis")
+    if (
+        _SYMPTOM_SIGNAL_RE.search(source)
+        and not re.search(
+            r"(?i)\b(?:risolt|scompars|regredit)[oaie]*\b", source
+        )
+    ):
+        result.add("symptom")
+    if _PROCEDURE_SIGNAL_RE.search(source):
+        result.add("procedure")
+    if _VITAL_SIGNAL_RE.search(source):
+        result.add("vital_sign")
+    if _DECISION_SIGNAL_RE.search(source):
+        result.add("clinical_decision")
+    if _HOSPITALIZATION_SIGNAL_RE.search(source):
+        result.add("hospitalization")
+    if _DISCHARGE_SIGNAL_RE.search(source):
+        result.add("discharge")
+    if _BIOMARKER_SIGNAL_RE.search(source):
+        result.add("biomarker")
+    return result
+
+
+def _coverage_recovery_plan(
+    sentence_spans: list[SentenceSpan],
+    items: list[dict[str, Any]],
+) -> tuple[list[SentenceSpan], tuple[str, ...]]:
+    """Select source spans whose explicit clinical signals remain uncovered.
+
+    This is a recall guard, not a rule-based extractor. The rules merely decide
+    whether one compact, category-constrained retry is needed; the LLM must
+    still return a source-grounded object and the normal validator is applied.
+    """
+    covered: dict[str, set[int]] = {}
+    for item in items:
+        # Legacy/test clients may still return the pre-v8 broad ``category``
+        # instead of a wire ``fact_type``. Count those objects as covered too,
+        # otherwise the recall guard pays for a needless second generation.
+        fact_type = str(
+            item.get("fact_type")
+            or _fact_type_for_category(str(item.get("category") or ""))
+        )
+        covered.setdefault(fact_type, set()).update(_wire_refs(item))
+
+    covered_at_ref: dict[int, set[str]] = {}
+    for fact_type, refs in covered.items():
+        for ref in refs:
+            covered_at_ref.setdefault(ref, set()).add(fact_type)
+
+    missing_by_type: dict[str, set[int]] = {}
+    for span in sentence_spans:
+        for fact_type in _coverage_signal_types(span.text):
+            if span.sentence_id not in covered.get(fact_type, set()):
+                present_types = covered_at_ref.get(span.sentence_id, set())
+                pathology_result = bool(_PATHOLOGY_CONTEXT_RE.search(span.text))
+                # A pathology-result sentence mentioning the diagnosis or the
+                # biopsy is already represented by its histopathology atom.
+                # Retrying it as both diagnosis and procedure mostly creates
+                # duplicate labels, not new source evidence.
+                if (
+                    pathology_result
+                    and "histopathology" in present_types
+                    and fact_type in {"diagnosis", "procedure"}
+                ):
+                    continue
+                if (
+                    fact_type == "procedure"
+                    and _PERFORMED_PROCEDURE_RE.search(span.text)
+                ):
+                    # A lossless deterministic supplement runs after the LLM
+                    # and is cheaper and more stable than a category retry.
+                    continue
+                missing_by_type.setdefault(fact_type, set()).add(
+                    span.sentence_id
+                )
+    if not missing_by_type:
+        return [], ()
+
+    wanted_refs = set().union(*missing_by_type.values())
+    selected = [
+        span for span in sentence_spans if span.sentence_id in wanted_refs
+    ]
+    selected_types = tuple(
+        fact_type for fact_type in LLM_ATOMIC_FACT_TYPES
+        if fact_type in missing_by_type
+    )
+    return selected, selected_types
 
 
 def _canonical_wire_mapping(
@@ -2059,6 +2610,65 @@ def _wire_refs(item: dict[str, Any]) -> list[int]:
     return sorted(result)
 
 
+_MEDICATION_STATE_SIGNAL_RE = re.compile(
+    r"(?i)\b(?:propost|programmat|prescritt|avviat|iniziat|assunt|"
+    r"somministrat|proseguit|modificat|ridott|aumentat|interrott|"
+    r"sospes|ripres|riavviat|completat|terminat|annullat)\w*\b"
+)
+
+
+def _split_multi_state_medication_items(
+    items: list[dict[str, Any]], spans: list[SentenceSpan]
+) -> list[dict[str, Any]]:
+    """Split one model item that cites distinct medication transitions.
+
+    Small models occasionally join treatment start and later suspension in a
+    single object. Both source sentences are explicit, so separating them is a
+    lossless structural correction; lifecycle, dose and dates are then
+    grounded independently by the normal deterministic enrichers.
+    """
+    result: list[dict[str, Any]] = []
+    for raw in items:
+        item = copy.deepcopy(raw)
+        if str(item.get("fact_type") or "") != "medication":
+            result.append(item)
+            continue
+        refs = _wire_refs(item)
+        transition_refs = [
+            ref for ref in refs
+            if ref <= len(spans)
+            and _MEDICATION_STATE_SIGNAL_RE.search(spans[ref - 1].text)
+        ]
+        if len(transition_refs) < 2:
+            result.append(item)
+            continue
+        for ref in transition_refs:
+            source = spans[ref - 1].text.casefold()
+            split = copy.deepcopy(item)
+            split["source_refs"] = [ref]
+            for key in (
+                "observation_date", "observation_date_end", "date_precision",
+                "clinical_status",
+            ):
+                split.pop(key, None)
+            medication = split.get("medication")
+            if isinstance(medication, dict):
+                medication.pop("lifecycle_status", None)
+                for field in ("dose", "route", "frequency"):
+                    value = str(medication.get(field) or "").casefold()
+                    if value and value not in source:
+                        medication.pop(field, None)
+                if not medication:
+                    split.pop("medication", None)
+            if not re.search(
+                r"\b(?:linea|schema|regime|ciclo|adiuvant|neoadiuvant|"
+                r"palliativ|curativ|mantenimento)\w*\b", source,
+            ):
+                split.pop("oncology", None)
+            result.append(split)
+    return result
+
+
 def _merge_wire_values(
     left: dict[str, Any],
     right: dict[str, Any],
@@ -2096,11 +2706,20 @@ def _contextual_date_for_refs(
     if not refs or not spans:
         return None, None, None
     first = refs[0]
+    current_text = spans[first - 1].text
+    explicitly_referential = bool(re.search(
+        r"(?i)\b(?:nella\s+stessa\s+data|in\s+tale\s+data|"
+        r"in\s+quella\s+data|alla\s+dimissione|successivamente|"
+        r"il\s+giorno\s+seguente)\b",
+        current_text,
+    ))
     lower = max(1, first - maximum_distance)
     for sentence_id in range(first - 1, lower - 1, -1):
         span = spans[sentence_id - 1]
         expression = _explicit_date_expression(span.text)
-        if expression:
+        if expression and (
+            explicitly_referential or _looks_like_temporal_heading(span.text)
+        ):
             return expression, sentence_id, span.text
     return None, None, None
 
@@ -2110,6 +2729,236 @@ _RESOLVABLE_SYMPTOMS = (
     "diarrea", "astenia", "prurito", "rash", "cefalea", "vertigini",
     "edema", "disfagia", "disuria", "ematuria", "parestesie",
 )
+
+_NEGATED_IMAGING_CONCEPT_RE = re.compile(
+    r"(?i)\b(?:embol\w*|metastas\w*|lesion\w*|nodul\w*|"
+    r"linfoaden\w*|adenopati\w*|versament\w*|trombos\w*|frattur\w*|"
+    r"ischemi\w*|emorragi\w*|recidiv\w*|progression\w*|"
+    r"pneumotorace|consolidament\w*|infiltrat\w*|ostruzion\w*)\b"
+)
+
+
+def _explicit_performed_procedure_evidence(
+    *,
+    patient_id: str,
+    document_id: str,
+    document_date: str | None,
+    full_text: str,
+    geometry,
+    model_name: str,
+    existing: list[ClinicalEvidence],
+) -> list[ClinicalEvidence]:
+    """Recover an explicitly performed named procedure without another LLM."""
+    spans = split_sentence_spans(full_text)
+    result: list[ClinicalEvidence] = []
+    for span in spans:
+        for match in _PERFORMED_PROCEDURE_RE.finditer(span.text):
+            concept = " ".join(match.group("procedure").split()).strip()
+            if any(
+                item.category in {"procedure", "surgery"}
+                and _identity_text(item.normalized_entity) == _identity_text(concept)
+                and span.sentence_id in item.data.get("sentence_refs", [])
+                for item in (*existing, *result)
+            ):
+                continue
+            quote_verified, matched_quote = locate_quote(span.text, full_text)
+            if not quote_verified:
+                continue
+            temporal_value = _temporal_expression_from_quote(matched_quote)
+            temporal = normalize_clinical_date(
+                temporal_value, document_date=document_date
+            )
+            page, bbox = None, None
+            if geometry is not None:
+                page, bbox = geometry.locate_source(matched_quote, None)
+            outcome_match = re.search(
+                r"(?i)\b(?:negativ\w*\s+per|con\s+esito)\s+([^.;]{2,120})",
+                matched_quote,
+            )
+            procedure_payload = {
+                "procedure_type": concept,
+                **(
+                    {"outcome": outcome_match.group(0).strip(" .")}
+                    if outcome_match else {}
+                ),
+            }
+            data = {
+                "fact_type": "procedure",
+                "polarity": "present",
+                "report_date": document_date,
+                "quote_verified": True,
+                "date_original_text": temporal.original_text,
+                "date_approximate": temporal.approximate,
+                "sentence_refs": [span.sentence_id],
+                "deterministic_explicit_procedure": True,
+                "source_reference": {
+                    "document_id": document_id,
+                    "page": page,
+                    "bbox": list(bbox) if bbox else None,
+                    "passage": matched_quote,
+                    "sentence_refs": [span.sentence_id],
+                },
+            }
+            result.append(ClinicalEvidence(
+                evidence_id=stable_evidence_id(
+                    document_id=document_id,
+                    category="procedure",
+                    entity=concept,
+                    quote=matched_quote,
+                    observed_date=temporal.start,
+                    page=page,
+                    assertion="present",
+                    certainty="confirmed",
+                ),
+                patient_id=patient_id,
+                document_id=document_id,
+                category="procedure",
+                normalized_entity=concept,
+                fact_type="procedure",
+                concept_original=concept,
+                canonical_label=concept,
+                mapping_status="unmapped",
+                typed_payload={"procedure": procedure_payload},
+                source_text=matched_quote,
+                assertion="present",
+                certainty="confirmed",
+                clinical_status="completed",
+                observed_date=temporal.start,
+                document_date=document_date,
+                date_precision=temporal.precision,
+                date_source=temporal.source,
+                source_page=page,
+                bbox=bbox,
+                confidence=1.0,
+                extraction_method="deterministic_explicit_procedure",
+                model_name=model_name,
+                prompt_version=ATOMIC_PROMPT_VERSION,
+                schema_version="3.0",
+                status="auto",
+                data=data,
+            ))
+    return result
+
+
+def _explicit_negated_imaging_evidence(
+    *,
+    patient_id: str,
+    document_id: str,
+    document_date: str | None,
+    full_text: str,
+    geometry,
+    model_name: str,
+    existing: list[ClinicalEvidence],
+) -> list[ClinicalEvidence]:
+    """Recover explicit, clinically meaningful negative imaging findings."""
+    spans = split_sentence_spans(full_text)
+    result: list[ClinicalEvidence] = []
+    negative = re.compile(
+        r"(?i)\b(?:senza(?:\s+evidenza\s+di)?|assenza\s+di|"
+        r"non\s+(?:si\s+)?(?:evidenzia|documenta|rileva)(?:no)?)\s+"
+        r"(?P<concept>[^,;:.]{2,100})"
+    )
+    for span in spans:
+        if not _IMAGING_CONTEXT_RE.search(span.text):
+            continue
+        for match in negative.finditer(span.text):
+            candidate = match.group("concept").strip(" .")
+            concept_match = _NEGATED_IMAGING_CONCEPT_RE.search(candidate)
+            if not concept_match:
+                continue
+            concept = candidate[concept_match.start():].strip(" .")
+            # Do not absorb a following independent clause.
+            concept = re.split(
+                r"(?i)\s+(?:mentre|ma|tuttavia|con)\s+", concept, maxsplit=1
+            )[0].strip(" .")
+            if not concept:
+                continue
+            if any(
+                item.category == "imaging_finding"
+                and item.assertion == "absent"
+                and _identity_text(item.normalized_entity) == _identity_text(concept)
+                and span.sentence_id in item.data.get("sentence_refs", [])
+                for item in (*existing, *result)
+            ):
+                continue
+            quote_verified, matched_quote = locate_quote(span.text, full_text)
+            if not quote_verified:
+                continue
+            temporal_value = _temporal_expression_from_quote(matched_quote)
+            temporal = normalize_clinical_date(
+                temporal_value, document_date=document_date
+            )
+            page, bbox = None, None
+            if geometry is not None:
+                page, bbox = geometry.locate_source(matched_quote, None)
+            modality = re.search(
+                r"(?i)\b(?:TC|TAC|RMN?|PET(?:[- /]?FDG|/TC)?|RX|"
+                r"ecografi\w*)\b",
+                matched_quote,
+            )
+            typed = {
+                "radiology_finding": {
+                    "modality": modality.group(0) if modality else ""
+                }
+            }
+            if not typed["radiology_finding"]["modality"]:
+                typed = {}
+            data = {
+                "fact_type": "radiology_finding",
+                "polarity": "negated",
+                "report_date": document_date,
+                "quote_verified": True,
+                "date_original_text": temporal.original_text,
+                "date_approximate": temporal.approximate,
+                "sentence_refs": [span.sentence_id],
+                "deterministic_explicit_negative_imaging": True,
+                "source_reference": {
+                    "document_id": document_id,
+                    "page": page,
+                    "bbox": list(bbox) if bbox else None,
+                    "passage": matched_quote,
+                    "sentence_refs": [span.sentence_id],
+                },
+            }
+            result.append(ClinicalEvidence(
+                evidence_id=stable_evidence_id(
+                    document_id=document_id,
+                    category="imaging_finding",
+                    entity=concept,
+                    quote=matched_quote,
+                    observed_date=temporal.start,
+                    page=page,
+                    assertion="absent",
+                    certainty="excluded",
+                ),
+                patient_id=patient_id,
+                document_id=document_id,
+                category="imaging_finding",
+                normalized_entity=concept,
+                fact_type="radiology_finding",
+                concept_original=concept,
+                canonical_label=concept,
+                mapping_status="unmapped",
+                typed_payload=typed,
+                source_text=matched_quote,
+                assertion="absent",
+                certainty="excluded",
+                clinical_status="excluded",
+                observed_date=temporal.start,
+                document_date=document_date,
+                date_precision=temporal.precision,
+                date_source=temporal.source,
+                source_page=page,
+                bbox=bbox,
+                confidence=1.0,
+                extraction_method="deterministic_explicit_negative_imaging",
+                model_name=model_name,
+                prompt_version=ATOMIC_PROMPT_VERSION,
+                schema_version="3.0",
+                status="auto",
+                data=data,
+            ))
+    return result
 
 
 def _explicit_resolution_evidence(
@@ -2126,9 +2975,10 @@ def _explicit_resolution_evidence(
     spans = split_sentence_spans(full_text)
     result: list[ClinicalEvidence] = []
     pattern = re.compile(
-        r"(?i)\b(?:la|il|lo|l['’]|i|gli|le)\s+"
+        r"(?i)(?:\b(?:la|il|lo|l['’]|i|gli|le)\s+|"
+        r"\balla\s+dimissione\s+)"
         r"(?P<subject>[a-zà-öø-ÿ][a-zà-öø-ÿ'’\- ]{0,70}?)\s+"
-        r"(?:è|e'|sono|risulta(?:no)?)\s+"
+        r"(?:è|e'|sono|risult\w*)\s+"
         r"(?P<state>risolt[oaie]?|scompars[oaie]?|regredit[oaie]?|assente)\b"
     )
     for span in spans:
@@ -2442,6 +3292,8 @@ def _clean_text(value: object, maximum: int) -> str:
 
 def _clean_optional(value: object, maximum: int) -> str | None:
     cleaned = _clean_text(value, maximum)
+    if cleaned.casefold().strip(" .") in _WIRE_MISSING_TEXT:
+        return None
     return cleaned or None
 
 
@@ -2480,6 +3332,43 @@ def _fact_type_for_category(category: str) -> str:
         "recommendation": "clinical_decision",
     }
     return preferred.get(str(category or ""), str(category or "other"))
+
+
+def _specific_atomic_category(
+    *, category: str, fact_type: str, concept: str, quote: str
+) -> str:
+    """Project broad wire buckets onto explicit clinical event categories."""
+    entity = _identity_text(concept)
+    source = _identity_text(quote)
+    if fact_type == "vital_sign" and entity in {
+        "ecog", "performance status"
+    }:
+        return "functional_status"
+    if fact_type != "diagnosis":
+        return category
+    if "familiarita" in source or "anamnesi familiare" in source:
+        return "family_history"
+    if "allerg" in entity or "allerg" in source:
+        return "allergy"
+    if "progression" in entity:
+        return "progression"
+    if any(marker in entity for marker in (
+        "risposta completa", "risposta parziale", "risposta metabolica",
+        "stabilita di malattia",
+    )):
+        return "response"
+    if (
+        any(marker in entity for marker in (
+            "tossicita", "miocardite", "polineuropatia", "uveite",
+        ))
+        and any(marker in source for marker in (
+            "tossicita", "correlat", "trattamento", "terapia",
+        ))
+    ):
+        return "toxicity"
+    if re.search(r"\bimmuno[- ]?correlat\w*\b", source):
+        return "toxicity"
+    return category
 
 
 def _bounded_float(value: object, default: float) -> float:
@@ -2542,6 +3431,14 @@ def _temporal_expression_from_quote(
     )
     if duration:
         return duration.group(0)
+    interval = re.search(
+        r"(?i)\bdal\s+\d{1,2}\s+al\s+\d{1,2}\s+"
+        r"(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|"
+        r"settembre|ottobre|novembre|dicembre)(?:\s+(?:19|20)\d{2})?\b",
+        text,
+    )
+    if interval:
+        return interval.group(0)
     if _temporal_context_mismatch(category, text):
         return None
     return _explicit_date_expression(text)
@@ -2550,8 +3447,14 @@ def _temporal_expression_from_quote(
 def _explicit_date_expression(text: str) -> str | None:
     explicit = re.search(
         r"\b(?:\d{1,2}[./-]\d{1,2}[./-](?:\d{2}|\d{4})|"
-        r"(?:19|20)\d{2}-\d{1,2}-\d{1,2})\b",
+        r"(?:19|20)\d{2}-\d{1,2}-\d{1,2}|"
+        r"\d{1,2}\s+(?:gennaio|febbraio|marzo|aprile|maggio|giugno|"
+        r"luglio|agosto|settembre|ottobre|novembre|dicembre)"
+        r"(?:\s+(?:19|20)\d{2})?|"
+        r"(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|"
+        r"settembre|ottobre|novembre|dicembre)\s+(?:19|20)\d{2})\b",
         str(text or ""),
+        re.IGNORECASE,
     )
     return explicit.group(0) if explicit else None
 
@@ -2594,7 +3497,9 @@ def _ground_certainty(
 ) -> str:
     """Correct certainty values contradicted by the cited source itself."""
     text = str(quote or "").casefold()
-    if re.search(
+    if category not in {
+        "medication", "procedure", "hospitalization", "discharge", "care_plan"
+    } and re.search(
         r"\b(?:esclus[oa]|assenza\s+di|non\s+(?:si\s+)?evidenz\w*|"
         r"negativ[oa]\s+per)\b",
         text,
@@ -2741,18 +3646,43 @@ def _normalize_measurement(
     unit: str | None,
 ) -> tuple[str, str, float | None, str | None]:
     """Normalize high-value vital measurements without clinical inference."""
-    combined = f"{entity} {quote}"
-    if re.search(r"(?i)\b(?:spo2|saturazione(?:\s+di\s+ossigeno)?)\b", combined):
+    entity_is_spo2 = bool(re.search(
+        r"(?i)^\s*(?:spo2|saturazione(?:\s+di\s+ossigeno)?)"
+        r"(?:\s*[<>≤≥]?\s*\d+(?:[.,]\d+)?\s*%?)?\s*$", entity
+    ))
+    percent_spo2 = bool(
+        str(unit or "").strip() == "%"
+        and re.search(
+            r"(?i)\b(?:spo2|saturazione(?:\s+di\s+ossigeno)?)\b", quote
+        )
+    )
+    if entity_is_spo2 or percent_spo2:
         match = re.search(
             r"(?i)\b(?:spo2|saturazione(?:\s+di\s+ossigeno)?)\s*"
-            r"(?:[:=]?\s*)([<>≤≥]?\s*\d+(?:[.,]\d+)?)\s*%?",
-            combined,
+            r"(?:(?:era|pari\s+a|di)\s+|[:=]?\s*)"
+            r"([<>≤≥]?\s*\d+(?:[.,]\d+)?)\s*%?",
+            quote,
         )
         if numeric_value is None and match:
             numeric_value = _safe_float(
                 re.sub(r"[^\d,.-]", "", match.group(1)).replace(",", ".")
             )
         return "SpO2", "vital_sign", numeric_value, unit or "%"
+    if (
+        _identity_text(entity) in {"temperatura", "febbre"}
+        or str(unit or "").casefold().strip() in {"°c", "c", "celsius"}
+    ):
+        match = re.search(
+            r"(?i)\btemperatura\s*"
+            r"(?:(?:era|pari\s+a|di)\s+|[:=]?\s*)"
+            r"([<>≤≥]?\s*\d+(?:[.,]\d+)?)\s*°?C\b",
+            quote,
+        )
+        if numeric_value is None and match:
+            numeric_value = _safe_float(
+                re.sub(r"[^\d,.-]", "", match.group(1)).replace(",", ".")
+            )
+        return "temperatura", "vital_sign", numeric_value, unit or "°C"
     return entity, category, numeric_value, unit
 
 

@@ -1,0 +1,12 @@
+Estrai l'identità del PAZIENTE a cui si riferisce il documento.
+
+Campi:
+- name: nome e cognome completi del paziente, come scritti nel documento
+- birth_date: data di nascita in formato YYYY-MM-DD, se presente
+- fiscal_code: codice fiscale a 16 caratteri, se presente; altrimenti stringa vuota
+- confidence: confidenza da 0.0 a 1.0
+
+Regole:
+- è rilevante SOLO il paziente: ignora medici, infermieri, referenti e ogni altra persona citata nel testo;
+- se non puoi determinare il paziente con sicurezza, lascia i campi vuoti;
+- non inventare o correggere alcun valore.

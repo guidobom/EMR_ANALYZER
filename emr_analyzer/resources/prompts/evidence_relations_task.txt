@@ -1,0 +1,1 @@
+Per ogni candidato stabilisci linked. Usa cohesive/must_link solo se le evidenze possono descrivere uno stesso episodio; usa context_only per contesto utile ma non aggregabile, cannot_link per incompatibilità e uncertain se insufficiente.

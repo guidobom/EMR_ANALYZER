@@ -488,8 +488,8 @@ class LLMConfigDialog(QDialog):
         grid.addWidget(description_label, 0, 0, 1, 6)
 
         backend = QComboBox()
-        backend.addItem("llama.cpp · GGUF (macOS / CUDA)", "llama_cpp")
-        backend.addItem("vLLM · CUDA (DGX / Linux)", "vllm")
+        backend.addItem("llama.cpp · GGUF (Metal / CUDA)", "llama_cpp")
+        backend.addItem("vLLM · CUDA (Linux / DGX Spark)", "vllm")
         backend_index = backend.findData(config.backend)
         backend.setCurrentIndex(backend_index if backend_index >= 0 else 0)
         backend.setToolTip(
@@ -692,7 +692,13 @@ class LLMConfigDialog(QDialog):
         vllm_enforce_eager.setChecked(config.vllm_enforce_eager)
         vllm_grid.addWidget(QLabel("Precisione:"), 0, 0)
         vllm_grid.addWidget(vllm_dtype, 0, 1)
-        vllm_grid.addWidget(QLabel("Quota memoria GPU:"), 0, 2)
+        vllm_memory_label = QLabel("Quota memoria motore:")
+        vllm_memory_label.setToolTip(
+            "Frazione della memoria CUDA utilizzabile dal motore. Su DGX "
+            "Spark è parte dei 128 GB coerenti condivisi anche con sistema "
+            "operativo e applicazione, non una VRAM separata."
+        )
+        vllm_grid.addWidget(vllm_memory_label, 0, 2)
         vllm_grid.addWidget(vllm_gpu_memory, 0, 3)
         vllm_grid.addWidget(QLabel("Tensor parallel GPU:"), 1, 0)
         vllm_grid.addWidget(vllm_tensor_parallel, 1, 1)
@@ -1074,7 +1080,7 @@ class LLMConfigDialog(QDialog):
         if backend == "vllm":
             text = (
                 f"vLLM gestirà fino a {workers} richieste concorrenti · "
-                f"quota memoria GPU "
+                f"quota memoria motore "
                 f"{widgets['vllm_gpu_memory_utilization'].value():.0%} · "
                 f"tensor parallel {widgets['vllm_tensor_parallel_size'].value()}"
             )
@@ -1086,7 +1092,8 @@ class LLMConfigDialog(QDialog):
             info_label.setText(text)
             info_label.setToolTip(
                 "vLLM pianifica dinamicamente le sequenze entro la quota di "
-                "memoria GPU configurata."
+                "memoria configurata. Su DGX Spark la GPU GB10 condivide la "
+                "memoria coerente con CPU, sistema operativo e applicazione."
             )
             return
         from ..utils.hardware import (
@@ -1437,7 +1444,8 @@ class LLMConfigDialog(QDialog):
         from ..utils.hardware import recommend_all
 
         try:
-            rec = recommend_all(model, role)
+            backend = str(widgets["backend"].currentData() or "llama_cpp")
+            rec = recommend_all(model, role, backend=backend)
         except Exception:
             if not silent:
                 QMessageBox.warning(
@@ -1466,6 +1474,24 @@ class LLMConfigDialog(QDialog):
         widgets["context_length"].setValue(rec.context_length)
         widgets["max_output_tokens"].setValue(rec.max_output_tokens)
 
+        dgx_engine_note = ""
+        if backend == "vllm":
+            try:
+                from ..utils.hardware import HardwareProfile
+
+                hardware = HardwareProfile.capture()
+            except Exception:
+                hardware = None
+            if hardware is not None and hardware.is_dgx_spark:
+                widgets["vllm_gpu_memory_utilization"].setValue(0.85)
+                widgets["vllm_tensor_parallel_size"].setValue(1)
+                widgets["vllm_enforce_eager"].setChecked(False)
+                dgx_engine_note = (
+                    "• DGX Spark: quota motore 85%, tensor parallel 1, "
+                    "CUDA Graph abilitate — riserva per memoria coerente "
+                    "condivisa"
+                )
+
         # Workers: pick the recommended value if it's in the combo
         combo = widgets.get("workers_combo")
         if combo is not None and combo.count() > 0:
@@ -1491,6 +1517,8 @@ class LLMConfigDialog(QDialog):
             f"• Slot paralleli: {rec.parallel_workers} — "
             f"{rec.workers_rationale}",
         ]
+        if dgx_engine_note:
+            lines.append(dgx_engine_note)
         widgets["rec_label"].setText(
             "<br>".join(lines)
         )
@@ -2016,6 +2044,30 @@ class LLMConfigDialog(QDialog):
                 "superare la lunghezza del contesto.",
             )
             return False
+        if config.backend == "vllm" and config.vllm_tensor_parallel_size > 1:
+            try:
+                from ..utils.hardware import HardwareProfile
+
+                hardware = HardwareProfile.capture()
+            except Exception:
+                hardware = None
+            if (
+                hardware is not None
+                and hardware.has_nvidia_cuda
+                and hardware.nvidia_gpu_count > 0
+                and config.vllm_tensor_parallel_size
+                > hardware.nvidia_gpu_count
+            ):
+                QMessageBox.warning(
+                    self,
+                    "Tensor parallel non valido",
+                    f"{title}: tensor parallel "
+                    f"{config.vllm_tensor_parallel_size} richiede almeno "
+                    f"{config.vllm_tensor_parallel_size} GPU CUDA, ma ne "
+                    f"sono state rilevate {hardware.nvidia_gpu_count}. "
+                    "DGX Spark integra una sola GPU GB10: usa il valore 1.",
+                )
+                return False
         return True
 
     def accept(self) -> None:

@@ -14,7 +14,7 @@ ATOMIC_FACT_TYPES = (
     "medication", "laboratory_test", "radiology_finding",
     "instrumental_finding", "diagnosis", "symptom",
     "clinical_decision", "procedure", "clinical_sign", "vital_sign",
-    "histopathology",
+    "histopathology", "biomarker", "hospitalization", "discharge",
 )
 
 EVIDENCE_DISPOSITIONS = (

@@ -271,6 +271,7 @@ class ServerManager:
             "--port", str(port),
             "-c", str(key.ctx_size * key.np),
             "-np", str(key.np),
+            "-ngl", "all",
             "-ctk", "q8_0",
             "-ctv", "q8_0",
             "-rea", "off",

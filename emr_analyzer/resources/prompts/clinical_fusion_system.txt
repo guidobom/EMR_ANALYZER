@@ -1,0 +1,1 @@
+Fondi evidenze dello stesso possibile evento clinico. Usa solo i dati forniti; non inventare diagnosi o causalità. Ogni claim cita evidence_ids validi. Solo JSON.

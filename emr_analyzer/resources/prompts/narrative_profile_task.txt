@@ -1,0 +1,1 @@
+Redigi un profilo clinico narrativo basato sulle osservazioni cliniche fornite in ordine cronologico. Non inventare nulla. Se un dato non è presente, non menzionarlo. Organizza il testo in paragrafi cronologici coerenti e cita le date quando disponibili.

@@ -340,8 +340,17 @@ def _device_lines(output: str) -> tuple[str, ...]:
 def _expected_backend(system: str) -> str:
     if system.casefold() == "darwin":
         return "METAL"
-    if system.casefold() == "linux" and shutil.which("nvidia-smi"):
-        return "CUDA"
+    if system.casefold() == "linux":
+        if shutil.which("nvidia-smi") or Path("/dev/nvidiactl").exists():
+            return "CUDA"
+        try:
+            from ..utils.nvidia import cached_nvidia_gpu
+
+            gpu = cached_nvidia_gpu(system, platform.machine())
+            if gpu.available or gpu.is_dgx_spark:
+                return "CUDA"
+        except Exception:
+            pass
     return "CPU"
 
 

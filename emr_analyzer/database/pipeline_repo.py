@@ -49,6 +49,62 @@ class ClinicalPipelineRepository:
 
     # ------------------------------------------------------------- sources
 
+    def replace_aggregation_coverage(
+        self,
+        patient_id: str,
+        run_id: str,
+        rows,
+    ) -> None:
+        """Persist one immutable audit snapshot of evidence-event coverage."""
+        with self.db:
+            self.db.execute(
+                "DELETE FROM clinical_aggregation_coverage WHERE run_id=?",
+                (run_id,),
+            )
+            for row in rows:
+                self.db.execute(
+                    """INSERT INTO clinical_aggregation_coverage
+                       (run_id, patient_id, evidence_id, disposition, status,
+                        event_ids_json, reason, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        patient_id,
+                        row.evidence_id,
+                        row.disposition,
+                        row.status,
+                        _json(list(row.event_ids)),
+                        row.reason,
+                        _now(),
+                    ),
+                )
+
+    def list_aggregation_coverage(
+        self,
+        patient_id: str,
+        *,
+        run_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict]:
+        clauses = ["patient_id=?"]
+        params: list[object] = [patient_id]
+        if run_id:
+            clauses.append("run_id=?")
+            params.append(run_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        rows = self.db.execute(
+            "SELECT * FROM clinical_aggregation_coverage WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at DESC, evidence_id",
+            tuple(params),
+        ).fetchall()
+        return [{
+            **dict(row),
+            "event_ids": _loads(row["event_ids_json"], []),
+        } for row in rows]
+
     def replace_evidence_sources(
         self, evidence_id: str, sources: list[EvidenceSourceReference]
     ) -> None:

@@ -328,7 +328,12 @@ class PDFViewerDialog(QDialog):
         self._preview = DocumentEvidencePreview(services, self)
         layout.addWidget(self._preview)
         self._preview.set_document(
-            doc_data, highlights=[highlight] if highlight else []
+            doc_data,
+            highlights=[highlight] if highlight else [],
+            selected_evidence_id=(
+                str(highlight.get("evidence_id"))
+                if highlight and highlight.get("evidence_id") else None
+            ),
         )
 
     def focus_evidence(self, page_number: int, bbox: list[float]) -> None:

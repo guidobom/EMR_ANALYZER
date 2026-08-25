@@ -9,13 +9,12 @@ import json
 import uuid
 
 from ..models.clinical_pipeline import ClinicalHypothesis
+from ..prompt_catalog import load_prompt
 
 
-_SYSTEM_PROMPT = (
-    "Proponi soltanto collegamenti clinici plausibili da sottoporre a revisione "
-    "umana. Non trasformare una semplice vicinanza temporale in causalità e "
-    "non aggiungere fatti assenti. Rispondi esclusivamente con JSON conforme "
-    "allo schema."
+_SYSTEM_PROMPT = load_prompt("hypothesis_system")
+_TASK_PROMPT = load_prompt(
+    "hypothesis_task", required_markers=("plausible=true", "candidate_id")
 )
 
 _SCHEMA = {
@@ -131,11 +130,7 @@ class HypothesisDiscovery:
                 "target": _event_payload(by_id[item.target_event_id]),
             })
         prompt = (
-            "Valuta i candidati seguenti. plausible=true anche per una "
-            "relazione clinicamente plausibile ma non documentata, purché "
-            "l'incertezza sia esplicita. Ogni output deve riusare esattamente "
-            "un candidate_id fornito. Le ipotesi saranno escluse dal RAG fino "
-            "alla revisione umana.\n\nCANDIDATI:\n"
+            _TASK_PROMPT + "\n\nCANDIDATI:\n"
             + json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
         )
         generator = self.llm.generate_structured

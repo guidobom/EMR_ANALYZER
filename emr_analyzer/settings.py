@@ -55,7 +55,9 @@ class LLMRoleConfig:
     # selected and therefore make role settings fully round-trippable when
     # switching between the two backends.
     vllm_dtype: str = "auto"
-    vllm_gpu_memory_utilization: float = 0.90
+    # Leave headroom for the OS and CUDA graphs. This is especially important
+    # on DGX Spark, where GB10 and the CPU share one coherent 128 GB pool.
+    vllm_gpu_memory_utilization: float = 0.85
     vllm_tensor_parallel_size: int = 1
     vllm_quantization: str = ""
     vllm_trust_remote_code: bool = False
@@ -416,6 +418,7 @@ class LabEvidencePolicy:
 
 @dataclass(frozen=True)
 class ClinicalPipelinePolicy:
+    aggregation_engine: str = "v3"
     adaptive_specialized_retry: bool = True
     max_specialized_retries: int = 1
     consensus_profile: str = "selective"
@@ -434,6 +437,11 @@ class ClinicalPipelinePolicy:
         profile = str(payload.get("consensus_profile", "selective"))
         if profile not in {"fast", "selective", "robust", "research"}:
             profile = "selective"
+        aggregation_engine = str(
+            payload.get("aggregation_engine", "v3")
+        ).strip().casefold()
+        if aggregation_engine not in {"v3", "v4"}:
+            aggregation_engine = "v3"
 
         def integer(name: str, default: int, minimum: int, maximum: int) -> int:
             try:
@@ -453,6 +461,7 @@ class ClinicalPipelinePolicy:
             if isinstance(value, str) else bool(value)
         )
         return cls(
+            aggregation_engine=aggregation_engine,
             adaptive_specialized_retry=adaptive,
             max_specialized_retries=integer(
                 "max_specialized_retries", 1, 0, 10

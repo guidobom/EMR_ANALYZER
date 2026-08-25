@@ -66,6 +66,7 @@ from emr_analyzer.models.clinical_registry import (
     ProcessingRun,
 )
 from emr_analyzer.extraction.llm_client import OutputLimitError
+from emr_analyzer.settings import ClinicalPipelinePolicy
 
 
 def _seed(db: DatabaseEngine) -> None:
@@ -126,6 +127,21 @@ class _StructuredCaptureLlm:
         return self.response
 
 
+class _SequencedStructuredLlm(_StructuredCaptureLlm):
+    def __init__(self, responses):
+        super().__init__({})
+        self.responses = list(responses)
+
+    def generate_structured(
+        self, prompt, system, schema, *, max_tokens=None
+    ):
+        self.calls.append({
+            "prompt": prompt, "system": system, "schema": schema,
+            "max_tokens": max_tokens,
+        })
+        return self.responses.pop(0) if self.responses else {}
+
+
 class ClinicalRegistryV2Test(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -146,6 +162,13 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertEqual(relative.start, "2025-03-31")
         self.assertEqual(relative.precision, "approximate")
         self.assertEqual(relative.source, "retrospective_duration")
+        day_without_year = normalize_clinical_date(
+            "15 febbraio", document_date="2024-03-20"
+        )
+        self.assertEqual(
+            (day_without_year.start, day_without_year.precision),
+            ("2024-02-15", "day"),
+        )
         undated = normalize_clinical_date(
             None, document_date="2025-05-31"
         )
@@ -318,7 +341,7 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertNotIn("source_text", properties)
         self.assertNotIn("document_date", properties)
         self.assertNotIn("confidence", properties)
-        self.assertTrue(ATOMIC_PROMPT_VERSION.startswith("atomic_evidence_it_v8"))
+        self.assertTrue(ATOMIC_PROMPT_VERSION.startswith("atomic_evidence_it_v10"))
         self.assertEqual(len(ATOMIC_PROMPT_DIGEST), 64)
 
     def test_atomic_v8_dynamic_schema_prevents_invalid_citation_ids(self):
@@ -327,6 +350,126 @@ class ClinicalRegistryV2Test(unittest.TestCase):
             "source_refs"
         ]
         self.assertEqual(refs["items"]["enum"], [1, 2, 3])
+        self.assertEqual(
+            set(schema["required"]), set(schema["properties"])
+        )
+
+    def test_atomic_v10_one_pass_repairs_transitions_dates_and_negatives(self):
+        llm = _StructuredCaptureLlm({
+            "medication": [{
+                "concept": "nivolumab", "polarity": "present",
+                "source_refs": [1, 2],
+            }],
+            "radiology_finding": [{
+                "concept": "opacità a vetro smerigliato",
+                "polarity": "negated", "source_refs": [3],
+                "payload": {"modality": "TC", "comparison": "riduzione"},
+            }],
+            "histopathology": [{
+                "concept": "melanoma ulcerato", "polarity": "present",
+                "source_refs": [4],
+                "payload": {"biomarkers": ["Breslow 3,2 mm"]},
+            }],
+            "biomarker": [{
+                "concept": "BRAF", "polarity": "negated",
+                "source_refs": [5],
+                "payload": {"method": "genetico", "specimen": "cute"},
+            }],
+            "instrumental_finding": [{
+                "concept": "broncoscopia con BAL", "polarity": "present",
+                "source_refs": [6], "value_text": "negativa per infezioni",
+            }, {
+                "concept": "TSH", "polarity": "present",
+                "source_refs": [7], "numeric_value": 0.02,
+                "unit": "mUI/L",
+            }],
+        })
+        extractor = AtomicEvidenceExtractor(llm)
+        items = extractor.extract_document(
+            patient_id="P001", document_id="D1", document_type="oncologia",
+            document_date="2024-03-20",
+            text=(
+                "Il 10 gennaio 2024 è stato iniziato nivolumab. "
+                "Il 16 febbraio nivolumab è stato sospeso. "
+                "La TC del 5 marzo mostrava riduzione delle opacità a vetro "
+                "smerigliato, senza embolia polmonare. "
+                "La biopsia originaria mostrava melanoma ulcerato con "
+                "Breslow 3,2 mm. BRAF non mutato. Il 20 marzo è stata "
+                "eseguita broncoscopia con BAL, negativa per infezioni. "
+                "Gli esami mostravano TSH 0,02 mUI/L, sotto il range."
+            ),
+        )
+        self.assertEqual(len(llm.calls), 1)
+        medication = [item for item in items if item.category == "medication"]
+        self.assertEqual(
+            [(item.observed_date, item.clinical_status) for item in medication],
+            [("2024-01-10", "started"), ("2024-02-16", "suspended")],
+        )
+        improved = next(
+            item for item in items
+            if item.normalized_entity == "opacità a vetro smerigliato"
+        )
+        self.assertEqual((improved.assertion, improved.clinical_status), (
+            "present", "improved"
+        ))
+        embolism = next(
+            item for item in items if "embolia" in item.normalized_entity
+        )
+        self.assertEqual((embolism.assertion, embolism.certainty), (
+            "absent", "excluded"
+        ))
+        pathology = next(
+            item for item in items if item.category == "histopathology"
+        )
+        self.assertIsNone(pathology.observed_date)
+        self.assertEqual(
+            pathology.typed_payload["histopathology"]["measurement"],
+            "Breslow 3,2 mm",
+        )
+        biomarker = next(
+            item for item in items if item.category == "biomarker"
+        )
+        self.assertEqual(
+            (biomarker.assertion, biomarker.certainty, biomarker.value_text),
+            ("present", "confirmed", "non mutato"),
+        )
+        self.assertEqual(biomarker.typed_payload, {})
+        procedures = [item for item in items if item.category == "procedure"]
+        self.assertEqual(
+            [(item.normalized_entity, item.observed_date) for item in procedures],
+            [("broncoscopia con BAL", "2024-03-20")],
+        )
+        self.assertFalse(any(item.normalized_entity == "TSH" for item in items))
+        self.assertEqual(
+            extractor.last_extraction_metrics()["coverage_retries"], 0
+        )
+
+    def test_atomic_v10_preserves_planned_followup_target_and_timing(self):
+        llm = _StructuredCaptureLlm({
+            "clinical_decision": [{
+                "concept": "rivalutazione pneumologica",
+                "polarity": "present", "source_refs": [1],
+            }],
+        })
+        item = AtomicEvidenceExtractor(
+            llm,
+            policy=ClinicalPipelinePolicy(adaptive_specialized_retry=False),
+        ).extract_document(
+            patient_id="P001", document_id="D1", document_type="visita",
+            document_date="2024-03-20",
+            text=(
+                "È stata programmata rivalutazione pneumologica con nuova "
+                "TC dopo quattro settimane."
+            ),
+        )[0]
+        self.assertEqual(item.clinical_status, "planned")
+        self.assertEqual(
+            item.typed_payload["clinical_decision"]["target"], "nuova TC"
+        )
+        self.assertEqual(
+            item.typed_payload["clinical_decision"]["timing"],
+            "dopo quattro settimane",
+        )
 
     def test_atomic_v8_normalizes_harmless_wire_variants_without_retry(self):
         llm = _StructuredCaptureLlm({
@@ -361,6 +504,66 @@ class ClinicalRegistryV2Test(unittest.TestCase):
             "signal_characteristics",
             items[0].typed_payload["radiology_finding"],
         )
+
+    def test_atomic_v9_recovers_uncovered_named_medication(self):
+        llm = _SequencedStructuredLlm([
+            {"diagnosis": [{
+                "concept": "melanoma metastatico", "polarity": "present",
+                "source_refs": [1],
+            }]},
+            {"medication": [{
+                "concept": "Nivolumab", "polarity": "present",
+                "source_refs": [1],
+                "clinical_status": "started",
+                "medication": {"lifecycle_status": "started"},
+            }]},
+        ])
+        items = AtomicEvidenceExtractor(llm).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="visita_oncologica",
+            document_date="2025-07-29",
+            text=(
+                "Paziente con melanoma metastatico: il 29.07.25 inizia "
+                "rechallenge con Nivolumab."
+            ),
+        )
+        medication = [item for item in items if item.category == "medication"]
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual([item.normalized_entity for item in medication], [
+            "Nivolumab"
+        ])
+        self.assertEqual(medication[0].clinical_status, "started")
+        self.assertEqual(
+            AtomicEvidenceExtractor(llm).policy.adaptive_specialized_retry,
+            True,
+        )
+
+    def test_atomic_v9_repairs_medication_bucket_and_rejects_numeric_vital(self):
+        llm = _StructuredCaptureLlm({
+            "procedure": [{
+                "concept": "terapia", "polarity": "present",
+                "source_refs": [1],
+            }],
+            "vital_sign": [{
+                "concept": "3X 2,5", "polarity": "present",
+                "source_refs": [2],
+            }],
+        })
+        items = AtomicEvidenceExtractor(
+            llm,
+            policy=ClinicalPipelinePolicy(adaptive_specialized_retry=False),
+        ).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="visita_oncologica",
+            document_date="2026-03-02",
+            text=(
+                "18.03.26 Terapia con Nivolumab. "
+                "Linfoadenomegalia inguinale destra di 3X 2,5 cm."
+            ),
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].category, "medication")
+        self.assertEqual(items[0].normalized_entity.casefold(), "nivolumab")
 
     def test_content_hint_follows_radiology_text_not_wrong_declared_label(self):
         text = (
@@ -1026,6 +1229,9 @@ class ClinicalRegistryV2Test(unittest.TestCase):
                 lab_repo=LabRepository(self.db),
                 overlay_repo=DocumentTextOverlayRepository(self.db),
                 llm_client=llm,
+                pipeline_policy=ClinicalPipelinePolicy(
+                    adaptive_specialized_retry=False
+                ),
                 db=self.db,
             )
             atomic_result = builder.extract_atomic_evidence(

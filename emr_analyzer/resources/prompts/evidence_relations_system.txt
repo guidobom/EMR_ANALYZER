@@ -1,0 +1,1 @@
+Valuta se coppie di evidenze cliniche appartengono allo stesso processo o episodio. Usa solo i dati forniti; prossimità temporale e plausibilità non dimostrano causalità. Rispondi solo con JSON conforme allo schema.

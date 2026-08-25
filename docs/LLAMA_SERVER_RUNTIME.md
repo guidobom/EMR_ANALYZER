@@ -49,7 +49,8 @@ L'ultimo comando deve elencare un dispositivo `Metal`/`MTL`. Se mostra solo
 
 Usare il CUDA Toolkit supportato dalla macchina; su DGX Spark è consigliabile
 compilare direttamente sulla macchina così CMake seleziona l'architettura
-nativa:
+nativa. GB10 usa compute capability 12.1 (`sm_121`); con il toolkit CUDA 13
+di DGX OS è preferibile dichiararla esplicitamente:
 
 ```bash
 sudo apt update
@@ -61,6 +62,7 @@ git checkout <TAG_O_COMMIT_SCELTO>
 cmake -S . -B build-emr \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=121 \
   -DGGML_NATIVE=ON \
   -DBUILD_SHARED_LIBS=OFF
 cmake --build build-emr --config Release --target llama-server --parallel
@@ -70,6 +72,11 @@ cmake --build build-emr --config Release --target llama-server --parallel
 Il controllo finale deve elencare almeno un dispositivo `CUDA`. La build resta
 dipendente dal driver e dal runtime CUDA installati sulla macchina, ma non da
 una seconda installazione di llama.cpp.
+
+Su DGX Spark `nvidia-smi` può mostrare `Memory-Usage: Not Supported`: GB10
+condivide la memoria coerente con la CPU. Questo non è un errore se
+`--list-devices` elenca `CUDA0: NVIDIA GB10`; l'app dimensiona i runtime sui
+128 GB di RAM di sistema e mantiene una riserva separata.
 
 ## Importazione e utilizzo nell'app
 
@@ -107,5 +114,9 @@ viene cancellata automaticamente.
 ~/.emr_analyzer/runtimes/llama.cpp/<piattaforma>/<installazione>/llama-server \
   -v --list-devices
 ```
+
+Riferimenti: [hardware DGX Spark](https://docs.nvidia.com/dgx/dgx-spark/hardware.html),
+[release notes DGX OS](https://docs.nvidia.com/dgx/dgx-spark/release-notes.html) e
+[build di llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
 
 Il percorso esatto e la checksum completa sono visibili in **Configura LLM**.

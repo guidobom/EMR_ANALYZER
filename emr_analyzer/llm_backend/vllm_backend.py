@@ -61,6 +61,22 @@ def _has_local_weights(model_path: Path) -> bool:
         return False
 
 
+def _local_weight_size(model_path: Path) -> int | None:
+    """Total local checkpoint bytes, following cache snapshot symlinks."""
+    suffixes = {".safetensors", ".bin", ".pt", ".pth", ".gguf"}
+    try:
+        paths = [model_path] if model_path.is_file() else list(
+            model_path.rglob("*")
+        )
+        sizes = [
+            path.stat().st_size for path in paths
+            if path.is_file() and path.suffix.casefold() in suffixes
+        ]
+    except OSError:
+        return None
+    return sum(sizes) if sizes else None
+
+
 def list_cached_vllm_models() -> list[str]:
     """Return cached repositories that declare a text-generation model."""
     root = _hub_cache_root()
@@ -144,7 +160,7 @@ def resolve_vllm_model(name: str) -> dict | None:
         "source": "huggingface_cache" if not requested_path.exists() else "local",
         "architecture": str(merged.get("model_type") or architecture or ""),
         "max_context_length": maximum,
-        "size_bytes": None,
+        "size_bytes": _local_weight_size(source),
         "chat_capable": chat_capable,
         "weights_present": _has_local_weights(source),
     }
@@ -197,7 +213,7 @@ class VllmBackend:
             int(getattr(config, "parallel_workers", 1) or 1),
             int(getattr(config, "vllm_tensor_parallel_size", 1) or 1),
             str(getattr(config, "vllm_dtype", "auto") or "auto"),
-            round(float(getattr(config, "vllm_gpu_memory_utilization", 0.9) or 0.9), 3),
+            round(float(getattr(config, "vllm_gpu_memory_utilization", 0.85) or 0.85), 3),
             str(getattr(config, "vllm_quantization", "") or ""),
             bool(getattr(config, "vllm_trust_remote_code", False)),
             bool(getattr(config, "vllm_enforce_eager", False)),

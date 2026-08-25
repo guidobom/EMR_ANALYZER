@@ -15,6 +15,7 @@ from .workspace_tabs import WorkspaceTabs
 from .context_panel import ContextPanel
 from .llm_config_dialog import LLMConfigDialog
 from .pipeline_config_dialog import PipelineConfigDialog
+from .prompt_manager_dialog import PromptManagerDialog
 from .excluded_evidence_dialog import ExcludedEvidenceDialog
 from .hypothesis_dialog import HypothesisDialog
 from .styles import MAIN_STYLESHEET
@@ -128,6 +129,13 @@ class MainWindow(QMainWindow):
         pipeline_action.triggered.connect(self._open_pipeline_config)
         tools_menu.addAction(pipeline_action)
 
+        prompts_action = QAction("Gestisci &prompt LLM...", self)
+        prompts_action.setToolTip(
+            "Apre, modifica, versiona e assegna i prompt alle pipeline"
+        )
+        prompts_action.triggered.connect(self._open_prompt_manager)
+        tools_menu.addAction(prompts_action)
+
         exclusions_action = QAction("Rivedi evidenze &escluse...", self)
         exclusions_action.triggered.connect(self._open_excluded_evidence)
         tools_menu.addAction(exclusions_action)
@@ -227,6 +235,15 @@ class MainWindow(QMainWindow):
         self._configure_llm_action.triggered.connect(self._open_llm_config)
         toolbar.addAction(self._configure_llm_action)
 
+        self._prompt_manager_action = QAction("✎ Prompt", self)
+        self._prompt_manager_action.setToolTip(
+            "Apri il Prompt Manager e scegli la versione per ogni compito"
+        )
+        self._prompt_manager_action.triggered.connect(
+            self._open_prompt_manager
+        )
+        toolbar.addAction(self._prompt_manager_action)
+
         self._ollama_label = QLabel(" 🔌")
         self._ollama_label.setToolTip("Stato del motore locale (llama.cpp)")
         toolbar.addWidget(self._ollama_label)
@@ -295,6 +312,19 @@ class MainWindow(QMainWindow):
             self.statusbar.showMessage(
                 "Configurazione della pipeline clinica aggiornata", 5000
             )
+
+    def _open_prompt_manager(self):
+        dialog = PromptManagerDialog(
+            self,
+            services=self._services,
+            patient_id=self._current_patient_id,
+        )
+        dialog.exec_()
+        self.statusbar.showMessage(
+            "Prompt aggiornati; riavvia l'app se hai attivato o modificato "
+            "una versione",
+            7000,
+        )
 
     def _open_excluded_evidence(self):
         if not self._current_patient_id:

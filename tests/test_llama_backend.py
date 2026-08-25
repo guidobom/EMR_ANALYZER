@@ -262,6 +262,7 @@ class TestServerManager(unittest.TestCase):
         # Total ctx = per-request ctx × slots (server splits it).
         self.assertEqual(argv[argv.index("-c") + 1], str(32768 * 4))
         self.assertEqual(argv[argv.index("-np") + 1], "4")
+        self.assertEqual(argv[argv.index("-ngl") + 1], "all")
         self.assertEqual(argv[argv.index("-ctk") + 1], "q8_0")
         self.assertIn("-rea", argv)
 

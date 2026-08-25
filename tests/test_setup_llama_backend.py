@@ -143,6 +143,7 @@ class TestEnsureBinary(unittest.TestCase):
         )
         self.assertIn("GGML_CUDA=ON", printed)
         self.assertIn("DGX Spark", printed)
+        self.assertIn("CMAKE_CUDA_ARCHITECTURES=121", printed)
 
     def test_found_binary_is_returned_verbatim(self):
         with mock.patch(

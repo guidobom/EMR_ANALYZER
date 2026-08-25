@@ -74,6 +74,7 @@ class CachedModelTest(unittest.TestCase):
                 info = resolve_vllm_model("Qwen/Clinical-Test")
             self.assertEqual(info["architecture"], "qwen3")
             self.assertEqual(info["max_context_length"], 65536)
+            self.assertEqual(info["size_bytes"], len(b"fake-weights"))
 
     def test_missing_repo_is_not_treated_as_available(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
@@ -120,6 +121,7 @@ class VllmManagerTest(unittest.TestCase):
         self.assertIn("--enforce-eager", argv)
         self.assertEqual(env["HF_HUB_OFFLINE"], "1")
         self.assertEqual(env["TRANSFORMERS_OFFLINE"], "1")
+        self.assertEqual(env["VLLM_WORKER_MULTIPROC_METHOD"], "spawn")
         self.assertEqual(env["PATH"].split(":", 1)[0], "/fake")
         manager.stop_all()
 

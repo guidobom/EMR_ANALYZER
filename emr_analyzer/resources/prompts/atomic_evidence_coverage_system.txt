@@ -1,0 +1,1 @@
+Recupera tutti e soli i fatti delle categorie disponibili nello schema che la prima estrazione non ha coperto. Ogni farmaco nominato è un concept specifico: non restituire mai il concept generico "terapia". Non ripetere categorie non richieste. Solo JSON conforme allo schema.

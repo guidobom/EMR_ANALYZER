@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "prompts": [
+    {
+      "key": "patient_identity_system",
+      "label": "Attribuzione paziente — ruolo",
+      "pipeline": "0 · Attribuzione del documento",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 40
+    },
+    {
+      "key": "patient_identity_task",
+      "label": "Attribuzione paziente — istruzioni",
+      "pipeline": "0 · Attribuzione del documento",
+      "institutional_version": "institutional-v1",
+      "required_markers": ["confidence"],
+      "minimum_length": 80
+    },
+    {
+      "key": "clinical_text_system",
+      "label": "Estrazione testo clinico — ruolo",
+      "pipeline": "1 · Estrazione testo clinico",
+      "institutional_version": "institutional-v6",
+      "minimum_length": 80
+    },
+    {
+      "key": "clinical_text_instructions",
+      "label": "Estrazione testo clinico — istruzioni",
+      "pipeline": "1 · Estrazione testo clinico",
+      "institutional_version": "institutional-v6",
+      "required_markers": ["REGOLE OBBLIGATORIE"],
+      "minimum_length": 200
+    },
+    {
+      "key": "atomic_evidence_system",
+      "label": "Evidenze atomiche — ruolo",
+      "pipeline": "2 · Estrazione evidenze atomiche",
+      "institutional_version": "institutional-v10",
+      "minimum_length": 80
+    },
+    {
+      "key": "atomic_evidence_it",
+      "label": "Evidenze atomiche — istruzioni complete",
+      "pipeline": "2 · Estrazione evidenze atomiche",
+      "institutional_version": "institutional-v10",
+      "required_markers": ["Vincoli obbligatori", "source_refs"],
+      "minimum_length": 400
+    },
+    {
+      "key": "atomic_evidence_repair_system",
+      "label": "Evidenze atomiche — riparazione",
+      "pipeline": "2 · Estrazione evidenze atomiche",
+      "institutional_version": "institutional-v10",
+      "minimum_length": 80
+    },
+    {
+      "key": "atomic_evidence_coverage_system",
+      "label": "Evidenze atomiche — recupero copertura",
+      "pipeline": "2 · Estrazione evidenze atomiche",
+      "institutional_version": "institutional-v10",
+      "minimum_length": 80
+    },
+    {
+      "key": "clinical_fusion_system",
+      "label": "Fusione eventi clinici — ruolo",
+      "pipeline": "3 · Creazione eventi clinici",
+      "institutional_version": "institutional-v3",
+      "minimum_length": 60
+    },
+    {
+      "key": "clinical_fusion_task",
+      "label": "Fusione eventi clinici — istruzioni",
+      "pipeline": "3 · Creazione eventi clinici",
+      "institutional_version": "institutional-v3",
+      "required_markers": ["evidence_ids"],
+      "minimum_length": 150
+    },
+    {
+      "key": "evidence_relations_system",
+      "label": "Relazioni tra evidenze — ruolo",
+      "pipeline": "3 · Creazione eventi clinici",
+      "institutional_version": "institutional-v2",
+      "minimum_length": 60
+    },
+    {
+      "key": "evidence_relations_task",
+      "label": "Relazioni tra evidenze — istruzioni",
+      "pipeline": "3 · Creazione eventi clinici",
+      "institutional_version": "institutional-v2",
+      "required_markers": ["linked"],
+      "minimum_length": 80
+    },
+    {
+      "key": "episode_assembly_system",
+      "label": "Assemblaggio episodi — ruolo",
+      "pipeline": "3 · Creazione eventi clinici",
+      "institutional_version": "institutional-v3",
+      "minimum_length": 70
+    },
+    {
+      "key": "episode_assembly_task",
+      "label": "Assemblaggio episodi — istruzioni",
+      "pipeline": "3 · Creazione eventi clinici",
+      "institutional_version": "institutional-v3",
+      "required_markers": ["absorbed_event_ids", "related_event_ids"],
+      "minimum_length": 250
+    },
+    {
+      "key": "hypothesis_system",
+      "label": "Ipotesi cliniche — ruolo",
+      "pipeline": "4 · Ipotesi cliniche",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 60
+    },
+    {
+      "key": "hypothesis_task",
+      "label": "Ipotesi cliniche — istruzioni",
+      "pipeline": "4 · Ipotesi cliniche",
+      "institutional_version": "institutional-v1",
+      "required_markers": ["candidate_id"],
+      "minimum_length": 100
+    },
+    {
+      "key": "clinical_query_system",
+      "label": "Interrogazione registro — ruolo",
+      "pipeline": "5 · Consultazione del registro",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 120
+    },
+    {
+      "key": "narrative_profile_system",
+      "label": "Profilo narrativo — ruolo",
+      "pipeline": "5 · Consultazione del registro",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 100
+    },
+    {
+      "key": "narrative_profile_task",
+      "label": "Profilo narrativo — istruzioni",
+      "pipeline": "5 · Consultazione del registro",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 100
+    },
+    {
+      "key": "irae_system",
+      "label": "Analisi irAE — ruolo",
+      "pipeline": "6 · Analisi irAE",
+      "institutional_version": "institutional-v1",
+      "required_markers": ["tabella Markdown"],
+      "minimum_length": 80
+    }
+  ]
+}

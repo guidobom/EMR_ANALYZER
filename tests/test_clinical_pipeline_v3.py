@@ -249,6 +249,65 @@ def test_graph_clusters_multimodal_evidence_and_blocks_contradictions():
     )
 
 
+def test_later_negation_updates_the_episode_as_resolution_context():
+    present = _evidence(
+        "E1", "symptom", "dispnea", day="2025-01-01"
+    )
+    resolved = _evidence(
+        "E2", "symptom", "dispnea", assertion="absent",
+        day="2025-01-10",
+    )
+    resolved.clinical_status = "resolved"
+
+    result = EvidenceGraphBuilder().build(
+        "P1", [present, resolved], anchor_evidence_ids={"E1"}
+    )
+
+    assert result.relations[0].relation_type == "documents_resolution"
+    assert result.relations[0].cluster_effect == "context_only"
+    assert any(
+        set(cluster.evidence_ids) == {"E1", "E2"}
+        for cluster in result.clusters
+    )
+
+
+def test_every_primary_singleton_remains_visible_in_registry_candidates():
+    items = [
+        _evidence("E1", "symptom", "tosse"),
+        _evidence("E2", "laboratory_finding", "tsh_soppresso"),
+        _evidence("E3", "imaging_finding", "nodulo_polmonare"),
+    ]
+
+    result = EvidenceGraphBuilder().build(
+        "P1", items, anchor_evidence_ids={item.evidence_id for item in items}
+    )
+
+    represented = {
+        evidence_id
+        for cluster in result.clusters
+        for evidence_id in cluster.evidence_ids
+    }
+    assert represented == {"E1", "E2", "E3"}
+
+
+def test_therapy_and_procedure_remain_autonomous_primary_events():
+    symptom = _evidence("E1", "symptom", "dispnea")
+    therapy = _evidence("E2", "medication", "prednisone")
+    procedure = _evidence("E3", "procedure", "tac_torace")
+
+    result = EvidenceGraphBuilder().build(
+        "P1", [symptom, therapy, procedure],
+        anchor_evidence_ids={"E1", "E2", "E3"},
+    )
+
+    memberships = [set(cluster.evidence_ids) for cluster in result.clusters]
+    assert {"E1"} in memberships
+    assert {"E2"} in memberships
+    assert {"E3"} in memberships
+    assert not any({"E1", "E2"} <= membership for membership in memberships)
+    assert not any({"E1", "E3"} <= membership for membership in memberships)
+
+
 def test_graph_candidate_generation_is_bounded_not_quadratic():
     items = []
     start = date(2025, 1, 1)
