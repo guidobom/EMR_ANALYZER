@@ -29,7 +29,7 @@ for directory in (TOOLS_DIR, PROJECT_ROOT):
 from score_atomic_benchmark import EXCLUDED, _is_match, _pair_score
 from score_snomed_benchmark import _gold_snomed_events, _hierarchical_match
 
-from emr_analyzer.clinical.snomed import SnomedIndex, load_snapshot
+from emr_analyzer.clinical.snomed import SnomedIndex, load_gps, load_snapshot
 
 
 def _a_candidates(payload: dict) -> list[dict]:
@@ -181,9 +181,18 @@ def main() -> None:
     parser.add_argument("--case-ids", nargs="+", required=True)
     parser.add_argument("--a-dir", default="snomed")
     parser.add_argument("--b-dir", default="events")
+    parser.add_argument(
+        "--gps", action="store_true",
+        help="Source is the GPS freeset (interim CC BY-ND), not an RF2 release",
+    )
     args = parser.parse_args()
 
-    release = load_snapshot(args.release_dir)
+    # Same kind routing as the benchmark runs; GPS has no IS-A graph so the
+    # hierarchical code agreement degrades to exact matching.
+    release = (
+        load_gps(args.release_dir)
+        if args.gps else load_snapshot(args.release_dir)
+    )
     index = SnomedIndex(release.concepts.values())
     source = __import__("json").loads(
         (args.root / "sol" / "reference_all.json").read_text(encoding="utf-8")

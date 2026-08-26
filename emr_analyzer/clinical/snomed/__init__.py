@@ -28,6 +28,7 @@ from .domains import (  # noqa: E402
     is_event_like,
     semantic_tag,
 )
+from .gps_loader import load_gps  # noqa: E402
 from .index import SnomedIndex, normalize_tokens  # noqa: E402
 from .models import (  # noqa: E402
     DEFAULT_LANG_ORDER,
@@ -63,6 +64,7 @@ __all__ = [
     "candidate_digest",
     "fact_types_for_concept",
     "is_event_like",
+    "load_gps",
     "load_snapshot",
     "normalize_tokens",
     "semantic_tag",

@@ -114,6 +114,14 @@ python tools/score_snomed_benchmark.py \
   --runs qwen snomed
 ```
 
+In attesa della licenza MLDS, le run possono usare il **Global Patient Set**
+come pilota intermedio: stesso loader manager con `kind="gps"` (flag `--gps`
+nei comandi `snomed`/`events`), sorgente un TSV piatto
+`ConceptID | Active | FSN | USPreferredTerm` (CC BY-ND, file fuori repo).
+Limiti attesi rispetto al release RF2: nessun IS-A → `code_hierarchical`
+collassa su `code_exact`; solo US-English → `retrieval_recall` su corpus
+italiano degradato; nessun sinonimo.
+
 Definizione delle metriche (per caso, aggregate sul totale dei codici gold):
 
 | Metrica | Definizione |

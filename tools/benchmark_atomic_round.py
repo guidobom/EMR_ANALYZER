@@ -308,6 +308,7 @@ def run_snomed(
     langs: Iterable[str] = SNOMED_LANGUAGES,
     cap: int | None = None,
     min_score: float | None = None,
+    kind: str = "rf2",
 ) -> None:
     """Run Percorso A (SNOMED-constrained extraction) over the sample.
 
@@ -315,6 +316,9 @@ def run_snomed(
     diagnostics in the ``snomed`` block: release digest, candidate-set sizes,
     empty candidate chunks, the union of retrieved codes (the recall ceiling
     for constrained generation) and coded/unmapped atom counts.
+
+    ``kind`` selects the source: ``"rf2"`` (licensed release, default) or
+    ``"gps"`` (interim Global Patient Set freeset).
     """
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     if case_ids:
@@ -326,8 +330,8 @@ def run_snomed(
     target.mkdir(exist_ok=True)
 
     langs = tuple(langs) or tuple(SNOMED_LANGUAGES)
-    snapshot = snomed_manager.snapshot(release_dir, langs)
-    index = snomed_manager.index(release_dir, langs)
+    snapshot = snomed_manager.snapshot(release_dir, langs, kind=kind)
+    index = snomed_manager.index(release_dir, langs, kind=kind)
     effective_cap = cap if cap is not None else SNOMED_CANDIDATE_CAP
     effective_min = (
         min_score if min_score is not None else SNOMED_CANDIDATE_MIN_SCORE
@@ -500,6 +504,7 @@ def run_events(
     langs: Iterable[str] = SNOMED_LANGUAGES,
     cap: int | None = None,
     min_score: float | None = None,
+    kind: str = "rf2",
 ) -> None:
     """Run Percorso B (experimental direct events) over the sample.
 
@@ -507,6 +512,9 @@ def run_events(
     ``events`` payload with the direct-event records (closed-set codes and
     dates, grounded passages) plus the builder diagnostics.  Percorso B is a
     research prototype and never the default path.
+
+    ``kind`` selects the source: ``"rf2"`` (licensed release, default) or
+    ``"gps"`` (interim Global Patient Set freeset).
     """
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     if case_ids:
@@ -518,8 +526,8 @@ def run_events(
     target.mkdir(exist_ok=True)
 
     langs = tuple(langs) or tuple(SNOMED_LANGUAGES)
-    snapshot = snomed_manager.snapshot(release_dir, langs)
-    index = snomed_manager.index(release_dir, langs)
+    snapshot = snomed_manager.snapshot(release_dir, langs, kind=kind)
+    index = snomed_manager.index(release_dir, langs, kind=kind)
     effective_cap = cap if cap is not None else SNOMED_CANDIDATE_CAP
     effective_min = (
         min_score if min_score is not None else SNOMED_CANDIDATE_MIN_SCORE
@@ -791,6 +799,10 @@ def main() -> None:
     snomed.add_argument("--langs", nargs="*")
     snomed.add_argument("--cap", type=int)
     snomed.add_argument("--min-score", type=float)
+    snomed.add_argument(
+        "--gps", action="store_true",
+        help="Source is the GPS freeset (interim CC BY-ND), not an RF2 release",
+    )
     events = subparsers.add_parser("events")
     events.add_argument("--output", type=Path, required=True)
     events.add_argument("--release-dir", type=Path, required=True)
@@ -800,6 +812,10 @@ def main() -> None:
     events.add_argument("--langs", nargs="*")
     events.add_argument("--cap", type=int)
     events.add_argument("--min-score", type=float)
+    events.add_argument(
+        "--gps", action="store_true",
+        help="Source is the GPS freeset (interim CC BY-ND), not an RF2 release",
+    )
     args = parser.parse_args()
     if args.command == "sample":
         build_sample(args.projects_root, args.output)
@@ -813,6 +829,7 @@ def main() -> None:
             langs=tuple(args.langs or SNOMED_LANGUAGES),
             cap=args.cap,
             min_score=args.min_score,
+            kind="gps" if args.gps else "rf2",
         )
     elif args.command == "events":
         run_events(
@@ -824,6 +841,7 @@ def main() -> None:
             langs=tuple(args.langs or SNOMED_LANGUAGES),
             cap=args.cap,
             min_score=args.min_score,
+            kind="gps" if args.gps else "rf2",
         )
     else:
         run_qwen(

@@ -34,7 +34,7 @@ for directory in (TOOLS_DIR, PROJECT_ROOT):
 
 from score_atomic_benchmark import _load_augmented_reference, _is_match, score_run
 
-from emr_analyzer.clinical.snomed import SnomedIndex, load_snapshot
+from emr_analyzer.clinical.snomed import SnomedIndex, load_gps, load_snapshot
 
 
 def _gold_snomed_events(case_events: list[dict]) -> list[dict]:
@@ -143,9 +143,18 @@ def main() -> None:
     parser.add_argument("--case-ids", nargs="+", required=True)
     parser.add_argument("--run-dir", default="snomed")
     parser.add_argument("--runs", nargs="+", default=("qwen", "snomed"))
+    parser.add_argument(
+        "--gps", action="store_true",
+        help="Source is the GPS freeset (interim CC BY-ND), not an RF2 release",
+    )
     args = parser.parse_args()
 
-    release = load_snapshot(args.release_dir)
+    # ``_hierarchical_match`` needs the IS-A graph, which GPS lacks (the metric
+    # degrades to exact matching); load via the same kind as the run.
+    release = (
+        load_gps(args.release_dir)
+        if args.gps else load_snapshot(args.release_dir)
+    )
     index = SnomedIndex(release.concepts.values())
 
     reference_path = args.root / "sol" / "reference_all.json"
