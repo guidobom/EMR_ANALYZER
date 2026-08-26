@@ -93,6 +93,12 @@ class SnomedIndex:
     def concept(self, code: str) -> SnomedConcept | None:
         return self._concepts.get(code)
 
+    def has_token(self, token: str) -> bool:
+        """Whether any indexed term contains the exact token (e.g. a literal
+        abbreviation like ``spo2``).  Lets the retriever decide whether the
+        release's own description surface already resolves an abbreviation."""
+        return token in self._token_postings
+
     def parents(self, code: str) -> frozenset[str]:
         concept = self._concepts.get(code)
         return concept.parents if concept else frozenset()
