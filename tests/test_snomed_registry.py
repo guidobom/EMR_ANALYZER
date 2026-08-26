@@ -53,15 +53,15 @@ FIXTURE_DIR = (
 
 
 class _SnomedLlm:
-    """Fake LLM always emitting the valid constrained code for ``diabete``."""
+    """Fake LLM emitting a valid constrained SNOMED code for the chunk."""
 
     model = "fake-snomed-medical"
     context_length = 32768
     max_output_tokens = 4096
     is_available = True
 
-    def generate_structured(self, prompt, system, schema, **kwargs):
-        return {
+    def __init__(self, response=None):
+        self._response = response or {
             "diagnosis": [
                 {
                     "snomed_code": "44054006",
@@ -70,6 +70,9 @@ class _SnomedLlm:
                 },
             ],
         }
+
+    def generate_structured(self, prompt, system, schema, **kwargs):
+        return self._response
 
 
 def _seed(db: DatabaseEngine) -> None:
@@ -196,31 +199,36 @@ class TestVariantConstants:
         )
 
 
+def _run_snomed_extraction(db, *, text, response=None):
+    """Run the atomic stage through the registry with the SNOMED variant."""
+    old_workspace = active_workspace.path
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "workspace"
+        extraction = workspace / "P001" / "extraction"
+        extraction.mkdir(parents=True)
+        (extraction / "D1.md").write_text(text, encoding="utf-8")
+        active_workspace.set_path(workspace)
+        builder = ClinicalRegistryBuilder(
+            atomic_llm_client=_SnomedLlm(response=response),
+            pipeline_policy=_snomed_policy(),
+            **_repos(db),
+        )
+        try:
+            result = builder.extract_atomic_evidence(
+                "P001", incremental=False, num_workers=1
+            )
+        finally:
+            active_workspace.set_path(old_workspace)
+    return builder, result
+
+
 class TestAtomicExtractionPersistence:
     def test_snomed_atoms_persist_with_terminology_payload(
         self, db, snapshot
     ):
-        old_workspace = active_workspace.path
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp) / "workspace"
-            extraction = workspace / "P001" / "extraction"
-            extraction.mkdir(parents=True)
-            (extraction / "D1.md").write_text(
-                "Il paziente ha diabete mellito di tipo 2.",
-                encoding="utf-8",
-            )
-            active_workspace.set_path(workspace)
-            builder = ClinicalRegistryBuilder(
-                atomic_llm_client=_SnomedLlm(),
-                pipeline_policy=_snomed_policy(),
-                **_repos(db),
-            )
-            try:
-                result = builder.extract_atomic_evidence(
-                    "P001", incremental=False, num_workers=1
-                )
-            finally:
-                active_workspace.set_path(old_workspace)
+        builder, result = _run_snomed_extraction(
+            db, text="Il paziente ha diabete mellito di tipo 2.",
+        )
 
         assert result["total_entries"] >= 1
         evidence = builder.evidence_repo.get_by_patient("P001")
@@ -246,3 +254,33 @@ class TestAtomicExtractionPersistence:
         parameters = json.loads(row["parameters_json"])
         assert parameters["atomic_variant"] == "snomed"
         assert parameters["snomed_release_digest"] == snapshot.digest
+
+    def test_abbreviation_fallback_resolves_through_registry(self, db):
+        # ``HT`` is not a literal token in the fixture index, so the curated
+        # abbreviation fallback is what lets the retriever recall hypertension.
+        # This exercises the fallback end-to-end through the registry builder.
+        builder, result = _run_snomed_extraction(
+            db,
+            text="Il paziente presenta HT.",
+            response={
+                "diagnosis": [
+                    {
+                        "snomed_code": "38341003",
+                        "polarity": "present",
+                        "source_refs": [1],
+                    },
+                ],
+            },
+        )
+
+        assert result["total_entries"] >= 1
+        evidence = builder.evidence_repo.get_by_patient("P001")
+        snomed_atoms = [
+            e for e in evidence if e.terminology_system == "SNOMED CT"
+        ]
+        assert len(snomed_atoms) == 1
+        atom = snomed_atoms[0]
+        assert atom.terminology_code == "38341003"
+        assert atom.canonical_label == "Ipertensione arteriosa"
+        assert atom.extraction_method == "llm_atomic_snomed_v1"
+        assert atom.mapping_status == "resolved_llm"
