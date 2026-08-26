@@ -72,6 +72,19 @@ class DeterministicTerminologyResolver:
         return [self.resolve(item) for item in evidence]
 
     def resolve(self, item):
+        # A code already assigned by the constrained SNOMED stage is final.
+        # Without this early return the lab block below would rewrite a
+        # SNOMED-coded laboratory atom through the parameter normalizer and a
+        # LOINC mapping could then overwrite the code.  Preserve the label,
+        # promote an unmapped status, and stop.
+        if item.terminology_system == "SNOMED CT" and item.terminology_code:
+            if item.mapping_status == "unmapped":
+                item.mapping_status = "resolved_llm"
+            item.canonical_label = item.canonical_label or (
+                item.normalized_entity or item.concept_original
+            )
+            return item
+
         original_unit = str(item.unit or "")
         if item.fact_type == "laboratory_test" or item.category == (
             "laboratory_finding"
