@@ -109,6 +109,33 @@ class TestLoadSnapshot:
         # Only English is present: Italian is tolerated as missing.
         assert snapshot.languages == ("en",)
 
+    def test_national_namespace_descriptions_are_merged(self, tmp_path):
+        # A national extension (e.g. the Italian edition) ships its descriptions
+        # under a national namespace rather than ``_INT_``.  The loader must
+        # still merge them so the full-language RAG is usable.
+        root = _write_mini_release(tmp_path, languages=("en",))
+        it_rows = [
+            {"id": f"80000{i}", "effectiveTime": "20260101", "active": "1",
+             "moduleId": "900000000000207008", "conceptId": "99900001",
+             "languageCode": "it", "typeId": "900000000000013009",
+             "term": "Disturbo di prova",
+             "caseSignificanceId": "900000000000448009"}
+            for i in range(2)
+        ]
+        (root / "sct2_Description_Full-it_IT_20260101.txt").write_text(
+            "|".join(DESCRIPTION_HEADER) + "\n"
+            + "".join("|".join(row[c] for c in DESCRIPTION_HEADER) + "\n"
+                      for row in it_rows),
+            encoding="utf-8",
+        )
+        snapshot = load_snapshot(root, languages=("en", "it"))
+        assert set(snapshot.languages) == {"en", "it"}
+        concept = snapshot.concept("99900001")
+        assert any(
+            d.lang == "it" and d.term == "Disturbo di prova"
+            for d in concept.descriptions
+        )
+
     def test_reordered_header_is_tolerated(self, tmp_path):
         root = _write_mini_release(tmp_path, with_concept_headers=False)
         snapshot = load_snapshot(root)

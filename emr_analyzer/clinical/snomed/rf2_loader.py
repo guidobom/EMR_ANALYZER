@@ -30,8 +30,12 @@ from .models import (
 
 
 CONCEPT_FILENAME_RE = re.compile(r"^sct2_Concept_(Full|Snapshot)_INT_.*\.txt$")
+# The namespace segment accepts ``INT`` plus any two-letter national extension
+# namespace (e.g. the Italian edition ships ``-it_IT_``): those files carry the
+# Italian descriptions that make the full SNOMED CT RAG usable on an Italian
+# clinical corpus.  ``_INT_`` remains the international baseline.
 DESCRIPTION_FILENAME_RE = re.compile(
-    r"^sct2_Description_(Full|Snapshot)-([A-Za-z]+)_INT_.*\.txt$"
+    r"^sct2_Description_(Full|Snapshot)-([A-Za-z]+)_(?:INT|[A-Z]{2})_.*\.txt$"
 )
 RELATIONSHIP_FILENAME_RE = re.compile(
     r"^sct2_Relationship_(Full|Snapshot)_INT_.*\.txt$"
