@@ -1,5 +1,6 @@
 """Centralized configuration for EMR Analyzer."""
 
+import os
 from pathlib import Path
 
 # --- Application paths ---
@@ -100,6 +101,17 @@ CLINICAL_STATE_LLM_MODEL_NAME = "qwen3-14b"
 # Default model for LlmClient when no LLMRoleConfig is provided.
 DEFAULT_LLM_MODEL_NAME = DOCUMENT_LLM_MODEL_NAME
 LLM_DEFAULT_CONTEXT_LENGTH = 32768
+
+# SNOMED CT release + candidate-retrieval defaults.  RF2 release data is
+# licensed and never committed to the repository; it lives outside the repo in
+# a user-supplied directory (Fase 0), configured here or in settings.json.
+SNOMED_RELEASE_DIR = Path(
+    os.environ.get("EMR_ANALYZER_SNOMED_RELEASE_DIR", "")
+    or (BASE_DIR / "snomed" / "releases")
+)
+SNOMED_LANGUAGES: tuple[str, ...] = ("en", "it")
+SNOMED_CANDIDATE_CAP = 32
+SNOMED_CANDIDATE_MIN_SCORE = 0.2
 
 # Legacy Ollama constants, kept only for old persisted settings compatibility.
 OLLAMA_BASE_URL = "http://localhost:11434"

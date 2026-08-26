@@ -429,6 +429,14 @@ class ClinicalPipelinePolicy:
     cohesive_threshold: float = 0.72
     bridge_split_threshold: float = 0.58
     lab: LabEvidencePolicy = field(default_factory=LabEvidencePolicy)
+    # Atomic extraction variant: "standard" (free-text concept) or "snomed"
+    # (closed per-chunk SNOMED candidate enum).  The SNOMED variant requires a
+    # licensed RF2 release in ``snomed_release_dir``.
+    atomic_extraction_variant: str = "standard"
+    snomed_release_dir: str = ""
+    snomed_languages: tuple[str, ...] = ("en", "it")
+    snomed_candidate_cap: int = 32
+    snomed_candidate_min_score: float = 0.2
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ClinicalPipelinePolicy":
@@ -478,7 +486,37 @@ class ClinicalPipelinePolicy:
             cohesive_threshold=floating("cohesive_threshold", 0.72),
             bridge_split_threshold=floating("bridge_split_threshold", 0.58),
             lab=LabEvidencePolicy.from_dict(payload.get("lab", {})),
+            atomic_extraction_variant=_atomic_variant(payload),
+            snomed_release_dir=str(
+                payload.get("snomed_release_dir", "") or ""
+            ).strip(),
+            snomed_languages=_snomed_languages(payload.get("snomed_languages")),
+            snomed_candidate_cap=integer("snomed_candidate_cap", 32, 8, 64),
+            snomed_candidate_min_score=floating(
+                "snomed_candidate_min_score", 0.2
+            ),
         )
+
+
+def _atomic_variant(payload: dict) -> str:
+    variant = str(
+        payload.get("atomic_extraction_variant", "standard")
+    ).strip().casefold()
+    return variant if variant in {"standard", "snomed"} else "standard"
+
+
+def _snomed_languages(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        parsed = tuple(
+            token.strip() for token in value.split(",") if token.strip()
+        )
+    elif isinstance(value, (list, tuple)):
+        parsed = tuple(
+            str(token).strip() for token in value if str(token).strip()
+        )
+    else:
+        parsed = ()
+    return parsed or ("en", "it")
 
 
 def load_pipeline_policy(

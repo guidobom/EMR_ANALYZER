@@ -72,6 +72,19 @@ from ..models.clinical_pipeline import (
 )
 from ..settings import load_pipeline_policy
 
+# Version constants of the SNOMED-constrained atomic variant.  Imported from
+# the lightweight snomed package surface; the extractor class and prompt digest
+# are imported lazily only when the variant is actually selected.
+from .snomed import (  # noqa: E402
+    SNOMED_ATOMIC_PIPELINE_VERSION,
+    SNOMED_ATOMIC_PROMPT_VERSION,
+)
+
+# Extraction methods produced by the narrative atomic LLM stage (standard
+# free-text and the SNOMED-constrained variant).  Selects which evidence is
+# eligible for exact-block reuse across documents.
+_LLM_ATOMIC_EXTRACTION_METHODS = {"llm_atomic_v2", "llm_atomic_snomed_v1"}
+
 
 class RegistryBuildCancelled(RuntimeError):
     """Safe cooperative cancellation of a registry build."""
@@ -122,9 +135,81 @@ class ClinicalRegistryBuilder:
         self.pipeline_repo = pipeline_repo
         self.pipeline_policy = pipeline_policy or load_pipeline_policy()
         self.db = db or timeline_repo.db
-        self.atomic_extractor = (
-            AtomicEvidenceExtractor(self.atomic_llm, policy=self.pipeline_policy)
-            if self.atomic_llm else None
+        if self.atomic_llm and (
+            self.pipeline_policy.atomic_extraction_variant == "snomed"
+        ):
+            self.atomic_extractor = self._build_snomed_extractor(self.atomic_llm)
+        else:
+            self.atomic_extractor = (
+                AtomicEvidenceExtractor(
+                    self.atomic_llm, policy=self.pipeline_policy
+                )
+                if self.atomic_llm else None
+            )
+
+    def _build_snomed_extractor(self, llm):
+        """Build the SNOMED-constrained extractor for the active policy.
+
+        Requires a licensed RF2 release; a missing/unconfigured release is a
+        configuration error raised immediately rather than a silent fallback
+        that would quietly change the extraction contract.
+        """
+        from ..config import (
+            SNOMED_CANDIDATE_CAP,
+            SNOMED_CANDIDATE_MIN_SCORE,
+            SNOMED_LANGUAGES,
+            SNOMED_RELEASE_DIR,
+        )
+        from .snomed import SnomedCandidateRetriever, SnomedIndex
+        from .snomed.extractor import SnomedAtomicEvidenceExtractor
+        from .snomed.release_manager import manager as snomed_manager
+
+        policy = self.pipeline_policy
+        release_dir = str(policy.snomed_release_dir or SNOMED_RELEASE_DIR)
+        languages = tuple(policy.snomed_languages) or tuple(SNOMED_LANGUAGES)
+        snapshot = snomed_manager.snapshot(release_dir, languages)
+        index = snomed_manager.index(release_dir, languages)
+        retriever = SnomedCandidateRetriever(
+            index,
+            langs=languages,
+            cap=policy.snomed_candidate_cap or SNOMED_CANDIDATE_CAP,
+            min_score=(
+                policy.snomed_candidate_min_score
+                if policy.snomed_candidate_min_score is not None
+                else SNOMED_CANDIDATE_MIN_SCORE
+            ),
+            release_digest=snapshot.digest,
+        )
+        return SnomedAtomicEvidenceExtractor(
+            llm, retriever=retriever, policy=policy
+        )
+
+    def _atomic_prompt_constants(
+        self,
+    ) -> tuple[str, str, str, str | None]:
+        """Variant-aware atomic constants for checkpoints and manifest rows.
+
+        Returns ``(pipeline_version, prompt_version, prompt_digest,
+        release_digest|None)``.  The SNOMED variant uses its own version/digest
+        constants and includes the RF2 release digest so that swapping the
+        release re-extracts even when the retrieved candidate codes happen to
+        be unchanged.
+        """
+        retriever = getattr(self.atomic_extractor, "retriever", None)
+        if retriever is not None:
+            from .snomed.extractor import SNOMED_ATOMIC_PROMPT_DIGEST
+
+            return (
+                SNOMED_ATOMIC_PIPELINE_VERSION,
+                SNOMED_ATOMIC_PROMPT_VERSION,
+                SNOMED_ATOMIC_PROMPT_DIGEST,
+                str(getattr(retriever, "release_digest", "") or "") or None,
+            )
+        return (
+            ATOMIC_PIPELINE_VERSION,
+            ATOMIC_PROMPT_VERSION,
+            ATOMIC_PROMPT_DIGEST,
+            None,
         )
 
     def reload_policy(self) -> None:
@@ -190,6 +275,13 @@ class ClinicalRegistryBuilder:
         input_evidence_hash = _evidence_hash(
             self.evidence_repo.get_by_patient(patient_id)
         ) if mode == "events" else ""
+        (
+            _atomic_pipeline_version,
+            _atomic_prompt_version,
+            _atomic_prompt_digest,
+            _release_digest,
+        ) = self._atomic_prompt_constants()
+        _atomic_variant_label = "snomed" if _release_digest else "standard"
         run = ProcessingRun(
             patient_id=patient_id,
             stage={
@@ -202,17 +294,22 @@ class ClinicalRegistryBuilder:
                 if mode == "events" else
                 self.atomic_extractor.model_name if self.atomic_extractor else None
             ),
+            # The atomic stage is skipped when only events are built, so these
+            # constants describe the atomic variant actually in use (standard
+            # vs SNOMED-constrained) rather than a hard-coded default.
             model_digest=(
                 event_model_digest if mode == "events" else atomic_model_digest
             ),
-            prompt_version=ATOMIC_PROMPT_VERSION,
+            prompt_version=_atomic_prompt_version,
             parameters={
                 "incremental": incremental,
                 "requested_workers": num_workers,
                 "document_count": len(documents),
                 "mode": mode,
                 "input_evidence_hash": input_evidence_hash,
-                "atomic_prompt_digest": ATOMIC_PROMPT_DIGEST,
+                "atomic_prompt_digest": _atomic_prompt_digest,
+                "atomic_variant": _atomic_variant_label,
+                "snomed_release_digest": _release_digest,
                 "atomic_model": getattr(self.atomic_llm, "model", None),
                 "event_model": getattr(self.event_llm, "model", None),
                 "aggregation_engine": self.pipeline_policy.aggregation_engine,
@@ -266,7 +363,8 @@ class ClinicalRegistryBuilder:
                 ) if self.overlay_repo else base_text
                 input_hash = content_hash(
                     effective_text, doc.document_date, doc.document_type,
-                    ATOMIC_PROMPT_VERSION, ATOMIC_PROMPT_DIGEST,
+                    _atomic_prompt_version, _atomic_prompt_digest,
+                    _release_digest,
                 )
                 # Current documents remain eligible as canonical sources for
                 # exact-block reuse by new/interrupted targets.  They are not
@@ -276,7 +374,7 @@ class ClinicalRegistryBuilder:
                 current = (incremental or not run_atomic) and (
                     self.processing_repo.is_current(
                         doc.id, "atomic_evidence", input_hash,
-                        ATOMIC_PIPELINE_VERSION, ATOMIC_PROMPT_VERSION,
+                        _atomic_pipeline_version, _atomic_prompt_version,
                         atomic_model_digest,
                         compatible_pipeline_versions=(
                             ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS
@@ -353,8 +451,8 @@ class ClinicalRegistryBuilder:
                 item = ProcessingManifestItem(
                     patient_id=patient_id, document_id=doc.id,
                     stage="atomic_evidence", input_hash=input_hash,
-                    pipeline_version=ATOMIC_PIPELINE_VERSION,
-                    run_id=run.run_id, prompt_version=ATOMIC_PROMPT_VERSION,
+                    pipeline_version=_atomic_pipeline_version,
+                    run_id=run.run_id, prompt_version=_atomic_prompt_version,
                     model_digest=atomic_model_digest, status="running",
                 )
                 self.processing_repo.upsert_manifest(item)
@@ -543,7 +641,7 @@ class ClinicalRegistryBuilder:
                         item for item in self.evidence_repo.get_by_document(
                             document_id
                         )
-                        if item.extraction_method == "llm_atomic_v2"
+                        if item.extraction_method in _LLM_ATOMIC_EXTRACTION_METHODS
                     ]
                     source_evidence_cache[document_id] = cached
                 return cached
@@ -1004,7 +1102,7 @@ class ClinicalRegistryBuilder:
                             "elapsed_seconds": elapsed,
                         },
                         model_used=getattr(self.atomic_llm, "model", None),
-                        model_version=ATOMIC_PROMPT_VERSION,
+                        model_version=_atomic_prompt_version,
                         run_id=run.run_id,
                     )
                 if progress_callback:
@@ -1430,7 +1528,7 @@ class ClinicalRegistryBuilder:
                         "elapsed_seconds": elapsed,
                     },
                     model_used=run.model_name,
-                    model_version=ATOMIC_PROMPT_VERSION,
+                    model_version=run.prompt_version,
                     run_id=run.run_id,
                 )
             if progress_callback:
