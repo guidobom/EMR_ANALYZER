@@ -88,3 +88,48 @@ anomalie ematochimiche narrative, emogasanalisi, transizioni farmacologiche,
 azioni pianificate/eseguite, date retrospettive e reperti negativi rilevanti.
 Sensibilità e precisione definitive devono essere calcolate su documenti non
 usati per modificare il prompt, con revisori clinici ciechi alla versione.
+
+## Percorso A — estrazione SNOMED-vincolata (branch `snomed`)
+
+La sezione documenta il tooling di benchmark del Percorso A e le metriche;
+i valori vengono compilati dopo la prima run reale sul release licenziato
+(Fase 0 del piano: acquisizione via MLDS). Con la generazione vincolata l'LLM
+può emettere solo codici del set candidato per chunk: **il retrieval è quindi
+il tetto del recall** e la metrica che lo isola è `retrieval_recall`.
+
+Comandi:
+
+```bash
+# Run Percorso A (stessa infrastruttura sample/manifest del baseline).
+python tools/benchmark_atomic_round.py snomed \
+  --output /tmp/bench --release-dir <RELEASE> \
+  --cap 32 --min-score 0.2
+
+# Scoring contro l'annotazione SNOMED utente (gold esterno, stile
+# sol/reference_all.json con snomed_code sugli eventi).
+python tools/score_snomed_benchmark.py \
+  --root /tmp/bench \
+  --release-dir <RELEASE> \
+  --case-ids <TC1> ... \
+  --runs qwen snomed
+```
+
+Definizione delle metriche (per caso, aggregate sul totale dei codici gold):
+
+| Metrica | Definizione |
+|---|---|
+| `retrieval_recall` | Quota dei codici gold presenti nell'unione `retrieved_codes` del caso (dal blocco `snomed` del payload). Diagnostico chiave: isola il retrieval dal LLM. |
+| `code_exact` | Quota dei codici gold emessi verbatim. |
+| `code_hierarchical` | Quota dei codici gold emessi verbatim o come antenato/discente IS-A del codice emesso (navigazione sull'indice del release). |
+| `code_mismatch` | Quota dei codici gold senza corrispondenza gerarchica. |
+| `snomed_coverage` | Quota degli eventi gold con `snomed_code` catturati come atomo codificato (match semantico, indipendente dall'identità del codice). |
+| `semantic_proxy` | Le proxy semantiche a livello atomo (`score_run`) sugli stessi casi, per A/B comparabile baseline-vs-SNOMED. |
+
+Il payload per caso in `snomed/<case>.json` espone anche `release_digest`,
+`candidate_chunks`, `empty_candidate_chunks`, `candidate_set_sizes(_avg)`,
+`coded_atoms`/`unmapped_atoms` e `mapped_by_fact_type`. Il fallback
+abbreviazioni (dizionario curato in `resources/snomed_abbreviations.json`)
+alza `retrieval_recall` per token come `HT`, `DM`, `SO2` assenti come token
+letterali del release.
+
+Valori della prima run reale (da compilare): *pending*.
