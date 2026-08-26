@@ -133,3 +133,32 @@ alza `retrieval_recall` per token come `HT`, `DM`, `SO2` assenti come token
 letterali del release.
 
 Valori della prima run reale (da compilare): *pending*.
+
+### Percorso B — eventi diretti da RAG (sperimentale)
+
+`DirectSnomedEventBuilder` salta lo strato atomico: per ogni chunk produce
+eventi a livello documento con lo stesso contratto closed-set (`snomed_code`
+`enum` sui candidati *event-like*, `observed_date` `enum` sulle date
+grounded nel testo, `source_refs` di frasi esatte). Gli eventi di laboratorio
+sono deterministici (righe fuori range mappate tramite l'indice), mai via LLM.
+Il percorso è marcatamente sperimentale e non è mai il default.
+
+```bash
+# Run Percorso B (stessa infrastruttura di `snomed`).
+python tools/benchmark_atomic_round.py events \
+  --output /tmp/bench --release-dir <RELEASE>
+
+# Confronto event-level: Percorso A (`snomed/`) vs Percorso B (`events/`)
+# vs reference (stesso gold esterno).
+python tools/score_direct_events.py \
+  --root /tmp/bench \
+  --release-dir <RELEASE> \
+  --case-ids <TC1> ...
+```
+
+Metriche (per caso, aggregate): recall/precision di A (atomi codificati) e di B
+(eventi diretti) contro gli eventi di reference (match semantico `_is_match`);
+accordo codice di A e di B (exact / gerarchico IS-A) sui gold con `snomed_code`;
+`B_date_agreement` (date uguali sulle coppie matchate); `B_grounded` (quota di
+eventi B con passaggio sorgente esatto). Valori della prima run reale (da
+compilare): *pending*.
