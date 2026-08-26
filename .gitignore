@@ -57,6 +57,8 @@ identity.key
 *.tsv
 *.xls
 *.xlsx
+# Synthetic SNOMED fixture manifest: a test oracle, not patient/export data.
+!tests/fixtures/snomed_rf2/concepts.csv
 
 # Clinical documents and images: never commit real patient data
 *.pdf
