@@ -20,6 +20,7 @@ def _lab(
     abnormal: bool = False,
     flag: str | None = None,
     source: str | None = None,
+    material: str | None = None,
 ) -> LabValue:
     return LabValue(
         patient_id="P001",
@@ -35,6 +36,7 @@ def _lab(
         flag=flag,
         sample_date="2025-04-12",
         page=2,
+        biological_material=material,
         source_text=source or f"{name} {value:g} mg/dL {low}-{high}",
     )
 
@@ -132,6 +134,77 @@ def test_narrative_lab_filter_removes_only_same_deterministic_measurement():
 
     assert removed == 1
     assert kept == [pattern]
+
+
+def test_narrative_urine_claim_not_suppressed_by_blood_row():
+    deterministic = abnormal_lab_evidence(
+        patient_id="P001", document_id="D_LAB",
+        document_date="2025-04-13",
+        lab_values=[_lab("Emoglobina", 7.0, flag="L", material=None)],
+    )
+    urine_claim = ClinicalEvidence(
+        patient_id="P001", document_id="D_LAB",
+        category="laboratory_finding", fact_type="laboratory_test",
+        normalized_entity="Emoglobina", source_text="Emoglobina 7 mg/dL",
+        observed_date="2025-04-12", numeric_value=7.0, unit="mg/dL",
+        typed_payload={
+            "parameter_name": "Emoglobina",
+            "biological_material": "urine",
+        },
+    )
+
+    kept, removed = filter_narrative_lab_duplicates(
+        [urine_claim], deterministic
+    )
+
+    assert removed == 0
+    assert kept == [urine_claim]
+
+
+def test_material_match_still_suppresses():
+    deterministic = abnormal_lab_evidence(
+        patient_id="P001", document_id="D_LAB",
+        document_date="2025-04-13",
+        lab_values=[_lab("Emoglobina", 7.0, flag="L", material="urine")],
+    )
+    urine_claim = ClinicalEvidence(
+        patient_id="P001", document_id="D_LAB",
+        category="laboratory_finding", fact_type="laboratory_test",
+        normalized_entity="Emoglobina", source_text="Emoglobina 7 mg/dL",
+        observed_date="2025-04-12", numeric_value=7.0, unit="mg/dL",
+        typed_payload={
+            "parameter_name": "Emoglobina",
+            "biological_material": "urine",
+        },
+    )
+
+    kept, removed = filter_narrative_lab_duplicates(
+        [urine_claim], deterministic
+    )
+
+    assert removed == 1
+    assert kept == []
+
+
+def test_material_missing_vs_missing_still_suppresses():
+    deterministic = abnormal_lab_evidence(
+        patient_id="P001", document_id="D_LAB",
+        document_date="2025-04-13",
+        lab_values=[_lab("PCR", 12.0, flag="H")],
+    )
+    repeated = ClinicalEvidence(
+        patient_id="P001", document_id="D_LAB",
+        category="laboratory_finding", fact_type="laboratory_test",
+        normalized_entity="PCR elevata", source_text="PCR 12 mg/dL elevata",
+        observed_date="2025-04-12", numeric_value=12.0, unit="mg/dL",
+    )
+
+    kept, removed = filter_narrative_lab_duplicates(
+        [repeated], deterministic
+    )
+
+    assert removed == 1
+    assert kept == []
 
 
 def test_abnormal_lab_without_source_passage_is_not_promoted_to_evidence():

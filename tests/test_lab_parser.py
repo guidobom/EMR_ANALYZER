@@ -465,5 +465,134 @@ Referto Completo
         self.assertEqual(result, "laboratorio")
 
 
+def test_urine_hemoglobin_is_specimen_suffixed():
+    text = """[0] ESAME URINE COMPLETO
+Emoglobina : 0.20 mg/dl Assente
+[0] EMOCROMO
+HGB : 12.2 g/dl 11.5 - 16.5
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    by_name = {lv.normalized_name: lv for lv in values}
+    urine = by_name["emoglobina_urine"]
+    assert urine.value == 0.2
+    assert urine.unit == "mg/dL"
+    assert urine.biological_material == "urine"
+    blood = by_name["emoglobina"]
+    assert blood.value == 12.2
+    assert blood.biological_material is None
+
+
+def test_serum_proteine_after_urine_section_is_not_suffixed():
+    text = """[0] ESAME URINE COMPLETO
+Proteine : 20 * mg/dl 0 - 15
+[0] PROTEINE: 6.0 * g/dl 6.6 - 8.3
+[0] ELETTROFORESI PROTEINE
+Albumina : 52.5 * %
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    by_name = {lv.normalized_name: lv for lv in values}
+    assert by_name["proteine_urine"].value == 20.0
+    assert by_name["proteine_urine"].biological_material == "urine"
+    assert by_name["proteine"].value == 6.0
+    assert by_name["proteine"].biological_material is None
+    assert "albumina" in by_name
+
+
+def test_doc_level_urine_material_suffixes_all_rows():
+    text = """Materiale: Urina
+Emoglobina : 0.20 mg/dl
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    assert [lv.normalized_name for lv in values] == ["emoglobina_urine"]
+    assert values[0].biological_material == "urine"
+
+
+def test_urine_sediment_counts_suffixed_and_blood_counts_not():
+    text = """[0] ESAME URINE COMPLETO
+Eritrociti: 56 /ul 0 - 15
+Leucociti: 10 /ul 0 - 20
+[0] EMOCROMO
+LEUCOCITI: 10 x10^3/ul 4 - 10
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    by_name = {lv.normalized_name: lv for lv in values}
+    assert "eritrociti_urine" in by_name
+    assert "leucociti_urine" in by_name
+    assert "leucociti" in by_name
+
+
+def test_glucosio_textual_urine_suffixed_numeric_not():
+    text = """[0] ESAME URINE COMPLETO
+Glucosio : Assente mg/dl Assente
+[0] EMOCROMO
+GLUCOSIO : 135 * mg/dl 70 - 110
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    by_name = {lv.normalized_name: lv for lv in values}
+    assert by_name["glucosio_urine"].value_text == "ASSENTE"
+    assert by_name["glucosio"].value == 135.0
+
+
+def test_markdown_table_row_in_urine_section_is_suffixed():
+    text = """[0] ESAME URINE COMPLETO
+| Esame | Esito | (flag) | U.M. | Intervalli Riferimento |
+|---|---|---|---|---|
+| Emoglobina : | 0.20 | | mg/dL | Assente |
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    by_name = {lv.normalized_name: lv for lv in values}
+    assert by_name["emoglobina_urine"].value == 0.2
+    assert by_name["emoglobina_urine"].biological_material == "urine"
+
+
+def test_dataframe_tables_use_document_specimen():
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        [["Emoglobina", "0.20", "mg/dL", "Assente"]],
+        columns=["Esame", "Valore", "U.M.", "Intervalli"],
+    )
+    values = LabParser().parse(
+        "Materiale: Urina\n", tables=[frame],
+        patient_id="P", document_id="D",
+    )
+    assert [lv.normalized_name for lv in values] == ["emoglobina_urine"]
+    assert values[0].biological_material == "urine"
+
+    serum_values = LabParser().parse(
+        "Materiale: Siero\n", tables=[frame],
+        patient_id="P", document_id="D",
+    )
+    assert [lv.normalized_name for lv in serum_values] == ["emoglobina"]
+    assert serum_values[0].biological_material is None
+
+
+def test_noise_coordinatrice_rows_rejected():
+    text = """Coordinatrice HGB : 12.2 g/dl
+HGB : 12.2 g/dl 11.5 - 16.5
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    assert [lv.normalized_name for lv in values] == ["emoglobina"]
+
+
+def test_noise_range_artifact_rejected():
+    text = """(30.0 - 35.0), PLT : 249 x10^3/ul
+DAY SERVICE - 5.80, Emoglobina : 12.2 g/dl
+Emoglobina : 12.2 g/dl 11.5 - 16.5
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    assert [lv.normalized_name for lv in values] == ["emoglobina"]
+
+
+def test_hyphenated_real_analytes_survive_noise_filter():
+    text = """Ricerca Antigene SARS-CoV-2 : NEGATIVO
+CA 19-9 : 35 U/mL
+Anti HAV - IgM : NEGATIVO
+CK-MB (massa) : 21 ng/mL
+"""
+    values = LabParser().parse(text, patient_id="P", document_id="D")
+    assert len(values) == 4
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

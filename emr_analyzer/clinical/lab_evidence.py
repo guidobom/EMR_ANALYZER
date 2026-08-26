@@ -264,11 +264,18 @@ def _laboratory_comparison_key(item: ClinicalEvidence):
     parameter_key = _normalize_lab_parameter(parameter)
     if not parameter_key:
         return None
+    payload = item.typed_payload or {}
+    material = (
+        payload.get("biological_material")
+        or item.data.get("biological_material")
+    )
+    material_key = _normalize_lab_parameter(material) if material else ""
     return (
         parameter_key,
         str(item.observed_date or ""),
         item.numeric_value,
         _normalize_lab_unit(item.unit),
+        material_key,
     )
 
 
@@ -287,6 +294,10 @@ def _same_laboratory_measurement(candidate, reference) -> bool:
         except (TypeError, ValueError):
             return False
     candidate_unit, reference_unit = candidate[3], reference[3]
+    candidate_material, reference_material = candidate[4], reference[4]
+    # Specimen mismatch means a different measurement (urine Hb vs blood Hb).
+    if (candidate_material or "") != (reference_material or ""):
+        return False
     return not (
         candidate_unit and reference_unit and candidate_unit != reference_unit
     )

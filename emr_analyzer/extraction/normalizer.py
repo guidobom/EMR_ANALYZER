@@ -2,13 +2,14 @@
 
 import re
 
-from ..config import LAB_SYNONYMS, UNIT_MAPPING
+from ..config import LAB_SYNONYMS, SPECIMEN_SUFFIX_WHITELIST, UNIT_MAPPING
 
 
 class LabNormalizer:
     """Normalizes lab parameter names and units to canonical forms."""
 
-    def normalize_parameter(self, name: str, unit: str = "") -> str:
+    def normalize_parameter(self, name: str, unit: str = "",
+                            specimen: str | None = None) -> str:
         """
         Normalize a lab parameter name:
         - Lowercase
@@ -56,6 +57,17 @@ class LabNormalizer:
                 "/μL", "×10³/μL", "×10⁶/μL",
             }:
                 cleaned = f"{cleaned}_assoluti"
+
+        # Specimen-aware naming: only a whitelisted analyte in a detected
+        # non-default specimen gets the suffix, and only when the unit
+        # passes the analyte-specific gate.  A unit-less row is never
+        # suffixed (no justification without a measurable discriminator).
+        spec = str(specimen or "").strip().casefold()
+        gates = SPECIMEN_SUFFIX_WHITELIST.get(cleaned)
+        if gates and spec in gates and normalized_unit:
+            allowed = gates[spec]
+            if allowed is None or normalized_unit in allowed:
+                cleaned = f"{cleaned}_{spec}"
 
         return cleaned or name.lower().replace(" ", "_")
 

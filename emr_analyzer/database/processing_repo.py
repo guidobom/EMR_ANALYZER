@@ -110,16 +110,24 @@ class ProcessingRepository:
             pipeline_version, *compatible_pipeline_versions,
         )))
         placeholders = ", ".join("?" for _ in versions)
+        # An empty current digest means "no model configured": the contract
+        # cannot be contradicted by a model change, so the stored digest is
+        # accepted as-is.  A configured digest is compared strictly.
+        digest_filter = ""
+        params = [
+            document_id, stage, input_hash, *versions,
+            prompt_version or "",
+        ]
+        if model_digest:
+            digest_filter = " AND model_digest=?"
+            params.append(model_digest)
         row = self.db.execute(
             f"""SELECT status FROM processing_manifest
                WHERE document_id=? AND stage=? AND input_hash=?
                  AND pipeline_version IN ({placeholders}) AND prompt_version=?
-                 AND model_digest=?
+                 {digest_filter}
                ORDER BY updated_at DESC LIMIT 1""",
-            (
-                document_id, stage, input_hash, *versions,
-                prompt_version or "", model_digest or "",
-            ),
+            tuple(params),
         ).fetchone()
         return bool(row and row["status"] == "completed")
 

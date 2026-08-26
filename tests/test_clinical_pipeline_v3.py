@@ -184,6 +184,61 @@ def test_deterministic_loinc_resolution_is_persisted(tmp_path):
     assert stored.mapping_confidence == 0.9
 
 
+def test_urine_loinc_resolution_is_persisted(tmp_path):
+    db = DatabaseEngine(tmp_path / "pipeline.sqlite")
+    init_database(db)
+    _seed(db)
+    repository = EvidenceRepository(db)
+    repository.insert_batch([
+        ClinicalEvidence(
+            evidence_id="E_URINE_HB", patient_id="P1", document_id="D1",
+            category="laboratory_finding", fact_type="laboratory_test",
+            normalized_entity="emoglobina_urine",
+            concept_original="Emoglobina urine",
+            numeric_value=0.2, unit="mg/dL",
+            source_text="Emoglobina 0.2 mg/dL",
+        ),
+        ClinicalEvidence(
+            evidence_id="E_URINE_PROT", patient_id="P1", document_id="D1",
+            category="laboratory_finding", fact_type="laboratory_test",
+            normalized_entity="proteine_urine",
+            concept_original="Proteine urine",
+            numeric_value=20.0, unit="mg/dL",
+            source_text="Proteine 20 mg/dL",
+        ),
+    ])
+    stored = {
+        item.normalized_entity: item
+        for item in repository.get_by_patient("P1")
+    }
+    assert stored["emoglobina_urine"].terminology_system == "LOINC"
+    assert stored["emoglobina_urine"].terminology_code == "726-0"
+    assert stored["emoglobina_urine"].mapping_status == (
+        "resolved_deterministic"
+    )
+    assert stored["proteine_urine"].terminology_system == "LOINC"
+    assert stored["proteine_urine"].terminology_code == "2888-6"
+
+
+def test_urine_loinc_surprising_unit_is_not_coded(tmp_path):
+    db = DatabaseEngine(tmp_path / "pipeline.sqlite")
+    init_database(db)
+    _seed(db)
+    repository = EvidenceRepository(db)
+    item = ClinicalEvidence(
+        evidence_id="E_URINE_HB", patient_id="P1", document_id="D1",
+        category="laboratory_finding", fact_type="laboratory_test",
+        normalized_entity="emoglobina_urine",
+        concept_original="Emoglobina urine",
+        numeric_value=12.0, unit="g/dL",
+        source_text="Emoglobina 12 g/dL",
+    )
+    repository.insert_batch([item])
+    stored = repository.get_by_patient("P1")[0]
+    assert stored.terminology_code is None
+    assert stored.mapping_status == "normalized_not_coded"
+
+
 def test_evidence_source_persistence_is_idempotent_for_duplicate_paths(tmp_path):
     db = DatabaseEngine(tmp_path / "source-idempotency.sqlite")
     init_database(db)

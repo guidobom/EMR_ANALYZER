@@ -190,6 +190,88 @@ class DocumentsTabTest(unittest.TestCase):
         self.assertEqual(lab_repo.deleted, ["DOC_000011"])
         tab.deleteLater()
 
+    def test_lab_document_processing_writes_no_atomic_evidence(self):
+        """Out-of-range labs become evidence only via 'Estrai evidenze'."""
+        document = DocumentRecord(
+            id="DOC_000013", patient_id="P001", filename="laboratory.pdf",
+            original_path="/nonexistent/laboratory.pdf", file_hash="laboratory",
+            document_type=DocumentType.LABORATORIO.value,
+        )
+
+        class _EvidenceSpy:
+            def __init__(self):
+                self.calls = []
+
+            def replace_document_method(self, doc_id, method, evidence):
+                self.calls.append((doc_id, method, evidence))
+
+        from emr_analyzer.extraction.lab_parser import LabParser
+
+        parser = LabParser()
+        lab_repo = _LabRepository()
+        evidence_spy = _EvidenceSpy()
+        tab = DocumentsTab()
+        tab.set_services({
+            "lab_parser": parser,
+            "lab_repo": lab_repo,
+            "evidence_repo": evidence_spy,
+        })
+
+        tab._run_extraction(
+            document,
+            "Materiale: Urina\nEmoglobina : 0.20 mg/dL Assente",
+            None, [], _Progress(), skip_llm=True,
+        )
+
+        self.assertEqual(evidence_spy.calls, [])
+        self.assertEqual(len(lab_repo.inserted), 1)
+        self.assertEqual(
+            lab_repo.inserted[0].normalized_name, "emoglobina_urine"
+        )
+        tab.deleteLater()
+
+    def test_lab_parser_receives_raw_text_not_cleaned(self):
+        document = DocumentRecord(
+            id="DOC_000012", patient_id="P001", filename="laboratory.pdf",
+            original_path="/nonexistent/laboratory.pdf", file_hash="laboratory",
+            document_type=DocumentType.LABORATORIO.value,
+        )
+
+        class _SpecimenStrippingCleaner:
+            def clean(self, text):
+                # The real cleaner drops repeated "Materiale:" lines.
+                return "\n".join(
+                    line for line in text.splitlines()
+                    if "Materiale" not in line
+                )
+
+        class _RecordingTextParser:
+            def __init__(self):
+                self.calls = 0
+                self.received = []
+
+            def parse(self, text, **kwargs):
+                self.calls += 1
+                self.received.append(text)
+                return []
+
+        parser = _RecordingTextParser()
+        tab = DocumentsTab()
+        tab.set_services({
+            "lab_parser": parser,
+            "lab_repo": _LabRepository(),
+            "cleaner": _SpecimenStrippingCleaner(),
+        })
+
+        raw_text = "Materiale: Urina\nEmoglobina 0.20 mg/dL"
+        tab._run_extraction(
+            document, raw_text, None, [], _Progress(), skip_llm=True,
+        )
+
+        self.assertEqual(parser.calls, 1)
+        self.assertIn("Materiale: Urina", parser.received[0])
+        tab.deleteLater()
+
     def test_batch_stage_progress_never_moves_backwards(self):
         values = []
         total = 20

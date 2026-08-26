@@ -42,6 +42,16 @@ _LOINC_LAB = {
         "C reactive protein [Mass/volume] in Serum or Plasma", "1988-5",
         {"mg/L", "mg/dL"},
     ),
+    # Urine variants are only emitted when the specimen detector has
+    # suffixed the canonical name (e.g. emoglobina_urine).  726-0 is the
+    # quantitative urine hemoglobin term; the dipstick ordinal is a
+    # different code and must never be used for numeric rows.
+    "emoglobina_urine": (
+        "Hemoglobin [Mass/volume] in Urine", "726-0", {"mg/dL"},
+    ),
+    "proteine_urine": (
+        "Protein [Mass/volume] in Urine", "2888-6", {"mg/dL"},
+    ),
 }
 
 

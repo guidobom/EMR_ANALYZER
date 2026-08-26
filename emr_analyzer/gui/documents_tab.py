@@ -1115,8 +1115,10 @@ class DocumentsTab(QWidget):
             and lab_parser
         ):
             progress.add_log("  ⚗️  Estrazione valori di laboratorio...")
+            # The RAW text is parsed: the cleaner strips repeated specimen
+            # markers ("Materiale: Siero") that the specimen detector needs.
             lab_values = lab_parser.parse(
-                cleaned, tables=tables,
+                text, tables=tables,
                 patient_id=patient_id, document_id=doc_id,
                 sample_date=doc.document_date,
                 parsing_result=parsing_result,
@@ -1130,16 +1132,10 @@ class DocumentsTab(QWidget):
                 "clinico (documento non laboratoristico)"
             )
 
-        evidence_repo = self._services.get("evidence_repo")
-        if evidence_repo:
-            evidence_repo.replace_document_method(
-                doc_id,
-                "deterministic_lab",
-                self._lab_values_to_evidence(
-                    doc, lab_values, parsing_result=parsing_result
-                ),
-            )
-
+        # Out-of-range values do NOT become atomic evidence here: the
+        # deterministic lab atoms are built only when the user launches
+        # "Estrai evidenze atomiche" (ClinicalRegistryBuilder.
+        # _sync_abnormal_lab_evidence, from lab_values).
         events = []
         # Lab reports have no clinical narrative — only structured values.
         # The ClinicalTextIsolator would hallucinate numbers on a table of
@@ -1701,19 +1697,6 @@ class DocumentsTab(QWidget):
             "created_at": datetime.now().isoformat(),
         }
         doc.metadata_json = json.dumps(metadata, ensure_ascii=False)
-
-    @staticmethod
-    def _lab_values_to_evidence(doc, lab_values: list,
-                                parsing_result=None) -> list:
-        from ..clinical.lab_evidence import abnormal_lab_evidence
-
-        return abnormal_lab_evidence(
-            patient_id=doc.patient_id,
-            document_id=doc.id,
-            document_date=doc.document_date,
-            lab_values=lab_values,
-            geometry=parsing_result,
-        )
 
     def _extract_document_date(self, text: str) -> str | None:
         """

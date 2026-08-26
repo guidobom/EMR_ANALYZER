@@ -362,7 +362,7 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertNotIn("source_text", properties)
         self.assertNotIn("document_date", properties)
         self.assertNotIn("confidence", properties)
-        self.assertTrue(ATOMIC_PROMPT_VERSION.startswith("atomic_evidence_it_v11"))
+        self.assertTrue(ATOMIC_PROMPT_VERSION.startswith("atomic_evidence_it_v12"))
         self.assertEqual(len(ATOMIC_PROMPT_DIGEST), 64)
 
     def test_atomic_v8_dynamic_schema_prevents_invalid_citation_ids(self):
@@ -1126,6 +1126,31 @@ class ClinicalRegistryV2Test(unittest.TestCase):
             "D1", "atomic_evidence", "same-input", "registry_pipeline_v4",
             "different-prompt", "model-a",
             compatible_pipeline_versions=("registry_pipeline_v3",),
+        ))
+
+    def test_unconfigured_model_digest_accepts_stored_contract(self):
+        """With no model configured the stored digest cannot be contradicted."""
+        repo = ProcessingRepository(self.db)
+        run = ProcessingRun(patient_id="P001", stage="clinical_registry_v2")
+        repo.start_run(run)
+        manifest = ProcessingManifestItem(
+            patient_id="P001", document_id="D1", stage="atomic_evidence",
+            input_hash="same-input", pipeline_version="registry_pipeline_v4",
+            prompt_version="atomic_evidence_it_v5", model_digest="model-a",
+            run_id=run.run_id, status="running",
+        )
+        repo.upsert_manifest(manifest)
+        repo.mark_result(manifest.manifest_id, status="completed")
+
+        # No model configured: wildcard, the stored digest is accepted.
+        self.assertTrue(repo.is_current(
+            "D1", "atomic_evidence", "same-input", "registry_pipeline_v4",
+            "atomic_evidence_it_v5", "",
+        ))
+        # A configured but different model still invalidates the contract.
+        self.assertFalse(repo.is_current(
+            "D1", "atomic_evidence", "same-input", "registry_pipeline_v4",
+            "atomic_evidence_it_v5", "model-b",
         ))
 
     def test_exact_block_reuse_removes_only_later_same_section_and_type(self):

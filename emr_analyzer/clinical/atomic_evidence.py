@@ -31,9 +31,11 @@ from ..settings import ClinicalPipelinePolicy
 from ..prompt_catalog import load_prompt, prompts_digest
 
 
-ATOMIC_PIPELINE_VERSION = "registry_pipeline_v11"
-# v11 adds narrative laboratory fallback, explicit planned/performed grounding,
-# complete structured serialization and safer within-document deduplication.
+ATOMIC_PIPELINE_VERSION = "registry_pipeline_v12"
+# v12 adds deterministic repairs for medication polarity coherence, structured
+# measurement recovery from qualitative text and date-precision audit markers,
+# together with the reinforced prompt contract (structured measures, therapy
+# polarity, date precision, radiology granularity, clinical_decision scope).
 # Old extraction checkpoints do not prove that this contract was applied.
 ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS: tuple[str, ...] = ()
 
@@ -82,6 +84,30 @@ _PERFORMED_OR_RESULT_RE = re.compile(
     r"dimess|somministrat|ha\s+(?:mostrato|evidenziato|documentato)|"
     r"(?:mostra|evidenzia|documenta|dimostra|rileva|referta)(?:to|ta)?|"
     r"esito|risultato)\w*\b"
+)
+
+# A therapy with one of these states is being taken: an ongoing therapy list
+# ("TD ...") is present, never negated.
+_ACTIVE_THERAPY_STATUSES = {
+    "ongoing", "active", "started", "taken", "administered",
+    "resumed", "dose_changed",
+}
+_MEDICATION_NEGATION_RE = re.compile(
+    r"(?i)\bnon\s+(?:assum\w*|in\s+terapia\s+con|praticat\w*)\b|"
+    r"\bsospension\w+\s+di\b"
+)
+
+# Canonical unit labels for measures recovered from qualitative text.
+_MEASURE_UNIT_MAP = {
+    "mm": "mm", "cm": "cm", "mg": "mg", "ml": "mL", "mcg": "µg",
+    "µg": "µg", "kg": "kg", "suvmax": "SUVmax", "mmhg": "mmHg",
+    "%": "%", "mm/h": "mm/h",
+}
+_MEASURE_UNITS = "|".join(
+    rf"{re.escape(unit)}(?=[\s.,;:)«»]|$)" for unit in _MEASURE_UNIT_MAP
+)
+_FULL_DATE_RE = re.compile(
+    r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})\b"
 )
 
 # These are projections produced after atomic extraction. Allowing the LLM to
@@ -305,7 +331,7 @@ def build_atomic_evidence_schema(
 
 ATOMIC_EVIDENCE_SCHEMA = build_atomic_evidence_schema()
 
-ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v11"
+ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v12"
 ATOMIC_PROMPT_DIGEST = prompts_digest(
     _ATOMIC_SYSTEM_PROMPT,
     _ATOMIC_VALIDATION_REPAIR_SYSTEM_PROMPT,
@@ -1053,6 +1079,7 @@ class AtomicEvidenceExtractor:
             # Audit-only marker: the first response was repaired locally for a
             # harmless representation mismatch, without another LLM call.
             data["wire_normalized"] = True
+        _flag_date_review(data, matched_quote, temporal)
         therapy = _sanitize_nested_payload(
             item.get("therapy"),
             allowed={
@@ -1198,6 +1225,26 @@ class AtomicEvidenceExtractor:
         assertion, clinical_status, therapy = _medication_transition(
             category, matched_quote, assertion, clinical_status, therapy
         )
+        if category == "medication":
+            lifecycle = therapy.get("lifecycle_status") or clinical_status
+            if (
+                lifecycle in _ACTIVE_THERAPY_STATUSES
+                and (
+                    item.get("polarity") == "negated"
+                    or assertion == "absent"
+                )
+                and not _MEDICATION_NEGATION_RE.search(matched_quote)
+            ):
+                # A therapy listed as ongoing is present: never negated.
+                assertion = "present"
+                item["polarity"] = "present"
+                certainty = (
+                    "confirmed"
+                    if certainty in {"excluded", "unknown"}
+                    else certainty
+                )
+                therapy = dict(therapy)
+                therapy["polarity_repaired"] = "negated→present"
         if therapy:
             data["therapy"] = therapy
         if oncology:
@@ -1234,6 +1281,19 @@ class AtomicEvidenceExtractor:
             )
         numeric_value = _safe_float(item.get("numeric_value"))
         unit = _clean_optional(item.get("unit"), 80)
+        if (
+            numeric_value is None and not unit
+            and category not in {
+                "medication", "procedure", "care_plan",
+                "hospitalization", "discharge",
+            }
+        ):
+            extracted_value, extracted_unit = _measure_from_value_text(
+                item.get("value_text")
+            )
+            if extracted_value is not None:
+                numeric_value, unit = extracted_value, extracted_unit
+                data["value_measurement_extracted"] = "value_text"
         entity, category, numeric_value, unit = _normalize_measurement(
             entity, category, matched_quote, numeric_value, unit
         )
@@ -3447,6 +3507,69 @@ def _llm_laboratory_claim_is_relevant(
         return True
     # Explicit visual flags are common in normalized laboratory tables.
     return bool(re.search(r"(?:^|\s)(?:\*{1,3}|[HL])(?:\s|$)", quote))
+
+
+def _measure_from_value_text(
+    value_text,
+) -> tuple[float | None, str | None]:
+    """Recover a single unambiguous measure buried in a qualitative field.
+
+    Conservative: only when exactly one candidate is present, the text is
+    short, and there is no "/" (blood pressure, dates).  Medications and
+    procedures are excluded by the caller (dose and technique belong to
+    their dedicated payload fields).
+    """
+    text = str(value_text or "").strip()
+    if not text or len(text) > 120 or "/" in text:
+        return None, None
+    candidates = set()
+    patterns = (
+        rf"(?i)(?P<num>\d+(?:[.,]\d+)?)\s*(?P<unit>{_MEASURE_UNITS})",
+        rf"(?i)(?P<unit>{_MEASURE_UNITS})\s*(?P<num>\d+(?:[.,]\d+)?)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            candidates.add(
+                (match.group("num"), match.group("unit").casefold())
+            )
+    if len(candidates) != 1:
+        return None, None
+    raw_num, raw_unit = candidates.pop()
+    try:
+        number = float(raw_num.replace(",", "."))
+    except ValueError:
+        return None, None
+    return number, _MEASURE_UNIT_MAP.get(raw_unit, raw_unit)
+
+
+def _flag_date_review(data: dict, quote: str, temporal) -> None:
+    """Auditable marker when the emitted date degrades or conflicts.
+
+    Fires only when the quoted passage contains exactly one full date: the
+    comparison is unambiguous.  The marker is informational (surfaced by
+    the review UI), it never alters the value.
+    """
+    matches = _FULL_DATE_RE.findall(str(quote or ""))
+    if not temporal.start or len(matches) != 1:
+        return
+    from ..utils.date_utils import parse_italian_date
+
+    day, month, year = matches[0]
+    try:
+        quoted_iso = parse_italian_date(f"{day}/{month}/{year}")
+    except (ValueError, TypeError):
+        return
+    if not quoted_iso:
+        return
+    if len(temporal.start) >= 10:
+        if temporal.start != quoted_iso:
+            data["date_review"] = (
+                f"discordanza data fonte ({temporal.start} vs {quoted_iso})"
+            )
+    elif temporal.start == quoted_iso[: len(temporal.start)]:
+        data["date_review"] = (
+            f"precisione degradata rispetto alla fonte ({quoted_iso})"
+        )
 
 
 def _project_planned_action(

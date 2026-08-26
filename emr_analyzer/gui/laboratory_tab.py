@@ -73,9 +73,9 @@ class LaboratoryTab(QWidget):
 
         # Lab values table
         self._table = QTableWidget()
-        self._table.setColumnCount(9)
+        self._table.setColumnCount(10)
         self._table.setHorizontalHeaderLabels([
-            "Data", "Parametro", "Valore", "Unità", "Range",
+            "Data", "Parametro", "Valore", "Unità", "Materiale", "Range",
             "Esito", "Confidenza", "Fonte", "Pagina"
         ])
         self._table.horizontalHeader().setStretchLastSection(True)
@@ -150,7 +150,9 @@ class LaboratoryTab(QWidget):
                 val_str = lv.value_text
             self._table.setItem(i, 2, QTableWidgetItem(val_str))
             self._table.setItem(i, 3, QTableWidgetItem(lv.unit or ""))
-            self._table.setItem(i, 4, QTableWidgetItem(lv.reference_text))
+            material = (lv.biological_material or "").capitalize()
+            self._table.setItem(i, 4, QTableWidgetItem(material))
+            self._table.setItem(i, 5, QTableWidgetItem(lv.reference_text))
             if lv.flag == "H":
                 outcome = "⚠ Alto"
             elif lv.flag == "L":
@@ -159,10 +161,10 @@ class LaboratoryTab(QWidget):
                 outcome = "⚠ Fuori range"
             else:
                 outcome = "✓ Normale"
-            self._table.setItem(i, 5, QTableWidgetItem(outcome))
-            self._table.setItem(i, 6, QTableWidgetItem(f"{lv.confidence:.2f}"))
-            self._table.setItem(i, 7, QTableWidgetItem(lv.document_id))
-            self._table.setItem(i, 8, QTableWidgetItem(str(lv.page or "")))
+            self._table.setItem(i, 6, QTableWidgetItem(outcome))
+            self._table.setItem(i, 7, QTableWidgetItem(f"{lv.confidence:.2f}"))
+            self._table.setItem(i, 8, QTableWidgetItem(lv.document_id))
+            self._table.setItem(i, 9, QTableWidgetItem(str(lv.page or "")))
 
             # Color abnormal rows
             if lv.is_abnormal:
@@ -172,7 +174,7 @@ class LaboratoryTab(QWidget):
                     bg = Qt.blue
                 else:
                     bg = Qt.darkYellow
-                for col in range(9):
+                for col in range(10):
                     item = self._table.item(i, col)
                     if item:
                         item.setBackground(bg)

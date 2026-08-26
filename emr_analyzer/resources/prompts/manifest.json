@@ -13,7 +13,9 @@
       "label": "Attribuzione paziente — istruzioni",
       "pipeline": "0 · Attribuzione del documento",
       "institutional_version": "institutional-v1",
-      "required_markers": ["confidence"],
+      "required_markers": [
+        "confidence"
+      ],
       "minimum_length": 80
     },
     {
@@ -28,36 +30,42 @@
       "label": "Estrazione testo clinico — istruzioni",
       "pipeline": "1 · Estrazione testo clinico",
       "institutional_version": "institutional-v6",
-      "required_markers": ["REGOLE OBBLIGATORIE"],
+      "required_markers": [
+        "REGOLE OBBLIGATORIE"
+      ],
       "minimum_length": 200
     },
     {
       "key": "atomic_evidence_system",
       "label": "Evidenze atomiche — ruolo",
       "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v11",
+      "institutional_version": "institutional-v12",
       "minimum_length": 80
     },
     {
       "key": "atomic_evidence_it",
       "label": "Evidenze atomiche — istruzioni complete",
       "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v11",
-      "required_markers": ["Vincoli obbligatori", "source_refs", "laboratory_test"],
+      "institutional_version": "institutional-v12",
+      "required_markers": [
+        "Vincoli obbligatori",
+        "source_refs",
+        "laboratory_test"
+      ],
       "minimum_length": 400
     },
     {
       "key": "atomic_evidence_repair_system",
       "label": "Evidenze atomiche — riparazione",
       "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v11",
+      "institutional_version": "institutional-v12",
       "minimum_length": 80
     },
     {
       "key": "atomic_evidence_coverage_system",
       "label": "Evidenze atomiche — recupero copertura",
       "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v11",
+      "institutional_version": "institutional-v12",
       "minimum_length": 80
     },
     {
@@ -72,7 +80,9 @@
       "label": "Fusione eventi clinici — istruzioni",
       "pipeline": "3 · Creazione eventi clinici",
       "institutional_version": "institutional-v3",
-      "required_markers": ["evidence_ids"],
+      "required_markers": [
+        "evidence_ids"
+      ],
       "minimum_length": 150
     },
     {
@@ -87,7 +97,9 @@
       "label": "Relazioni tra evidenze — istruzioni",
       "pipeline": "3 · Creazione eventi clinici",
       "institutional_version": "institutional-v2",
-      "required_markers": ["linked"],
+      "required_markers": [
+        "linked"
+      ],
       "minimum_length": 80
     },
     {
@@ -102,7 +114,10 @@
       "label": "Assemblaggio episodi — istruzioni",
       "pipeline": "3 · Creazione eventi clinici",
       "institutional_version": "institutional-v3",
-      "required_markers": ["absorbed_event_ids", "related_event_ids"],
+      "required_markers": [
+        "absorbed_event_ids",
+        "related_event_ids"
+      ],
       "minimum_length": 250
     },
     {
@@ -117,7 +132,9 @@
       "label": "Ipotesi cliniche — istruzioni",
       "pipeline": "4 · Ipotesi cliniche",
       "institutional_version": "institutional-v1",
-      "required_markers": ["candidate_id"],
+      "required_markers": [
+        "candidate_id"
+      ],
       "minimum_length": 100
     },
     {
@@ -146,7 +163,9 @@
       "label": "Analisi irAE — ruolo",
       "pipeline": "6 · Analisi irAE",
       "institutional_version": "institutional-v1",
-      "required_markers": ["tabella Markdown"],
+      "required_markers": [
+        "tabella Markdown"
+      ],
       "minimum_length": 80
     }
   ]

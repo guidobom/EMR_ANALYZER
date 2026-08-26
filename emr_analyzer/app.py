@@ -33,6 +33,7 @@ from .extraction.clinical_text_isolator import ClinicalTextIsolator
 from .clinical.clinical_history_builder import ClinicalHistoryBuilder
 from .clinical.registry_builder import ClinicalRegistryBuilder
 from .clinical.document_deletion import DocumentDeletionService
+from .clinical.evidence_deletion import EvidenceDeletionService
 from .clinical.patient_deletion import PatientWorkspaceDeletionService
 from .clinical.document_reattribution import DocumentReattributionService
 from .gui.main_window import MainWindow
@@ -291,6 +292,9 @@ class EMRAnalyzerApp:
         })
         self._services["document_deletion"] = DocumentDeletionService(
             db, doc_repo, audit_repo=audit_repo
+        )
+        self._services["evidence_deletion"] = EvidenceDeletionService(
+            db, review_repo, registry_repo, cs_repo, audit_repo=audit_repo
         )
         self._services["patient_workspace_deletion"] = (
             PatientWorkspaceDeletionService(db, patient_repo)

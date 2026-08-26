@@ -372,6 +372,17 @@ class ClinicalHistoryTab(QWidget):
         self._clear_registry_btn.setStyleSheet("color: #c0392b;")
         bottom_layout.addWidget(self._clear_registry_btn)
 
+        self._clear_evidence_btn = QPushButton("🗑️ Elimina Evidenze")
+        self._clear_evidence_btn.setToolTip(
+            "Cancella TUTTE le evidenze atomiche, il registro cronologico, "
+            "il profilo narrativo e le annotazioni del golden set di questo "
+            "paziente. Documenti, valori di laboratorio strutturati, dati "
+            "di identità e registro delle operazioni restano invariati."
+        )
+        self._clear_evidence_btn.clicked.connect(self._on_clear_evidence)
+        self._clear_evidence_btn.setStyleSheet("color: #c0392b;")
+        bottom_layout.addWidget(self._clear_evidence_btn)
+
         self._count_label = QLabel("")
         bottom_layout.addWidget(self._count_label)
 
@@ -1317,6 +1328,70 @@ class ClinicalHistoryTab(QWidget):
             builder.clear_timeline(self._current_patient_id)
             builder.clear_narrative(self._current_patient_id)
         self._refresh()
+
+    def _on_clear_evidence(self):
+        """Delete the atomic evidence and reset registry and profile."""
+        if self._guard_busy():
+            return
+        patient_id = self._current_patient_id
+        if not patient_id:
+            return
+
+        evidence_repo = self._services.get("evidence_repo")
+        evidence_count = (
+            len(evidence_repo.get_by_patient(patient_id))
+            if evidence_repo else 0
+        )
+        if not evidence_count:
+            QMessageBox.information(
+                self, "Nessuna evidenza",
+                "Nessuna evidenza atomica da eliminare per questo paziente."
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "Conferma eliminazione",
+            f"Eliminare TUTTE le {evidence_count} evidenze atomiche di "
+            f"questo paziente?\n\n"
+            f"Verranno azzerati anche il registro cronologico e il profilo "
+            f"narrativo; ogni evento sarà registrato come escluso nella "
+            f"revisione clinica. Verranno eliminate anche le annotazioni "
+            f"del golden set di questo paziente.\n\n"
+            f"Restano invariati: documenti, valori di laboratorio "
+            f"strutturati, dati di identità e registro delle operazioni.\n\n"
+            f"Questa azione è IRREVERSIBILE.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        service = self._services.get("evidence_deletion")
+        if service is None:
+            QMessageBox.critical(
+                self, "Eliminazione non disponibile",
+                "Il servizio di eliminazione delle evidenze non è "
+                "inizializzato.",
+            )
+            return
+        result = service.delete(patient_id)
+        if not result.deleted:
+            details = result.error or "Errore non specificato"
+            if result.warnings:
+                details += "\n" + "\n".join(result.warnings)
+            QMessageBox.critical(
+                self, "Eliminazione non riuscita",
+                f"Le evidenze del paziente non sono state eliminate "
+                f"completamente.\n\n{details}",
+            )
+            return
+        self._refresh()
+        QMessageBox.information(
+            self, "Evidenze eliminate",
+            f"Eliminate {result.removed_evidence_count} evidenze atomiche.\n"
+            f"Registro cronologico e profilo narrativo azzerati "
+            f"({result.rejected_event_count} eventi esclusi).",
+        )
 
     def _on_dedup(self):
         """Deduplicate the existing registry without re-extracting."""

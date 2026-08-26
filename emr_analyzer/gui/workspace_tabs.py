@@ -33,7 +33,7 @@ class WorkspaceTabs(QTabWidget):
         self._current_patient_id = None
         self._current_document_id = None
         self._irae_queue_worker = None
-        self._registry_queue_worker = None
+        self._registry_queue_workers: dict = {}
 
         # Create tabs
         self._documents_tab = DocumentsTab()
@@ -98,7 +98,7 @@ class WorkspaceTabs(QTabWidget):
         except Exception:
             pass
         for worker in (
-            self._irae_queue_worker, self._registry_queue_worker,
+            self._irae_queue_worker, *self._registry_queue_workers.values(),
         ):
             if worker is not None and worker.isRunning():
                 cancel = getattr(worker, "cancel", None)
@@ -121,7 +121,7 @@ class WorkspaceTabs(QTabWidget):
             pass
         workers = [
             worker for worker in (
-                self._irae_queue_worker, self._registry_queue_worker,
+                self._irae_queue_worker, *self._registry_queue_workers.values(),
             )
             if worker is not None and worker.isRunning()
         ]
@@ -131,7 +131,7 @@ class WorkspaceTabs(QTabWidget):
                 worker.wait(remaining)
         return sum(
             1 for worker in (
-                self._irae_queue_worker, self._registry_queue_worker,
+                self._irae_queue_worker, *self._registry_queue_workers.values(),
             )
             if worker is not None and worker.isRunning()
         ) + sum(
@@ -149,7 +149,7 @@ class WorkspaceTabs(QTabWidget):
         return any(
             worker is not None and worker.isRunning()
             for worker in (
-                self._irae_queue_worker, self._registry_queue_worker,
+                self._irae_queue_worker, *self._registry_queue_workers.values(),
             )
         )
 
@@ -408,10 +408,26 @@ class WorkspaceTabs(QTabWidget):
         self, patient_ids: list[str], *, force_rebuild: bool = False,
         stage: str = "atomic",
     ) -> None:
-        """Run one explicit registry phase for several patients in order."""
+        """Run one explicit registry phase for several patients in order.
+
+        One queue per phase may run concurrently (atomic evidence and
+        clinical events use independent local models); a second queue of
+        the same phase, and any per-document LLM operation, still blocks.
+        """
         if not patient_ids:
             return
-        if self.llm_operation_running():
+        running = self._registry_queue_workers.get(stage)
+        if running is not None and running.isRunning():
+            QMessageBox.information(
+                self, "Coda già in esecuzione",
+                "Una coda della stessa fase è già in esecuzione. "
+                "Attendi il suo completamento prima di avviarne un'altra.",
+            )
+            return
+        if (
+            self._documents_tab.llm_operation_running()
+            or self._clinical_history_tab._worker_running()
+        ):
             QMessageBox.information(
                 self, "Operazione LLM in corso",
                 "Attendi il completamento dell'operazione corrente prima "
@@ -445,6 +461,12 @@ class WorkspaceTabs(QTabWidget):
             1, int(getattr(state_config, "parallel_workers", 1) or 1)
         )
 
+        other_stage = "events" if stage == "atomic" else "atomic"
+        other_queue = self._registry_queue_workers.get(other_stage)
+        concurrent = (
+            other_queue is not None and other_queue.isRunning()
+        )
+
         from .workers import RegistryQueueWorker
 
         worker = RegistryQueueWorker(
@@ -452,13 +474,19 @@ class WorkspaceTabs(QTabWidget):
             force_rebuild=force_rebuild,
             stage=stage,
         )
-        self._registry_queue_worker = worker
+        self._registry_queue_workers[stage] = worker
         results: list[dict] = []
         state = {"index": 0, "total": len(patient_ids), "patient": ""}
         progress = ProgressDialog(
             f"Coda {stage} — paziente 1/{len(patient_ids)}", parent=self,
         )
         progress.show()
+        if concurrent:
+            progress.add_log(
+                "⚠️ In parallelo alla coda dell'altra fase: i due modelli "
+                "locali saranno residenti insieme in RAM e le prestazioni "
+                "potranno ridursi."
+            )
         process_gui_events()
 
         def on_started(index: int, total: int, patient_id: str) -> None:
@@ -526,7 +554,7 @@ class WorkspaceTabs(QTabWidget):
         def on_queue_finished() -> None:
             cancelled = progress.is_cancelled()
             worker.deleteLater()
-            self._registry_queue_worker = None
+            self._registry_queue_workers.pop(stage, None)
             progress.mark_done()
             progress.accept()
             if self._current_patient_id:

@@ -10,6 +10,8 @@ from .patterns import (
     LAB_TABULAR_PATTERN, LAB_INLINE_PATTERN,
     build_known_param_pattern,
 )
+from .specimen import detect_document_specimen, section_specimen
+from ..config import SPECIMEN_SUFFIX_WHITELIST, SPECIMEN_TEXTUAL_ONLY
 from ..models.lab_result import LabValue
 
 
@@ -100,12 +102,20 @@ class LabParser:
             or (detected_dates[0] if detected_dates else None)
         )
 
+        # Document-level default specimen from "Materiale:" lines.  Section
+        # headers inside the text can override it per section.
+        doc_specimen = detect_document_specimen(text)
+
         # Phase 1: Extract from structured tables
         if tables:
-            results.extend(self._parse_tables(tables, patient_id, document_id))
+            results.extend(self._parse_tables(
+                tables, patient_id, document_id, specimen=doc_specimen
+            ))
 
         # Phase 2: Extract from free text
-        text_results = self._parse_text(text, patient_id, document_id)
+        text_results = self._parse_text(
+            text, patient_id, document_id, specimen=doc_specimen
+        )
 
         # Assign the explicit document/sample date to every source layer.
         if effective_sample_date:
@@ -169,7 +179,8 @@ class LabParser:
         return None
 
     def _parse_tables(self, tables: list, patient_id: str,
-                      document_id: str) -> list[LabValue]:
+                      document_id: str,
+                      specimen: str | None = None) -> list[LabValue]:
         """Extract lab values from pandas DataFrames produced by the PDF parser."""
         results = []
         for df in tables:
@@ -240,8 +251,14 @@ class LabParser:
                         value, ref_low, ref_high, ref_text
                     )
 
-                normalized_name = self.normalizer.normalize_parameter(
+                base_normalized = self.normalizer.normalize_parameter(
                     param_name, unit_norm
+                )
+                effective_specimen = self._resolve_specimen(
+                    base_normalized, unit_norm, specimen, value_text_result
+                )
+                normalized_name = self.normalizer.normalize_parameter(
+                    param_name, unit_norm, specimen=effective_specimen
                 )
 
                 results.append(LabValue(
@@ -257,6 +274,7 @@ class LabParser:
                     reference_text=ref_text,
                     is_abnormal=is_abnormal,
                     flag=flag,
+                    biological_material=effective_specimen,
                     source_text=f"{param_name} {value_str} {unit}".strip(),
                     confidence=0.9,  # Tables have higher confidence
                 ))
@@ -293,32 +311,77 @@ class LabParser:
         return False, None
 
     def _parse_text(self, text: str, patient_id: str,
-                    document_id: str) -> list[LabValue]:
-        """Extract lab values from free text and markdown tables."""
+                    document_id: str,
+                    specimen: str | None = None) -> list[LabValue]:
+        """Extract lab values from free text and markdown tables.
+
+        Single pass with a section-specimen state: section headers
+        ("[0] ESAME URINE COMPLETO") update the state, result lines and
+        markdown table rows inherit the specimen active at their position.
+        """
         results = []
-
-        # Phase A: Parse markdown tables (pipe-separated)
-        results.extend(self._parse_markdown_tables(text, patient_id, document_id))
-
-        # Phase B: Parse one native result line at a time.  This preserves the
-        # association value → flag → unit → reference interval and prevents a
-        # regex from crossing into headers, signatures or adjacent analytes.
         current_page = None
-        for raw_line in text.splitlines():
+        state = specimen
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            raw_line = lines[i]
             page_match = _PAGE_LINE_RE.search(raw_line)
             if page_match:
                 current_page = int(page_match.group(1))
+                i += 1
                 continue
-            if "|" in raw_line:
+
+            stripped = raw_line.lstrip()
+            if stripped.startswith("|"):
+                block = [raw_line]
+                i += 1
+                while i < len(lines) and lines[i].lstrip().startswith("|"):
+                    block.append(lines[i])
+                    i += 1
+                # Same minimum as the legacy block regex: a single isolated
+                # pipe line is not a table.
+                if len(block) >= 2:
+                    for pipe_line in block:
+                        cells = [
+                            c.strip()
+                            for c in pipe_line.strip().split("|")
+                        ]
+                        if cells and cells[0] == "":
+                            cells = cells[1:]
+                        if cells and cells[-1] == "":
+                            cells = cells[:-1]
+                        if not cells:
+                            continue
+                        if re.match(r"^[\s\-:]+$", "|".join(cells)):
+                            continue  # separator row
+                        if len(cells) == 1:
+                            is_header, token = section_specimen(cells[0])
+                            if is_header:
+                                state = token
+                                continue
+                        lab_value = self._parse_table_row(
+                            cells, patient_id, document_id, specimen=state
+                        )
+                        if lab_value:
+                            results.append(lab_value)
+                continue
+
+            is_header, token = section_specimen(raw_line)
+            if is_header:
+                state = token
+                i += 1
                 continue
             lab_value = self._parse_result_line(
                 raw_line,
                 patient_id,
                 document_id,
                 current_page,
+                specimen=state,
             )
             if lab_value:
                 results.append(lab_value)
+            i += 1
 
         return results
 
@@ -328,6 +391,7 @@ class LabParser:
         patient_id: str,
         document_id: str,
         page: int | None = None,
+        specimen: str | None = None,
     ) -> LabValue | None:
         source_line = str(raw_line or "").strip()
         if not source_line:
@@ -421,12 +485,18 @@ class LabParser:
             elif marker in {"*", "**", "***", "!"}:
                 is_abnormal, flag = True, "*"
 
+        base_normalized = self.normalizer.normalize_parameter(
+            param_name, unit
+        )
+        effective_specimen = self._resolve_specimen(
+            base_normalized, unit, specimen, value_text_result
+        )
         return LabValue(
             patient_id=patient_id,
             document_id=document_id,
             parameter_name=param_name,
             normalized_name=self.normalizer.normalize_parameter(
-                param_name, unit
+                param_name, unit, specimen=effective_specimen
             ),
             value=value,
             value_text=value_text_result,
@@ -437,13 +507,47 @@ class LabParser:
             reference_text=reference_text,
             is_abnormal=is_abnormal,
             flag=flag,
+            biological_material=effective_specimen,
             page=page,
             source_text=source_line,
             confidence=0.98 if reference_text else 0.92,
         )
 
     @staticmethod
+    def _is_noise_parameter(parameter_name: str) -> bool:
+        """True when the raw parameter name is header/analyzer junk.
+
+        Digit-gated on purpose: real analytes with hyphens survive
+        ("SARS-CoV-2", "CA 19-9", "Anti HAV - IgM", "CK-MB (massa)",
+        "25-Idrossi vitamina D").
+        """
+        p = re.sub(r"^\[\d+\]\s*", "", str(parameter_name or "")).strip()
+        low = p.casefold()
+        # Analyzer label lines: "Coordinatrice HGB : 12.2 g/dl"
+        if low.startswith("coordinatrice"):
+            return True
+        # Reference ranges glued into the name: "(30.0 - 35.0), PLT",
+        # "ITALIA GRANATA 3.80 - 5.80, EMOGLOBINA" (spaces required, so
+        # "CA 19-9" and "CK-MB" survive).
+        if re.search(r"\d[\d.,]*\s+[-–]\s+\d", p):
+            return True
+        # A dash at a word boundary followed by a digit: "DAY SERVICE - 5.80",
+        # "MRC - 0, SpO2".
+        if re.search(r"(?:^|[\s(])[-–]\s*\d", p):
+            return True
+        # Long leading numeric IDs: "0532 236328 - CREATININA".
+        # "25-Idrossi" has only two digits and survives.
+        if re.match(r"^\(?\s*\d[\d\s]{2,}\s+[-–]", p):
+            return True
+        if re.search(r"in\s+data[\s_:]*\d", p):
+            return True
+        if re.match(r"^ingresso[\s_]*\d", low):
+            return True
+        return False
+
+    @classmethod
     def _is_plausible_parameter(
+        cls,
         parameter_name: str,
         unit: str = "",
         reference_text: str = "",
@@ -453,6 +557,8 @@ class LabParser:
             r"^\[\d+\]\s*", "", str(parameter_name or "")
         ).strip()
         if not parameter or len(parameter) > 100:
+            return False
+        if cls._is_noise_parameter(parameter):
             return False
         if not re.search(r"[A-Za-zÀ-ÿΑ-ω]", parameter):
             return False
@@ -502,6 +608,36 @@ class LabParser:
             or has_recognized_unit
             or (reference_text and has_known_name)
         )
+
+    def _resolve_specimen(
+        self,
+        base_normalized: str,
+        unit: str,
+        specimen: str | None,
+        value_text_result,
+    ) -> str | None:
+        """Downgrade a specimen claim that the analyte's own signal rejects.
+
+        Numeric results of textual-only analytes (e.g. blood glucose) are
+        never suffixed, and a whitelisted analyte whose unit gate rejects
+        the specimen (serum protein with g/dL inside a urine section) keeps
+        neither the suffix nor the material claim.
+        """
+        effective = specimen
+        if (
+            effective
+            and base_normalized in SPECIMEN_TEXTUAL_ONLY
+            and value_text_result is None
+        ):
+            return None
+        gates = SPECIMEN_SUFFIX_WHITELIST.get(base_normalized) or {}
+        if effective and effective in gates:
+            suffixed = self.normalizer.normalize_parameter(
+                base_normalized, unit, specimen=effective
+            )
+            if suffixed == base_normalized:
+                return None
+        return effective
 
     def _abnormal_status(
         self,
@@ -592,7 +728,8 @@ class LabParser:
         return results
 
     def _parse_table_row(self, cells: list[str], patient_id: str,
-                         document_id: str) -> LabValue | None:
+                         document_id: str,
+                         specimen: str | None = None) -> LabValue | None:
         """
         Parse a single row from a markdown table.
         Columns (5): [Esame, Esito, Flag, U.M., Intervalli]
@@ -705,8 +842,14 @@ class LabParser:
         # Clean up parameter name (remove content in parentheses for display)
         param_display = param_cell
 
-        normalized_name = self.normalizer.normalize_parameter(
+        base_normalized = self.normalizer.normalize_parameter(
             param_cell, unit_norm or ""
+        )
+        effective_specimen = self._resolve_specimen(
+            base_normalized, unit_norm or "", specimen, value_text_result
+        )
+        normalized_name = self.normalizer.normalize_parameter(
+            param_cell, unit_norm or "", specimen=effective_specimen
         )
 
         # Build source text
@@ -729,6 +872,7 @@ class LabParser:
             reference_text=ref_str[:200] if ref_str else "",
             is_abnormal=is_abnormal,
             flag=flag,
+            biological_material=effective_specimen,
             source_text=source,
             confidence=0.85,
         )

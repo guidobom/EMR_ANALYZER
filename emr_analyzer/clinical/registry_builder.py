@@ -1176,7 +1176,7 @@ class ClinicalRegistryBuilder:
             ) -> None:
                 if progress_callback:
                     progress_callback(
-                        60 + int(8 * completed / max(total, 1)),
+                        60 + int(25 * completed / max(total, 1)),
                         "Relazioni cliniche "
                         f"{completed}/{total} "
                         f"(cache {cache_hits}, regole {auto_resolved})",
@@ -1211,7 +1211,7 @@ class ClinicalRegistryBuilder:
             def fusion_progress(completed: int, total: int) -> None:
                 if progress_callback:
                     progress_callback(
-                        68 + int(4 * completed / max(total, 1)),
+                        85 + int(8 * completed / max(total, 1)),
                         f"Fusione eventi {completed}/{total}",
                     )
 
@@ -1226,13 +1226,13 @@ class ClinicalRegistryBuilder:
 
             if progress_callback:
                 progress_callback(
-                    72,
+                    93,
                     "Grafo clinico: relazioni pesate e split esplicito...",
                 )
             correlation_bundles = []
 
             if progress_callback:
-                progress_callback(78, "Trend di laboratorio e terapie...")
+                progress_callback(95, "Trend di laboratorio e terapie...")
             trends, trend_bundles = LabTrendBuilder(self.db).build(
                 patient_id, primary_evidence + contextual_evidence
             )
@@ -1266,7 +1266,7 @@ class ClinicalRegistryBuilder:
 
             if progress_callback:
                 progress_callback(
-                    82, "Assemblaggio LLM dei problemi/episodi clinici..."
+                    97, "Assemblaggio LLM dei problemi/episodi clinici..."
                 )
             # The v3 graph already defines event membership. A second semantic
             # absorption pass would be able to merge evidence without a graph
@@ -1290,7 +1290,7 @@ class ClinicalRegistryBuilder:
             event_relations = list(relation_map.values())
 
             if progress_callback:
-                progress_callback(88, "Salvataggio registro versionato...")
+                progress_callback(98, "Salvataggio registro versionato...")
             self.registry_repo.replace_generated_registry(
                 patient_id,
                 [bundle.episode for bundle in all_bundles],

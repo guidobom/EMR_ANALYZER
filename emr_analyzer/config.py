@@ -237,6 +237,50 @@ UNIT_MAPPING = {
 }
 
 
+# --- Specimen detection (biological material) ---
+
+# Ordered regex rules for the value after "Materiale:" in a lab report.
+# A mapping of None means "default specimen (blood/serum/plasma) — no
+# suffix".  Swabs and BAL are out of scope and map to the default.
+MATERIAL_RULES: tuple[tuple[str, str | None], ...] = (
+    (r"mitto|urina|urine|vesc", "urine"),   # Mitto Intermedio, Urina, Catetere vesc.
+    (r"feci|fecale|coprocoltura", "feces"),
+    (r"liquor|liquido\s+cefalo", "liquor"),
+    (r"siero|sangue|plasma", None),         # default specimen
+    (r"broncolavaggio|\bbal\b", None),
+    (r"tampone|t\.", None),
+)
+
+# Ordered regex rules matched against section-header lines ("[0] EMOCROMO",
+# "ESAME URINE COMPLETO").  None = reset to the document default specimen.
+SECTION_SPECIMEN_HINTS: tuple[tuple[str, str | None], ...] = (
+    (r"esame\s+urine|urine\s+(?:completo|urgente)|urinocoltura", "urine"),
+    (r"colturale\s+feci|coprocoltura", "feces"),
+    (r"liquor|rachicentesi", "liquor"),
+    (r"emocromo|reticolociti|emogasanalisi|gasometria|elettroforesi|"
+     r"sierologia|coagulazione|tempo\s+di\s+protrombina", None),
+)
+
+# Suffix whitelist: final canonical name -> specimen -> allowed units.
+# A None unit-gate means any unit (section state is the only discriminator).
+SPECIMEN_SUFFIX_WHITELIST: dict[str, dict[str, set[str] | None]] = {
+    "emoglobina": {"urine": {"mg/dL"}},          # blood Hb: g/dL
+    "proteine": {"urine": {"mg/dL"}, "liquor": {"mg/dL"}},
+    "glucosio": {"urine": None},                 # textual-only, see below
+    "leucociti": {"urine": None},
+    "eritrociti": {"urine": None},
+    "creatinina": {"urine": {"mg/24h", "g/24h"}},
+    "potassio": {"urine": {"mmol/24h"}},
+    "sodio": {"urine": {"mmol/24h"}},
+    "cloro": {"urine": {"mmol/24h"}},
+    "calcio": {"urine": {"mg/24h"}},
+}
+
+# Analytes whose urine variant is only safe when the result is textual
+# ("Glucosio : Assente" — blood glucose is always numeric).
+SPECIMEN_TEXTUAL_ONLY: frozenset[str] = frozenset({"glucosio"})
+
+
 # --- Document classification keywords ---
 RADIOLOGY_KEYWORDS = [
     r"\bTECNICA\s+(?:DI\s+)?ESAME\b", r"\bMETODICA\b",
