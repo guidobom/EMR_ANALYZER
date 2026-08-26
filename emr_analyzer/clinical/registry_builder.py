@@ -1157,9 +1157,13 @@ class ClinicalRegistryBuilder:
             existing_events = self.registry_repo.get_events(
                 patient_id, include_rejected=True
             )
+            graph_llm = _graph_voting_llm(self.atomic_llm, self.event_llm)
+            use_atomic_for_voting = graph_llm is self.atomic_llm
+            # The atomic runtime stays resident when it votes on the graph;
+            # otherwise it is released to reserve memory for event synthesis.
             inactive_runtimes_released += (
                 self._release_atomic_runtime_before_events(
-                    enabled=event_llm_available
+                    enabled=event_llm_available and not use_atomic_for_voting
                 )
             )
             consolidator = ClinicalConsolidator(
@@ -1175,16 +1179,20 @@ class ClinicalRegistryBuilder:
                 auto_resolved: int,
             ) -> None:
                 if progress_callback:
+                    voting_model = (
+                        getattr(graph_llm, "model", "") or "regole"
+                    )
                     progress_callback(
                         60 + int(25 * completed / max(total, 1)),
                         "Relazioni cliniche "
                         f"{completed}/{total} "
-                        f"(cache {cache_hits}, regole {auto_resolved})",
+                        f"(voto {voting_model}, cache {cache_hits}, "
+                        f"regole {auto_resolved})",
                     )
 
             try:
                 graph_result = EvidenceGraphBuilder(
-                    self.event_llm if event_llm_available else None,
+                    graph_llm,
                     policy=self.pipeline_policy,
                 ).build(
                     patient_id, primary_evidence + contextual_evidence,
@@ -2491,6 +2499,20 @@ def _evidence_hash(evidence) -> str:
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _graph_voting_llm(atomic_llm, event_llm):
+    """Model for evidence-graph pair voting.
+
+    Pair classification ("same clinical fact or not") is a much simpler task
+    than event synthesis: the smaller/faster atomic model is preferred when
+    configured, the events model remains the fallback.
+    """
+    if atomic_llm is not None and getattr(atomic_llm, "is_available", False):
+        return atomic_llm
+    if event_llm is not None and getattr(event_llm, "is_available", False):
+        return event_llm
+    return None
 
 
 def _llm_model_digest(llm) -> str:

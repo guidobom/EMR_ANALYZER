@@ -2045,5 +2045,23 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertEqual(repo.verify_chain("P001"), (True, []))
 
 
+def test_graph_voting_prefers_available_atomic_model():
+    from types import SimpleNamespace
+
+    from emr_analyzer.clinical.registry_builder import _graph_voting_llm
+
+    atomic = SimpleNamespace(is_available=True)
+    events = SimpleNamespace(is_available=True)
+    assert _graph_voting_llm(atomic, events) is atomic
+    assert _graph_voting_llm(None, events) is events
+    assert _graph_voting_llm(
+        SimpleNamespace(is_available=False), events
+    ) is events
+    assert _graph_voting_llm(
+        atomic, SimpleNamespace(is_available=False)
+    ) is atomic
+    assert _graph_voting_llm(None, None) is None
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -299,7 +299,8 @@ class ClinicalHistoryQueryWorker(QThread):
                  clinical_profile: str, question: str,
                  conversation: list[dict] | None = None,
                  use_conversation_context: bool = False,
-                 registry_repo=None, patient_id: str = "", parent=None):
+                 registry_repo=None, patient_id: str = "",
+                 evidence_repo=None, parent=None):
         super().__init__(parent)
         self.llm_client = llm_client
         self.entries = entries
@@ -309,6 +310,7 @@ class ClinicalHistoryQueryWorker(QThread):
         self.use_conversation_context = use_conversation_context
         self.registry_repo = registry_repo
         self.patient_id = patient_id
+        self.evidence_repo = evidence_repo
 
     def run(self):
         try:
@@ -340,6 +342,11 @@ class ClinicalHistoryQueryWorker(QThread):
 
         service = ClinicalQueryService(self.registry_repo)
         details = service.retrieve(self.patient_id, self.question)
+        if not details and self.evidence_repo is not None:
+            # Registry not built yet: interrogate the DETERMINISTIC timeline
+            # built from atomic evidence.  The LLM never reconstructs the
+            # chronology itself.
+            return self._run_timeline_query(system_prompt)
         valid_ids = {
             detail["event"]["event_id"] for detail in details
         }
@@ -411,6 +418,47 @@ class ClinicalHistoryQueryWorker(QThread):
                                 for detail in details)
                 )
         return answer
+
+    def _run_timeline_query(self, system_prompt: str) -> str:
+        """Interrogate the deterministic timeline when the registry is empty.
+
+        The chronology is built and filtered by code; the LLM only reads
+        the already-ordered compact text.
+        """
+        from ..clinical.query_service import (
+            build_query_prompt, infer_intents, is_broad_question,
+        )
+        from ..clinical.timeline_serializer import (
+            INTENT_TYPES, build_timeline, filter_entries, format_compact,
+        )
+
+        evidence = self.evidence_repo.get_by_patient(self.patient_id)
+        entries = build_timeline(evidence)
+        intents = infer_intents(self.question)
+        if not is_broad_question(self.question) and intents:
+            types = set().union(*(
+                INTENT_TYPES.get(intent, set()) for intent in intents
+            ))
+            entries = filter_entries(entries, types=types)
+        context_length = int(
+            getattr(self.llm_client, "context_length", 32768) or 32768
+        )
+        output_tokens = int(
+            getattr(self.llm_client, "max_output_tokens", 4096) or 4096
+        )
+        context_chars = max(
+            12_000,
+            int(max(4000, context_length - output_tokens - 2500) * 2.3),
+        )
+        timeline_text = format_compact(entries, max_chars=context_chars)
+        user_prompt = build_query_prompt(
+            "",
+            timeline_text or "Nessuna evidenza atomica disponibile.",
+            self.question,
+            conversation=self.conversation,
+            use_conversation_context=self.use_conversation_context,
+        )
+        return self.llm_client.generate_text(user_prompt, system_prompt)
 
 
 def _deterministic_cited_event(detail: dict) -> str:

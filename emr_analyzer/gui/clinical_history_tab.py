@@ -1957,6 +1957,7 @@ class ClinicalHistoryTab(QWidget):
             use_conversation_context=use_context,
             registry_repo=self._services.get("registry_repo"),
             patient_id=patient_id,
+            evidence_repo=self._services.get("evidence_repo"),
         )
         self._query_worker.result_ready.connect(self._on_query_result)
         self._query_worker.error.connect(self._on_query_error)
