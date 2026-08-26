@@ -294,20 +294,35 @@ def build_atomic_evidence_schema(
     sentence_count: int | None = None,
     *,
     fact_types: Iterable[str] | None = None,
+    snomed_codes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build a compact category-bucket schema for one source chunk.
 
     The decoder can only emit citation identifiers that actually occur in the
     prompt.  This removes the most frequent post-validation failure before a
     token is sampled instead of paying for a full corrective generation.
+
+    When ``snomed_codes`` is provided (the SNOMED-constrained variant) every
+    item additionally requires ``snomed_code`` as a closed ``enum`` over the
+    chunk candidate codes and drops the free-text ``concept`` field: the model
+    can never emit a code outside the retrieved set.
     """
     selected = tuple(
         fact_type for fact_type in (fact_types or LLM_ATOMIC_FACT_TYPES)
         if fact_type in LLM_ATOMIC_FACT_TYPES
     )
+    codes = tuple(dict.fromkeys(snomed_codes)) if snomed_codes is not None else None
     properties: dict[str, Any] = {}
     for fact_type in selected:
         item_schema = _wire_item_schema(fact_type)
+        if codes is not None:
+            item_schema["properties"]["snomed_code"] = {
+                "type": "string", "enum": list(codes),
+            }
+            item_schema["properties"].pop("concept", None)
+            item_schema["required"] = [
+                "snomed_code", "polarity", "source_refs",
+            ]
         if sentence_count is not None and sentence_count > 0:
             refs = item_schema["properties"]["source_refs"]
             refs["items"] = {
@@ -398,6 +413,13 @@ class AtomicExtractionCancelled(RuntimeError):
 class AtomicEvidenceExtractor:
     """Extract every observation before any deduplication or synthesis."""
 
+    # Extraction-method label persisted on every emitted atom.  The SNOMED
+    # variant (snomed/extractor.py) overrides this to
+    # ``llm_atomic_snomed_v1``; the base value is byte-compatible with the
+    # historical hard-coded label.  A class attribute (not merely an __init__
+    # field) keeps ``object.__new__``-based test doubles deterministic.
+    _atomic_extraction_method = "llm_atomic_v2"
+
     def __init__(
         self,
         llm_client,
@@ -433,7 +455,7 @@ class AtomicEvidenceExtractor:
         # request counters thread-local so timings/tokens from simultaneous
         # documents can never contaminate one another.
         self._metrics_local = threading.local()
-        self._schema_cache: dict[tuple[int, tuple[str, ...]], dict[str, Any]] = {}
+        self._schema_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._schema_cache_lock = threading.Lock()
         try:
             parameters = inspect.signature(
@@ -558,6 +580,14 @@ class AtomicEvidenceExtractor:
                     position += 1
                     if parsed is not None:
                         evidence.append(parsed)
+                        if parsed.extraction_method != "llm_atomic_v2":
+                            # Variant extractor (SNOMED-constrained): count
+                            # whether the atom carried a terminology code.
+                            variant_metrics = self._current_metrics()
+                            if parsed.terminology_system == "SNOMED CT":
+                                variant_metrics["snomed_coded_atoms"] += 1
+                            else:
+                                variant_metrics["snomed_unmapped_atoms"] += 1
             if chunk_progress_callback is not None:
                 chunk_progress_callback(chunk_number, len(chunks))
         evidence.extend(_explicit_performed_procedure_evidence(
@@ -638,6 +668,27 @@ class AtomicEvidenceExtractor:
                 ))
             return extracted
 
+    def _snomed_candidates_for_chunk(
+        self, chunk: TextChunk
+    ):
+        """Hook for the SNOMED-constrained variant; the base emits no candidates.
+
+        Returning ``None`` keeps the standard free-text path byte-identical.
+        The subclass (snomed/extractor.py) computes a closed candidate set for
+        the chunk and also resolves the label/domain lookups needed by the
+        schema, prompt and wire-validation plumbing below.
+        """
+        return None
+
+    def _snomed_candidate_catalog(self, candidates) -> str | None:
+        """Format the closed candidate catalog for the prompt, if any."""
+        if candidates is None:
+            return None
+        to_catalog = getattr(candidates, "to_catalog", None)
+        if callable(to_catalog):
+            return to_catalog()
+        return None
+
     def _extract_chunk(
         self,
         chunk: TextChunk,
@@ -646,14 +697,26 @@ class AtomicEvidenceExtractor:
         document_date: str | None,
     ) -> tuple[list[dict[str, Any]], list[SentenceSpan]]:
         sentence_spans = split_sentence_spans(chunk.text)
+        snomed_candidates = self._snomed_candidates_for_chunk(chunk)
+        if (
+            snomed_candidates is not None
+            and getattr(snomed_candidates, "empty", False)
+        ):
+            # An empty candidate set is not an error: the chunk degrades to the
+            # standard path with unmapped atoms rather than being skipped.
+            self._current_metrics()["snomed_empty_candidate_chunks"] += 1
+        candidate_catalog = self._snomed_candidate_catalog(snomed_candidates)
         prompt = build_atomic_prompt(
             chunk,
             document_type=document_type,
             document_date=document_date,
             sentence_spans=sentence_spans,
+            candidate_catalog=candidate_catalog,
         )
         generator = self.llm.generate_structured
-        base_schema = self._schema_for(len(sentence_spans))
+        base_schema = self._schema_for(
+            len(sentence_spans), snomed_candidates=snomed_candidates
+        )
 
         def generate(
             system_prompt: str,
@@ -677,7 +740,9 @@ class AtomicEvidenceExtractor:
                 self._record_last_generation()
 
         data = generate(self._system_prompt)
-        validation = _validate_wire_response(data, sentence_spans)
+        validation = _validate_wire_response(
+            data, sentence_spans, snomed_candidates=snomed_candidates
+        )
         items = list(validation.items)
         pending = list(validation.issues)
         metrics = self._current_metrics()
@@ -697,6 +762,7 @@ class AtomicEvidenceExtractor:
             repair_schema = self._schema_for(
                 len(sentence_spans),
                 fact_types=relevant_types or LLM_ATOMIC_FACT_TYPES,
+                snomed_candidates=snomed_candidates,
             )
             issue_payload = [issue.for_prompt() for issue in pending[:24]]
             repaired = generate(
@@ -716,7 +782,7 @@ class AtomicEvidenceExtractor:
                 ),
             )
             repaired_validation = _validate_wire_response(
-                repaired, sentence_spans
+                repaired, sentence_spans, snomed_candidates=snomed_candidates
             )
             items.extend(repaired_validation.items)
             metrics["repaired_items"] += len(repaired_validation.items)
@@ -754,14 +820,21 @@ class AtomicEvidenceExtractor:
                     page_start=chunk.page_start,
                     page_end=chunk.page_end,
                 )
+                recovery_candidates = self._snomed_candidates_for_chunk(
+                    recovery_chunk
+                )
                 recovery_prompt = build_atomic_prompt(
                     recovery_chunk,
                     document_type=document_type,
                     document_date=document_date,
                     sentence_spans=compact_spans,
+                    candidate_catalog=self._snomed_candidate_catalog(
+                        recovery_candidates
+                    ),
                 )
                 recovery_schema = self._schema_for(
-                    len(compact_spans), fact_types=recovery_types
+                    len(compact_spans), fact_types=recovery_types,
+                    snomed_candidates=recovery_candidates,
                 )
                 recovered = generate(
                     self._coverage_system_prompt,
@@ -779,7 +852,8 @@ class AtomicEvidenceExtractor:
                     source_prompt=recovery_prompt,
                 )
                 recovered_validation = _validate_wire_response(
-                    recovered, compact_spans
+                    recovered, compact_spans,
+                    snomed_candidates=recovery_candidates,
                 )
                 metrics["invalid_items"] += len(
                     recovered_validation.issues
@@ -816,20 +890,39 @@ class AtomicEvidenceExtractor:
         sentence_count: int,
         *,
         fact_types: Iterable[str] | None = None,
+        snomed_candidates=None,
     ) -> dict[str, Any]:
-        """Reuse immutable response contracts across parallel chunks."""
+        """Reuse immutable response contracts across parallel chunks.
+
+        The cache key includes the candidate digest when the SNOMED-constrained
+        variant is active, so two chunks with different candidate sets never
+        share a schema (their ``enum`` differs).  The standard path keeps the
+        historical ``(sentence_count, fact_types)`` key unchanged.
+        """
         selected = tuple(
             fact_type for fact_type in (
                 fact_types or LLM_ATOMIC_FACT_TYPES
             )
             if fact_type in LLM_ATOMIC_FACT_TYPES
         )
-        key = (max(0, int(sentence_count)), selected)
+        base_key = (max(0, int(sentence_count)), selected)
+        candidate_digest = (
+            getattr(snomed_candidates, "digest", None)
+            if snomed_candidates is not None else None
+        )
+        key = base_key if candidate_digest is None else (
+            base_key[0], base_key[1], str(candidate_digest),
+        )
         with self._schema_cache_lock:
             cached = self._schema_cache.get(key)
             if cached is None:
                 cached = build_atomic_evidence_schema(
-                    key[0], fact_types=selected
+                    key[0],
+                    fact_types=selected,
+                    snomed_codes=(
+                        tuple(getattr(snomed_candidates, "codes", ()) or ())
+                        if candidate_digest is not None else None
+                    ),
                 )
                 self._schema_cache[key] = cached
             return cached
@@ -859,6 +952,9 @@ class AtomicEvidenceExtractor:
                 "items_before_deduplication": 0,
                 "within_document_duplicates": 0,
                 "final_items": 0,
+                "snomed_empty_candidate_chunks": 0,
+                "snomed_coded_atoms": 0,
+                "snomed_unmapped_atoms": 0,
             }
             self._metrics_local.value = metrics
         return metrics
@@ -897,6 +993,19 @@ class AtomicEvidenceExtractor:
         retry_depth: int = 0,
     ) -> ClinicalEvidence | None:
         entity = _clean_text(item.get("normalized_entity"), 300)
+        snomed = item.get("snomed") or {}
+        if snomed.get("code"):
+            terminology_system = "SNOMED CT"
+            terminology_code = str(snomed.get("code"))
+            mapping_status = str(snomed.get("status") or "resolved_llm")
+            mapping_confidence = float(snomed.get("confidence") or 0.0)
+            canonical_label = snomed.get("preferred_term") or entity
+        else:
+            terminology_system = None
+            terminology_code = None
+            mapping_status = "unmapped"
+            mapping_confidence = None
+            canonical_label = entity
         refs = _safe_sentence_refs(item.get("source_refs"), sentence_spans)
         source_quote = _quote_from_sentence_refs(refs, sentence_spans)
         if not source_quote:
@@ -1079,6 +1188,13 @@ class AtomicEvidenceExtractor:
             # Audit-only marker: the first response was repaired locally for a
             # harmless representation mismatch, without another LLM call.
             data["wire_normalized"] = True
+        if snomed.get("code"):
+            # Audit trail for the SNOMED-constrained path: the code that the
+            # deterministic level resolved into ``concept``/terminology fields.
+            data["snomed"] = {
+                key: value for key, value in snomed.items()
+                if key != "domain_fact_types"
+            }
         _flag_date_review(data, matched_quote, temporal)
         therapy = _sanitize_nested_payload(
             item.get("therapy"),
@@ -1335,8 +1451,11 @@ class AtomicEvidenceExtractor:
             normalized_entity=entity,
             fact_type=str(data.get("fact_type") or category),
             concept_original=entity,
-            canonical_label=entity,
-            mapping_status="unmapped",
+            canonical_label=canonical_label,
+            terminology_system=terminology_system,
+            terminology_code=terminology_code,
+            mapping_status=mapping_status,
+            mapping_confidence=mapping_confidence,
             typed_payload={
                 key: value for key, value in (
                     ("medication", therapy),
@@ -1374,7 +1493,7 @@ class AtomicEvidenceExtractor:
             source_page=page,
             bbox=bbox,
             confidence=(0.75 if quote_verified else 0.35),
-            extraction_method="llm_atomic_v2",
+            extraction_method=self._atomic_extraction_method,
             model_name=self.model_name,
             prompt_version=ATOMIC_PROMPT_VERSION,
             schema_version="3.0",
@@ -1420,8 +1539,14 @@ def build_atomic_prompt(
     document_type: str,
     document_date: str | None,
     sentence_spans: list[SentenceSpan] | None = None,
+    candidate_catalog: str | None = None,
 ) -> str:
-    """Return a cache-friendly prompt with deterministic source references."""
+    """Return a cache-friendly prompt with deterministic source references.
+
+    ``candidate_catalog`` (the SNOMED-constrained variant) appends the closed
+    set of codes the model is allowed to emit; without it the prompt is
+    byte-identical to the historical output.
+    """
     pages = (
         f"{chunk.page_start or 'n.d.'}-{chunk.page_end or 'n.d.'}"
     )
@@ -1430,7 +1555,7 @@ def build_atomic_prompt(
         f"[S{span.sentence_id}] {span.text}" for span in spans
     )
     inferred_type = infer_document_content_type(chunk.text)
-    return (
+    prompt = (
         f"CONTESTO: tipo_dichiarato={document_type or 'non classificato'}; "
         f"contenuto_probabile={inferred_type}; "
         f"data_documento={document_date or 'non disponibile'}; "
@@ -1438,6 +1563,14 @@ def build_atomic_prompt(
         "In refs usa solo i numeri degli ID S seguenti.\n\n"
         f"TESTO:\n{numbered_text}"
     )
+    if candidate_catalog:
+        prompt += (
+            "\n\nCANDIDATI (unici codici SNOMED ammessi; scegli il codice più "
+            "specifico fra questi — non inventare né usare codici fuori "
+            "elenco):\n"
+            + candidate_catalog
+        )
+    return prompt
 
 
 def infer_document_content_type(text: str) -> str:
@@ -1816,6 +1949,7 @@ def _expand_atomic_item(item: dict[str, Any]) -> dict[str, Any]:
             "additional_data": item.get("extra") or {},
             "typed_payload": item.get("payload") or {},
             "wire_normalized": bool(item.get("_wire_normalized")),
+            "snomed": item.get("_snomed") or {},
         }
     is_v5 = any(key in item for key in ("c", "e", "r"))
     is_v4 = "entity" in item or "refs" in item
@@ -1921,6 +2055,8 @@ def _validated_wire_items(
 def _validate_wire_response(
     data: object,
     sentence_spans: list[SentenceSpan],
+    *,
+    snomed_candidates=None,
 ) -> WireValidationResult:
     """Create canonical wire items and reject only clinically unsafe gaps.
 
@@ -1954,7 +2090,8 @@ def _validate_wire_response(
                 valid.append(item)
                 continue
             normalized, reasons, changed = _canonical_wire_item(
-                item, str(item.get("fact_type") or ""), sentence_spans
+                item, str(item.get("fact_type") or ""), sentence_spans,
+                snomed_candidates=snomed_candidates,
             )
             if normalized is None:
                 issues.append(WireValidationIssue(
@@ -1989,7 +2126,8 @@ def _validate_wire_response(
             continue
         for raw in bucket:
             normalized, reasons, changed = _canonical_wire_item(
-                raw, fact_type, sentence_spans
+                raw, fact_type, sentence_spans,
+                snomed_candidates=snomed_candidates,
             )
             if normalized is None:
                 issues.append(WireValidationIssue(
@@ -2002,10 +2140,73 @@ def _validate_wire_response(
     return WireValidationResult(valid, issues, normalized_items)
 
 
+def _resolve_snomed_code(value: dict[str, Any], candidates) -> dict[str, Any] | None:
+    """Resolve a wire ``snomed_code`` to term/domain metadata, or ``None``.
+
+    ``None`` means the code is missing or outside the closed candidate set: the
+    caller treats it as a repairable failure.  There is never a free-text
+    fallback in the constrained path.
+    """
+    raw_code = str(value.get("snomed_code") or "").strip()
+    if not raw_code:
+        return None
+    codes = tuple(getattr(candidates, "codes", ()) or ())
+    if raw_code not in codes:
+        return None
+    concept = (
+        candidates.concept(raw_code)
+        if callable(getattr(candidates, "concept", None)) else None
+    )
+    preferred = ""
+    if concept is not None:
+        preferred = str(concept.preferred_term() or "").strip()
+        if not preferred:
+            display = getattr(concept, "display_label", None)
+            if callable(display):
+                preferred = str(display() or "").strip()
+    preferred = preferred or raw_code
+    domains = tuple(
+        (getattr(candidates, "domain_fact_types", {}) or {}).get(raw_code, ())
+    )
+    return {
+        "system": "SNOMED CT",
+        "code": raw_code,
+        "term": preferred,
+        "preferred_term": preferred,
+        "status": "resolved_llm",
+        "confidence": 0.90,
+        "domain_fact_types": domains,
+        "candidate_digest": str(getattr(candidates, "digest", "") or ""),
+        "release_digest": str(getattr(candidates, "release_digest", "") or ""),
+        "domain_mismatch": False,
+    }
+
+
+def _snomed_domain_guard(
+    fact_type: str,
+    snomed_meta: dict[str, Any],
+) -> tuple[str, bool]:
+    """Reclassify only when the code pins exactly one atomic bucket.
+
+    Permissive by design: a code mapping to several buckets never hard-fails;
+    when the chosen bucket is not among the code's domains the mismatch is
+    recorded for audit instead.
+    """
+    domains = tuple(snomed_meta.get("domain_fact_types") or ())
+    if len(domains) == 1 and domains[0] != fact_type:
+        snomed_meta["reclassified_from"] = fact_type
+        return domains[0], False
+    if domains and fact_type not in domains:
+        return fact_type, True
+    return fact_type, False
+
+
 def _canonical_wire_item(
     raw: object,
     fact_type: str,
     sentence_spans: list[SentenceSpan],
+    *,
+    snomed_candidates=None,
 ) -> tuple[dict[str, Any] | None, list[str], bool]:
     """Normalize one v8/v7 object without discarding clinical information."""
     if fact_type not in LLM_ATOMIC_FACT_TYPES:
@@ -2019,6 +2220,8 @@ def _canonical_wire_item(
     # ``extra`` existed in v7. Accept it as a canonical compatibility field;
     # current v8 schemas no longer offer it to the model.
     compatibility = {"extra"}
+    if snomed_candidates is not None:
+        allowed.add("snomed_code")
     unknown = set(value) - allowed - compatibility
     if unknown:
         return None, [
@@ -2032,14 +2235,25 @@ def _canonical_wire_item(
             value.pop(key)
             changed = True
 
-    concept = value.get("concept")
-    if not isinstance(concept, str) and concept is not None:
-        concept = str(concept)
-        changed = True
-    concept = " ".join(str(concept or "").split()).strip()
-    if not concept:
-        return None, ["concept mancante o vuoto."], changed
-    value["concept"] = concept
+    snomed_meta: dict[str, Any] | None = None
+    if snomed_candidates is not None:
+        snomed_meta = _resolve_snomed_code(value, snomed_candidates)
+        if snomed_meta is None:
+            return None, [
+                "snomed_code mancante o non nel set candidato."
+            ], changed
+        value["snomed_code"] = snomed_meta["code"]
+        value["concept"] = snomed_meta["preferred_term"]
+        concept = value["concept"]
+    else:
+        concept = value.get("concept")
+        if not isinstance(concept, str) and concept is not None:
+            concept = str(concept)
+            changed = True
+        concept = " ".join(str(concept or "").split()).strip()
+        if not concept:
+            return None, ["concept mancante o vuoto."], changed
+        value["concept"] = concept
 
     polarity_aliases = {
         "present": "present", "presente": "present", "positive": "present",
@@ -2075,7 +2289,13 @@ def _canonical_wire_item(
         )
     )
     if semantic_error:
-        return None, [semantic_error], changed or semantic_changed
+        if snomed_candidates is None:
+            return None, [semantic_error], changed or semantic_changed
+        # The SNOMED code is authoritative: keep the injected term and let the
+        # domain guard decide the bucket.  Record the base-guard disagreement
+        # for audit instead of hard-failing a valid closed-set code.
+        if snomed_meta is not None:
+            snomed_meta["base_semantic_error"] = semantic_error
     if semantic_changed:
         value["concept"] = concept
         changed = True
@@ -2143,7 +2363,16 @@ def _canonical_wire_item(
         else:
             value.pop(key, None)
 
-    value["fact_type"] = fact_type
+    if snomed_meta is not None:
+        final_fact_type, domain_mismatch = _snomed_domain_guard(
+            fact_type, snomed_meta
+        )
+        snomed_meta["domain_mismatch"] = domain_mismatch
+        value["_snomed"] = snomed_meta
+        value["fact_type"] = final_fact_type
+        changed = changed or final_fact_type != fact_type
+    else:
+        value["fact_type"] = fact_type
     if changed:
         value["_wire_normalized"] = True
     return value, [], changed
