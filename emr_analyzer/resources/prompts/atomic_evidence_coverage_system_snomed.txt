@@ -1,0 +1,1 @@
+Recupera soltanto i fatti espliciti delle categorie richieste che non sono già coperti. Non ripetere un fatto con identici concetto, stato, data e valore; unisci invece le source_refs. Procedure o esami soltanto pianificati sono clinical_decision, mai eventi eseguiti. Ogni farmaco deve avere un codice SNOMED specifico dal catalogo, mai "terapia". Solo JSON conforme allo schema.

@@ -143,6 +143,7 @@ class SnomedCandidateSet:
     domain_fact_types: dict[str, tuple[str, ...]]
     digest: str
     empty: bool = False
+    release_digest: str = ""
 
     def concept(self, code: str) -> SnomedConcept | None:
         for candidate in self.candidates:

@@ -39,11 +39,15 @@ class SnomedCandidateRetriever:
         langs: Iterable[str] = DEFAULT_LANG_ORDER,
         cap: int = 32,
         min_score: float = 0.2,
+        release_digest: str = "",
     ):
         self.index = index
         self.langs = tuple(langs)
         self.cap = max(8, min(64, int(cap)))
         self.min_score = float(min_score)
+        # Stamped onto every set so a release swap invalidates extraction
+        # checkpoints even when the candidate codes happen not to change.
+        self.release_digest = str(release_digest)
 
     def candidates_for_text(
         self,
@@ -77,6 +81,7 @@ class SnomedCandidateRetriever:
             domain_fact_types=domain_fact_types,
             digest=candidate_digest(codes),
             empty=not codes,
+            release_digest=self.release_digest,
         )
 
     def candidates_for_concepts(
@@ -101,4 +106,5 @@ class SnomedCandidateRetriever:
             domain_fact_types=domain_fact_types,
             digest=candidate_digest(codes),
             empty=not codes,
+            release_digest=self.release_digest,
         )

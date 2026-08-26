@@ -1,0 +1,90 @@
+Estrai tutti i fatti clinici espliciti dal TESTO numerato nel contenitore JSON
+previsto dallo schema. Analizza una volta ogni frase e voce di elenco, quindi
+esegui un solo controllo finale di copertura. Restituisci soltanto JSON.
+
+Vincoli obbligatori:
+- restituisci una volta ciascuna chiave di primo livello prevista dallo schema;
+  usa [] per le categorie senza fatti;
+- un oggetto rappresenta un solo concetto in un singolo stato, data e valore.
+  Se una frase contiene fatti indipendenti, separali. Se lo stesso fatto con
+  identici stato, data e valore è ripetuto, emettilo una sola volta unendo le
+  source_refs; non unire mai evoluzioni, episodi o transizioni differenti;
+- snomed_code è il codice SNOMED CT del concetto clinico citato, scelto dal
+  catalogo CANDIDATI. Scegli il codice più specifico che rappresenta il
+  concetto, senza data, stato, sede, valore o spiegazioni; non usare etichette
+  generiche come terapia, esame, visita, controllo, reperto o procedura e non
+  inventare né usare codici fuori elenco;
+- source_refs contiene da 1 a 6 INTERI: [S3] diventa 3. Ogni riferimento deve
+  sostenere direttamente concetto, polarità, stato, valore e data; per una
+  data anaforica cita anche la frase antecedente che la definisce;
+- observation_date e observation_date_end contengono soltanto una data o un
+  periodo esplicitamente riferiti al fatto, anche retrospettivi. Non copiare la
+  data del referto e non usare date soltanto adiacenti; se assente, ometti il
+  campo. Conserva la massima precisione documentata;
+- polarity è present per fatti, risultati e transizioni documentati, suspected
+  per ipotesi esplicite, negated per assenza/esclusione. Un risultato negativo
+  o non mutato è present con value_text; una risoluzione è negated con
+  clinical_status=resolved;
+- numeric_value contiene solo il numero e unit la sua unità; value_text solo
+  risultati qualitativi. Sede, lateralità, gravità e stato vanno nei campi
+  dedicati. Non dedurre causalità, diagnosi, grading o attributi non scritti;
+- ogni misura documentata (diametro, spessore, SUVmax, pressione, peso,
+  percentuale) DEVE essere in numeric_value+unit, es. 23 con unit mm. Non
+  scrivere mai numeri di misura dentro snomed_code o value_text;
+- se il giorno della data è esplicito nel testo non degradare a mese o anno:
+  emetti sempre la data completa con la precisione massima documentata.
+
+Stato dell'azione:
+- procedure contiene solo procedure esplicitamente eseguite. Esami, procedure,
+  ricoveri o dimissioni richiesti, consigliati, programmati, eventuali, in
+  attesa o da eseguire sono clinical_decision con clinical_status=planned;
+  non inventare un risultato per un esame soltanto ordinato;
+- medication contiene un oggetto per farmaco/schema e per ogni transizione
+  distinta: proposed, prescribed, started, taken, administered, ongoing,
+  dose_changed, suspended, interrupted, resumed, stopped o completed. Compila
+  medication con nome originale, principio attivo, dose, via, frequenza,
+  indicazione e aderenza; oncology solo se esplicito. Una sospensione è
+  polarity=present, non negated. Un elenco di terapia domiciliare o in corso
+  (es. "TD metformina...", "in terapia con") è polarity=present con
+  clinical_status=ongoing: negated SOLO per assenza o esclusione esplicita,
+  mai con uno stato attivo.
+
+Copertura clinica:
+- diagnosis: diagnosi, comorbilità, tossicità, complicanze, risposta,
+  progressione, recidiva, allergie, familiarità e fattori di rischio; gli
+  attributi della diagnosi (istotipo, stadio, sedi) restano nello stesso
+  oggetto, non in atomi separati;
+- symptom, clinical_sign e vital_sign: separa ogni sintomo riferito, segno
+  obiettivo e parametro fisiologico clinicamente rilevante;
+- radiology_finding e instrumental_finding: un oggetto per ogni reperto
+  patologico, potenzialmente patologico, evolutivo o negativo rilevante. Tieni
+  nello stesso oggetto misure e attributi del medesimo reperto; la sede va in
+  anatomical_site, non in oggetti separati dello stesso reperto. I reperti di
+  normalità (strutture "normali", "in asse", "libere") si emettono solo se
+  negativi rilevanti per il quesito clinico, non come elenco di strutture
+  esaminate;
+- histopathology e biomarker: conserva sempre campione, istotipo, grado,
+  margini, invasione e misure (Breslow, Clark, dimensioni) nei campi dedicati,
+  più i risultati molecolari/proteici positivi o negativi;
+- laboratory_test è un fallback per anomalie presenti nel testo narrativo:
+  pattern clinici (es. anemia o leucocitosi), risultati qualitativi rilevanti e
+  valori esplicitamente fuori intervallo o marcati anomali. Ometti valori
+  normali isolati. Non trasformare pannelli richiesti in risultati. I duplicati
+  dei valori strutturati saranno rimossi dalla pipeline deterministica;
+- procedure: atto diagnostico, terapeutico o chirurgico realmente eseguito;
+  clinical_decision: solo decisioni con verbo deliberativo esplicito (si
+  programma, si richiede, si consiglia, si dispone); un semplice controllo o
+  follow-up di routine non è un clinical_decision; hospitalization e
+  discharge: eventi realmente avvenuti, con motivo, intervallo ed esito.
+
+Miglioramento, peggioramento, stabilità, persistenza e risoluzione sono nuove
+osservazioni solo quando modificano stato, data o valore. Conserva negazioni
+solo se rilevanti per diagnosi differenziale, stadiazione, sicurezza, risposta,
+follow-up o risoluzione. Non estrarre tecnica senza risultato, amministrazione,
+intestazioni, prenotazioni o affermazioni non verificabili.
+
+Il catalogo CANDIDATI elenca gli unici codici SNOMED ammessi per questo testo:
+non esiste alcun codice valido fuori da esso. Prima di chiudere verifica
+silenziosamente: ogni frase clinica non amministrativa è coperta; ogni oggetto è
+atomico, direttamente citato, codificato con un codice del catalogo CANDIDATI e
+non è la ripetizione di un oggetto con identici concetto, stato, data e valore.

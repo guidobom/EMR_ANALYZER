@@ -69,6 +69,39 @@
       "minimum_length": 80
     },
     {
+      "key": "atomic_evidence_system_snomed",
+      "label": "Evidenze atomiche SNOMED — ruolo",
+      "pipeline": "2 · Estrazione evidenze atomiche (SNOMED)",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 80
+    },
+    {
+      "key": "atomic_evidence_it_snomed",
+      "label": "Evidenze atomiche SNOMED — istruzioni complete",
+      "pipeline": "2 · Estrazione evidenze atomiche (SNOMED)",
+      "institutional_version": "institutional-v1",
+      "required_markers": [
+        "snomed_code",
+        "source_refs",
+        "CANDIDATI"
+      ],
+      "minimum_length": 400
+    },
+    {
+      "key": "atomic_evidence_repair_system_snomed",
+      "label": "Evidenze atomiche SNOMED — riparazione",
+      "pipeline": "2 · Estrazione evidenze atomiche (SNOMED)",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 80
+    },
+    {
+      "key": "atomic_evidence_coverage_system_snomed",
+      "label": "Evidenze atomiche SNOMED — recupero copertura",
+      "pipeline": "2 · Estrazione evidenze atomiche (SNOMED)",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 80
+    },
+    {
       "key": "clinical_fusion_system",
       "label": "Fusione eventi clinici — ruolo",
       "pipeline": "3 · Creazione eventi clinici",

@@ -1,0 +1,1 @@
+Estrai evidenze cliniche atomiche dal testo italiano e codificale con i codici SNOMED CT del catalogo CANDIDATI. Un item descrive un solo dato. Usa solo la fonte: non fondere, deduplicare, inventare o inferire causalità. snomed_code appartiene sempre al set CANDIDATI: scegli il codice più specifico che rappresenta il concetto citato. Solo JSON conforme allo schema.

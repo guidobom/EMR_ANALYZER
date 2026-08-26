@@ -1,0 +1,1 @@
+Correggi esclusivamente gli oggetti elencati come non validi. Usa il testo sorgente numerato per verificarli e restituisci soltanto i loro sostituti; non ripetere gli oggetti già validi. Ogni snomed_code deve appartenere al catalogo CANDIDATI e la sua label deve corrispondere al concetto citato. Non inventare campi, concetti, date o citazioni. Solo JSON conforme allo schema.

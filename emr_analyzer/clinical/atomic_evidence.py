@@ -531,6 +531,9 @@ class AtomicEvidenceExtractor:
             "items_before_deduplication": 0,
             "within_document_duplicates": 0,
             "final_items": 0,
+            "snomed_empty_candidate_chunks": 0,
+            "snomed_coded_atoms": 0,
+            "snomed_unmapped_atoms": 0,
         }
         geometry = self._load_geometry(geometry_path)
         text_for_llm, deterministic_nonclinical = _isolate_nonclinical_lines(
@@ -702,9 +705,13 @@ class AtomicEvidenceExtractor:
             snomed_candidates is not None
             and getattr(snomed_candidates, "empty", False)
         ):
-            # An empty candidate set is not an error: the chunk degrades to the
-            # standard path with unmapped atoms rather than being skipped.
+            # An empty candidate set is not an error and never skips the chunk:
+            # it degrades to the standard free-text path with unmapped atoms.
+            # A closed ``enum`` of zero codes would be unsatisfiable and would
+            # make every item fail validation, so the set is treated as absent
+            # for schema/prompt/validation purposes.
             self._current_metrics()["snomed_empty_candidate_chunks"] += 1
+            snomed_candidates = None
         candidate_catalog = self._snomed_candidate_catalog(snomed_candidates)
         prompt = build_atomic_prompt(
             chunk,
@@ -823,6 +830,16 @@ class AtomicEvidenceExtractor:
                 recovery_candidates = self._snomed_candidates_for_chunk(
                     recovery_chunk
                 )
+                if (
+                    recovery_candidates is not None
+                    and getattr(recovery_candidates, "empty", False)
+                ):
+                    # Same degradation as the main pass: an empty enum would be
+                    # unsatisfiable, so recover with the standard free-text path.
+                    self._current_metrics()[
+                        "snomed_empty_candidate_chunks"
+                    ] += 1
+                    recovery_candidates = None
                 recovery_prompt = build_atomic_prompt(
                     recovery_chunk,
                     document_type=document_type,
