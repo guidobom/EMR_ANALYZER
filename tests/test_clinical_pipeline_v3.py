@@ -603,6 +603,9 @@ def test_atomic_validation_problem_triggers_specialized_retry_and_typed_payload(
     assert len(result) == 1
     assert result[0].typed_payload["radiology_finding"]["measurement"] == "8 mm"
     assert extractor.last_extraction_metrics()["validation_retries"] == 1
+    assert extractor.last_extraction_metrics()["initial_items"] == 0
+    assert extractor.last_extraction_metrics()["repaired_items"] == 1
+    assert extractor.last_extraction_metrics()["final_items"] == 1
 
 
 def test_manual_split_and_merge_preserve_event_identities_and_sources(tmp_path):

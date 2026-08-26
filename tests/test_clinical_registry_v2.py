@@ -277,6 +277,27 @@ class ClinicalRegistryV2Test(unittest.TestCase):
 
         self.assertEqual(len(deduplicate_atomic_evidence(evidence)), 3)
 
+    def test_atomic_dedup_collapses_reworded_same_state_and_keeps_sources(self):
+        common = dict(
+            patient_id="P001", document_id="D1", category="symptom",
+            normalized_entity="dispnea", assertion="present",
+            observed_date="2025-01-10", clinical_status="active",
+            data={"quote_verified": True},
+        )
+        unique = deduplicate_atomic_evidence([
+            ClinicalEvidence(
+                evidence_id="E1", source_text="Riferisce dispnea.", **common,
+            ),
+            ClinicalEvidence(
+                evidence_id="E2", source_text="La paziente segnala dispnea.",
+                **common,
+            ),
+        ])
+
+        self.assertEqual(len(unique), 1)
+        self.assertEqual(unique[0].data["atomic_duplicate_count"], 1)
+        self.assertEqual(len(unique[0].data["source_occurrences"]), 2)
+
     def test_atomic_dedup_does_not_redate_copied_relative_history(self):
         common = dict(
             patient_id="P001", category="symptom",
@@ -305,7 +326,7 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertEqual(len(unique), 1)
         self.assertEqual(unique[0].observed_date, "2024-11-10")
 
-    def test_atomic_v6_schema_is_explicit_strict_and_excludes_labs_from_llm(self):
+    def test_atomic_v11_schema_includes_narrative_laboratory_fallback(self):
         prompt = build_atomic_prompt(
             TextChunk(0, "Dispnea.", 1, 1),
             document_type="visita", document_date="2025-01-10",
@@ -328,7 +349,7 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertIn("medication", buckets)
         self.assertIn("radiology_finding", buckets)
         self.assertIn("clinical_decision", buckets)
-        self.assertNotIn("laboratory_test", buckets)
+        self.assertIn("laboratory_test", buckets)
         self.assertEqual(
             properties["polarity"]["enum"],
             ["present", "negated", "suspected"],
@@ -341,7 +362,7 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertNotIn("source_text", properties)
         self.assertNotIn("document_date", properties)
         self.assertNotIn("confidence", properties)
-        self.assertTrue(ATOMIC_PROMPT_VERSION.startswith("atomic_evidence_it_v10"))
+        self.assertTrue(ATOMIC_PROMPT_VERSION.startswith("atomic_evidence_it_v11"))
         self.assertEqual(len(ATOMIC_PROMPT_DIGEST), 64)
 
     def test_atomic_v8_dynamic_schema_prevents_invalid_citation_ids(self):
@@ -354,7 +375,7 @@ class ClinicalRegistryV2Test(unittest.TestCase):
             set(schema["required"]), set(schema["properties"])
         )
 
-    def test_atomic_v10_one_pass_repairs_transitions_dates_and_negatives(self):
+    def test_atomic_v11_one_pass_repairs_transitions_dates_and_negatives(self):
         llm = _StructuredCaptureLlm({
             "medication": [{
                 "concept": "nivolumab", "polarity": "present",
@@ -439,7 +460,10 @@ class ClinicalRegistryV2Test(unittest.TestCase):
             [(item.normalized_entity, item.observed_date) for item in procedures],
             [("broncoscopia con BAL", "2024-03-20")],
         )
-        self.assertFalse(any(item.normalized_entity == "TSH" for item in items))
+        tsh = next(item for item in items if item.normalized_entity == "TSH")
+        self.assertEqual(tsh.fact_type, "laboratory_test")
+        self.assertEqual(tsh.category, "laboratory_finding")
+        self.assertEqual((tsh.numeric_value, tsh.unit), (0.02, "mUI/L"))
         self.assertEqual(
             extractor.last_extraction_metrics()["coverage_retries"], 0
         )
@@ -469,6 +493,31 @@ class ClinicalRegistryV2Test(unittest.TestCase):
         self.assertEqual(
             item.typed_payload["clinical_decision"]["timing"],
             "dopo quattro settimane",
+        )
+
+    def test_atomic_v11_reclassifies_planned_procedure_as_decision(self):
+        llm = _StructuredCaptureLlm({
+            "procedure": [{
+                "concept": "biopsia renale", "polarity": "present",
+                "source_refs": [1],
+            }],
+        })
+        items = AtomicEvidenceExtractor(
+            llm,
+            policy=ClinicalPipelinePolicy(adaptive_specialized_retry=False),
+        ).extract_document(
+            patient_id="P001", document_id="D1",
+            document_type="visita", document_date="2025-01-10",
+            text="È stata programmata una biopsia renale.",
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].fact_type, "clinical_decision")
+        self.assertEqual(items[0].category, "care_plan")
+        self.assertEqual(items[0].clinical_status, "planned")
+        self.assertEqual(
+            items[0].typed_payload["clinical_decision"]["target"],
+            "biopsia renale",
         )
 
     def test_atomic_v8_normalizes_harmless_wire_variants_without_retry(self):
@@ -863,8 +912,9 @@ class ClinicalRegistryV2Test(unittest.TestCase):
                 refs = re.findall(r"\[S(\d+)\]", prompt)
                 if len(refs) > 1:
                     raise OutputLimitError(max_tokens or 1024)
+                entity = "tosse" if "tosse" in prompt.casefold() else "dispnea"
                 return {"evidence": [{
-                    "category": "symptom", "entity": "dispnea",
+                    "category": "symptom", "entity": entity,
                     "refs": [1], "assertion": "present",
                     "certainty": "patient_reported",
                     "significance": "clinically_relevant",

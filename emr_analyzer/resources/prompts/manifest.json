@@ -35,29 +35,29 @@
       "key": "atomic_evidence_system",
       "label": "Evidenze atomiche — ruolo",
       "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v10",
+      "institutional_version": "institutional-v11",
       "minimum_length": 80
     },
     {
       "key": "atomic_evidence_it",
       "label": "Evidenze atomiche — istruzioni complete",
       "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v10",
-      "required_markers": ["Vincoli obbligatori", "source_refs"],
+      "institutional_version": "institutional-v11",
+      "required_markers": ["Vincoli obbligatori", "source_refs", "laboratory_test"],
       "minimum_length": 400
     },
     {
       "key": "atomic_evidence_repair_system",
       "label": "Evidenze atomiche — riparazione",
       "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v10",
+      "institutional_version": "institutional-v11",
       "minimum_length": 80
     },
     {
       "key": "atomic_evidence_coverage_system",
       "label": "Evidenze atomiche — recupero copertura",
       "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v10",
+      "institutional_version": "institutional-v11",
       "minimum_length": 80
     },
     {

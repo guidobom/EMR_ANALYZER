@@ -6,7 +6,9 @@ import hashlib
 import json
 from datetime import date
 from pathlib import Path
+import re
 from typing import Iterable
+import unicodedata
 import uuid
 
 from ..models.clinical_evidence import ClinicalEvidence
@@ -16,6 +18,7 @@ from ..settings import LabEvidencePolicy
 
 LAB_EVIDENCE_SCHEMA_VERSION = "3.0"
 LAB_EXTRACTION_METHOD = "deterministic_lab"
+NARRATIVE_LAB_EXTRACTION_METHOD = "llm_atomic_v2"
 _ABNORMAL_FLAGS = {
     "H", "HIGH", "ALTO", "ALTA", "↑",
     "L", "LOW", "BASSO", "BASSA", "↓",
@@ -206,6 +209,104 @@ def abnormal_lab_evidence(
             },
         ))
     return evidence
+
+
+def filter_narrative_lab_duplicates(
+    evidence: Iterable[ClinicalEvidence],
+    authoritative: Iterable[ClinicalEvidence],
+) -> tuple[list[ClinicalEvidence], int]:
+    """Remove only exact LLM restatements of deterministic laboratory rows.
+
+    Narrative patterns (for example ``anemia``) remain distinct from their
+    supporting analytes.  A row is suppressed only when analyte, compatible
+    date and, when supplied by both sources, value/unit agree.  This keeps the
+    deterministic row as the auditable source of laboratory measurements
+    without losing clinically meaningful interpretations in prose.
+    """
+    authoritative_keys = [
+        _laboratory_comparison_key(item)
+        for item in authoritative
+        if _is_laboratory_atom(item)
+    ]
+    kept: list[ClinicalEvidence] = []
+    removed = 0
+    for item in evidence:
+        candidate = _laboratory_comparison_key(item)
+        if candidate and any(
+            _same_laboratory_measurement(candidate, reference)
+            for reference in authoritative_keys
+        ):
+            removed += 1
+            continue
+        kept.append(item)
+    return kept, removed
+
+
+def _is_laboratory_atom(item: ClinicalEvidence) -> bool:
+    return (
+        item.fact_type == "laboratory_test"
+        or item.category == "laboratory_finding"
+        or item.data.get("fact_type") == "laboratory_test"
+    )
+
+
+def _laboratory_comparison_key(item: ClinicalEvidence):
+    if not _is_laboratory_atom(item):
+        return None
+    payload = item.typed_payload or {}
+    parameter = (
+        payload.get("parameter_name")
+        or item.data.get("parameter_name")
+        or item.canonical_label
+        or item.normalized_entity
+        or item.concept_original
+    )
+    parameter_key = _normalize_lab_parameter(parameter)
+    if not parameter_key:
+        return None
+    return (
+        parameter_key,
+        str(item.observed_date or ""),
+        item.numeric_value,
+        _normalize_lab_unit(item.unit),
+    )
+
+
+def _same_laboratory_measurement(candidate, reference) -> bool:
+    if not candidate or not reference or candidate[0] != reference[0]:
+        return False
+    candidate_date, reference_date = candidate[1], reference[1]
+    if candidate_date and reference_date and candidate_date != reference_date:
+        return False
+    candidate_value, reference_value = candidate[2], reference[2]
+    if candidate_value is not None and reference_value is not None:
+        try:
+            tolerance = max(1e-9, abs(float(reference_value)) * 1e-6)
+            if abs(float(candidate_value) - float(reference_value)) > tolerance:
+                return False
+        except (TypeError, ValueError):
+            return False
+    candidate_unit, reference_unit = candidate[3], reference[3]
+    return not (
+        candidate_unit and reference_unit and candidate_unit != reference_unit
+    )
+
+
+def _normalize_lab_parameter(value) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(
+        r"\b(?:alto|alta|alti|alte|basso|bassa|bassi|basse|"
+        r"aumentat\w*|ridott\w*|elevat\w*|diminuit\w*|"
+        r"sopra|sotto|fuori|range|limiti?|valori?)\b",
+        " ",
+        text,
+    )
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _normalize_lab_unit(value) -> str:
+    return re.sub(r"\s+", "", str(value or "").casefold())
 
 
 def load_document_geometry(path: Path | None):

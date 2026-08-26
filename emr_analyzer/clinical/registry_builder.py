@@ -52,6 +52,7 @@ from .evidence_relevance import (
 from .lab_evidence import (
     LAB_EXTRACTION_METHOD,
     abnormal_lab_evidence,
+    filter_narrative_lab_duplicates,
     load_document_geometry,
 )
 from .projections import LabTrendBuilder, TherapyProjectionBuilder
@@ -1873,6 +1874,16 @@ class ClinicalRegistryBuilder:
         self, document_id: str, evidence, *, clear_missing: bool = True
     ) -> None:
         """Refresh LLM and deterministic-prefilter atoms independently."""
+        evidence = list(evidence)
+        getter = getattr(self.evidence_repo, "get_by_document", None)
+        stored = getter(document_id) if callable(getter) else []
+        authoritative_labs = [
+            item for item in stored
+            if item.extraction_method == LAB_EXTRACTION_METHOD
+        ]
+        evidence, _ = filter_narrative_lab_duplicates(
+            evidence, authoritative_labs
+        )
         grouped: dict[str, list] = {
             "llm_atomic_v2": [],
             "deterministic_nonclinical": [],

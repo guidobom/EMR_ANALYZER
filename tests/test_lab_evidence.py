@@ -3,9 +3,11 @@ from types import SimpleNamespace
 from emr_analyzer.clinical.lab_evidence import (
     LAB_EXTRACTION_METHOD,
     abnormal_lab_evidence,
+    filter_narrative_lab_duplicates,
     is_out_of_range,
 )
 from emr_analyzer.clinical.registry_builder import ClinicalRegistryBuilder
+from emr_analyzer.models.clinical_evidence import ClinicalEvidence
 from emr_analyzer.models.lab_result import LabValue
 
 
@@ -79,6 +81,57 @@ def test_only_abnormal_labs_become_citable_atomic_evidence():
         "passage": "PCR 12 mg/dL 4.0-10.0",
     }
     assert first.to_atomic_dict()["report_date"] == "2025-04-13"
+
+
+def test_atomic_serialization_keeps_structured_clinical_fields():
+    item = ClinicalEvidence(
+        patient_id="P001", document_id="D1", category="clinical_sign",
+        fact_type="clinical_sign", normalized_entity="edema",
+        source_text="Edema declive bilaterale di grado moderato.",
+        observed_date="2025-01", observed_date_end="2025-02",
+        date_precision="month", date_source="explicit_text",
+        clinical_status="active", anatomical_site="arti inferiori",
+        laterality="bilateral", severity="moderate", confidence=0.91,
+    )
+
+    serialized = item.to_atomic_dict()
+
+    assert serialized["patient_id"] == "P001"
+    assert serialized["observation_date_end"] == "2025-02"
+    assert serialized["date_precision"] == "month"
+    assert serialized["clinical_status"] == "active"
+    assert serialized["anatomical_site"] == "arti inferiori"
+    assert serialized["laterality"] == "bilateral"
+    assert serialized["severity"] == "moderate"
+    assert serialized["confidence"] == 0.91
+
+
+def test_narrative_lab_filter_removes_only_same_deterministic_measurement():
+    deterministic = abnormal_lab_evidence(
+        patient_id="P001", document_id="D_LAB",
+        document_date="2025-04-13",
+        lab_values=[_lab("PCR", 12.0, flag="H")],
+    )
+    repeated = ClinicalEvidence(
+        patient_id="P001", document_id="D_LAB",
+        category="laboratory_finding", fact_type="laboratory_test",
+        normalized_entity="PCR elevata", source_text="PCR 12 mg/dL elevata",
+        observed_date="2025-04-12", numeric_value=12.0, unit="mg/dL",
+    )
+    pattern = ClinicalEvidence(
+        patient_id="P001", document_id="D_LAB",
+        category="laboratory_finding", fact_type="laboratory_test",
+        normalized_entity="sindrome infiammatoria",
+        source_text="Quadro di sindrome infiammatoria.",
+        observed_date="2025-04-12",
+    )
+
+    kept, removed = filter_narrative_lab_duplicates(
+        [repeated, pattern], deterministic
+    )
+
+    assert removed == 1
+    assert kept == [pattern]
 
 
 def test_abnormal_lab_without_source_passage_is_not_promoted_to_evidence():

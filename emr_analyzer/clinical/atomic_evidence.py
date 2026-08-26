@@ -31,16 +31,17 @@ from ..settings import ClinicalPipelinePolicy
 from ..prompt_catalog import load_prompt, prompts_digest
 
 
-ATOMIC_PIPELINE_VERSION = "registry_pipeline_v9"
-# v9 adds explicit biomarker/hospitalization/discharge contracts and expands
-# source-coverage checks for symptoms and clinical state changes. Old
-# extraction checkpoints do not prove that this contract was applied.
+ATOMIC_PIPELINE_VERSION = "registry_pipeline_v11"
+# v11 adds narrative laboratory fallback, explicit planned/performed grounding,
+# complete structured serialization and safer within-document deduplication.
+# Old extraction checkpoints do not prove that this contract was applied.
 ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS: tuple[str, ...] = ()
 
 _ATOMIC_TASK = load_prompt(
     "atomic_evidence_it",
     required_markers=(
         "source_refs", "medication", "radiology_finding", "vital_sign",
+        "laboratory_test",
     ),
     minimum_length=200,
 )
@@ -69,6 +70,20 @@ _THERAPY_LIFECYCLE_STATUSES = (
     "suspended", "stopped", "resumed", "completed", "cancelled", "unknown",
 )
 
+_PLANNED_ACTION_RE = re.compile(
+    r"(?i)\b(?:da\s+(?:eseguire|effettuare|programmare)|"
+    r"si\s+(?:programma|programmerà|richiede|propone|consiglia)|"
+    r"(?:programmat|pianificat|previst|richiest|consigliat|indicat|"
+    r"propost|prenotat)\w*|in\s+attesa\s+di|eventuale|"
+    r"candidato\s+(?:a|ad))\b"
+)
+_PERFORMED_OR_RESULT_RE = re.compile(
+    r"(?i)\b(?:eseguit|effettuat|praticat|sottopost|operat|ricoverat|"
+    r"dimess|somministrat|ha\s+(?:mostrato|evidenziato|documentato)|"
+    r"(?:mostra|evidenzia|documenta|dimostra|rileva|referta)(?:to|ta)?|"
+    r"esito|risultato)\w*\b"
+)
+
 # These are projections produced after atomic extraction. Allowing the LLM to
 # emit them here would duplicate syndrome, trend and oncology-line notes.
 _DERIVED_EVENT_CATEGORIES = {
@@ -95,13 +110,15 @@ ATOMIC_FACT_TYPE_TO_CATEGORY = {
     "discharge": "discharge",
 }
 ATOMIC_FACT_TYPES = tuple(CONTRACT_FACT_TYPES)
-LLM_ATOMIC_FACT_TYPES = tuple(
-    fact_type for fact_type in ATOMIC_FACT_TYPES
-    if fact_type != "laboratory_test"
-)
+LLM_ATOMIC_FACT_TYPES = tuple(ATOMIC_FACT_TYPES)
 ATOMIC_POLARITIES = ("present", "negated", "suspected")
 
 _TYPED_PAYLOAD_FIELDS = {
+    "laboratory_test": {
+        "parameter_name", "operator", "reference_low", "reference_high",
+        "reference_text", "flag", "abnormal_direction",
+        "biological_material", "interpretation",
+    },
     "radiology_finding": {
         "modality", "body_region", "comparison", "impression", "measurement",
         "morphology", "signal_characteristics", "enhancement", "distribution",
@@ -288,7 +305,7 @@ def build_atomic_evidence_schema(
 
 ATOMIC_EVIDENCE_SCHEMA = build_atomic_evidence_schema()
 
-ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v10"
+ATOMIC_PROMPT_VERSION = "atomic_evidence_it_v11"
 ATOMIC_PROMPT_DIGEST = prompts_digest(
     _ATOMIC_SYSTEM_PROMPT,
     _ATOMIC_VALIDATION_REPAIR_SYSTEM_PROMPT,
@@ -460,6 +477,12 @@ class AtomicEvidenceExtractor:
             "prompt_ms": 0.0,
             "predicted_ms": 0.0,
             "prefiltered_nonclinical": 0,
+            "initial_items": 0,
+            "repaired_items": 0,
+            "coverage_items": 0,
+            "items_before_deduplication": 0,
+            "within_document_duplicates": 0,
+            "final_items": 0,
         }
         geometry = self._load_geometry(geometry_path)
         text_for_llm, deterministic_nonclinical = _isolate_nonclinical_lines(
@@ -538,7 +561,13 @@ class AtomicEvidenceExtractor:
             model_name=self.model_name,
             existing=evidence,
         ))
+        metrics = self._current_metrics()
+        metrics["items_before_deduplication"] = len(evidence)
         evidence = deduplicate_atomic_evidence(evidence)
+        metrics["within_document_duplicates"] = (
+            metrics["items_before_deduplication"] - len(evidence)
+        )
+        metrics["final_items"] = len(evidence)
         # Keep every extracted atom immutable and auditable.  Administrative
         # and methodological atoms are labelled here, then excluded only from
         # downstream registry projections.
@@ -628,6 +657,7 @@ class AtomicEvidenceExtractor:
         metrics = self._current_metrics()
         metrics["invalid_items"] += len(pending)
         metrics["normalized_items"] += validation.normalized_items
+        metrics["initial_items"] += len(validation.items)
         retries = (
             self.policy.max_specialized_retries
             if self.policy.adaptive_specialized_retry and pending else 0
@@ -663,6 +693,7 @@ class AtomicEvidenceExtractor:
                 repaired, sentence_spans
             )
             items.extend(repaired_validation.items)
+            metrics["repaired_items"] += len(repaired_validation.items)
             metrics["invalid_items"] += len(repaired_validation.issues)
             metrics["normalized_items"] += (
                 repaired_validation.normalized_items
@@ -741,6 +772,7 @@ class AtomicEvidenceExtractor:
                     ]
                     if recovered_item["source_refs"]:
                         items.append(recovered_item)
+                        metrics["coverage_items"] += 1
         coalesced = _split_multi_state_medication_items(
             _coalesce_adjacent_wire_items(items), sentence_spans
         )
@@ -795,6 +827,12 @@ class AtomicEvidenceExtractor:
                 "prompt_ms": 0.0,
                 "predicted_ms": 0.0,
                 "prefiltered_nonclinical": 0,
+                "initial_items": 0,
+                "repaired_items": 0,
+                "coverage_items": 0,
+                "items_before_deduplication": 0,
+                "within_document_duplicates": 0,
+                "final_items": 0,
             }
             self._metrics_local.value = metrics
         return metrics
@@ -850,10 +888,6 @@ class AtomicEvidenceExtractor:
             category = "medication"
         if category not in EVENT_CATEGORIES:
             category = "other"
-        if category == "laboratory_finding":
-            # Laboratory atoms have a single authoritative path from parsed
-            # structured rows.  Never admit an LLM-produced duplicate.
-            return None
         assertion = str(item.get("assertion") or "present").strip().lower()
         if assertion not in ASSERTION_TYPES:
             assertion = "unknown"
@@ -874,10 +908,26 @@ class AtomicEvidenceExtractor:
                 matched_quote,
             )
         ):
-            # Parsed laboratory rows are the sole authoritative source for
-            # analytes and reference ranges. Never persist an LLM duplicate
-            # merely because the model chose another bucket.
-            return None
+            # A small model can put an analyte in a neighbouring measurement
+            # bucket.  Reclassify it before validation; the deterministic lab
+            # path remains authoritative and removes an exact duplicate later.
+            fact_type = "laboratory_test"
+            category = "laboratory_finding"
+            item["fact_type"] = fact_type
+            item["category"] = category
+        if fact_type == "laboratory_test":
+            category = "laboratory_finding"
+            if not _llm_laboratory_claim_is_relevant(
+                entity=entity, quote=matched_quote, item=item,
+            ):
+                return None
+        fact_type, category = _project_planned_action(
+            fact_type=fact_type,
+            category=category,
+            entity=entity,
+            quote=matched_quote,
+            item=item,
+        )
         category = _specific_atomic_category(
             category=category,
             fact_type=fact_type,
@@ -2291,6 +2341,10 @@ def _coverage_recovery_plan(
         for fact_type in _coverage_signal_types(span.text):
             if span.sentence_id not in covered.get(fact_type, set()):
                 present_types = covered_at_ref.get(span.sentence_id, set())
+                if _coverage_type_is_present(
+                    fact_type, present_types, span.text
+                ):
+                    continue
                 pathology_result = bool(_PATHOLOGY_CONTEXT_RE.search(span.text))
                 # A pathology-result sentence mentioning the diagnosis or the
                 # biopsy is already represented by its histopathology atom.
@@ -2324,6 +2378,30 @@ def _coverage_recovery_plan(
         if fact_type in missing_by_type
     )
     return selected, selected_types
+
+
+def _coverage_type_is_present(
+    wanted: str, present: set[str], source_text: str
+) -> bool:
+    """Treat only clinically equivalent wire buckets as already covered."""
+    if wanted in present:
+        return True
+    if wanted in {"radiology_finding", "instrumental_finding"} and present & {
+        "radiology_finding", "instrumental_finding"
+    }:
+        return True
+    if wanted in {"vital_sign", "clinical_sign"} and present & {
+        "vital_sign", "clinical_sign"
+    }:
+        return True
+    if _PLANNED_ACTION_RE.search(source_text):
+        # A planned procedure may arrive on the wire in either bucket; it is
+        # projected deterministically to clinical_decision before persistence.
+        if wanted in {"procedure", "clinical_decision"} and present & {
+            "procedure", "clinical_decision"
+        }:
+            return True
+    return False
 
 
 def _canonical_wire_mapping(
@@ -3091,9 +3169,10 @@ def deduplicate_atomic_evidence(
 ) -> list[ClinicalEvidence]:
     """Return one clinical atom for repeated source evidence.
 
-    ``document_id`` and page coordinates deliberately do not participate in
-    the identity.  Near-verbatim evidence copied into later reports is one
-    clinical fact, not a new occurrence.  Every physical occurrence is kept
+    ``document_id``, quote wording and page coordinates deliberately do not
+    participate in the identity.  Reworded evidence copied within or between
+    reports is one clinical fact when concept, state, date, value and the other
+    discriminating fields agree.  Every physical occurrence is kept
     in ``data['source_occurrences']`` so provenance/Quick View remain lossless.
 
     A changed clinical date, value, treatment state, site, side or severity is
@@ -3163,7 +3242,6 @@ def _atomic_identity_key(item: ClinicalEvidence) -> tuple:
         item.patient_id,
         _identity_text(item.category),
         _identity_text(item.normalized_entity),
-        _identity_text(item.source_text),
         date_key,
         date_end_key,
         _identity_text(item.assertion),
@@ -3332,6 +3410,74 @@ def _fact_type_for_category(category: str) -> str:
         "recommendation": "clinical_decision",
     }
     return preferred.get(str(category or ""), str(category or "other"))
+
+
+_NARRATIVE_LAB_ABNORMALITY_RE = re.compile(
+    r"(?i)\b(?:anemi\w*|leuco(?:citos|pen)\w*|neutro(?:fil|pen)\w*|"
+    r"linfo(?:cit|pen)\w*|trombo(?:cit|pen)\w*|pancitopen\w*|"
+    r"iper\w+emi\w*|ipo\w+emi\w*|aumentat\w*|incrementat\w*|"
+    r"elevat\w*|ridott\w*|diminuit\w*|soppress\w*|alterat\w*|"
+    r"fuori\s+(?:range|intervallo)|sopra\s+(?:il\s+)?(?:range|limite)|"
+    r"sotto\s+(?:il\s+)?(?:range|limite)|positiv\w*|negativ\w*|"
+    r"patologic\w*|marcatamente)\b"
+)
+
+
+def _llm_laboratory_claim_is_relevant(
+    *, entity: str, quote: str, item: dict[str, Any]
+) -> bool:
+    """Admit only source-grounded narrative laboratory abnormalities.
+
+    Structured rows remain the authoritative numeric path.  This fallback is
+    deliberately narrower: it recovers qualitative patterns and values whose
+    abnormality is explicit in prose, but rejects an isolated normal number.
+    """
+    payload = item.get("typed_payload")
+    if not isinstance(payload, dict):
+        payload = item.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    if any(payload.get(key) not in (None, "", [], {}) for key in (
+        "reference_low", "reference_high", "reference_text", "flag",
+        "abnormal_direction",
+    )):
+        return True
+    value_text = str(item.get("value_text") or "")
+    source = f"{entity} {quote} {value_text}"
+    if _NARRATIVE_LAB_ABNORMALITY_RE.search(source):
+        return True
+    # Explicit visual flags are common in normalized laboratory tables.
+    return bool(re.search(r"(?:^|\s)(?:\*{1,3}|[HL])(?:\s|$)", quote))
+
+
+def _project_planned_action(
+    *, fact_type: str, category: str, entity: str, quote: str,
+    item: dict[str, Any],
+) -> tuple[str, str]:
+    """Represent a documented plan without fabricating a performed event."""
+    if fact_type not in {
+        "procedure", "radiology_finding", "instrumental_finding",
+        "hospitalization", "discharge",
+    }:
+        return fact_type, category
+    if not _PLANNED_ACTION_RE.search(quote) or _PERFORMED_OR_RESULT_RE.search(
+        quote
+    ):
+        return fact_type, category
+    fact_type = "clinical_decision"
+    category = "care_plan"
+    item["fact_type"] = fact_type
+    item["category"] = category
+    item["clinical_status"] = "planned"
+    payload = item.get("typed_payload")
+    if not isinstance(payload, dict):
+        payload = item.get("payload")
+    payload = dict(payload) if isinstance(payload, dict) else {}
+    item["typed_payload"] = {
+        "action": "planned",
+        "target": entity,
+        **({"timing": payload["timing"]} if payload.get("timing") else {}),
+    }
+    return fact_type, category
 
 
 def _specific_atomic_category(
