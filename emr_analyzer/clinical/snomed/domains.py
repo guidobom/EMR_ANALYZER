@@ -161,3 +161,28 @@ def _hint_types(
 
 def semantic_tag(concept: SnomedConcept) -> str:
     return concept.semantic_tag()
+
+
+# Semantic categories that describe a clinical event directly.  Situation and
+# event concepts canonicalize to ``disorder``; observables, substances,
+# morphologies and body structures are attributes of events, not events.
+EVENT_LIKE_TAGS = frozenset({"disorder", "finding", "procedure"})
+
+
+def is_event_like(
+    concept: SnomedConcept,
+    *,
+    langs: Iterable[str] = DEFAULT_LANG_ORDER,
+) -> bool:
+    """Return whether a concept can be a direct clinical event (Percorso B).
+
+    Used by the direct-events path to narrow the chunk candidate set to
+    event-like semantics before exposing it as the constrained ``enum``.
+    """
+    for lang in langs:
+        canonical = _TAG_CANONICAL.get(
+            concept.semantic_tag((lang,)).casefold()
+        )
+        if canonical in EVENT_LIKE_TAGS:
+            return True
+    return False

@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from emr_analyzer.clinical.atomic_evidence import AtomicEvidenceExtractor
 from emr_analyzer.clinical.lab_evidence import abnormal_lab_evidence
 from emr_analyzer.clinical.snomed import SnomedCandidateRetriever
+from emr_analyzer.clinical.snomed.direct_events import DirectSnomedEventBuilder
 from emr_analyzer.clinical.snomed.extractor import SnomedAtomicEvidenceExtractor
 from emr_analyzer.clinical.snomed.release_manager import manager as snomed_manager
 from emr_analyzer.config import (
@@ -489,6 +490,156 @@ def run_snomed(
     )
 
 
+def run_events(
+    output: Path,
+    *,
+    release_dir: str,
+    workers: int | None = None,
+    case_ids: set[str] | None = None,
+    result_dir: str = "events",
+    langs: Iterable[str] = SNOMED_LANGUAGES,
+    cap: int | None = None,
+    min_score: float | None = None,
+) -> None:
+    """Run Percorso B (experimental direct events) over the sample.
+
+    Same manifest/lab infrastructure as ``run_snomed``; each case writes an
+    ``events`` payload with the direct-event records (closed-set codes and
+    dates, grounded passages) plus the builder diagnostics.  Percorso B is a
+    research prototype and never the default path.
+    """
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    if case_ids:
+        manifest = [case for case in manifest if case["case_id"] in case_ids]
+        missing = case_ids - {case["case_id"] for case in manifest}
+        if missing:
+            raise ValueError(f"Case non trovati: {', '.join(sorted(missing))}")
+    target = output / result_dir
+    target.mkdir(exist_ok=True)
+
+    langs = tuple(langs) or tuple(SNOMED_LANGUAGES)
+    snapshot = snomed_manager.snapshot(release_dir, langs)
+    index = snomed_manager.index(release_dir, langs)
+    effective_cap = cap if cap is not None else SNOMED_CANDIDATE_CAP
+    effective_min = (
+        min_score if min_score is not None else SNOMED_CANDIDATE_MIN_SCORE
+    )
+
+    configs = load_llm_configs()
+    config = configs["atomic_evidence"]
+    policy = load_pipeline_policy()
+    effective_workers = max(1, min(workers or config.parallel_workers, 8))
+    client = LlmClient(config=config)
+    client.retain_only_this_runtime()
+    print(
+        "DIRECT-EVENTS CONFIG "
+        f"model={config.model} backend={config.backend} "
+        f"ctx={config.context_length} output={config.max_output_tokens} "
+        f"workers={effective_workers} release={snapshot.digest} "
+        f"langs={','.join(langs)} cap={effective_cap} min_score={effective_min}",
+        flush=True,
+    )
+    warm = client.warmup()
+    print(
+        f"DIRECT-EVENTS WARMUP {warm.get('elapsed_seconds', 0):.1f}s "
+        f"slots={warm.get('slots', '?')}", flush=True,
+    )
+
+    def make_builder():
+        retriever = _RecordingRetriever(SnomedCandidateRetriever(
+            index,
+            langs=langs,
+            cap=effective_cap,
+            min_score=effective_min,
+            release_digest=snapshot.digest,
+        ))
+        builder = DirectSnomedEventBuilder(
+            client, retriever=retriever, policy=policy.lab
+        )
+        return builder, retriever
+
+    write_lock = threading.Lock()
+    started = time.perf_counter()
+    completed = 0
+
+    def one(case: dict) -> tuple[str, bool, float, int, int]:
+        case_id = case["case_id"]
+        result_path = target / f"{case_id}.json"
+        if result_path.exists():
+            return case_id, True, 0.0, 0, 0
+        text = Path(case["sanitized_path"]).read_text(encoding="utf-8")
+        builder, _retriever = make_builder()
+        case_started = time.perf_counter()
+        try:
+            events = builder.build_events(
+                patient_id=case["patient_id"],
+                document_id=case["document_id"],
+                document_type=case["document_type"],
+                document_date=case["document_date"],
+                text=text,
+                lab_values=_lab_values(case),
+            )
+            payload = {
+                "case_id": case_id,
+                "status": "ok",
+                "elapsed_seconds": time.perf_counter() - case_started,
+                "metrics": builder.last_metrics(),
+                "direct_events": [event.to_dict() for event in events],
+            }
+            temporary = result_path.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(result_path)
+            metrics = payload["metrics"]
+            return (
+                case_id, False, payload["elapsed_seconds"],
+                len(events), int(metrics.get("llm_calls", 0)),
+            )
+        except Exception as exc:
+            payload = {
+                "case_id": case_id,
+                "status": "error",
+                "elapsed_seconds": time.perf_counter() - case_started,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            result_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return case_id, False, payload["elapsed_seconds"], -1, -1
+
+    try:
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            futures = {pool.submit(one, case): case for case in manifest}
+            for future in as_completed(futures):
+                case_id, cached, elapsed, event_count, calls = future.result()
+                with write_lock:
+                    completed += 1
+                    total_elapsed = time.perf_counter() - started
+                    rate = completed / total_elapsed if total_elapsed else 0.0
+                    eta = (
+                        (len(manifest) - completed) / rate if rate else 0.0
+                    )
+                    marker = "cached" if cached else (
+                        "error" if event_count < 0 else "ok"
+                    )
+                    print(
+                        f"DIRECT-EVENTS {completed:02d}/{len(manifest)} {case_id} "
+                        f"{marker} {elapsed:.1f}s events={event_count} "
+                        f"calls={calls} ETA={eta / 60:.1f}m",
+                        flush=True,
+                    )
+    finally:
+        shutdown_all_backends()
+    print(
+        f"DIRECT-EVENTS COMPLETE elapsed={(time.perf_counter() - started) / 60:.1f}m",
+        flush=True,
+    )
+
+
 def run_qwen(
     output: Path,
     *,
@@ -640,11 +791,31 @@ def main() -> None:
     snomed.add_argument("--langs", nargs="*")
     snomed.add_argument("--cap", type=int)
     snomed.add_argument("--min-score", type=float)
+    events = subparsers.add_parser("events")
+    events.add_argument("--output", type=Path, required=True)
+    events.add_argument("--release-dir", type=Path, required=True)
+    events.add_argument("--workers", type=int)
+    events.add_argument("--case-ids", nargs="*")
+    events.add_argument("--result-dir", default="events")
+    events.add_argument("--langs", nargs="*")
+    events.add_argument("--cap", type=int)
+    events.add_argument("--min-score", type=float)
     args = parser.parse_args()
     if args.command == "sample":
         build_sample(args.projects_root, args.output)
     elif args.command == "snomed":
         run_snomed(
+            args.output,
+            release_dir=str(args.release_dir),
+            workers=args.workers,
+            case_ids=set(args.case_ids or ()),
+            result_dir=args.result_dir,
+            langs=tuple(args.langs or SNOMED_LANGUAGES),
+            cap=args.cap,
+            min_score=args.min_score,
+        )
+    elif args.command == "events":
+        run_events(
             args.output,
             release_dir=str(args.release_dir),
             workers=args.workers,

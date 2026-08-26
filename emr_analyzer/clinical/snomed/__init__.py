@@ -25,6 +25,7 @@ SNOMED_ATOMIC_PROMPT_VERSION = "atomic_evidence_it_snomed_v1"
 from .domains import (  # noqa: E402
     FSN_FACT_TYPE_HINTS,
     fact_types_for_concept,
+    is_event_like,
     semantic_tag,
 )
 from .index import SnomedIndex, normalize_tokens  # noqa: E402
@@ -61,6 +62,7 @@ __all__ = [
     "_ReleaseManager",
     "candidate_digest",
     "fact_types_for_concept",
+    "is_event_like",
     "load_snapshot",
     "normalize_tokens",
     "semantic_tag",
