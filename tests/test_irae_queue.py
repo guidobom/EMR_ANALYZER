@@ -143,6 +143,46 @@ class MergeIraeQueueSummariesTest(unittest.TestCase):
         self.assertEqual(merge_irae_queue_summaries([], []), [])
 
 
+class ChooseIraeMethodTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _choose(self, click_index: int):
+        """Call ``choose_irae_method`` faking a click on button ``index``."""
+        def fake_exec(box):
+            setattr(box, "_fake_clicked", box.buttons()[click_index])
+            return QMessageBox.Accepted
+
+        def fake_clicked(box):
+            return box._fake_clicked
+
+        # Le funzioni reali (patch.object new=...) vengono legate al box:
+        # un MagicMock come side_effect non riceverebbe l'istanza.
+        with mock.patch.object(QMessageBox, "exec_", fake_exec), \
+                mock.patch.object(QMessageBox, "clickedButton", fake_clicked):
+            from emr_analyzer.gui.workspace_tabs import choose_irae_method
+            return choose_irae_method(None)
+
+    def test_recommended_button_returns_structured(self):
+        self.assertEqual(self._choose(0), "structured")
+
+    def test_classic_button_returns_classic(self):
+        self.assertEqual(self._choose(1), "classic")
+
+    def test_dismiss_returns_none(self):
+        # Regressione: QMessageBox.question(parent, ..., "a", "b") non esiste
+        # su PyQt5 (TypeError) — la scelta usa addButton ed è annullabile.
+        def fake_reject(box):
+            return QMessageBox.Rejected
+
+        with mock.patch.object(QMessageBox, "exec_", fake_reject), \
+                mock.patch.object(QMessageBox, "clickedButton",
+                                  lambda box: None):
+            from emr_analyzer.gui.workspace_tabs import choose_irae_method
+            self.assertIsNone(choose_irae_method(None))
+
+
 class FakeLlm:
     def __init__(self, responses=None, fail_patient=None):
         self.responses = list(responses or [])

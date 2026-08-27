@@ -21,6 +21,41 @@ from .qt_utils import process_gui_events
 from ..models import Patient
 
 
+def choose_irae_method(parent) -> str | None:
+    """Ask which irAE analysis method to run.
+
+    Returns ``"structured"``, ``"classic"`` or ``None`` when the dialog is
+    dismissed without a choice (ESC / close button).  Uses a ``QMessageBox``
+    with ``addButton`` because the PyQt5 two-string overload
+    ``QMessageBox.question(parent, title, text, "a", "b")`` does not exist:
+    it raises ``TypeError: argument 4 has unexpected type 'str'`` (only the
+    ``StandardButtons`` form is accepted).
+    """
+    box = QMessageBox(parent)
+    box.setWindowTitle("Metodo di analisi irAE")
+    box.setText(
+        "Quale metodo di analisi irAE vuoi eseguire sui pazienti "
+        "selezionati?\n\n"
+        "• Strutturato NCTCAE 3-layer (consigliato): lessico "
+        "deterministico sulle evidenze atomiche + una chiamata "
+        "strutturata per organo (grado CTCAE, data di prima insorgenza, "
+        "inizio immunoterapia). Richiede lo stadio 'Estrai evidenze'.\n"
+        "• Protocollo classico a chunk: prompt unico sul registro "
+        "cronologico, output Markdown libero."
+    )
+    structured_btn = box.addButton(
+        "Strutturato NCTCAE 3-layer (consigliato)", QMessageBox.AcceptRole
+    )
+    box.addButton("Protocollo classico a chunk", QMessageBox.ActionRole)
+    box.setDefaultButton(structured_btn)
+    box.exec_()
+    if box.clickedButton() is None:
+        return None
+    if box.clickedButton() == structured_btn:
+        return "structured"
+    return "classic"
+
+
 class WorkspaceTabs(QTabWidget):
     """Central tab container for the patient workspace."""
 
@@ -686,20 +721,10 @@ class WorkspaceTabs(QTabWidget):
             )
             return
 
-        choice = QMessageBox.question(
-            self, "Metodo di analisi irAE",
-            "Quale metodo di analisi irAE vuoi eseguire sui pazienti "
-            "selezionati?\n\n"
-            "• Strutturato NCTCAE 3-layer (consigliato): lessico "
-            "deterministico sulle evidenze atomiche + una chiamata "
-            "strutturata per organo (grado CTCAE, data di prima insorgenza, "
-            "inizio immunoterapia). Richiede lo stadio 'Estrai evidenze'.\n"
-            "• Protocollo classico a chunk: prompt unico sul registro "
-            "cronologico, output Markdown libero.",
-            "Strutturato NCTCAE 3-layer (consigliato)",
-            "Protocollo classico a chunk",
-        )
-        if choice == 0:
+        method = choose_irae_method(self)
+        if method is None:
+            return
+        if method == "structured":
             self._run_irae_layer3_queue(patient_ids, llm)
         else:
             self._run_irae_classic_queue(patient_ids, llm)
