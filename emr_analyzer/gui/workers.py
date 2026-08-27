@@ -649,16 +649,25 @@ class IraeLayer3QueueWorker(QThread):
                         organ_results[organs[0]].get("error")
                         or "tutte le chiamate per organo sono fallite"
                     )
+                findings = [
+                    item
+                    for result in organ_results.values()
+                    for item in result.get("iraes", [])
+                ]
+                consolidation = irae_layers.consolidate_iraes(
+                    self.llm_client, findings, meta.get("anchor"),
+                    max_tokens=self.max_tokens,
+                )
+                self.chunk_progress.emit(
+                    len(organ_prompts) + 1, len(organ_prompts) + 1
+                )
                 report: dict = {
                     **meta,
                     "organ_results": {
                         organ: organ_results[organ] for organ in organs
                     },
-                    "iraes": [
-                        item
-                        for result in organ_results.values()
-                        for item in result.get("iraes", [])
-                    ],
+                    "iraes": consolidation["iraes"],
+                    "consolidation": consolidation,
                     "analyzed_at": datetime.now().isoformat(timespec="seconds"),
                 }
                 self.patient_structured.emit(patient_id, report)

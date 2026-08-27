@@ -164,11 +164,13 @@ class ChooseIraeMethodTest(unittest.TestCase):
             from emr_analyzer.gui.workspace_tabs import choose_irae_method
             return choose_irae_method(None)
 
-    def test_recommended_button_returns_structured(self):
+    def test_confirm_button_returns_structured(self):
         self.assertEqual(self._choose(0), "structured")
 
-    def test_classic_button_returns_classic(self):
-        self.assertEqual(self._choose(1), "classic")
+    def test_cancel_button_returns_none(self):
+        # Il protocollo classico a chunk è temporaneamente disattivato: il
+        # dialogo offre solo "Avvia analisi strutturata" / "Annulla".
+        self.assertIsNone(self._choose(1))
 
     def test_dismiss_returns_none(self):
         # Regressione: QMessageBox.question(parent, ..., "a", "b") non esiste

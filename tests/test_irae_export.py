@@ -76,7 +76,19 @@ class IraeRowsForExcelTest(unittest.TestCase):
         self.assertEqual(row["analyzed_at"], "2026-08-27T10:00:00")
         self.assertEqual(rows[1]["key_evidence_ids"], "E-UVE, E-9")
         # every result key has a header column.
-        self.assertEqual(len(EXCEL_COLUMNS), 13)
+        self.assertEqual(len(EXCEL_COLUMNS), 14)
+
+    def test_source_organs_and_notes_are_exported(self):
+        from emr_analyzer.clinical.irae_export import irae_rows_for_excel
+
+        finding = _finding(
+            source_organs=["Miocardite/Cardiotossicità", "Dermatite"],
+            notes="ripresa con prednisone 1 mg/kg",
+        )
+        rows, skipped = irae_rows_for_excel([_result("P001", _report([finding]))])
+        self.assertEqual(skipped, [])
+        self.assertEqual(rows[0]["organ"], "Miocardite/Cardiotossicità, Dermatite")
+        self.assertEqual(rows[0]["notes"], "ripresa con prednisone 1 mg/kg")
 
     def test_patients_without_structured_findings_are_skipped(self):
         from emr_analyzer.clinical.irae_export import irae_rows_for_excel
@@ -122,9 +134,10 @@ class WriteIraeXlsxTest(unittest.TestCase):
             sheet = workbook["irAE"]
             self.assertEqual(sheet.max_row, 3)  # header + 2 findings
             self.assertEqual(sheet["A1"].value, "Paziente")
-            self.assertEqual(sheet["B1"].value, "Organo")
+            self.assertEqual(sheet["B1"].value, "Organi di origine")
             self.assertEqual(sheet["C1"].value, "Tipo irAE")
             self.assertEqual(sheet["G1"].value, "Nuova vs riacutizzazione")
+            self.assertEqual(sheet["K1"].value, "Approfondimento clinico")
             self.assertEqual(sheet["A2"].value, "P001")
             self.assertEqual(sheet["B2"].value, "Miocardite/Cardiotossicità")
             self.assertEqual(sheet["D2"].value, "G2")

@@ -13,7 +13,7 @@ from typing import Any
 # (result key, Excel header) — stable column order for the workbook.
 EXCEL_COLUMNS: list[tuple[str, str]] = [
     ("patient_id", "Paziente"),
-    ("organ", "Organo"),
+    ("organ", "Organi di origine"),
     ("irAE_type", "Tipo irAE"),
     ("ctcae_grade", "Grado CTCAE"),
     ("first_onset_date", "Prima insorgenza"),
@@ -22,6 +22,7 @@ EXCEL_COLUMNS: list[tuple[str, str]] = [
     ("alternative_causes", "Cause alternative"),
     ("confidence", "Confidenza"),
     ("key_evidence_ids", "Evidenze chiave"),
+    ("notes", "Approfondimento clinico"),
     ("immunotherapy_start", "Inizio immunoterapia"),
     ("candidates_total", "N° candidati"),
     ("analyzed_at", "Data analisi"),
@@ -60,9 +61,11 @@ def irae_rows_for_excel(
             continue
         immunotherapy = _immunotherapy_label(report)
         for item in findings:
+            organs = item.get("source_organs") or []
+            organ = ", ".join(organs) if organs else item.get("organ", "")
             rows.append({
                 "patient_id": result["patient_id"],
-                "organ": item.get("organ", ""),
+                "organ": organ,
                 "irAE_type": item.get("irAE_type", ""),
                 "ctcae_grade": item.get("ctcae_grade", ""),
                 "first_onset_date": item.get("first_onset_date", ""),
@@ -75,6 +78,7 @@ def irae_rows_for_excel(
                 "key_evidence_ids": ", ".join(
                     item.get("key_evidence_ids") or []
                 ),
+                "notes": item.get("notes", ""),
                 "immunotherapy_start": immunotherapy,
                 "candidates_total": report.get("candidates_total", ""),
                 "analyzed_at": report.get("analyzed_at", ""),

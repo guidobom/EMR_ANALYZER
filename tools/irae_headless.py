@@ -257,6 +257,42 @@ def main(argv: list[str] | None = None) -> int:
             conf = item.get("confidence")
             if conf is not None:
                 print(f"      confidenza: {conf}")
+
+    # ---- Layer 4 (final consolidation: dedup + approfondimento) -----------
+    consolidation = report.get("consolidation") or {}
+    print("\n" + "=" * 78)
+    print("CONSOLIDAMENTO FINALE (Layer 4)")
+    print("=" * 78)
+    if not consolidation.get("applied"):
+        reason = consolidation.get("error") or "non eseguito"
+        print(f"  [skip] consolidamento non applicato: {reason}")
+    else:
+        consolidated = consolidation.get("iraes") or []
+        merged = (consolidation.get("input_count") or 0) - (
+            consolidation.get("output_count") or 0
+        )
+        print(
+            f"  {consolidation.get('output_count', 0)} irAE definitivi "
+            f"da {consolidation.get('input_count', 0)} reperti per organo "
+            f"({merged} unificati)"
+        )
+        for item in consolidated:
+            grade = item.get("ctcae_grade", "?")
+            prob = item.get("probability_immune", "?")
+            onset = item.get("first_onset_date", "?")
+            organs = ", ".join(item.get("source_organs") or [])
+            organ_txt = f" [{organs}]" if organs else ""
+            print(
+                f"  • {item.get('irAE_type', '?')} · {grade} · "
+                f"insorgenza {onset} · {prob}{organ_txt}"
+            )
+            if item.get("notes"):
+                print(f"      approfondimento: {item['notes']}")
+            if item.get("alternative_causes"):
+                print(f"      cause alt.: {item.get('alternative_causes')}")
+            ev = ",".join(item.get("key_evidence_ids", [])[:5])
+            if ev:
+                print(f"      evidenze: [{ev}]")
     print("\n" + "=" * 78)
 
     if args.output_json:

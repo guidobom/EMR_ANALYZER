@@ -22,38 +22,37 @@ from ..models import Patient
 
 
 def choose_irae_method(parent) -> str | None:
-    """Ask which irAE analysis method to run.
+    """Confirm the irAE analysis method.
 
-    Returns ``"structured"``, ``"classic"`` or ``None`` when the dialog is
-    dismissed without a choice (ESC / close button).  Uses a ``QMessageBox``
-    with ``addButton`` because the PyQt5 two-string overload
-    ``QMessageBox.question(parent, title, text, "a", "b")`` does not exist:
-    it raises ``TypeError: argument 4 has unexpected type 'str'`` (only the
-    ``StandardButtons`` form is accepted).
+    The classic chunked protocol is temporarily disabled (it lacks the final
+    duplicate-elimination pass and the structured granularity of the 3-layer
+    model), so the dialog only offers the structured analysis.  Returns
+    ``"structured"`` or ``None`` when dismissed without confirmation (ESC /
+    close button).  Uses a ``QMessageBox`` with ``addButton`` because the
+    PyQt5 two-string overload ``QMessageBox.question(parent, title, text,
+    "a", "b")`` does not exist: it raises ``TypeError: argument 4 has
+    unexpected type 'str'`` (only the ``StandardButtons`` form is accepted).
     """
     box = QMessageBox(parent)
-    box.setWindowTitle("Metodo di analisi irAE")
+    box.setWindowTitle("Analisi irAE")
     box.setText(
-        "Quale metodo di analisi irAE vuoi eseguire sui pazienti "
+        "Avvia l'analisi irAE strutturata NCTCAE sui pazienti "
         "selezionati?\n\n"
-        "• Strutturato NCTCAE 3-layer (consigliato): lessico "
-        "deterministico sulle evidenze atomiche + una chiamata "
-        "strutturata per organo (grado CTCAE, data di prima insorgenza, "
-        "inizio immunoterapia). Richiede lo stadio 'Estrai evidenze'.\n"
-        "• Protocollo classico a chunk: prompt unico sul registro "
-        "cronologico, output Markdown libero."
+        "• Lessico deterministico sulle evidenze atomiche (Layer 1-2)\n"
+        "• Una chiamata strutturata per organo (Layer 3)\n"
+        "• Passata finale di consolidamento ed eliminazione dei duplicati "
+        "(Layer 4)\n\n"
+        "Il protocollo classico a chunk è temporaneamente disattivato."
     )
     structured_btn = box.addButton(
-        "Strutturato NCTCAE 3-layer (consigliato)", QMessageBox.AcceptRole
+        "Avvia analisi strutturata", QMessageBox.AcceptRole
     )
-    box.addButton("Protocollo classico a chunk", QMessageBox.ActionRole)
+    cancel_btn = box.addButton("Annulla", QMessageBox.RejectRole)
     box.setDefaultButton(structured_btn)
     box.exec_()
-    if box.clickedButton() is None:
+    if box.clickedButton() in (None, cancel_btn):
         return None
-    if box.clickedButton() == structured_btn:
-        return "structured"
-    return "classic"
+    return "structured"
 
 
 class WorkspaceTabs(QTabWidget):
@@ -701,14 +700,13 @@ class WorkspaceTabs(QTabWidget):
         return plans
 
     def run_irae_queue(self, patient_ids: list[str]):
-        """Run the irAE protocol over several registries, in order.
+        """Run the structured NCTCAE irAE analysis over several patients.
 
-        Asks which method to use: the structured NCTCAE 3-layer analysis
-        (deterministic lexicon over atomic evidence + one structured LLM
-        call per organ) or the classic chunked protocol over the
-        chronological registry.  Plans are built on the main thread; the
-        LLM calls run in a background worker so the UI stays responsive.  A
-        summary dialog with one tab per patient opens at the end.
+        The classic chunked protocol is temporarily disabled, so only the
+        structured 3-layer method (+ Layer 4 consolidation) runs.  Plans are
+        built on the main thread; the LLM calls run in a background worker
+        so the UI stays responsive.  A summary dialog with one tab per
+        patient opens at the end.
         """
         if not patient_ids:
             return
@@ -721,13 +719,9 @@ class WorkspaceTabs(QTabWidget):
             )
             return
 
-        method = choose_irae_method(self)
-        if method is None:
+        if choose_irae_method(self) is None:
             return
-        if method == "structured":
-            self._run_irae_layer3_queue(patient_ids, llm)
-        else:
-            self._run_irae_classic_queue(patient_ids, llm)
+        self._run_irae_layer3_queue(patient_ids, llm)
 
     def _run_irae_classic_queue(self, patient_ids: list[str], llm):
         """Legacy chunked irAE protocol over the chronological registry."""

@@ -72,6 +72,22 @@ class FakeStructuredLlm:
         self.calls.append(prompt)
         if self.fail_patient and f"paziente {self.fail_patient}" in prompt:
             raise RuntimeError("errore simulato")
+        if "FASE FINALE" in prompt:
+            # Layer 4 consolidation: merges all per-organ findings into one.
+            return {
+                "iraes": [{
+                    "irAE_type": "irAE consolidato",
+                    "ctcae_grade": "G1",
+                    "first_onset_date": "2022-11-22",
+                    "probability_immune": "PROBABILE",
+                    "new_onset_vs_exacerbation": "nuova insorgenza",
+                    "alternative_causes": "nessuna",
+                    "confidence": 0.9,
+                    "key_evidence_ids": ["E-TROP"],
+                    "source_organs": ["test"],
+                    "notes": "approfondimento di test",
+                }]
+            }
         return {
             "iraes": [{
                 "organ": "test",
@@ -141,13 +157,21 @@ class AnalyzeIraeTest(unittest.TestCase):
         self.assertIn("immunotherapy_start", report)
         self.assertEqual(report["immunotherapy_start"]["date"], "2022-09-01")
         self.assertEqual(len(report["organ_results"]), 3)
-        self.assertEqual(len(report["iraes"]), 3)
+        # Layer 4 merges the three per-organ findings into one final irAE.
+        self.assertEqual(len(report["iraes"]), 1)
+        self.assertEqual(report["iraes"][0]["irAE_type"], "irAE consolidato")
+        self.assertTrue(report["consolidation"]["applied"])
+        self.assertEqual(report["consolidation"]["input_count"], 3)
+        self.assertEqual(report["consolidation"]["output_count"], 1)
+        self.assertIn("layer4", report["timing_seconds"])
         self.assertIn("total", report["timing_seconds"])
-        self.assertEqual(len(llm.calls), 3)
+        # 3 organ calls + 1 consolidation call.
+        self.assertEqual(len(llm.calls), 4)
         self.assertTrue(
             all("Miocardite" in c or "Dermatite" in c or "Oculari" in c
-                for c in llm.calls)
+                for c in llm.calls[:3])
         )
+        self.assertIn("FASE FINALE", llm.calls[3])
 
     def test_analyze_irae_empty_patient_has_no_llm_calls(self):
         rows = irae_layers.evidence_rows_from_models([
@@ -158,6 +182,77 @@ class AnalyzeIraeTest(unittest.TestCase):
         self.assertEqual(report["candidates_total"], 0)
         self.assertEqual(report["organ_results"], {})
         self.assertEqual(report["iraes"], [])
+        self.assertEqual(len(llm.calls), 0)
+
+
+class ConsolidateIraeTest(unittest.TestCase):
+    def _findings(self):
+        return [
+            {
+                "organ": "Miocardite/Cardiotossicità",
+                "irAE_type": "Elevazione della troponina",
+                "ctcae_grade": "G2", "first_onset_date": "2022-11-22",
+                "probability_immune": "PROBABILE",
+                "key_evidence_ids": ["E-TROP"],
+            },
+            {
+                "organ": "Dermatite",
+                "irAE_type": "Rash maculopapulare",
+                "ctcae_grade": "G1", "first_onset_date": "2022-12-13",
+                "probability_immune": "POSSIBILE",
+                "key_evidence_ids": ["E-RASH"],
+            },
+        ]
+
+    def test_build_prompt_lists_findings_and_marks_fase_finale(self):
+        anchor = {
+            "first_drug": "nivolumab", "first_date": "2022-09-01",
+            "first_raw": "2022-09-01", "last_drug": "nivolumab",
+            "last_date": "2022-09-01", "last_raw": "2022-09-01",
+        }
+        prompt, truncated = irae_layers.build_consolidation_prompt(
+            self._findings(), anchor
+        )
+        self.assertEqual(truncated, 0)
+        self.assertIn("FASE FINALE", prompt)
+        self.assertIn("nivolumab dal 2022-09-01", prompt)
+        self.assertIn("[1] Organo: Miocardite/Cardiotossicità", prompt)
+        self.assertIn("[2] Organo: Dermatite", prompt)
+        self.assertIn("UNISCI i duplicati", prompt)
+
+    def test_consolidate_returns_final_iraes(self):
+        llm = FakeStructuredLlm()
+        result = irae_layers.consolidate_iraes(
+            llm, self._findings(), None, max_tokens=512
+        )
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["input_count"], 2)
+        self.assertEqual(result["output_count"], 1)
+        self.assertEqual(result["iraes"][0]["irAE_type"], "irAE consolidato")
+        self.assertEqual(len(llm.calls), 1)
+
+    def test_consolidate_fallback_to_input_on_exception(self):
+        class BrokenLlm(FakeStructuredLlm):
+            def generate_structured(self, prompt, system="", schema=None, *,
+                                    max_tokens=None):
+                self.calls.append(prompt)
+                raise RuntimeError("boom")
+
+        llm = BrokenLlm()
+        result = irae_layers.consolidate_iraes(
+            llm, self._findings(), None, max_tokens=512
+        )
+        self.assertFalse(result["applied"])
+        self.assertIn("boom", result["error"])
+        # Fallback: the analysis is never lost.
+        self.assertEqual(result["iraes"], self._findings())
+        self.assertEqual(result["output_count"], 2)
+
+    def test_consolidate_empty_findings_makes_no_call(self):
+        llm = FakeStructuredLlm()
+        result = irae_layers.consolidate_iraes(llm, [], None)
+        self.assertFalse(result["applied"])
+        self.assertEqual(result["iraes"], [])
         self.assertEqual(len(llm.calls), 0)
 
 
@@ -201,6 +296,48 @@ class RenderMarkdownTest(unittest.TestCase):
         })
         self.assertIn("⚠️ Errore", markdown)
 
+    def test_renders_consolidated_section_with_organs_and_notes(self):
+        report = {
+            "organ_results": {},
+            "consolidation": {
+                "applied": True,
+                "error": None,
+                "input_count": 2,
+                "output_count": 1,
+                "iraes": [{
+                    "irAE_type": "Miocardite da ICI",
+                    "ctcae_grade": "G2",
+                    "first_onset_date": "2022-11-22",
+                    "probability_immune": "PROBABILE",
+                    "source_organs": [
+                        "Miocardite/Cardiotossicità", "Dermatite",
+                    ],
+                    "notes": "ripresa con prednisone 1 mg/kg",
+                    "key_evidence_ids": ["E-TROP", "E-RASH"],
+                }],
+            },
+        }
+        markdown = irae_layers.render_irae_markdown(report)
+        self.assertIn("Analisi finale consolidata (Layer 4)", markdown)
+        self.assertIn("Miocardite da ICI", markdown)
+        self.assertIn("Miocardite/Cardiotossicità, Dermatite", markdown)
+        self.assertIn("ripresa con prednisone 1 mg/kg", markdown)
+        self.assertIn("Uniti 2 reperti per organo in 1 irAE definitivi", markdown)
+
+    def test_consolidation_not_applied_omits_section(self):
+        report = {
+            "organ_results": {},
+            "consolidation": {
+                "applied": False,
+                "error": "OutputLimitError: boom",
+                "input_count": 2,
+                "output_count": 2,
+                "iraes": [],
+            },
+        }
+        markdown = irae_layers.render_irae_markdown(report)
+        self.assertNotIn("Analisi finale consolidata (Layer 4)", markdown)
+
 
 class IraeLayer3QueueWorkerTest(unittest.TestCase):
     def _plans(self):
@@ -242,14 +379,17 @@ class IraeLayer3QueueWorkerTest(unittest.TestCase):
         self.assertEqual(started, [(1, 2, "P001"), (2, 2, "P002")])
         self.assertEqual([p for p, _ in finished_ok], ["P001", "P002"])
         self.assertEqual(errors, [])
-        self.assertEqual(len(llm.calls), 3)
-        self.assertIn("irAE di test", finished_ok[0][1])
-        # chunk_progress covers both organs of P001 then one of P002.
-        self.assertEqual(len(progress), 3)
+        # P001: 2 organs + 1 consolidation; P002: 1 organ + 1 consolidation.
+        self.assertEqual(len(llm.calls), 5)
+        self.assertIn("irAE consolidato", finished_ok[0][1])
+        self.assertIn("irAE di test", finished_ok[0][1])  # sezione per organo
+        # chunk_progress: P001 (2 organi + consolidamento) then P002 (1 + 1).
+        self.assertEqual(len(progress), 5)
         # patient_structured carries the raw report (for the Excel export).
         self.assertEqual([p for p, _ in structured], ["P001", "P002"])
-        self.assertEqual(len(structured[0][1]["iraes"]), 2)
+        self.assertEqual(len(structured[0][1]["iraes"]), 1)
         self.assertEqual(len(structured[1][1]["iraes"]), 1)
+        self.assertTrue(structured[0][1]["consolidation"]["applied"])
         self.assertIn("analyzed_at", structured[0][1])
 
     def test_meta_anchor_is_rendered_in_markdown(self):
