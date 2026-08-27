@@ -48,11 +48,46 @@ class IraeQueueResultDialog(QDialog):
         save_btn = QPushButton("💾 Salva tutto")
         save_btn.clicked.connect(self._save_all)
         buttons.addWidget(save_btn)
+        excel_btn = QPushButton("📊 Esporta Excel")
+        excel_btn.clicked.connect(self._export_excel)
+        buttons.addWidget(excel_btn)
         buttons.addStretch()
         close_btn = QPushButton("Chiudi")
         close_btn.clicked.connect(self.accept)
         buttons.addWidget(close_btn)
         layout.addLayout(buttons)
+
+    def _export_excel(self):
+        """Export the structured findings to a single .xlsx workbook."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Esporta risultati irAE",
+            "irae_risultati.xlsx", "Excel (*.xlsx)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        from ..clinical.irae_export import write_irae_xlsx
+
+        try:
+            written, skipped = write_irae_xlsx(self._results, path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Esportazione fallita",
+                f"Impossibile scrivere il file Excel:\n{exc}",
+            )
+            return
+        message = (
+            f"Righe esportate: {written}\n"
+            f"File: {path}"
+        )
+        if skipped:
+            message += (
+                "\nPazienti senza dati strutturati (saltati): "
+                + ", ".join(skipped)
+            )
+        QMessageBox.information(self, "Esportazione completata", message)
 
     def _save_all(self):
         directory = QFileDialog.getExistingDirectory(

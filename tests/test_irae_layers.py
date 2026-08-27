@@ -211,26 +211,33 @@ class IraeLayer3QueueWorkerTest(unittest.TestCase):
         ]
 
     def _run_worker(self, worker):
-        started, finished_ok, errors, progress = [], [], [], []
+        started, finished_ok, errors, progress, structured = (
+            [], [], [], [], []
+        )
         worker.patient_started.connect(
             lambda i, n, p: started.append((i, n, p))
         )
         worker.patient_finished.connect(
             lambda p, m: finished_ok.append((p, m))
         )
+        worker.patient_structured.connect(
+            lambda p, r: structured.append((p, r))
+        )
         worker.patient_error.connect(lambda p, e: errors.append((p, e)))
         worker.chunk_progress.connect(
             lambda c, n: progress.append((c, n))
         )
         worker.run()
-        return started, finished_ok, errors, progress
+        return started, finished_ok, errors, progress, structured
 
     def test_runs_patients_in_order_with_structured_calls(self):
         from emr_analyzer.gui.workers import IraeLayer3QueueWorker
 
         llm = FakeStructuredLlm()
         worker = IraeLayer3QueueWorker(llm, self._plans())
-        started, finished_ok, errors, progress = self._run_worker(worker)
+        started, finished_ok, errors, progress, structured = (
+            self._run_worker(worker)
+        )
 
         self.assertEqual(started, [(1, 2, "P001"), (2, 2, "P002")])
         self.assertEqual([p for p, _ in finished_ok], ["P001", "P002"])
@@ -239,6 +246,11 @@ class IraeLayer3QueueWorkerTest(unittest.TestCase):
         self.assertIn("irAE di test", finished_ok[0][1])
         # chunk_progress covers both organs of P001 then one of P002.
         self.assertEqual(len(progress), 3)
+        # patient_structured carries the raw report (for the Excel export).
+        self.assertEqual([p for p, _ in structured], ["P001", "P002"])
+        self.assertEqual(len(structured[0][1]["iraes"]), 2)
+        self.assertEqual(len(structured[1][1]["iraes"]), 1)
+        self.assertIn("analyzed_at", structured[0][1])
 
     def test_meta_anchor_is_rendered_in_markdown(self):
         from emr_analyzer.gui.workers import IraeLayer3QueueWorker
@@ -257,17 +269,21 @@ class IraeLayer3QueueWorkerTest(unittest.TestCase):
             [("P001", [("Miocardite/Cardiotossicità", "prompt")], meta)],
         )
         finished = []
+        structured = []
         worker.patient_finished.connect(lambda p, m: finished.append(m))
+        worker.patient_structured.connect(lambda p, r: structured.append(r))
         worker.run()
         self.assertIn("Inizio immunoterapia", finished[0])
         self.assertIn("nivolumab", finished[0])
         self.assertIn("Candidati pre-filtrati", finished[0])
+        self.assertEqual(structured[0]["candidates_total"], 2)
+        self.assertEqual(structured[0]["anchor"]["first_drug"], "nivolumab")
 
     def test_empty_plans_raise_explicit_patient_error(self):
         from emr_analyzer.gui.workers import IraeLayer3QueueWorker
 
         worker = IraeLayer3QueueWorker(FakeStructuredLlm(), [("P003", [])])
-        started, finished_ok, errors, _ = self._run_worker(worker)
+        started, finished_ok, errors, _, _ = self._run_worker(worker)
         self.assertEqual(started, [(1, 1, "P003")])
         self.assertEqual(finished_ok, [])
         self.assertEqual(len(errors), 1)
@@ -284,10 +300,11 @@ class IraeLayer3QueueWorkerTest(unittest.TestCase):
         worker = IraeLayer3QueueWorker(
             FakeStructuredLlm(fail_patient="P002"), plans
         )
-        started, finished_ok, errors, _ = self._run_worker(worker)
+        started, finished_ok, errors, _, structured = self._run_worker(worker)
 
         self.assertEqual([p for p, _ in finished_ok], ["P001"])
         self.assertEqual([p for p, _ in errors], ["P002"])
+        self.assertEqual([p for p, _ in structured], ["P001"])
 
     def test_cancel_stops_between_patients(self):
         from emr_analyzer.gui.workers import IraeLayer3QueueWorker
@@ -308,7 +325,7 @@ class IraeLayer3QueueWorkerTest(unittest.TestCase):
 
         worker = IraeLayer3QueueWorker(CancellingLlm(None), self._plans())
         worker.llm_client.worker = worker
-        started, finished_ok, errors, _ = self._run_worker(worker)
+        started, finished_ok, errors, _, _ = self._run_worker(worker)
         # P001 completes its two organ calls, P002 is skipped.
         self.assertEqual([p for p, _ in finished_ok], ["P001"])
         self.assertEqual(errors, [])

@@ -5,6 +5,7 @@ with the main GUI thread via Qt signals.
 """
 
 import threading
+from datetime import datetime
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -585,6 +586,7 @@ class IraeLayer3QueueWorker(QThread):
     chunk_progress = pyqtSignal(int, int)        # organ_index, organ_total
     patient_finished = pyqtSignal(str, str)      # patient_id, markdown
     patient_error = pyqtSignal(str, str)         # patient_id, error
+    patient_structured = pyqtSignal(str, object)  # patient_id, report dict
 
     def __init__(
         self,
@@ -657,7 +659,9 @@ class IraeLayer3QueueWorker(QThread):
                         for result in organ_results.values()
                         for item in result.get("iraes", [])
                     ],
+                    "analyzed_at": datetime.now().isoformat(timespec="seconds"),
                 }
+                self.patient_structured.emit(patient_id, report)
                 self.patient_finished.emit(
                     patient_id, irae_layers.render_irae_markdown(report)
                 )

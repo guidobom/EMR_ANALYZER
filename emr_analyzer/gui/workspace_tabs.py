@@ -816,10 +816,21 @@ class WorkspaceTabs(QTabWidget):
                 f"Analisi parte {chunk}/{n}...",
             )
         )
+        # The structured method also emits the raw report so the result
+        # dialog can export it (Excel): attach it to the same result entry.
+        structured_by_patient: dict[str, dict] = {}
+        if hasattr(worker, "patient_structured"):
+            worker.patient_structured.connect(
+                lambda pid, report, store=structured_by_patient: (
+                    store.__setitem__(pid, report)
+                )
+            )
         worker.patient_finished.connect(
-            lambda pid, markdown, results=results: (
+            lambda pid, markdown, results=results,
+            structured_by_patient=structured_by_patient: (
                 results.append({
                     "patient_id": pid, "label": pid, "markdown": markdown,
+                    "structured": structured_by_patient.pop(pid, None),
                     "error": None,
                 }),
                 progress.add_log(f"✓ {pid}: analisi completata"),
