@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from emr_analyzer.database.engine import DatabaseEngine
+from emr_analyzer.database.evidence_repo import EvidenceRepository
 from emr_analyzer.database.migrations import init_database
 from emr_analyzer.database.patient_repo import PatientRepository
 from emr_analyzer.database.timeline_repo import TimelineRepository
@@ -20,6 +21,7 @@ from emr_analyzer.gui.irae_queue_dialog import IraeQueueDialog
 from emr_analyzer.gui.irae_queue_result_dialog import IraeQueueResultDialog
 from emr_analyzer.gui.workers import IraeQueueWorker
 from emr_analyzer.models import Patient
+from emr_analyzer.models.clinical_evidence import ClinicalEvidence
 from emr_analyzer.models.clinical_timeline import ClinicalTimelineEntry
 
 
@@ -55,6 +57,90 @@ class PatientsWithEntriesTest(unittest.TestCase):
             self.assertEqual(by_id["P001"]["timeline_count"], 2)
             self.assertEqual(by_id["P002"]["timeline_count"], 1)
             self.assertEqual(by_id["P001"]["pseudonym"], "uno")
+
+
+class PatientsWithEvidenceTest(unittest.TestCase):
+    def _insert_document(self, db, doc_id: str, patient_id: str) -> None:
+        db.execute(
+            """INSERT INTO documents
+               (id, patient_id, filename, original_path, file_hash,
+                document_date, document_type, import_date)
+               VALUES (?, ?, 'd.pdf', '/d.pdf', 'hash', '2025-01-10',
+                       'referto', '2026-01-01')""",
+            (doc_id, patient_id),
+        )
+
+    def test_lists_only_patients_with_atomic_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseEngine(Path(tmp) / "registry.db")
+            init_database(db)
+            patient_repo = PatientRepository(db)
+            patient_repo.insert(Patient(id="P001", pseudonym="uno", sex="M"))
+            patient_repo.insert(Patient(id="P002", pseudonym="due", sex="F"))
+            patient_repo.insert(Patient(id="P003", pseudonym="tre", sex="M"))
+            for doc_id, pid in (("D1", "P001"), ("D2", "P001"), ("D3", "P002")):
+                self._insert_document(db, doc_id, pid)
+            db.commit()
+            evidence_repo = EvidenceRepository(db)
+            evidence_repo.insert_batch([
+                ClinicalEvidence(
+                    evidence_id="E1", patient_id="P001", document_id="D1",
+                    category="diagnosis", normalized_entity="melanoma",
+                    source_text="Melanoma", observed_date="2025-01-10",
+                ),
+                ClinicalEvidence(
+                    evidence_id="E2", patient_id="P001", document_id="D2",
+                    category="diagnosis", normalized_entity="melanoma",
+                    source_text="Melanoma", observed_date="2025-01-12",
+                ),
+                ClinicalEvidence(
+                    evidence_id="E3", patient_id="P002", document_id="D3",
+                    category="diagnosis", normalized_entity="melanoma",
+                    source_text="Melanoma", observed_date="2025-02-01",
+                ),
+            ])
+
+            summaries = evidence_repo.patients_with_evidence()
+
+            by_id = {s["id"]: s for s in summaries}
+            self.assertEqual(set(by_id), {"P001", "P002"})
+            self.assertEqual(by_id["P001"]["evidence_count"], 2)
+            self.assertEqual(by_id["P002"]["evidence_count"], 1)
+            self.assertEqual(by_id["P001"]["pseudonym"], "uno")
+
+
+class MergeIraeQueueSummariesTest(unittest.TestCase):
+    def test_registry_kept_and_evidence_only_patients_added(self):
+        from emr_analyzer.gui.irae_queue_dialog import (
+            merge_irae_queue_summaries,
+        )
+
+        merged = merge_irae_queue_summaries(
+            [
+                {"id": "P001", "pseudonym": "uno", "timeline_count": 12},
+                {"id": "P002", "pseudonym": "due", "timeline_count": 3},
+            ],
+            [
+                {"id": "P002", "pseudonym": "due", "evidence_count": 40},
+                {"id": "P003", "pseudonym": "tre", "evidence_count": 7},
+            ],
+        )
+
+        by_id = {s["id"]: s for s in merged}
+        self.assertEqual(list(by_id), ["P001", "P002", "P003"])
+        # Registry patients keep their timeline count untouched.
+        self.assertEqual(by_id["P001"]["timeline_count"], 12)
+        self.assertEqual(by_id["P002"]["timeline_count"], 3)
+        # Evidence-only patients fall back to the evidence count.
+        self.assertEqual(by_id["P003"]["timeline_count"], 7)
+        self.assertEqual(by_id["P003"]["pseudonym"], "tre")
+
+    def test_empty_lists_return_empty(self):
+        from emr_analyzer.gui.irae_queue_dialog import (
+            merge_irae_queue_summaries,
+        )
+
+        self.assertEqual(merge_irae_queue_summaries([], []), [])
 
 
 class FakeLlm:

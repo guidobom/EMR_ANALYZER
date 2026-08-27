@@ -118,6 +118,23 @@ class EvidenceRepository:
         ).fetchall()
         return [self._row_to_evidence(row) for row in rows]
 
+    def patients_with_evidence(self) -> list[dict]:
+        """Summaries of every patient that HAS atomic evidence.
+
+        Each dict carries ``id``, ``pseudonym`` and ``evidence_count``;
+        ordered most recently created first.  Mirrors
+        ``TimelineRepository.patients_with_entries`` but over
+        ``clinical_evidence`` (the input of the structured irAE analysis).
+        """
+        rows = self.db.execute(
+            """SELECT p.id, p.pseudonym, COUNT(c.evidence_id) AS evidence_count
+               FROM patients p
+               JOIN clinical_evidence c ON c.patient_id = p.id
+               GROUP BY p.id
+               ORDER BY p.created_at DESC, p.id"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def delete_by_document(self, document_id: str) -> None:
         self.db.execute(
             "DELETE FROM clinical_evidence WHERE document_id=?", (document_id,)

@@ -473,25 +473,33 @@ class MainWindow(QMainWindow):
     def _on_show_irae_queue(self):
         """Launch the multi-patient irAE analysis queue.
 
-        Only patients that HAVE a chronological registry are listed; the
-        queue runs after the selection dialog closes.
+        Lists the patients that HAVE a chronological registry, plus those
+        with atomic evidence (the input of the structured NCTCAE 3-layer
+        method) that have no registry yet, so the batch can run as soon as
+        the 'Estrai evidenze' stage is complete.  The queue runs after the
+        selection dialog closes.
         """
         timeline_repo = self._services.get("timeline_repo")
-        if not timeline_repo:
+        evidence_repo = self._services.get("evidence_repo")
+        if not timeline_repo and not evidence_repo:
             QMessageBox.warning(
                 self, "Errore", "Servizio del registro non disponibile."
             )
             return
-        summaries = timeline_repo.patients_with_entries()
+
+        from .irae_queue_dialog import IraeQueueDialog, merge_irae_queue_summaries
+
+        summaries = merge_irae_queue_summaries(
+            timeline_repo.patients_with_entries() if timeline_repo else [],
+            evidence_repo.patients_with_evidence() if evidence_repo else [],
+        )
         if not summaries:
             QMessageBox.information(
                 self, "Nessun registro",
-                "Nessun paziente ha ancora un registro cronologico "
-                "generato.",
+                "Nessun paziente ha ancora un registro cronologico o "
+                "evidenze atomiche generate.",
             )
             return
-
-        from .irae_queue_dialog import IraeQueueDialog
 
         dialog = IraeQueueDialog(summaries, parent=self)
         if dialog.exec_() != QDialog.Accepted:

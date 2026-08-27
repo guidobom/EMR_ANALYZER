@@ -9,6 +9,30 @@ from PyQt5.QtWidgets import (
 )
 
 
+def merge_irae_queue_summaries(
+    timeline_summaries: list[dict],
+    evidence_summaries: list[dict],
+) -> list[dict]:
+    """Union of the registry and evidence patient lists for the irAE queue.
+
+    Patients with a chronological registry keep their ``timeline_count``
+    untouched; patients found only in the atomic evidence (the input of the
+    structured NCTCAE 3-layer method) get ``timeline_count`` set to their
+    ``evidence_count`` so the dialog's count column stays populated.
+    """
+    merged: dict[str, dict] = {}
+    for summary in timeline_summaries:
+        merged[summary["id"]] = dict(summary)
+    for summary in evidence_summaries:
+        if summary["id"] not in merged:
+            merged[summary["id"]] = {
+                "id": summary["id"],
+                "pseudonym": summary.get("pseudonym") or "",
+                "timeline_count": summary.get("evidence_count", 0),
+            }
+    return list(merged.values())
+
+
 class IraeQueueDialog(QDialog):
     """Checkbox list of the patients that HAVE a chronological registry."""
 
