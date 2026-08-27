@@ -569,6 +569,104 @@ class IraeQueueWorker(QThread):
                 )
 
 
+class IraeLayer3QueueWorker(QThread):
+    """Run the structured 3-layer irAE analysis over several patients.
+
+    ``patient_plans`` is a list of ``(patient_id, [(organ, prompt), ...])``
+    with the per-organ Layer 3 prompts pre-built on the main thread (SQLite
+    is not touched here).  Each organ call is a structured LLM call with the
+    constrained JSON schema from ``irae_layers``; organ calls of one patient
+    run in a bounded thread pool (llama-server slots), patients run
+    sequentially.  Results are rendered to Markdown and emitted with the same
+    signal contract as :class:`IraeQueueWorker`, so the queue wiring and the
+    result dialog stay unchanged.  Cancellation is honoured between patients.
+    """
+    patient_started = pyqtSignal(int, int, str)  # index, total, patient_id
+    chunk_progress = pyqtSignal(int, int)        # organ_index, organ_total
+    patient_finished = pyqtSignal(str, str)      # patient_id, markdown
+    patient_error = pyqtSignal(str, str)         # patient_id, error
+
+    def __init__(
+        self,
+        llm_client,
+        patient_plans,
+        *,
+        max_tokens: int = 4096,
+        parallel: int = 4,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.patient_plans = patient_plans
+        self.max_tokens = max_tokens
+        self.parallel = parallel
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from ..clinical import irae_layers
+
+        total = len(self.patient_plans)
+        for index, plan in enumerate(self.patient_plans, start=1):
+            patient_id = plan[0]
+            organ_prompts = plan[1]
+            meta = plan[2] if len(plan) > 2 else {}
+            if self._cancelled:
+                break
+            self.patient_started.emit(index, total, patient_id)
+            try:
+                if not organ_prompts:
+                    raise RuntimeError(
+                        "nessun candidato irAE (esegui prima lo stadio "
+                        "'Estrai evidenze' per questo paziente)"
+                    )
+                organ_results: dict[str, dict] = {}
+                organs = [organ for organ, _ in organ_prompts]
+                max_workers = max(1, min(self.parallel, len(organ_prompts)))
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {
+                        pool.submit(
+                            irae_layers.run_organ_call,
+                            self.llm_client, organ, prompt, self.max_tokens,
+                        ): organ
+                        for organ, prompt in organ_prompts
+                    }
+                    for position, future in enumerate(
+                        as_completed(futures), start=1
+                    ):
+                        self.chunk_progress.emit(position, len(organ_prompts))
+                        result = future.result()
+                        organ_results[result["organ"]] = result
+                failed = [o for o in organs if organ_results.get(o, {}).get("error")]
+                if len(failed) == len(organs):
+                    raise RuntimeError(
+                        organ_results[organs[0]].get("error")
+                        or "tutte le chiamate per organo sono fallite"
+                    )
+                report: dict = {
+                    **meta,
+                    "organ_results": {
+                        organ: organ_results[organ] for organ in organs
+                    },
+                    "iraes": [
+                        item
+                        for result in organ_results.values()
+                        for item in result.get("iraes", [])
+                    ],
+                }
+                self.patient_finished.emit(
+                    patient_id, irae_layers.render_irae_markdown(report)
+                )
+            except Exception as exc:
+                self.patient_error.emit(
+                    patient_id, f"Errore analisi irAE strutturata: {str(exc)}"
+                )
+
+
 class IraeAnalysisWorker(QThread):
     """Run the irAE protocol over the whole registry, chunk by chunk."""
     progress = pyqtSignal(int, int)  # chunk_index, chunk_total

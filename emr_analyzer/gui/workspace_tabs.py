@@ -598,12 +598,82 @@ class WorkspaceTabs(QTabWidget):
             plans.append((pid, prompts))
         return plans
 
+    @staticmethod
+    def _build_irae_layer3_plans(
+        services: dict,
+        patient_ids: list[str],
+        *,
+        max_candidates: int = 60,
+    ) -> list[tuple[str, list[tuple[str, str]], dict]]:
+        """Pre-build per-organ Layer 3 prompts from the atomic evidence.
+
+        Main thread only (SQLite must not be touched from the worker): each
+        patient's ``clinical_evidence`` rows are loaded through
+        ``evidence_repo``, Layers 1-2 run deterministically, and one bounded
+        prompt per organ is produced.  Returns ``[(pid, [(organ, prompt)],
+        meta)]`` where ``meta`` carries the anchor/candidate counts so the
+        worker can render a complete report.  A patient without atomic
+        evidence yields an empty prompt list (the worker reports an explicit
+        error).
+        """
+        from ..clinical import irae_layers
+        from ..clinical.irae_prototype import (
+            find_ici_anchor,
+            scan_for_irae,
+            summarize_candidates,
+        )
+
+        evidence_repo = services.get("evidence_repo")
+        if evidence_repo is None:
+            raise RuntimeError("evidence_repo non disponibile nei servizi")
+        plans: list[tuple[str, list[tuple[str, str]], dict]] = []
+        for pid in patient_ids:
+            rows = irae_layers.evidence_rows_from_models(
+                evidence_repo.get_by_patient(pid)
+            )
+            anchor = find_ici_anchor(rows)
+            candidates = scan_for_irae(rows, anchor)
+            by_organ: dict[str, list] = {}
+            for candidate in candidates:
+                by_organ.setdefault(candidate.organ, []).append(candidate)
+            organ_order = [s["organ"] for s in summarize_candidates(candidates)]
+            prompts = [
+                (
+                    organ,
+                    irae_layers.build_organ_prompt(
+                        organ, by_organ[organ], anchor, max_candidates
+                    )[0],
+                )
+                for organ in organ_order
+            ]
+            meta: dict = {
+                "candidates_total": len(candidates),
+                "anchor": (
+                    {
+                        "first_drug": anchor.first_drug,
+                        "first_date": anchor.first_date.isoformat(),
+                        "first_raw": anchor.first_raw,
+                        "last_drug": anchor.last_drug,
+                        "last_date": anchor.last_date.isoformat(),
+                        "last_raw": anchor.last_raw,
+                        "occurrences": anchor.occurrences,
+                    }
+                    if anchor is not None
+                    else None
+                ),
+            }
+            plans.append((pid, prompts, meta))
+        return plans
+
     def run_irae_queue(self, patient_ids: list[str]):
         """Run the irAE protocol over several registries, in order.
 
-        Plans are built on the main thread; the LLM calls run in a
-        background worker so the UI stays responsive.  A summary dialog
-        with one tab per patient opens at the end.
+        Asks which method to use: the structured NCTCAE 3-layer analysis
+        (deterministic lexicon over atomic evidence + one structured LLM
+        call per organ) or the classic chunked protocol over the
+        chronological registry.  Plans are built on the main thread; the
+        LLM calls run in a background worker so the UI stays responsive.  A
+        summary dialog with one tab per patient opens at the end.
         """
         if not patient_ids:
             return
@@ -616,6 +686,26 @@ class WorkspaceTabs(QTabWidget):
             )
             return
 
+        choice = QMessageBox.question(
+            self, "Metodo di analisi irAE",
+            "Quale metodo di analisi irAE vuoi eseguire sui pazienti "
+            "selezionati?\n\n"
+            "• Strutturato NCTCAE 3-layer (consigliato): lessico "
+            "deterministico sulle evidenze atomiche + una chiamata "
+            "strutturata per organo (grado CTCAE, data di prima insorgenza, "
+            "inizio immunoterapia). Richiede lo stadio 'Estrai evidenze'.\n"
+            "• Protocollo classico a chunk: prompt unico sul registro "
+            "cronologico, output Markdown libero.",
+            "Strutturato NCTCAE 3-layer (consigliato)",
+            "Protocollo classico a chunk",
+        )
+        if choice == 0:
+            self._run_irae_layer3_queue(patient_ids, llm)
+        else:
+            self._run_irae_classic_queue(patient_ids, llm)
+
+    def _run_irae_classic_queue(self, patient_ids: list[str], llm):
+        """Legacy chunked irAE protocol over the chronological registry."""
         from ..clinical import irae_analysis
 
         try:
@@ -634,10 +724,49 @@ class WorkspaceTabs(QTabWidget):
             return
 
         plans = self._build_irae_plans(self._services, patient_ids, protocol)
+        self._run_irae_queue_with_worker(
+            patient_ids, llm, plans, "IraeQueueWorker"
+        )
 
-        from .workers import IraeQueueWorker
+    def _run_irae_layer3_queue(self, patient_ids: list[str], llm):
+        """Structured NCTCAE 3-layer irAE analysis over atomic evidence."""
+        from ..clinical import irae_layers
 
-        self._irae_queue_worker = IraeQueueWorker(llm, plans)
+        try:
+            plans = self._build_irae_layer3_plans(
+                self._services, patient_ids,
+                max_candidates=irae_layers.DEFAULT_MAX_CANDIDATES,
+            )
+        except RuntimeError as exc:
+            QMessageBox.warning(
+                self, "Analisi irAE non disponibile", str(exc)
+            )
+            return
+        self._run_irae_queue_with_worker(
+            patient_ids, llm, plans, "IraeLayer3QueueWorker",
+        )
+
+    def _run_irae_queue_with_worker(
+        self,
+        patient_ids: list[str],
+        llm,
+        plans: list,
+        worker_name: str,
+    ):
+        """Shared queue wiring for both irAE analysis methods.
+
+        ``plans`` is either ``[(pid, list[str])]`` (classic prompts) or
+        ``[(pid, list[(organ, prompt)])]`` (structured Layer 3).  Both
+        worker classes expose the same signal contract, so the progress
+        dialog, log and result dialog are identical.
+        """
+        from .workers import IraeLayer3QueueWorker, IraeQueueWorker
+
+        worker_cls = {
+            "IraeQueueWorker": IraeQueueWorker,
+            "IraeLayer3QueueWorker": IraeLayer3QueueWorker,
+        }[worker_name]
+        self._irae_queue_worker = worker_cls(llm, plans)
         worker = self._irae_queue_worker
         results: list[dict] = []
 

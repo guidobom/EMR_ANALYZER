@@ -110,6 +110,84 @@ PRIMARY_TOXICITY_LEXICON: dict[str, tuple[str, ...]] = {
         "artrit",
         "dolore articolare",
     ),
+    "Miocardite/Cardiotossicità": (
+        "miocardit",
+        "myocard",
+        "troponin",
+        "cardiotossic",
+        "cardio_tossic",
+        r"\bck-mb\b",
+        r"\bck_mb\b",
+        "frazione_di_eiezione",
+        "frazione di eiezione",
+        "aritm",
+        "tachicardi",
+        "fibrillazione",
+        "insufficienza cardiaca",
+        "insufficienza_cardiaca",
+        "scompenso cardiaco",
+        "scompenso_cardiaco",
+    ),
+    "Pancreatite": (
+        "lipasi",
+        "amilasi",
+        "isoamilasi",
+        "pancreat",
+    ),
+    "Oculari": (
+        "uveit",
+        "cheratit",
+        "sclerit",
+        "episclerit",
+        "retinopatia",
+        "coroidit",
+    ),
+    "Neurologiche": (
+        "polineuropat",
+        "neuropat",
+        "encefalit",
+        "mielit",
+        "meningit",
+        "miasten",
+        "nevrite",
+        "diplop",
+        "atassia",
+        "parkinson",
+    ),
+    "Ipofisite/Surrenale": (
+        "ipofisit",
+        "ipopituitarismo",
+        r"\bacth\b",
+        "cortisolo",
+        "insufficienza surrenalica",
+        "insufficienza_surrenalica",
+        "sindrome_di_cushing",
+    ),
+    "Ematologiche": (
+        "anemia_emolitica",
+        "anemia emolitica",
+        "emolisi",
+        "neutropenia",
+        "trombocitopenia",
+        "pancitopenia",
+        "agranulocitosi",
+    ),
+    "Cistite": (
+        "cistit",
+    ),
+    "Mucosite/Sicca": (
+        "mucosit",
+        "stomatit",
+        "xerostomia",
+        "cheratocongiuntivite secca",
+        "secchezza delle fauci",
+    ),
+    "Diabete/Iperglicemia": (
+        "iperglicemia",
+        "chetoacidosi",
+        "diabete di tipo",
+        "diabete_tipo",
+    ),
 }
 
 # Non-organ-specific symptoms; kept separate and flagged ``generic`` so the
@@ -150,6 +228,7 @@ class ToxicityCandidate:
     band: str
     quote: str
     generic: bool = False
+    value: str = ""
 
 
 def _parse_evidence_date(raw: str | None) -> date | None:
@@ -267,6 +346,7 @@ def scan_for_irae(
                 band=band_for_offset(offset),
                 quote=_quote_from_row(row),
                 generic=generic,
+                value=_value_from_row(row),
             )
         )
     band_rank = {name: index for index, name in enumerate(BAND_ORDER)}
@@ -283,6 +363,26 @@ def _quote_from_row(row: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _value_from_row(row: dict[str, Any]) -> str:
+    """Compact lab value for the prompt: number, operator and unit.
+
+    ``value_text`` wins (it is the human-readable rendering, e.g. ``>0.4``),
+    then the numeric value with its unit (e.g. ``712 ng/L``).  Returns ""
+    when the row is not a quantitative laboratory finding.
+    """
+    value_text = row.get("value_text")
+    if isinstance(value_text, str) and value_text.strip():
+        return value_text.strip()
+    numeric_value = row.get("numeric_value")
+    if numeric_value is None:
+        return ""
+    unit = row.get("unit")
+    unit = unit.strip() if isinstance(unit, str) and unit.strip() else ""
+    if isinstance(numeric_value, float) and numeric_value.is_integer():
+        numeric_value = int(numeric_value)
+    return f"{numeric_value} {unit}".strip()
 
 
 def summarize_candidates(candidates: list[ToxicityCandidate]) -> list[dict[str, Any]]:
