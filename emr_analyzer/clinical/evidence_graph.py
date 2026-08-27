@@ -121,6 +121,7 @@ class EvidenceGraphBuilder:
     def __init__(self, llm=None, *, policy: ClinicalPipelinePolicy | None = None):
         self.llm = llm
         self.policy = policy or ClinicalPipelinePolicy()
+        self._voting_errors: list[str] = []
 
     def build(
         self,
@@ -453,9 +454,12 @@ class EvidenceGraphBuilder:
                     pending.append(pair)
             notify_progress()
 
+            batch_size = _vote_batch_size(
+                int(getattr(self.llm, "context_length", 32768) or 32768)
+            )
             batches = [
-                pending[index:index + 32]
-                for index in range(0, len(pending), 32)
+                pending[index:index + batch_size]
+                for index in range(0, len(pending), batch_size)
             ]
             if not batches:
                 continue
@@ -503,6 +507,18 @@ class EvidenceGraphBuilder:
                 raise
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)
+
+        if calls and not any(
+            votes.get(pair.candidate_id) for pair in candidates
+        ):
+            detail = (
+                "; ".join(dict.fromkeys(self._voting_errors[:3]))
+                if self._voting_errors else "nessun voto valido ricevuto"
+            )
+            raise RuntimeError(
+                "Votazione relazioni fallita: il modello locale non ha "
+                f"prodotto alcun voto valido. ({detail})"
+            )
 
         result = []
         for pair in candidates:
@@ -606,7 +622,10 @@ class EvidenceGraphBuilder:
                 )
             else:
                 data = generator(prompt, _RELATION_SYSTEM_PROMPT, _RELATION_SCHEMA)
-        except Exception:
+        except Exception as exc:
+            self._voting_errors.append(
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            )
             return []
         return _validate_votes(data, {pair.candidate_id for pair in batch})
 
@@ -694,6 +713,18 @@ class EvidenceGraphBuilder:
                 cluster.roles[missing] = _role_for(by_id[missing], core=False)
                 cluster.relation_ids.append(relation.relation_id)
         return clusters, split_count
+
+
+def _vote_batch_size(context_length: int) -> int:
+    """Pairs per voting call, sized so prompt + output fit the context.
+
+    Measured on the real corpus: ~360 prompt tokens per pair plus ~160
+    output tokens per pair.  A 15% margin keeps the request safely inside
+    smaller contexts (the 4B voting model runs at 8k).
+    """
+    if context_length < 4096:
+        return 4
+    return max(4, min(32, int(context_length * 0.85 / 520)))
 
 
 def _is_later_resolution(left, right) -> bool:

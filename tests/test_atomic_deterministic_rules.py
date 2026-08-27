@@ -111,6 +111,48 @@ def test_measure_recovery_excluded_for_medication():
     assert "value_measurement_extracted" not in evidence.data
 
 
+def test_graph_voting_fails_loudly_when_model_produces_no_votes():
+    from emr_analyzer.clinical.evidence_graph import EvidenceGraphBuilder
+    from emr_analyzer.models.clinical_evidence import ClinicalEvidence
+
+    class _DeadLlm:
+        model = "dead"
+        max_output_tokens = 512
+
+        def generate_structured(self, prompt, system, schema, *, max_tokens=None):
+            raise RuntimeError("server non raggiungibile")
+
+    items = [
+        ClinicalEvidence(
+            evidence_id="E1", patient_id="P1", document_id="D1",
+            category="symptom", normalized_entity="dispnea",
+            source_text="dispnea", observed_date="2025-01-10",
+        ),
+        ClinicalEvidence(
+            evidence_id="E2", patient_id="P1", document_id="D1",
+            category="symptom", normalized_entity="astenia",
+            source_text="astenia", observed_date="2025-01-10",
+        ),
+    ]
+    builder = EvidenceGraphBuilder(_DeadLlm())
+    try:
+        builder.build("P1", items)
+    except RuntimeError as exc:
+        assert "Votazione relazioni fallita" in str(exc)
+        assert "server non raggiungibile" in str(exc)
+    else:
+        raise AssertionError("il fallimento silenzioso non è stato bloccato")
+
+
+def test_vote_batch_size_fits_small_contexts():
+    from emr_analyzer.clinical.evidence_graph import _vote_batch_size
+
+    assert _vote_batch_size(8192) == 13      # 4B voting model
+    assert _vote_batch_size(16384) == 26
+    assert _vote_batch_size(131072) == 32    # capped
+    assert _vote_batch_size(2048) == 4       # floor
+
+
 def test_date_review_marks_degraded_precision():
     data = {}
     _flag_date_review(

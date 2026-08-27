@@ -425,7 +425,7 @@ class ClinicalPipelinePolicy:
     local_window_days: int = 10
     longitudinal_window_days: int = 90
     longitudinal_step_days: int = 45
-    semantic_top_k: int = 12
+    semantic_top_k: int = 6
     cohesive_threshold: float = 0.72
     bridge_split_threshold: float = 0.58
     lab: LabEvidencePolicy = field(default_factory=LabEvidencePolicy)
@@ -474,7 +474,7 @@ class ClinicalPipelinePolicy:
             longitudinal_step_days=integer(
                 "longitudinal_step_days", 45, 1, 3650
             ),
-            semantic_top_k=integer("semantic_top_k", 12, 1, 100),
+            semantic_top_k=integer("semantic_top_k", 6, 1, 100),
             cohesive_threshold=floating("cohesive_threshold", 0.72),
             bridge_split_threshold=floating("bridge_split_threshold", 0.58),
             lab=LabEvidencePolicy.from_dict(payload.get("lab", {})),
