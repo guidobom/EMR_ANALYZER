@@ -18,9 +18,9 @@ from urllib.parse import urlparse
 from ..config import LLM_MODEL_CATALOG_CACHE_PATH
 
 
-CATALOG_REVIEW_DATE = "2026-08-21"
+CATALOG_REVIEW_DATE = "2026-08-27"
 CATALOG_SCHEMA_VERSION = 1
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
 _OLLAMA_TAG_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}:[A-Za-z0-9][A-Za-z0-9._-]{0,119}$"
 )
@@ -244,6 +244,37 @@ MODEL_CATALOG: tuple[CatalogModel, ...] = (
         source_url="https://ollama.com/library/ministral-3/tags",
         document_rank=4,
         clinical_state_rank=6,
+    ),
+    CatalogModel(
+        catalog_id="mistral-nemo-12b",
+        display_name="Mistral Nemo 12B Instruct",
+        ollama_tag="mistral-nemo:12b-instruct-q4_K_M",
+        provider="Mistral AI",
+        parameter_label="12B",
+        quantization="Q4_K_M",
+        download_size_gb=7.1,
+        context_length=131_072,
+        minimum_ram_gb=10,
+        recommended_ram_gb=16,
+        roles=("document", "clinical_state"),
+        profile="Evidenze · equilibrato",
+        description=(
+            "Raccomandato per l'estrazione di evidenze atomiche e la catena "
+            "di eventi clinici: output JSON disciplinati, italiano solido e "
+            "contesto 128K con ingombro ridotto."
+        ),
+        strengths=(
+            "Rispetto dello schema JSON, istruzioni strutturate in italiano "
+            "e latenza contenuta su configurazioni da 16 GiB."
+        ),
+        caution=(
+            "Per episodi molto lunghi è meno capace dei modelli da 27–30B; "
+            "verificare comunque ogni risultato."
+        ),
+        license_name="Apache 2.0",
+        source_url="https://ollama.com/library/mistral-nemo/tags",
+        document_rank=3,
+        clinical_state_rank=3,
     ),
     CatalogModel(
         catalog_id="qwen3-4b",

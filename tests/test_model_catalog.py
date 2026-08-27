@@ -70,11 +70,13 @@ def test_catalog_prioritizes_role_and_filters_for_ram():
     )
     assert events[0].catalog_id == "qwen3-30b-a3b-instruct"
     assert all("clinical_state" in model.roles for model in events)
+    assert "mistral-nemo-12b" in {model.catalog_id for model in events}
 
     atomic = filter_catalog(
         role="atomic_evidence", total_ram_gb=120, compatible_only=True
     )
     assert any(model.catalog_id == "qwen3-4b" for model in atomic)
+    assert "mistral-nemo-12b" in {model.catalog_id for model in atomic}
 
     small_document = filter_catalog(
         role="document", total_ram_gb=8, compatible_only=True
@@ -89,20 +91,20 @@ def test_catalog_prioritizes_role_and_filters_for_ram():
 def test_catalog_cache_is_atomic_validated_and_cannot_downgrade(tmp_path):
     cache = tmp_path / "catalog.json"
     manifest = builtin_catalog_manifest()
-    manifest["catalog_version"] = 2
+    manifest["catalog_version"] = 3
     manifest["review_date"] = "2026-09-01"
     raw = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
 
     cached = cache_catalog_manifest(raw, cache)
 
-    assert cached.catalog_version == 2
+    assert cached.catalog_version == 3
     assert load_catalog_snapshot(cache).source == "cache"
     downgrade = builtin_catalog_manifest()
     with pytest.raises(ValueError, match="meno recente"):
         cache_catalog_manifest(
             json.dumps(downgrade).encode("utf-8"), cache
         )
-    assert load_catalog_snapshot(cache).catalog_version == 2
+    assert load_catalog_snapshot(cache).catalog_version == 3
 
 
 def test_invalid_cached_catalog_falls_back_to_integrated(tmp_path):

@@ -316,7 +316,7 @@ def test_catalog_update_downloads_validates_and_caches_manifest(tmp_path):
     from emr_analyzer.llm_backend.model_catalog import builtin_catalog_manifest
 
     manifest = builtin_catalog_manifest()
-    manifest["catalog_version"] = 2
+    manifest["catalog_version"] = 3
     manifest["review_date"] = "2026-09-01"
     payload = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
     cache = tmp_path / "catalog.json"
@@ -332,7 +332,7 @@ def test_catalog_update_downloads_validates_and_caches_manifest(tmp_path):
             ),
         )
 
-    assert result["catalog_version"] == 2
+    assert result["catalog_version"] == 3
     assert result["updated"] is True
     assert result["model_count"] == len(manifest["models"])
     assert cache.read_bytes() == payload
