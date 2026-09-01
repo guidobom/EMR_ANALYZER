@@ -3,14 +3,35 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from emr_analyzer.clinical import irae_layers
 from emr_analyzer.clinical.irae_prototype import find_ici_anchor, scan_for_irae
+from emr_analyzer.config import active_workspace
 from emr_analyzer.models.clinical_evidence import ClinicalEvidence
+
+
+class _IraeWorkspaceIsolated(unittest.TestCase):
+    """Patch the active workspace to a temp dir for the whole test.
+
+    The queue/single workers persist ``irae_report.json`` per patient as soon
+    as a report is produced, so every test that runs them must isolate the
+    workspace or it would write into the real one.
+    """
+
+    def setUp(self) -> None:
+        self._ws_tmp = tempfile.TemporaryDirectory()
+        self._ws_patcher = mock.patch.object(
+            active_workspace, "path", Path(self._ws_tmp.name)
+        )
+        self._ws_patcher.start()
+        self.addCleanup(self._ws_patcher.stop)
+        self.addCleanup(self._ws_tmp.cleanup)
 
 
 def make_evidence(
@@ -756,7 +777,7 @@ class RenderMarkdownTest(unittest.TestCase):
         self.assertNotIn("Analisi finale consolidata (Layer 4)", markdown)
 
 
-class IraeLayer3QueueWorkerTest(unittest.TestCase):
+class IraeLayer3QueueWorkerTest(_IraeWorkspaceIsolated):
     def _plans(self):
         return [
             ("P001", [("Miocardite/Cardiotossicità", "organo Miocardite paziente P001"),
@@ -808,6 +829,28 @@ class IraeLayer3QueueWorkerTest(unittest.TestCase):
         self.assertEqual(len(structured[1][1]["iraes"]), 1)
         self.assertTrue(structured[0][1]["consolidation"]["applied"])
         self.assertIn("analyzed_at", structured[0][1])
+
+    def test_persists_structured_report_per_patient(self):
+        import tempfile
+        from pathlib import Path
+
+        from emr_analyzer.clinical.irae_reports import (
+            has_report, load_report,
+        )
+        from emr_analyzer.config import active_workspace
+        from emr_analyzer.gui.workers import IraeLayer3QueueWorker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(active_workspace, "path", Path(tmp)):
+                llm = FakeStructuredLlm()
+                worker = IraeLayer3QueueWorker(llm, self._plans())
+                _, _, errors, _, structured = self._run_worker(worker)
+                self.assertEqual(errors, [])
+                self.assertTrue(has_report("P001"))
+                self.assertTrue(has_report("P002"))
+                # The saved raw report equals the one emitted on the signal.
+                self.assertEqual(load_report("P001"), structured[0][1])
+                self.assertEqual(load_report("P002"), structured[1][1])
 
     def test_meta_anchor_is_rendered_in_markdown(self):
         from emr_analyzer.gui.workers import IraeLayer3QueueWorker
@@ -958,7 +1001,7 @@ class _ParallelFakeBackend:
         )
 
 
-class IraeLayer3QueueWorkerParallelTest(unittest.TestCase):
+class IraeLayer3QueueWorkerParallelTest(_IraeWorkspaceIsolated):
     def _plans(self):
         return [
             ("P001", [("Miocardite/Cardiotossicità",

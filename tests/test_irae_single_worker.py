@@ -104,6 +104,47 @@ class SinglePatientIraeWorkerTest(unittest.TestCase):
         self.assertIn("evidence", report)
         self.assertTrue(report["consolidation"]["applied"])
 
+    def test_persists_report_when_patient_id_given(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from emr_analyzer.clinical.irae_reports import (
+            has_report, load_report,
+        )
+        from emr_analyzer.config import active_workspace
+        from emr_analyzer.gui.workers import SinglePatientIraeWorker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(active_workspace, "path", Path(tmp)):
+                worker = SinglePatientIraeWorker(
+                    FakeStructuredLlm(), self._rows(), max_tokens=512,
+                    patient_id="P001",
+                )
+                reports, errors = self._run(worker)
+                self.assertEqual(errors, [])
+                self.assertTrue(has_report("P001"))
+                self.assertEqual(load_report("P001"), reports[0])
+
+    def test_no_report_saved_without_patient_id(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from emr_analyzer.clinical.irae_reports import has_report
+        from emr_analyzer.config import active_workspace
+        from emr_analyzer.gui.workers import SinglePatientIraeWorker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(active_workspace, "path", Path(tmp)):
+                worker = SinglePatientIraeWorker(
+                    FakeStructuredLlm(), self._rows(), max_tokens=512
+                )
+                reports, errors = self._run(worker)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(reports), 1)
+                self.assertFalse(has_report("P001"))
+
     def test_empty_rows_errors_without_llm_call(self):
         from emr_analyzer.gui.workers import SinglePatientIraeWorker
 

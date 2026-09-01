@@ -371,3 +371,95 @@ class IraeNoRegistryTest(ClinicalHistoryChatTabTest):
             self.tab._on_irae_analysis()
         self.assertIn("Nessuna evidenza atomica", info.call_args[0][1])
         self.assertIsNone(self.tab._irae_worker)
+
+
+class IraeRiepilogoTest(ClinicalHistoryChatTabTest):
+    """Per-patient reopen of the last saved irAE report ("Riepilogo irAE")."""
+
+    def _make_saved_report(self, patient_id: str) -> dict:
+        """Write a raw irAE report into the active workspace."""
+        import json
+
+        from emr_analyzer.config import active_workspace
+
+        report = {
+            "anchor": {
+                "first_drug": "nivolumab", "first_date": "2022-09-01",
+                "first_raw": "2022-09-01", "last_drug": "nivolumab",
+                "last_date": "2022-09-01", "last_raw": "2022-09-01",
+                "occurrences": 1,
+            },
+            "candidates_total": 1,
+            "iraes": [
+                {
+                    "irAE_type": "Miocardite da ICI", "ctcae_grade": "G2",
+                    "first_onset_date": "2022-11-22",
+                    "probability_immune": "PROBABILE",
+                    "key_evidence_ids": ["E-TROP"],
+                    "organ": "Miocardite/Cardiotossicità",
+                },
+            ],
+            "consolidation": {"applied": True},
+            "analyzed_at": "2026-09-01T10:00:00",
+        }
+        path = active_workspace.path / patient_id / "irae_report.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(report, ensure_ascii=False), encoding="utf-8"
+        )
+        return report
+
+    def _patch_workspace(self):
+        from emr_analyzer.config import active_workspace
+
+        return mock.patch.object(active_workspace, "path", Path(self._tmp.name))
+
+    def test_button_disabled_without_saved_report(self):
+        with self._patch_workspace():
+            self.tab.load_patient("P001")
+            self.assertFalse(self.tab._riepilogo_btn.isEnabled())
+
+    def test_button_enabled_with_saved_report(self):
+        with self._patch_workspace():
+            self._make_saved_report("P001")
+            self.tab.load_patient("P001")
+            self.assertTrue(self.tab._riepilogo_btn.isEnabled())
+
+    def test_button_disabled_while_busy_even_with_report(self):
+        with self._patch_workspace():
+            self._make_saved_report("P001")
+            self.tab.load_patient("P001")
+            with mock.patch.object(
+                self.tab, "_worker_running", return_value=True
+            ):
+                self.tab._update_busy_ui()
+            self.assertFalse(self.tab._riepilogo_btn.isEnabled())
+
+    def test_handler_opens_dialog_with_loaded_report(self):
+        from emr_analyzer.gui import irae_result_dialog
+
+        with self._patch_workspace():
+            report = self._make_saved_report("P001")
+            self.tab.load_patient("P001")
+            fake_dialog = mock.Mock()
+            with mock.patch.object(
+                irae_result_dialog, "IraeResultDialog",
+                return_value=fake_dialog,
+            ) as dialog_cls:
+                self.tab._on_riepilogo_irae()
+                dialog_cls.assert_called_once()
+                args, kwargs = dialog_cls.call_args
+                self.assertEqual(args[0], report)
+                self.assertEqual(kwargs["patient_id"], "P001")
+                fake_dialog.exec_.assert_called_once()
+
+    def test_handler_without_report_shows_message(self):
+        from emr_analyzer.gui import irae_result_dialog
+
+        with self._patch_workspace():
+            self.tab.load_patient("P001")
+            with mock.patch(
+                "emr_analyzer.gui.irae_result_dialog.IraeResultDialog"
+            ) as dialog_cls:
+                self.tab._on_riepilogo_irae()
+            dialog_cls.assert_not_called()

@@ -205,6 +205,15 @@ class ClinicalHistoryTab(QWidget):
         self._irae_btn.setEnabled(False)
         query_layout.addWidget(self._irae_btn)
 
+        self._riepilogo_btn = QPushButton("📂 Riepilogo irAE")
+        self._riepilogo_btn.setToolTip(
+            "Riapre l'ultima analisi irAE salvata di questo paziente (con "
+            "le correzioni applicate), senza rilanciare l'analisi."
+        )
+        self._riepilogo_btn.clicked.connect(self._on_riepilogo_irae)
+        self._riepilogo_btn.setEnabled(False)
+        query_layout.addWidget(self._riepilogo_btn)
+
         layout.addLayout(query_layout)
 
         # ---- Chat options --------------------------------------------------
@@ -464,6 +473,9 @@ class ClinicalHistoryTab(QWidget):
             events_current and event_count > 0 and not busy
         )
         self._irae_btn.setEnabled(has_entries and not busy)
+        self._riepilogo_btn.setEnabled(
+            has_patient and not busy and self._has_saved_irae_report()
+        )
         index = self._query_preset.findData("__IRAE_ANALYSIS__")
         if index >= 0:
             self._query_preset.model().item(index).setEnabled(
@@ -2045,7 +2057,9 @@ class ClinicalHistoryTab(QWidget):
 
         from .workers import SinglePatientIraeWorker
 
-        self._irae_worker = SinglePatientIraeWorker(llm, rows)
+        self._irae_worker = SinglePatientIraeWorker(
+            llm, rows, patient_id=self._current_patient_id or ""
+        )
         self._irae_worker.structured_ready.connect(
             self._on_irae_structured_ready
         )
@@ -2080,12 +2094,51 @@ class ClinicalHistoryTab(QWidget):
     def _on_irae_structured_ready(self, report: dict) -> None:
         self._progress_bar.setVisible(False)
         self._status_label.setText("")
-        self._irae_btn.setEnabled(bool(self._timeline_entries))
+        # The worker just persisted the report: refresh the entry points so
+        # "Riepilogo irAE" becomes available for this patient.
+        self._update_busy_ui()
         from .irae_result_dialog import IraeResultDialog
 
         dialog = IraeResultDialog(
             report,
             patient_id=self._current_patient_id or "",
+            services=self._services,
+            parent=self,
+        )
+        dialog.exec_()
+
+    def _has_saved_irae_report(self) -> bool:
+        """True when a saved irAE report exists for the current patient."""
+        if not self._current_patient_id:
+            return False
+        from ..clinical.irae_reports import has_report
+
+        return has_report(self._current_patient_id)
+
+    def _on_riepilogo_irae(self) -> None:
+        """Reopen the last saved irAE report of the current patient.
+
+        Loads the raw report (already persisted by the worker) and opens the
+        same ``IraeResultDialog`` used after a fresh analysis, so the
+        persisted manual corrections are re-applied automatically.
+        """
+        if self._guard_busy():
+            return
+        patient_id = self._current_patient_id or ""
+        from ..clinical.irae_reports import load_report
+        from .irae_result_dialog import IraeResultDialog
+
+        report = load_report(patient_id)
+        if report is None:
+            QMessageBox.information(
+                self, "Nessun risultato irAE",
+                "Nessuna analisi irAE salvata per questo paziente. "
+                "Esegui prima '⚡ Analisi irAE'.",
+            )
+            return
+        dialog = IraeResultDialog(
+            report,
+            patient_id=patient_id,
             services=self._services,
             parent=self,
         )

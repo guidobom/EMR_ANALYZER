@@ -13,6 +13,7 @@ from ..prompt_catalog import load_prompt
 
 from ..clinical.registry_builder import RegistryBuildCancelled
 from ..clinical import irae_layers
+from ..clinical.irae_reports import save_report
 
 
 class ClinicalHistoryWorker(QThread):
@@ -740,6 +741,7 @@ class IraeLayer3QueueWorker(QThread):
                 "evidence": meta.get("evidence", []),
                 "analyzed_at": datetime.now().isoformat(timespec="seconds"),
             }
+            save_report(patient_id, report)
             self.patient_structured.emit(patient_id, report)
             self.patient_finished.emit(
                 patient_id, irae_layers.render_irae_markdown(report)
@@ -767,6 +769,7 @@ class SinglePatientIraeWorker(QThread):
         llm_client,
         rows,
         *,
+        patient_id: str = "",
         max_candidates: int = irae_layers.DEFAULT_MAX_CANDIDATES,
         max_tokens: int = irae_layers.DEFAULT_MAX_TOKENS,
         parallel: int = irae_layers.DEFAULT_PARALLEL,
@@ -775,6 +778,7 @@ class SinglePatientIraeWorker(QThread):
         super().__init__(parent)
         self.llm_client = llm_client
         self.rows = rows
+        self.patient_id = str(patient_id or "")
         self.max_candidates = max_candidates
         self.max_tokens = max_tokens
         self.parallel = parallel
@@ -795,6 +799,8 @@ class SinglePatientIraeWorker(QThread):
                 parallel=self.parallel,
             )
             report["analyzed_at"] = datetime.now().isoformat(timespec="seconds")
+            if self.patient_id:
+                save_report(self.patient_id, report)
             self.structured_ready.emit(report)
         except Exception as exc:
             self.error.emit(f"Errore analisi irAE strutturata: {str(exc)}")
