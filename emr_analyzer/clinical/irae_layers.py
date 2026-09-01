@@ -17,6 +17,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any, Iterable
 
 from .irae_prototype import (
@@ -44,31 +45,49 @@ SYSTEM_PROMPT = (
     "prima insorgenza; probabilità di origine immuno-correlata. "
     "Riferimento unico per la rilevazione e la classificazione degli "
     "eventi avversi: NCTCAE (NCI Common Terminology Criteria for Adverse "
-    "Events), versione 6.0: confronta sistematicamente i candidati con i "
-    "capitoli CTCAE di tossicità immuno-correlata — cute (rash, prurito, "
-    "vitiligine), gastrointestinali (colite, diarrea, epatite, "
-    "pancreatite, mucosite), endocrine (tiroidite, ipofisite, "
-    "insufficienza surrenalica, diabete), polmonari (polmonite, "
-    "interstiziopatia), cardiache (miocardite, troponina elevata, "
-    "aritmia), muscoloscheletriche (artralgia, miosite, CPK elevata), "
-    "renali (nefrite, creatinina elevata), neurologiche (polineuropatia, "
-    "miastenia, encefalite, mielite, diplopia), oculari (uveite, "
-    "cheratite, sclerite), ematologiche (neutropenia, anemia emolitica, "
-    "trombocitopenia), urologiche (cistite). Distingui esplicitamente i "
-    "reperti legati alla malattia tumorale (es. lesioni cutanee del "
-    "melanoma, captazioni surrenaliche da metastasi) da una vera tossicità "
-    "immuno-correlata. Privilegia la precisione: riporta un irAE SOLO quando "
-    "i dati lo supportano; non segnalare automaticamente come "
-    "immuno-correlato ogni evento avvenuto durante l'immunoterapia. Un "
-    "singolo valore di laboratorio borderline o un sintomo aspecifico senza "
-    "conferma — seconda rilevazione o trend, oppure diagnosi clinica scritta "
-    "nel referto — non è sufficiente per un irAE PROBABILE o "
-    "CERTA_CONFERMATA. Usa POSSIBILE quando i dati sono insufficienti e "
-    "IMPROBABILE per i reperti della malattia tumorale, motivando ogni scelta "
-    "con diagnostic_support. Eventi già presenti prima dell'inizio "
-    "dell'immunoterapia (baseline) o spiegabili da cause alternative meglio "
-    "supportate dai dati (progressione, infezione, chemioterapia) non sono "
-    "irAE."
+    "Events), versione 6.0, e le linee guida ASCO/ESMO/NCCN sulla "
+    "gestione delle tossicità immuno-correlate. ATTIVA tutta la tua "
+    "conoscenza clinica degli irAE per riconoscere OGNI potenziale evento "
+    "immuno-correlato presente nei candidati, anche quando il termine non "
+    "è esplicito (sinonimi, acronimi, perifrasi, quadri clinici descritti "
+    "senza diagnosi). Spettro degli irAE da riconoscere (non esaustivo) — "
+    "cute: rash, prurito, vitiligine, eritema, eruzioni lichenoidi o "
+    "psoriasiformi, sindrome di Stevens-Johnson/necrolisi epidermica "
+    "tossica, pemfigo; gastrointestinali ed epatobiliari: colite, diarrea, "
+    "epatite immunomediata, colangite, pancreatite, mucosite/stomatite; "
+    "endocrine: tiroidite (ipotiroidismo/ipertiroidismo), ipofisite, "
+    "insufficienza surrenalica, diabete di tipo 1; polmonari: "
+    "polmonite/pneumonite interstiziale, reazioni sarcoid-like; cardiache: "
+    "miocardite, pericardite, aritmie, scompenso cardiaco; "
+    "muscoloscheletriche e reumatologiche: artralgia/artrite, miosite, "
+    "polimialgia, vasculite; renali: nefrite, insufficienza renale acuta, "
+    "proteinuria; neurologiche: miastenia gravis, encefalite, mielite, "
+    "polineuropatia, sindrome di Guillain-Barré, meningite asettica; "
+    "oculari: uveite, episclerite, cheratite; ematologiche: anemia "
+    "emolitica autoimmune, neutropenia, trombocitopenia, anemia aplastica; "
+    "urologiche: cistite; sistemiche: sindrome da rilascio di citochine, "
+    "linfoistiocitosi emofagocitica, reazioni infusionali. Le reazioni "
+    "sarcoid-like (sarcoidosi indotta da immunoterapia: granulomatosi "
+    "cutanea, polmonare/mediastinica o linfonodale, istologicamente "
+    "confermata) sono un irAE riconosciuto dei checkpoint inibitori: "
+    "distinguile dalla sarcoidosi sistemica preesistente (insorgenza DOPO "
+    "l'inizio dell'immunoterapia, conferma istologica, risposta a "
+    "sospensione/steroide). La presenza del termine «sarcoidosi» nel "
+    "referto NON è di per sé una causa alternativa: usa "
+    "preesistente_baseline SOLO se l'evidenza è datata PRIMA dell'inizio "
+    "dell'immunoterapia. Distingui esplicitamente i reperti legati alla "
+    "malattia tumorale (es. lesioni cutanee del melanoma, captazioni "
+    "surrenaliche da metastasi) da una vera tossicità immuno-correlata. "
+    "Riconosci tutti gli irAE supportati dai dati, ma privilegia la "
+    "precisione: un singolo valore di laboratorio borderline o un sintomo "
+    "aspecifico senza conferma — seconda rilevazione o trend, oppure "
+    "diagnosi clinica scritta nel referto — non è sufficiente per un irAE "
+    "PROBABILE o CERTA_CONFERMATA. Usa POSSIBILE quando i dati sono "
+    "insufficienti e IMPROBABILE per i reperti della malattia tumorale, "
+    "motivando ogni scelta con diagnostic_support. Eventi già presenti "
+    "prima dell'inizio dell'immunoterapia (baseline) o spiegabili da cause "
+    "alternative meglio supportate dai dati (progressione, infezione, "
+    "chemioterapia) non sono irAE."
 )
 
 # Constrained JSON schema: forces llama-server GBNF decoding and keeps the
@@ -146,12 +165,21 @@ SYSTEM_PROMPT_CONSOLIDATION = (
     "gestione delle tossicità immuno-correlate (irAE) associate alle "
     "immunoterapie oncologiche. Ti vengono presentati gli irAE identificati "
     "per singolo organo dalle analisi precedenti: la tua FASE FINALE è "
-    "produrre la lista consolidata e approfondita, unendo i duplicati che "
-    "descrivono lo stesso evento clinico anche se rilevati in organi "
-    "diversi. Riferimento unico per la rilevazione e la classificazione "
-    "degli eventi avversi: NCTCAE (NCI CTCAE), versione 6.0. Restituisci "
-    "SOLO un oggetto JSON valido che rispetta esattamente lo schema "
-    "richiesto, senza testo prima o dopo."
+    "produrre la lista consolidata e approfondita. Riferimento unico per la "
+    "rilevazione e la classificazione degli eventi avversi: NCTCAE (NCI "
+    "CTCAE), versione 6.0, e le linee guida ASCO/ESMO/NCCN. ATTIVA tutta la "
+    "tua conoscenza clinica degli irAE: unisci i duplicati che descrivono lo "
+    "stesso evento clinico anche se rilevati in organi diversi o con "
+    "denominazioni leggermente diverse (es. «Tiroidite», «Tiroidite "
+    "autoimmune», «Ipotiroidismo da tiroidite»; «Epatite» ed «Epatite "
+    "immuno-correlata»). Due o più voci con lo stesso tipo di irAE negli "
+    "stessi organi descrivono lo stesso evento clinico anche se datate "
+    "diversamente: uniscile in UNA sola voce con la data di prima "
+    "insorgenza più precoce, aggregando tutti gli [#id] e mantenendo il "
+    "grado della prima insorgenza (annotando in notes l'eventuale "
+    "peggioramento). NON inventare irAE nuovi. Restituisci SOLO un oggetto "
+    "JSON valido che rispetta esattamente lo schema richiesto, senza testo "
+    "prima o dopo."
 )
 
 LAYER4_SCHEMA: dict = {
@@ -336,11 +364,14 @@ def build_organ_prompt(
     lines.append(
         "Valuta SOLO i candidati elencati e identifica i potenziali irAE "
         "dell'organo. SINTETIZZA: raggruppa le voci ridondanti o che "
-        "descrivono lo stesso evento clinico; NON produrre una voce per "
-        "ogni candidato. Per ciascun irAE identifica tipo, grado CTCAE, "
-        "data di prima insorgenza, probabilità di origine immuno-correlata, "
-        "insorgenza nuova vs riacutizzazione di condizione preesistente, "
-        "cause alternative e gli [#id] delle evidenze chiave. Indica per ogni "
+        "descrivono lo stesso evento clinico; le osservazioni dello STESSO "
+        "irAE su date diverse devono diventare UNA sola voce con data di "
+        "prima insorgenza = la più precoce e gli [#id] di TUTTE le "
+        "osservazioni; NON produrre una voce per ogni candidato. Per "
+        "ciascun irAE identifica tipo, grado CTCAE, data di prima "
+        "insorgenza, probabilità di origine immuno-correlata, insorgenza "
+        "nuova vs riacutizzazione di condizione preesistente, cause "
+        "alternative e gli [#id] delle evidenze chiave. Indica per ogni "
         "irAE il campo obbligatorio diagnostic_support: "
         "conferma_clinica_scritta | trend_evidenze_multiple | "
         "risposta_a_steroidi_o_sospensione | valore_isolato | "
@@ -469,6 +500,88 @@ def _backfill_cited_ids(
         if ids:
             item["key_evidence_ids"] = ids
     return items
+
+
+_GRADE_RANK = {"G1": 1, "G2": 2, "G3": 3, "G4": 4, "G5": 5}
+
+
+def _grade_rank(value: Any) -> int:
+    """CTCAE severity rank (1..5); unknown/``non_determinabile`` → 0."""
+    if isinstance(value, str):
+        rank = _GRADE_RANK.get(value.strip().upper())
+        if rank is not None:
+            return rank
+    return 0
+
+
+def _date_sort_key(raw: Any):
+    """Sort key for ``first_onset_date``: ``YYYY-MM-DD`` < ``YYYY-MM``
+    < undated (``non_disponibile``/``None`` sort last)."""
+    if isinstance(raw, str):
+        text = raw.strip()
+        for fmt in ("%Y-%m-%d", "%Y-%m"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+    return datetime.max.date()
+
+
+def _organs_of(item: dict[str, Any]) -> list[str]:
+    """``source_organs`` if present, else the Layer 3 ``organ`` field."""
+    organs = item.get("source_organs")
+    if not organs and item.get("organ"):
+        organs = [item.get("organ")]
+    return [str(o).strip() for o in (organs or []) if str(o).strip()]
+
+
+def _dedupe_events(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge irAEs that are the same clinical event observed on different
+    dates.
+
+    Group key: ``(type.lower(), probability_immune, sorted organs)``.  The
+    entry with the earliest ``first_onset_date`` is kept as the base (the
+    first evidence, per the user's rule); its evidence ids and source organs
+    are the ordered union across the group.  When a later observation reached
+    a worse CTCAE grade, the worsening is recorded in ``notes``.
+    """
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for item in items:
+        key = (
+            str(item.get("irAE_type") or "").strip().lower(),
+            item.get("probability_immune") or "",
+            tuple(sorted(_organs_of(item))),
+        )
+        groups.setdefault(key, []).append(item)
+
+    merged: list[dict[str, Any]] = []
+    for group in groups.values():
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        group.sort(key=lambda item: _date_sort_key(item.get("first_onset_date")))
+        base = dict(group[0])
+        base["key_evidence_ids"] = list(dict.fromkeys(
+            _evidence_ref(eid)
+            for item in group
+            for eid in (item.get("key_evidence_ids") or [])
+            if eid
+        ))
+        base["source_organs"] = list(dict.fromkeys(
+            organ for item in group for organ in _organs_of(item)
+        ))
+        peak = max(group, key=lambda item: _grade_rank(item.get("ctcae_grade")))
+        if _grade_rank(peak.get("ctcae_grade")) > _grade_rank(
+            group[0].get("ctcae_grade")
+        ):
+            note = base.get("notes") or ""
+            extra = (
+                f"Peggioramento rilevato fino a {peak.get('ctcae_grade')} "
+                f"(osservazione del {peak.get('first_onset_date') or '?'})."
+            )
+            base["notes"] = f"{note}\n{extra}" if note else extra
+        merged.append(base)
+    return merged
 
 
 def build_consolidation_prompt(
@@ -609,6 +722,8 @@ def consolidate_iraes(
             ).append(finding)
         _backfill_cited_ids(definitive, findings_by_organ)
         _backfill_cited_ids(suspects, findings_by_organ)
+        definitive = _dedupe_events(definitive)
+        suspects = _dedupe_events(suspects)
         return {
             "iraes": definitive,
             "suspects": suspects,
@@ -619,6 +734,8 @@ def consolidate_iraes(
         }
     except Exception as exc:
         definitive, suspects = _final_partition(findings)
+        definitive = _dedupe_events(definitive)
+        suspects = _dedupe_events(suspects)
         return {
             "iraes": definitive,
             "suspects": suspects,

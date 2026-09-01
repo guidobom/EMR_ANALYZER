@@ -1179,5 +1179,172 @@ class BuildLayer3PlansTest(unittest.TestCase):
         self.assertEqual(plans[1][2]["evidence"], [])
 
 
+def _tiroidite(date, grade="G1", ids=("E-TSH",)) -> dict:
+    return {
+        "organ": "Tiroidite",
+        "irAE_type": "Tiroidite",
+        "ctcae_grade": grade,
+        "first_onset_date": date,
+        "probability_immune": "PROBABILE",
+        "new_onset_vs_exacerbation": "nuova insorgenza",
+        "alternative_causes": "nessuna",
+        "confidence": 0.9,
+        "key_evidence_ids": list(ids),
+    }
+
+
+class DedupeEventsTest(unittest.TestCase):
+    def test_merges_identical_events_keeping_first_onset(self):
+        items = [
+            _tiroidite("2023-05-11", ids=("E-TSH", "E-AB")),
+            _tiroidite("2023-03-29", ids=("E-TSH",)),
+            _tiroidite("2023-05-10", ids=("E-TSH",)),
+        ]
+        merged = irae_layers._dedupe_events(items)
+        self.assertEqual(len(merged), 1)
+        out = merged[0]
+        self.assertEqual(out["first_onset_date"], "2023-03-29")
+        self.assertEqual(out["ctcae_grade"], "G1")  # grado della prima evidenza
+        # union ordinata e normalizzata degli id (niente "#")
+        self.assertEqual(out["key_evidence_ids"], ["E-TSH", "E-AB"])
+
+    def test_worsening_recorded_in_notes(self):
+        items = [
+            {**_tiroidite("2024-11-05", grade="G2", ids=("E-TSH",)),
+             "irAE_type": "Epatite", "organ": "Epatite",
+             "source_organs": ["Epatite"]},
+            {**_tiroidite("2025-02-28", grade="G3", ids=("E-ALT",)),
+             "irAE_type": "Epatite", "organ": "Epatite",
+             "source_organs": ["Epatite"]},
+            {**_tiroidite("2025-04-11", grade="G4", ids=("E-ALT",)),
+             "irAE_type": "Epatite", "organ": "Epatite",
+             "source_organs": ["Epatite"]},
+        ]
+        merged = irae_layers._dedupe_events(items)
+        self.assertEqual(len(merged), 1)
+        out = merged[0]
+        self.assertEqual(out["ctcae_grade"], "G2")  # prima evidenza
+        self.assertEqual(out["first_onset_date"], "2024-11-05")
+        self.assertIn("G4", out["notes"])
+        self.assertIn("Peggioramento", out["notes"])
+        self.assertEqual(out["key_evidence_ids"], ["E-TSH", "E-ALT"])
+
+    def test_keeps_distinct_types_organs_and_probabilities(self):
+        items = [
+            _tiroidite("2023-03-29"),                      # Tiroidite
+            {**_tiroidite("2023-03-29"), "irAE_type": "Epatite",
+             "organ": "Epatite"},                          # tipo diverso
+            {**_tiroidite("2023-03-29"), "source_organs": ["Dermatite"]},
+            {**_tiroidite("2023-03-29"), "probability_immune": "POSSIBILE"},
+        ]
+        self.assertEqual(len(irae_layers._dedupe_events(items)), 4)
+
+    def test_uses_organ_field_when_source_organs_missing(self):
+        items = [
+            _tiroidite("2023-03-29"),
+            _tiroidite("2023-05-10"),
+        ]
+        self.assertEqual(len(irae_layers._dedupe_events(items)), 1)
+
+    def test_normalizes_hash_prefix_ids(self):
+        items = [
+            {**_tiroidite("2023-03-29"), "key_evidence_ids": ["#E-TSH"]},
+            {**_tiroidite("2023-05-10"), "key_evidence_ids": ["E-TSH"]},
+        ]
+        out = irae_layers._dedupe_events(items)[0]
+        self.assertEqual(out["key_evidence_ids"], ["E-TSH"])
+
+    def test_partial_date_orders_before_full_date(self):
+        items = [
+            _tiroidite("2023-05-10"),
+            _tiroidite("2023-05"),
+        ]
+        out = irae_layers._dedupe_events(items)[0]
+        self.assertEqual(out["first_onset_date"], "2023-05")
+
+    def test_undated_sorts_last(self):
+        items = [
+            {**_tiroidite("non_disponibile")},
+            _tiroidite("2023-03-29"),
+        ]
+        out = irae_layers._dedupe_events(items)[0]
+        self.assertEqual(out["first_onset_date"], "2023-03-29")
+
+
+class ConsolidateDedupTest(unittest.TestCase):
+    def test_consolidate_deduplicates_multi_date_output(self):
+        class MultiDateLlm:
+            calls = []
+
+            def generate_structured(self, prompt, system="", schema=None, *,
+                                    max_tokens=None):
+                MultiDateLlm.calls.append(prompt)
+                return {
+                    "iraes": [
+                        {**_tiroidite("2023-03-29", ids=("E-TSH",))},
+                        {**_tiroidite("2023-05-10", ids=("E-AB",)),
+                         "source_organs": ["Tiroidite"]},
+                        {**_tiroidite("2023-05-11", ids=("E-TSH", "E-AB")),
+                         "source_organs": ["Tiroidite"]},
+                    ]
+                }
+
+        result = irae_layers.consolidate_iraes(
+            MultiDateLlm(), [_tiroidite("2023-03-29")], None
+        )
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["output_count"], 1)
+        self.assertEqual(len(result["iraes"]), 1)
+        self.assertEqual(result["iraes"][0]["first_onset_date"], "2023-03-29")
+        self.assertEqual(
+            result["iraes"][0]["key_evidence_ids"], ["E-TSH", "E-AB"]
+        )
+        self.assertEqual(len(MultiDateLlm.calls), 1)
+
+    def test_consolidate_fallback_deduplicates_same_type(self):
+        class BrokenLlm:
+            def generate_structured(self, prompt, system="", schema=None, *,
+                                    max_tokens=None):
+                raise RuntimeError("boom")
+
+        findings = [
+            _tiroidite("2023-03-29"),
+            _tiroidite("2023-05-10"),
+        ]
+        result = irae_layers.consolidate_iraes(BrokenLlm(), findings, None)
+        self.assertFalse(result["applied"])
+        self.assertEqual(len(result["iraes"]), 1)
+        self.assertEqual(result["iraes"][0]["first_onset_date"], "2023-03-29")
+
+
+class SarcoidLexiconTest(unittest.TestCase):
+    def test_sarcoid_row_routes_to_dedicated_bucket(self):
+        rows = irae_layers.evidence_rows_from_models([
+            make_evidence(
+                "P061", "E-SAR", "diagnosis",
+                "sarcoidosi polmonare e cutanea", "2023-01",
+            ),
+        ])
+        candidates = scan_for_irae(rows, None)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(
+            candidates[0].organ, "Sarcoidosi/Reazione sarcoid-like"
+        )
+
+    def test_sarcoid_wins_over_cooccurring_dermatit_token(self):
+        rows = irae_layers.evidence_rows_from_models([
+            make_evidence(
+                "P061", "E-SAR2", "histopathology",
+                "dermatite cronica granulomatosa suggestiva di sarcoidosi",
+                "2023-01",
+            ),
+        ])
+        candidates = scan_for_irae(rows, None)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(
+            candidates[0].organ, "Sarcoidosi/Reazione sarcoid-like"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

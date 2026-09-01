@@ -61,6 +61,12 @@ LAB_THRESHOLD_ORGANS = frozenset({
 # atomic quote.  Full Italian laboratory names are included because the
 # extractor stores "alanina_aminotransferasi" rather than "ALT".
 PRIMARY_TOXICITY_LEXICON: dict[str, tuple[str, ...]] = {
+    # Reazioni sarcoid-like / sarcoidosi indotta da immunoterapia.  Posto PRIMA
+    # di Dermatite/Polmonite perché il testo "sarcoidosi polmonare e cutanea"
+    # contiene anche token dermatit/polmonit: la riga deve finire nel bucket
+    # dedicato, così il Layer 3 la valuta come irAE e non come reperto cutaneo
+    # o polmonare aspecifico.
+    "Sarcoidosi/Reazione sarcoid-like": ("sarcoid",),
     "Colite/Diarrea": (
         "diarrea",
         "diarrhe",
