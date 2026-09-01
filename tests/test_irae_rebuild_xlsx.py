@@ -271,6 +271,7 @@ class IraeRebuildXlsxTest(unittest.TestCase):
         with mock.patch.object(_ActiveWorkspace, "path", workspace):
             exit_code = main([
                 "--xlsx", str(xlsx),
+                "--project", "RENE",
                 "--workspace", str(workspace),
                 "--registry", str(self.registry),
             ])
@@ -286,6 +287,7 @@ class IraeRebuildXlsxTest(unittest.TestCase):
         xlsx = self._write_xlsx(_report())
         exit_code = main([
             "--xlsx", str(xlsx),
+            "--project", "RENE",
             "--workspace", str(self.root / "nope"),
             "--registry", str(self.root / "missing.db"),
         ])

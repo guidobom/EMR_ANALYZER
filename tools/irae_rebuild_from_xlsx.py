@@ -16,6 +16,15 @@ The rebuilt report is written with the same per-patient persistence the queue
 now uses (``irae_report.json`` under the workspace), so "📂 Riepilogo irAE"
 reopens it and manual corrections work exactly as for a fresh analysis.
 
+Works on any project: the target workspace and registry are derived from
+``--project`` (a folder under ``--projects-root``) and can be overridden with
+``--workspace`` / ``--registry``.
+
+Usage::
+
+    python tools/irae_rebuild_from_xlsx.py --xlsx <file.xlsx> --project RENE
+    python tools/irae_rebuild_from_xlsx.py --xlsx <file.xlsx> --project MELANOMA
+
 Known losses vs. a fresh run: the suspects (``consolidation.suspects``) and
 the per-organ LLM detail (``organ_results``) are not exported to Excel, so
 they cannot be recovered.
@@ -302,8 +311,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Excel esportato con '📊 Esporta Excel' dalla finestra dei risultati.",
     )
     parser.add_argument(
-        "--project", default="RENE",
-        help="Cartella del progetto (workspace). Default: RENE.",
+        "--project", required=True,
+        help=(
+            "Cartella del progetto, es. RENE, MELANOMA o LUNG. Obbligatoria: "
+            "i report vengono scritti in <projects-root>/<project>/<paziente>/."
+        ),
     )
     parser.add_argument(
         "--projects-root", type=Path, default=DEFAULT_PROJECTS_ROOT,
