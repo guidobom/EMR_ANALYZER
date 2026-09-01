@@ -13,6 +13,46 @@ from ..clinical.irae_layers import render_irae_markdown
 from ..utils.markdown_tables import render_markdown_to_html
 
 
+def collect_irae_failures(results: list[dict]) -> list[dict]:
+    """Per-patient issues surfaced at the end of a queue analysis.
+
+    Returns ``[{patient_id, problem, detail}]`` for every result with a
+    problem: a queue-level ``error``, a final consolidation that was not
+    applied (with its reason) or a per-organ analysis error.
+    """
+    failures: list[dict] = []
+    for result in results:
+        pid = result.get("patient_id") or "?"
+        if result.get("error"):
+            failures.append({
+                "patient_id": pid,
+                "problem": "Errore di analisi",
+                "detail": str(result["error"]),
+            })
+            continue
+        structured = result.get("structured")
+        if not isinstance(structured, dict):
+            continue
+        consolidation = structured.get("consolidation") or {}
+        if consolidation.get("applied") is False:
+            detail = consolidation.get("error") or (
+                "Consolidamento non applicato (nessun irAE confermato)."
+            )
+            failures.append({
+                "patient_id": pid,
+                "problem": "Consolidamento finale non applicato",
+                "detail": detail,
+            })
+        for organ, res in (structured.get("organ_results") or {}).items():
+            if res.get("error"):
+                failures.append({
+                    "patient_id": pid,
+                    "problem": f"Analisi {organ}",
+                    "detail": str(res["error"]),
+                })
+    return failures
+
+
 class IraeQueueResultDialog(QDialog):
     """One tab per patient, with a bulk save of the Markdown reports.
 
@@ -43,6 +83,21 @@ class IraeQueueResultDialog(QDialog):
         for index, result in enumerate(results):
             view = self._build_tab(result, index)
             self._tabs.addTab(view, result.get("label") or result["patient_id"])
+        failures = collect_irae_failures(results)
+        if failures:
+            problems_view = QTextBrowser()
+            problems_view.setOpenExternalLinks(False)
+            lines = [
+                f"<b>{failure['patient_id']}</b> — {failure['problem']}: "
+                f"{failure['detail']}"
+                for failure in failures
+            ]
+            problems_view.setHtml(
+                "<ul><li>" + "</li><li>".join(lines) + "</li></ul>"
+            )
+            self._tabs.insertTab(
+                0, problems_view, f"⚠️ Problemi ({len(failures)})"
+            )
         layout.addWidget(self._tabs, stretch=1)
 
         buttons = QHBoxLayout()

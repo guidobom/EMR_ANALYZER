@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..clinical.irae_layers import render_irae_markdown
+from ..config import active_workspace
 from ..utils.markdown_tables import render_markdown_to_html
 from .irae_patient_tab import IraePatientTab
 
@@ -29,9 +30,11 @@ class IraeResultDialog(QDialog):
         self.setWindowTitle(f"Analisi irAE — {patient_id}")
         self.resize(1100, 760)
         self._patient_id = patient_id
+        self._services = services
         self._markdown = ""
         self._structured_report = report if isinstance(report, dict) else None
         self._tab = None
+        self._recon_worker = None
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -57,6 +60,13 @@ class IraeResultDialog(QDialog):
             layout.addWidget(view, stretch=1)
 
         buttons = QHBoxLayout()
+        self._recon_btn = QPushButton("🔄 Rianalizza consolidamento")
+        self._recon_btn.setToolTip(
+            "Riesegue il solo consolidamento finale (Layer 4) con un budget di "
+            "token più alto, per i pazienti in cui era fallito."
+        )
+        self._recon_btn.clicked.connect(self._on_reconsolidate)
+        buttons.addWidget(self._recon_btn)
         save_btn = QPushButton("💾 Salva come Markdown")
         save_btn.clicked.connect(self._save)
         buttons.addWidget(save_btn)
@@ -68,9 +78,104 @@ class IraeResultDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         buttons.addWidget(close_btn)
         layout.addLayout(buttons)
+        self._recon_status = QLabel("")
+        layout.addWidget(self._recon_status)
+
+        self._recon_btn.setEnabled(self._can_reconsolidate())
 
     def _on_report_updated(self, report: dict) -> None:
         self._markdown = self._tab.markdown() if self._tab else self._markdown
+
+    def _can_reconsolidate(self) -> bool:
+        """Button enabled: a failed consolidation, per-organ results, an
+        available clinical-state LLM and no run already in flight."""
+        if self._recon_worker is not None and self._recon_worker.isRunning():
+            return False
+        report = self._structured_report
+        if not isinstance(report, dict) or not report.get("organ_results"):
+            return False
+        consolidation = report.get("consolidation") or {}
+        if consolidation.get("applied"):
+            return False
+        llm = (self._services or {}).get("clinical_state_llm_client")
+        return bool(llm is not None and getattr(llm, "is_available", False))
+
+    def _on_reconsolidate(self) -> None:
+        if not self._can_reconsolidate():
+            return
+        answer = QMessageBox.question(
+            self,
+            "Rianalizza consolidamento",
+            "Rieseguirà SOLO il consolidamento finale (Layer 4) di questo "
+            "paziente con un budget di token più alto, sovrascrivendo i "
+            "risultati parziali. Continuare?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        llm = (self._services or {}).get("clinical_state_llm_client")
+        from ..clinical.irae_evidence import load_registry_rows
+        from ..clinical.irae_reconsolidate import (
+            DEFAULT_RECONSOLIDATE_MAX_TOKENS,
+        )
+        from .workers import IraeReconsolidateWorker
+
+        registry_rows = None
+        db_path = active_workspace.path / "emr_registry.db"
+        if db_path.exists():
+            registry_rows = load_registry_rows(db_path, self._patient_id)
+
+        worker = IraeReconsolidateWorker(
+            llm,
+            self._structured_report,
+            patient_id=self._patient_id,
+            max_tokens=DEFAULT_RECONSOLIDATE_MAX_TOKENS,
+            registry_rows=registry_rows,
+            parent=self,
+        )
+        worker.ready.connect(self._on_reconsolidate_ready)
+        worker.error.connect(self._on_reconsolidate_error)
+        worker.finished.connect(self._on_reconsolidate_finished)
+        self._recon_worker = worker
+        self._recon_btn.setEnabled(False)
+        self._recon_status.setText("Rianalisi del consolidamento in corso...")
+        worker.start()
+
+    def _on_reconsolidate_ready(self, updated: dict) -> None:
+        self._structured_report = updated
+        if self._tab is not None:
+            self._tab.set_report(updated)
+        if updated.get("reconsolidation_error"):
+            self._recon_status.setText("")
+            QMessageBox.warning(
+                self,
+                "Riconsolidamento non applicato",
+                "Il consolidamento non è andato a buon fine; conservati i "
+                "risultati precedenti.\n"
+                + str(updated["reconsolidation_error"]),
+            )
+        else:
+            self._recon_status.setText(
+                "Riconsolidamento completato (Layer 4 rieseguito con budget "
+                "di token più alto)."
+            )
+
+    def _on_reconsolidate_error(self, message: str) -> None:
+        self._recon_status.setText("")
+        QMessageBox.critical(
+            self, "Riconsolidamento non riuscito", message
+        )
+
+    def _on_reconsolidate_finished(self) -> None:
+        self._recon_worker = None
+        self._recon_btn.setEnabled(self._can_reconsolidate())
+
+    def closeEvent(self, event) -> None:
+        worker = self._recon_worker
+        if worker is not None and worker.isRunning():
+            worker.wait()
+        super().closeEvent(event)
 
     def _current_markdown(self) -> str:
         if self._tab is not None:

@@ -12,7 +12,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from ..prompt_catalog import load_prompt
 
 from ..clinical.registry_builder import RegistryBuildCancelled
-from ..clinical import irae_layers
+from ..clinical import irae_layers, irae_reconsolidate
 from ..clinical.irae_reports import save_report
 
 
@@ -804,6 +804,53 @@ class SinglePatientIraeWorker(QThread):
             self.structured_ready.emit(report)
         except Exception as exc:
             self.error.emit(f"Errore analisi irAE strutturata: {str(exc)}")
+
+
+class IraeReconsolidateWorker(QThread):
+    """Re-run ONLY the Layer 4 consolidation of a saved irAE report.
+
+    The consolidation call of the original analysis may have exceeded its
+    output budget (``DEFAULT_MAX_TOKENS``), leaving ``consolidation.applied``
+    False.  This worker re-runs just that call with a higher budget, rebuilds
+    the evidence provenance and persists the updated report.  It never touches
+    SQLite: ``registry_rows`` are loaded on the main thread and passed in.
+    """
+
+    ready = pyqtSignal(object)  # updated report dict
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        llm_client,
+        report,
+        *,
+        patient_id: str = "",
+        max_tokens: int = irae_reconsolidate.DEFAULT_RECONSOLIDATE_MAX_TOKENS,
+        registry_rows=None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.report = report
+        self.patient_id = str(patient_id or "")
+        self.max_tokens = int(
+            max_tokens or irae_reconsolidate.DEFAULT_RECONSOLIDATE_MAX_TOKENS
+        )
+        self.registry_rows = registry_rows
+
+    def run(self):
+        try:
+            updated = irae_reconsolidate.reconsolidate_report(
+                self.report,
+                self.llm_client,
+                max_tokens=self.max_tokens,
+                registry_rows=self.registry_rows,
+            )
+            if self.patient_id:
+                save_report(self.patient_id, updated)
+            self.ready.emit(updated)
+        except Exception as exc:
+            self.error.emit(f"Errore riconsolidamento irAE: {str(exc)}")
 
 
 class IraeAnalysisWorker(QThread):

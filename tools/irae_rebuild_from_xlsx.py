@@ -33,13 +33,12 @@ they cannot be recovered.
 from __future__ import annotations
 
 import argparse
-import json
-import sqlite3
 import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from emr_analyzer.clinical.irae_evidence import load_registry_rows
 from emr_analyzer.clinical.irae_export import EXCEL_COLUMNS
 from emr_analyzer.clinical.irae_layers import (
     DEFAULT_MAX_CANDIDATES,
@@ -57,61 +56,9 @@ DEFAULT_PROJECTS_ROOT = Path.home() / "Desktop"
 _HEADER_TO_KEY = {header: key for key, header in EXCEL_COLUMNS}
 
 
-# ---------------------------------------------------------------------------
-# Registry → deterministic layers
-# ---------------------------------------------------------------------------
-
-
-def _parse_bbox(raw: Any) -> list | None:
-    """``bbox_json`` column → the ``bbox`` list ``_compact_evidence`` wants."""
-    if isinstance(raw, (list, tuple)):
-        return list(raw)
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = json.loads(raw)
-        except ValueError:
-            return None
-        return list(parsed) if isinstance(parsed, (list, tuple)) else None
-    return None
-
-
-def load_registry_rows(db_path: Path, patient_id: str) -> list[dict[str, Any]]:
-    """Atomic evidence rows shaped like ``evidence_rows_from_models`` output.
-
-    The ``clinical_evidence`` table already carries ``source_page``,
-    ``source_text`` and ``bbox_json`` at row level (provenance the inspector
-    needs to open and highlight the original PDF), so no ``data_json``
-    unpacking is required for those.
-    """
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
-    try:
-        records = con.execute(
-            "SELECT evidence_id, category, normalized_entity, observed_date, "
-            "       data_json, document_id, value_text, numeric_value, unit, "
-            "       source_page, source_text, bbox_json "
-            "FROM clinical_evidence WHERE patient_id = ? "
-            "ORDER BY observed_date, id",
-            (patient_id,),
-        ).fetchall()
-    finally:
-        con.close()
-
-    rows: list[dict[str, Any]] = []
-    for record in records:
-        row = dict(record)
-        row["bbox"] = _parse_bbox(row.get("bbox_json"))
-        row.pop("bbox_json", None)
-        raw = row.get("data_json")
-        if isinstance(raw, str) and raw.strip():
-            try:
-                row["data_json"] = json.loads(raw)
-            except ValueError:
-                row["data_json"] = None
-        else:
-            row["data_json"] = None
-        rows.append(row)
-    return rows
+# Registry rows: ``load_registry_rows`` lives in the shared clinical module
+# (``emr_analyzer.clinical.irae_evidence``) and is re-exported here so the
+# existing callers/tests keep importing it from the tool.
 
 
 # ---------------------------------------------------------------------------

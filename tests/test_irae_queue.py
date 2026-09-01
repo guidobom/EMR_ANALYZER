@@ -360,8 +360,12 @@ class IraeQueueResultDialogTest(unittest.TestCase):
                  "markdown": "", "error": "errore simulato"},
             ]
             dialog = IraeQueueResultDialog(results)
-            self.assertEqual(dialog._tabs.count(), 3)
-            self.assertIn("<table", dialog._tabs.widget(0).toHtml())
+            # P003 ha un errore → il tab iniziale "⚠️ Problemi (1)" si aggiunge
+            # alle 3 schede paziente.
+            self.assertEqual(dialog._tabs.count(), 4)
+            self.assertEqual(dialog._tabs.tabText(0), "⚠️ Problemi (1)")
+            self.assertIn("P003", dialog._tabs.widget(0).toHtml())
+            self.assertIn("<table", dialog._tabs.widget(1).toHtml())
 
             with mock.patch(
                 "emr_analyzer.gui.irae_queue_result_dialog."

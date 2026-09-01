@@ -50,6 +50,16 @@ class IraePatientTab(QWidget):
             self._raw_report, load_corrections(self._patient_id)
         )[0]
 
+    def set_report(self, report: dict) -> None:
+        """Replace the raw report and rebuild the view.
+
+        Persisted corrections are re-applied over the new raw report by
+        ``refresh`` (see ``apply_irae_corrections``), so a re-consolidated
+        report renders exactly like a freshly analysed one.
+        """
+        self._raw_report = report
+        self.refresh()
+
     def markdown(self) -> str:
         """Markdown of the currently displayed (corrected) report."""
         return render_irae_markdown(self._corrected)
