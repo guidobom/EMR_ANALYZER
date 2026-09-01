@@ -317,6 +317,10 @@ class LLMConfigDialogTest(unittest.TestCase):
                 return_value=16.0,
             ),
             patch(
+                "emr_analyzer.utils.hardware.get_system_ram_reserve_gb",
+                return_value=2.0,
+            ),
+            patch(
                 "emr_analyzer.utils.hardware.get_model_size_gb",
                 return_value=9.3,
             ),

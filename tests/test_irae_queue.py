@@ -323,6 +323,26 @@ class IraeQueueDialogTest(unittest.TestCase):
         self.assertEqual(dialog.selected_patient_ids(), ["P001", "P002"])
         dialog.deleteLater()
 
+    def test_instance_selector_defaults_to_auto(self):
+        dialog = IraeQueueDialog(self._summaries(), max_instances=3)
+        self.assertEqual(dialog.selected_instances(), 0)  # Auto (memoria)
+        self.assertTrue(dialog._instance_combo.isEnabled())
+        self.assertEqual(dialog._instance_combo.count(), 4)  # Auto + 1..3
+        dialog.deleteLater()
+
+    def test_instance_selector_forced_single_when_no_headroom(self):
+        dialog = IraeQueueDialog(self._summaries(), max_instances=1)
+        self.assertEqual(dialog.selected_instances(), 0)
+        self.assertFalse(dialog._instance_combo.isEnabled())
+        self.assertEqual(dialog._instance_combo.count(), 1)
+        dialog.deleteLater()
+
+    def test_instance_selector_caps_at_six(self):
+        dialog = IraeQueueDialog(self._summaries(), max_instances=12)
+        self.assertEqual(dialog._instance_combo.count(), 7)  # Auto + 1..6
+        self.assertEqual(dialog.selected_instances(), 0)
+        dialog.deleteLater()
+
 
 class IraeQueueResultDialogTest(unittest.TestCase):
     @classmethod
@@ -357,6 +377,86 @@ class IraeQueueResultDialogTest(unittest.TestCase):
             self.assertFalse(Path(tmp, "P003_irae.md").exists())
             self.assertIn("2", info.call_args[0][2])
             dialog.deleteLater()
+
+    def _structured_report(self) -> dict:
+        """A consolidated structured report with one definitive irAE."""
+        finding = {
+            "organ": "Miocardite/Cardiotossicità",
+            "irAE_type": "Miocardite da ICI",
+            "ctcae_grade": "G2",
+            "first_onset_date": "2022-11-22",
+            "probability_immune": "PROBABILE",
+            "new_onset_vs_exacerbation": "nuova insorgenza",
+            "alternative_causes": "nessuna",
+            "confidence": 0.9,
+            "key_evidence_ids": ["E-TROP"],
+        }
+        return {
+            "anchor": {
+                "first_drug": "nivolumab", "first_date": "2022-09-01",
+                "first_raw": "2022-09-01", "last_drug": "nivolumab",
+                "last_date": "2022-09-01", "last_raw": "2022-09-01",
+                "occurrences": 1,
+            },
+            "candidates_total": 1,
+            "iraes": [finding],
+            "consolidation": {
+                "applied": True, "error": None,
+                "input_count": 1, "output_count": 1,
+                "iraes": [finding],
+                "suspects": [],
+            },
+            "candidates": [{
+                "organ": "Miocardite/Cardiotossicità",
+                "evidence_id": "E-TROP",
+            }],
+            "evidence": [{
+                "evidence_id": "E-TROP",
+                "document_id": "DOC-1",
+                "source_page": 1,
+                "bbox": [1, 2, 3, 4],
+                "source_text": "troponina 1117 ng/L",
+                "normalized_entity": "troponina_i_hs",
+                "category": "laboratory_finding",
+                "observed_date": "2022-11-22",
+                "value_text": "1117",
+            }],
+        }
+
+    def test_structured_result_uses_inspectable_tab(self):
+        from emr_analyzer.config import active_workspace
+        from emr_analyzer.gui.irae_patient_tab import IraePatientTab
+
+        with tempfile.TemporaryDirectory() as tmp:
+            results = [{
+                "patient_id": "P001", "label": "P001",
+                "markdown": "", "error": None,
+                "structured": self._structured_report(),
+            }]
+            with mock.patch.object(active_workspace, "path", Path(tmp)):
+                dialog = IraeQueueResultDialog(results, services={})
+
+        self.assertIsInstance(dialog._tabs.widget(0), IraePatientTab)
+        # the result entry is refreshed to the CORRECTED report, so the bulk
+        # save / Excel export read the annotated (and possibly corrected) data.
+        self.assertEqual(
+            results[0]["structured"]["iraes"][0]["finding_id"], "irAE-1"
+        )
+        dialog.deleteLater()
+
+    def test_legacy_result_without_structured_keeps_text_tab(self):
+        from PyQt5.QtWidgets import QTextBrowser
+
+        results = [{
+            "patient_id": "P001", "label": "P001",
+            "markdown": "| A | B |\n|---|---|\n| 1 | 2 |", "error": None,
+        }]
+        # services provided, but no ``structured`` key: the read-only legacy
+        # tab is kept (backward compatibility with the classic queue).
+        dialog = IraeQueueResultDialog(results, services={})
+        self.assertIsInstance(dialog._tabs.widget(0), QTextBrowser)
+        self.assertIn("<table", dialog._tabs.widget(0).toHtml())
+        dialog.deleteLater()
 
 
 if __name__ == "__main__":

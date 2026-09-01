@@ -650,6 +650,8 @@ class WorkspaceTabs(QTabWidget):
         evidence yields an empty prompt list (the worker reports an explicit
         error).
         """
+        from dataclasses import asdict
+
         from ..clinical import irae_layers
         from ..clinical.irae_prototype import (
             find_ici_anchor,
@@ -695,18 +697,24 @@ class WorkspaceTabs(QTabWidget):
                     if anchor is not None
                     else None
                 ),
+                # Inspection payload (bounded, in clinical order): the Layer 2
+                # candidates plus the compact provenance of every cited
+                # evidence, so the result dialog can show and open them.
+                "candidates": [asdict(c) for c in candidates[:max_candidates]],
+                "evidence": irae_layers._compact_evidence(rows),
             }
             plans.append((pid, prompts, meta))
         return plans
 
-    def run_irae_queue(self, patient_ids: list[str]):
+    def run_irae_queue(self, patient_ids: list[str], instances: int = 0):
         """Run the structured NCTCAE irAE analysis over several patients.
 
         The classic chunked protocol is temporarily disabled, so only the
         structured 3-layer method (+ Layer 4 consolidation) runs.  Plans are
         built on the main thread; the LLM calls run in a background worker
         so the UI stays responsive.  A summary dialog with one tab per
-        patient opens at the end.
+        patient opens at the end.  *instances* (0 = auto) bounds how many
+        parallel llama-server runtimes the queue may use.
         """
         if not patient_ids:
             return
@@ -721,7 +729,7 @@ class WorkspaceTabs(QTabWidget):
 
         if choose_irae_method(self) is None:
             return
-        self._run_irae_layer3_queue(patient_ids, llm)
+        self._run_irae_layer3_queue(patient_ids, llm, instances=instances)
 
     def _run_irae_classic_queue(self, patient_ids: list[str], llm):
         """Legacy chunked irAE protocol over the chronological registry."""
@@ -747,7 +755,9 @@ class WorkspaceTabs(QTabWidget):
             patient_ids, llm, plans, "IraeQueueWorker"
         )
 
-    def _run_irae_layer3_queue(self, patient_ids: list[str], llm):
+    def _run_irae_layer3_queue(
+        self, patient_ids: list[str], llm, instances: int = 0
+    ):
         """Structured NCTCAE 3-layer irAE analysis over atomic evidence."""
         from ..clinical import irae_layers
 
@@ -763,6 +773,7 @@ class WorkspaceTabs(QTabWidget):
             return
         self._run_irae_queue_with_worker(
             patient_ids, llm, plans, "IraeLayer3QueueWorker",
+            instances=instances,
         )
 
     def _run_irae_queue_with_worker(
@@ -771,28 +782,45 @@ class WorkspaceTabs(QTabWidget):
         llm,
         plans: list,
         worker_name: str,
+        instances: int = 0,
     ):
         """Shared queue wiring for both irAE analysis methods.
 
         ``plans`` is either ``[(pid, list[str])]`` (classic prompts) or
         ``[(pid, list[(organ, prompt)])]`` (structured Layer 3).  Both
         worker classes expose the same signal contract, so the progress
-        dialog, log and result dialog are identical.
+        dialog, log and result dialog are identical.  *instances* (0 =
+        auto) is forwarded to the Layer 3 worker to run several llama-server
+        runtimes in parallel; the classic worker ignores it.
         """
+        from ..clinical import irae_layers
         from .workers import IraeLayer3QueueWorker, IraeQueueWorker
 
         worker_cls = {
             "IraeQueueWorker": IraeQueueWorker,
             "IraeLayer3QueueWorker": IraeLayer3QueueWorker,
         }[worker_name]
-        self._irae_queue_worker = worker_cls(llm, plans)
+        if worker_name == "IraeLayer3QueueWorker":
+            self._irae_queue_worker = worker_cls(
+                llm, plans, instances=instances
+            )
+        else:
+            self._irae_queue_worker = worker_cls(llm, plans)
         worker = self._irae_queue_worker
         results: list[dict] = []
 
         total = len(plans)
-        progress = ProgressDialog(
-            f"Coda analisi irAE — paziente 1/{total}", parent=self,
+        resolved = irae_layers.parallel_instance_count(
+            llm, override=instances
         )
+        if resolved > 1:
+            title = (
+                f"Coda analisi irAE — {total} pazienti, "
+                f"{resolved} istanze in parallelo"
+            )
+        else:
+            title = f"Coda analisi irAE — paziente 1/{total}"
+        progress = ProgressDialog(title, parent=self)
         progress.show()
         process_gui_events()
 
@@ -848,7 +876,9 @@ class WorkspaceTabs(QTabWidget):
             progress.accept()
             if results:
                 from .irae_queue_result_dialog import IraeQueueResultDialog
-                dialog = IraeQueueResultDialog(results, parent=self)
+                dialog = IraeQueueResultDialog(
+                    results, parent=self, services=self._services
+                )
                 dialog.exec_()
             else:
                 QMessageBox.information(

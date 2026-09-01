@@ -113,6 +113,32 @@ class IraeRowsForExcelTest(unittest.TestCase):
         rows, _ = irae_rows_for_excel([_result("P001", report)])
         self.assertEqual(rows[0]["immunotherapy_start"], "")
 
+    def test_new_inspection_keys_do_not_alter_rows(self):
+        from emr_analyzer.clinical.irae_export import (
+            EXCEL_COLUMNS,
+            irae_rows_for_excel,
+        )
+
+        report = _report([_finding()])
+        report["candidates"] = [{"evidence_id": "E1", "bbox": [1, 2, 3, 4]}]
+        report["evidence"] = [{"evidence_id": "E1", "source_page": 2}]
+        rows, skipped = irae_rows_for_excel([_result("P001", report)])
+
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["irAE_type"], "Elevazione della troponina")
+        self.assertEqual(len(EXCEL_COLUMNS), 14)
+
+    def test_hash_prefix_in_cited_ids_is_stripped(self):
+        from emr_analyzer.clinical.irae_export import irae_rows_for_excel
+
+        # the model echoes ``#EVD_x``; the Excel export writes registry ids.
+        report = _report([
+            _finding(key_evidence_ids=["#E-TROP", "#E-9"]),
+        ])
+        rows, _ = irae_rows_for_excel([_result("P001", report)])
+        self.assertEqual(rows[0]["key_evidence_ids"], "E-TROP, E-9")
+
 
 class WriteIraeXlsxTest(unittest.TestCase):
     def test_writes_workbook_with_header_and_rows(self):

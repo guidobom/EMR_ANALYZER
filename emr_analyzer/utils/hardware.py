@@ -39,6 +39,12 @@ _BYTES_PER_CONTEXT_TOKEN = 100_000  # ~100 KB per token (KV cache dominant)
 _OS_RESERVE_GB = 2.0
 _DGX_SPARK_MIN_RESERVE_GB = 12.0
 
+# Extra working memory (weights arena, CUDA graphs, sampler state) beyond the
+# weights + KV cache that a single llama-server instance really occupies.
+# Used by :func:`max_llm_instances` to bound how many sibling runtimes can
+# share the unified memory pool of a multi-patient irAE queue.
+_INSTANCE_MARGIN_BYTES = 3 * 1024 ** 3
+
 # ---------------------------------------------------------------------------
 # Hardware profile
 # ---------------------------------------------------------------------------
@@ -304,6 +310,44 @@ def get_safe_max_workers(
 ) -> int:
     """The highest worker count considered safe."""
     return calculate_max_workers(model_name, context_length)
+
+
+def max_llm_instances(
+    model_size_bytes: int,
+    context_length: int = 0,
+    workers: int = 1,
+    *,
+    cap: int = 0,
+) -> int:
+    """How many independent llama-server instances can share the memory pool.
+
+    Multi-patient irAE queues run one server per patient.  Each instance
+    reserves the weights plus its KV cache (``context_length * workers``
+    tokens at ~100 KB each — the per-slot context is split across the
+    ``workers`` parallel slots, so the total KV for one process scales with
+    the product), plus a working-memory margin and a share of the OS
+    reserve.  Uses the *currently available* system RAM (``psutil``, which
+    on the GB10 unified-memory DGX also reflects what the GPU pool has),
+    never Linux-specific ``nvidia-smi``.
+    """
+    available = psutil.virtual_memory().available
+    kv = (
+        max(0, int(context_length))
+        * max(1, int(workers))
+        * _BYTES_PER_CONTEXT_TOKEN
+    )
+    per = (
+        int(model_size_bytes)
+        + kv
+        + _INSTANCE_MARGIN_BYTES
+        + 2 * 1024 ** 3
+    )
+    if per <= 0:
+        return 1
+    count = max(1, available // per)
+    if cap > 0:
+        count = min(count, int(cap))
+    return count
 
 
 # ---------------------------------------------------------------------------

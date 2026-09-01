@@ -43,7 +43,8 @@ class LlmClient:
     def __init__(self, base_url: str | None = None,
                  model: str = DEFAULT_LLM_MODEL_NAME,
                  config: LLMRoleConfig | None = None,
-                 backend=None):
+                 backend=None,
+                 instance_id: int = 0):
         # ``base_url`` is kept for signature compatibility with older
         # callers; the llama.cpp backend owns its server URLs.
         self.base_url = str(base_url or "").rstrip("/")
@@ -94,6 +95,10 @@ class LlmClient:
         self.backend = (
             backend if backend is not None else get_backend(self.backend_type)
         )
+        # Instance discriminator (default 0): sibling clients with a nonzero
+        # instance_id resolve to a distinct llama-server process (multi-patient
+        # irAE queue).  The backend reads it off the client object.
+        self.instance_id = int(instance_id or 0)
         self._available = None  # Lazy check
         # Generation metadata is request-local: one LlmClient is deliberately
         # shared by the parallel registry workers.
@@ -102,6 +107,25 @@ class LlmClient:
     @property
     def keep_alive(self) -> str:
         return f"{self.keep_alive_minutes}m"
+
+    def for_instance(self, instance_id: int) -> "LlmClient":
+        """A sibling client pinned to a distinct server process (instance k).
+
+        The clone shares the same model, generation parameters and backend
+        singleton (so all instances share one port allocator); only
+        ``instance_id`` changes, which resolves to a different ``ServerKey``
+        and therefore a different llama-server process.
+        """
+        instance_id = int(instance_id or 0)
+        if instance_id == self.instance_id:
+            return self
+        clone = object.__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        clone.instance_id = instance_id
+        # Fresh per-thread generation metadata and lazy availability check.
+        clone._generation_local = threading.local()
+        clone._available = None
+        return clone
 
     def retain_only_this_runtime(self) -> int:
         """Unload app-owned models from inactive pipeline stages."""

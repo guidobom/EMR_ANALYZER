@@ -133,5 +133,34 @@ class TestGoldenSectionInjection(unittest.TestCase):
         self.assertNotIn("ESEMPI DI OUTPUT CORRETTO", captured["prompt"])
 
 
+class TestForInstance(unittest.TestCase):
+    """Sibling client clones pinned to distinct llama-server processes."""
+
+    def test_same_instance_returns_self(self):
+        client = LlmClient()
+        self.assertIs(client.for_instance(0), client)
+        self.assertIs(client.for_instance(None), client)
+
+    def test_clone_pins_new_instance_and_shares_backend(self):
+        client = LlmClient(model="qwen3:30b-a3b")
+        clone = client.for_instance(2)
+        self.assertIsNot(clone, client)
+        self.assertEqual(clone.instance_id, 2)
+        self.assertEqual(clone.model, client.model)
+        self.assertEqual(clone.context_length, client.context_length)
+        self.assertIs(clone.backend, client.backend)
+        self.assertIsNone(clone._available)
+        self.assertIsNot(clone._generation_local, client._generation_local)
+
+    def test_clones_are_mutually_independent(self):
+        client = LlmClient()
+        a = client.for_instance(1)
+        b = client.for_instance(2)
+        self.assertIsNot(a, b)
+        self.assertEqual(a.instance_id, 1)
+        self.assertEqual(b.instance_id, 2)
+        self.assertEqual(client.instance_id, 0)  # base untouched
+
+
 if __name__ == "__main__":
     unittest.main()

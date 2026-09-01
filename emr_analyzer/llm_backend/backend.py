@@ -70,12 +70,20 @@ class LlamaBackend:
     # -- key derivation -------------------------------------------------------
 
     def key_for(self, config) -> ServerKey:
-        """The server key serving *config*'s model/context/worker settings."""
+        """The server key serving *config*'s model/context/worker settings.
+
+        ``instance_id`` (default 0) discriminates otherwise identical
+        configurations so sibling clients can each own a distinct server
+        process (multi-patient irAE queue).  It must be part of the cache key
+        or two instances would collapse onto one cached ``ServerKey``.
+        """
+        instance = int(getattr(config, "instance_id", 0) or 0)
         cache_key = (
             str(getattr(config, "model", "")),
             int(getattr(config, "context_length", 32768) or 32768),
             int(getattr(config, "parallel_workers", 1) or 1),
             bool(getattr(config, "speculative_decoding", False)),
+            instance,
         )
         with self._cache_lock:
             cached = self._key_cache.get(cache_key)
@@ -94,6 +102,7 @@ class LlamaBackend:
             )
         np = int(getattr(config, "parallel_workers", 1) or 1)
         ctx = int(getattr(config, "context_length", 32768) or 32768)
+        instance = int(getattr(config, "instance_id", 0) or 0)
         total_ram = None
         try:
             import psutil
@@ -113,6 +122,7 @@ class LlamaBackend:
                 if bool(getattr(config, "speculative_decoding", False))
                 else "none"
             ),
+            instance=instance,
         )
 
     @staticmethod
@@ -142,15 +152,19 @@ class LlamaBackend:
             return None
         return self._manager.status(key)
 
-    def runtime_identity(self, config) -> tuple[str, int, int, str]:
+    def runtime_identity(self, config) -> tuple[str, int, int, str, int]:
         """Stable identity of the physical server used by *config*.
 
         Generation parameters such as temperature and output length are
-        request-scoped.  Only the GGUF file, per-slot context and slot count
-        decide whether two logical roles can share one llama-server process.
+        request-scoped.  Only the GGUF file, per-slot context, slot count and
+        instance number decide whether two logical roles can share one
+        llama-server process.
         """
         key = self.key_for(config)
-        return key.gguf_path, key.ctx_size, key.np, key.speculative_mode
+        return (
+            key.gguf_path, key.ctx_size, key.np,
+            key.speculative_mode, key.instance,
+        )
 
     def stop_config(self, config) -> bool:
         """Stop only the exact runtime selected by *config*.

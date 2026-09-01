@@ -9,18 +9,29 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMessageBox, QLabel, QTabWidget,
 )
 
+from ..clinical.irae_layers import render_irae_markdown
 from ..utils.markdown_tables import render_markdown_to_html
 
 
 class IraeQueueResultDialog(QDialog):
-    """One tab per patient, with a bulk save of the Markdown reports."""
+    """One tab per patient, with a bulk save of the Markdown reports.
 
-    def __init__(self, results: list[dict], parent=None):
-        """*results*: list of ``{patient_id, label, markdown, error}``."""
+    A result carrying a structured report dict (and with ``services``
+    provided) gets an ``IraePatientTab``: its findings are selectable, their
+    evidence is inspectable and each one can be corrected manually, with the
+    persisted corrections reflected in the bulk save and the Excel export.
+    Results without structured data keep the legacy read-only ``QTextBrowser``
+    tab.
+    """
+
+    def __init__(self, results: list[dict], parent=None, *, services=None):
+        """*results*: list of ``{patient_id, label, markdown, error,
+        structured}``."""
         super().__init__(parent)
         self.setWindowTitle("Analisi irAE multi-paziente — risultati")
         self.resize(1100, 760)
         self._results = results
+        self._services = services
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -29,18 +40,8 @@ class IraeQueueResultDialog(QDialog):
         ))
 
         self._tabs = QTabWidget()
-        for result in results:
-            view = QTextBrowser()
-            view.setOpenExternalLinks(False)
-            if result.get("error"):
-                view.setHtml(
-                    f"<span style='color:#c0392b;'>⚠️ "
-                    f"{result['error']}</span>"
-                )
-            else:
-                view.setHtml(render_markdown_to_html(
-                    result.get("markdown") or ""
-                ))
+        for index, result in enumerate(results):
+            view = self._build_tab(result, index)
             self._tabs.addTab(view, result.get("label") or result["patient_id"])
         layout.addWidget(self._tabs, stretch=1)
 
@@ -56,6 +57,57 @@ class IraeQueueResultDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         buttons.addWidget(close_btn)
         layout.addLayout(buttons)
+
+    def _build_tab(self, result: dict, index: int):
+        """The tab widget for one result: inspectable when structured."""
+        structured = result.get("structured")
+        if (
+            isinstance(structured, dict)
+            and not result.get("error")
+            and self._services is not None
+        ):
+            from ..clinical.irae_corrections import (
+                apply_irae_corrections,
+                load_corrections,
+            )
+            from .irae_patient_tab import IraePatientTab
+
+            patient_id = result["patient_id"]
+            # The tab owns the raw report and re-applies the persisted
+            # corrections; keep the result entry coherent so the bulk save
+            # and the Excel export always read the corrected report.
+            corrected, _ = apply_irae_corrections(
+                structured, load_corrections(patient_id)
+            )
+            result["structured"] = corrected
+            result["markdown"] = render_irae_markdown(corrected)
+            tab = IraePatientTab(
+                structured, patient_id, self._services, parent=self
+            )
+            tab.report_updated.connect(
+                lambda report, idx=index, res=result: self._on_tab_updated(
+                    idx, res, report
+                )
+            )
+            return tab
+
+        view = QTextBrowser()
+        view.setOpenExternalLinks(False)
+        if result.get("error"):
+            view.setHtml(
+                f"<span style='color:#c0392b;'>⚠️ "
+                f"{result['error']}</span>"
+            )
+        else:
+            view.setHtml(render_markdown_to_html(
+                result.get("markdown") or ""
+            ))
+        return view
+
+    def _on_tab_updated(self, index: int, result: dict, report: dict) -> None:
+        """A finding was corrected inside the tab: refresh the result entry."""
+        result["structured"] = report
+        result["markdown"] = render_irae_markdown(report)
 
     def _export_excel(self):
         """Export the structured findings to a single .xlsx workbook."""

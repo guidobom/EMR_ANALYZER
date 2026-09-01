@@ -487,6 +487,7 @@ class MainWindow(QMainWindow):
             )
             return
 
+        from ..clinical import irae_layers
         from .irae_queue_dialog import IraeQueueDialog, merge_irae_queue_summaries
 
         summaries = merge_irae_queue_summaries(
@@ -501,12 +502,19 @@ class MainWindow(QMainWindow):
             )
             return
 
-        dialog = IraeQueueDialog(summaries, parent=self)
+        llm = self._services.get("clinical_state_llm_client")
+        auto_max = irae_layers.parallel_instance_count(llm, override=0)
+        dialog = IraeQueueDialog(
+            summaries, max_instances=auto_max, parent=self
+        )
         if dialog.exec_() != QDialog.Accepted:
             return
         selected = dialog.selected_patient_ids()
+        instances = dialog.selected_instances()
         if selected:
-            self.workspace_tabs.run_irae_queue(selected)
+            self.workspace_tabs.run_irae_queue(
+                selected, instances=instances
+            )
 
     def _on_show_registry_queue(self):
         """Select patients and launch sequential registry generation."""

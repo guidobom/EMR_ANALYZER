@@ -76,7 +76,8 @@ def irae_rows_for_excel(
                 "alternative_causes": item.get("alternative_causes", ""),
                 "confidence": item.get("confidence", ""),
                 "key_evidence_ids": ", ".join(
-                    item.get("key_evidence_ids") or []
+                    str(eid).strip().lstrip("#")
+                    for eid in (item.get("key_evidence_ids") or [])
                 ),
                 "notes": item.get("notes", ""),
                 "immunotherapy_start": immunotherapy,

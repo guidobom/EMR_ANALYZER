@@ -13,8 +13,10 @@ and schema stay in one place.
 
 from __future__ import annotations
 
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from typing import Any, Iterable
 
 from .irae_prototype import (
@@ -26,7 +28,7 @@ from .irae_prototype import (
 )
 
 DEFAULT_MAX_CANDIDATES = 60
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 8192
 DEFAULT_PARALLEL = 4
 DEFAULT_MAX_CONSOLIDATION_FINDINGS = 200
 
@@ -54,10 +56,19 @@ SYSTEM_PROMPT = (
     "cheratite, sclerite), ematologiche (neutropenia, anemia emolitica, "
     "trombocitopenia), urologiche (cistite). Distingui esplicitamente i "
     "reperti legati alla malattia tumorale (es. lesioni cutanee del "
-    "melanoma, captazioni surrenaliche da metastasi) da una vera "
-    "tossicità immuno-correlata. Privilegia la sensibilità, ma non "
-    "considerare automaticamente immuno-correlato qualsiasi evento "
-    "verificatosi durante immunoterapia."
+    "melanoma, captazioni surrenaliche da metastasi) da una vera tossicità "
+    "immuno-correlata. Privilegia la precisione: riporta un irAE SOLO quando "
+    "i dati lo supportano; non segnalare automaticamente come "
+    "immuno-correlato ogni evento avvenuto durante l'immunoterapia. Un "
+    "singolo valore di laboratorio borderline o un sintomo aspecifico senza "
+    "conferma — seconda rilevazione o trend, oppure diagnosi clinica scritta "
+    "nel referto — non è sufficiente per un irAE PROBABILE o "
+    "CERTA_CONFERMATA. Usa POSSIBILE quando i dati sono insufficienti e "
+    "IMPROBABILE per i reperti della malattia tumorale, motivando ogni scelta "
+    "con diagnostic_support. Eventi già presenti prima dell'inizio "
+    "dell'immunoterapia (baseline) o spiegabili da cause alternative meglio "
+    "supportate dai dati (progressione, infezione, chemioterapia) non sono "
+    "irAE."
 )
 
 # Constrained JSON schema: forces llama-server GBNF decoding and keeps the
@@ -104,10 +115,22 @@ LAYER3_SCHEMA: dict = {
                         "items": {"type": "string"},
                         "description": "Identificatori [#id] delle evidenze chiave.",
                     },
+                    "diagnostic_support": {
+                        "type": "string",
+                        "enum": [
+                            "conferma_clinica_scritta",
+                            "trend_evidenze_multiple",
+                            "risposta_a_steroidi_o_sospensione",
+                            "valore_isolato",
+                            "preesistente_baseline",
+                            "non_specificato",
+                        ],
+                        "description": "Base diagnostica dell'irAE: diagnosi clinica scritta nel referto, più rilevazioni/trend, risposta a steroidi o sospensione dell'immunoterapia, singolo valore/sintomo isolato, preesistente all'immunoterapia, o non specificata.",
+                    },
                 },
                 "required": [
                     "organ", "irAE_type", "ctcae_grade", "first_onset_date",
-                    "probability_immune",
+                    "probability_immune", "diagnostic_support",
                 ],
             },
         }
@@ -176,7 +199,7 @@ LAYER4_SCHEMA: dict = {
                 },
                 "required": [
                     "irAE_type", "ctcae_grade", "first_onset_date",
-                    "probability_immune",
+                    "probability_immune", "key_evidence_ids",
                 ],
             },
         }
@@ -207,6 +230,7 @@ def evidence_rows_from_models(
             data = _get(item, "data_json", None)
         if not isinstance(data, dict):
             data = {}
+        bbox = _get(item, "bbox", None)
         rows.append({
             "evidence_id": _get(item, "evidence_id", ""),
             "category": _get(item, "category", ""),
@@ -216,8 +240,38 @@ def evidence_rows_from_models(
             "value_text": _get(item, "value_text", ""),
             "numeric_value": _get(item, "numeric_value", None),
             "unit": _get(item, "unit", ""),
+            "document_id": _get(item, "document_id", ""),
+            "source_page": _get(item, "source_page", None),
+            "bbox": list(bbox) if bbox else None,
+            "source_text": _get(item, "source_text", ""),
         })
     return rows
+
+
+def _compact_evidence(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Slim evidence rows for the report, without the extraction payload.
+
+    The report carries both the Layer 2 ``candidates`` and this compact list
+    so the inspector can render the evidence cited by the model even when it
+    is not a deterministic candidate (``key_evidence_ids`` may point to any
+    atomic evidence).  Only provenance and a short value are kept — never
+    ``data_json``.
+    """
+    compact: list[dict[str, Any]] = []
+    for row in rows:
+        bbox = row.get("bbox")
+        compact.append({
+            "evidence_id": row.get("evidence_id") or "",
+            "document_id": row.get("document_id") or "",
+            "source_page": row.get("source_page"),
+            "bbox": list(bbox) if bbox else None,
+            "source_text": row.get("source_text") or "",
+            "normalized_entity": row.get("normalized_entity") or "",
+            "category": row.get("category") or "",
+            "observed_date": row.get("observed_date") or "",
+            "value_text": row.get("value_text") or "",
+        })
+    return compact
 
 
 def format_candidate_line(candidate: ToxicityCandidate) -> str:
@@ -233,6 +287,8 @@ def format_candidate_line(candidate: ToxicityCandidate) -> str:
     )
     if candidate.value:
         line += f" — VALORE: {candidate.value}"
+    if candidate.reference:
+        line += f" — REFERENZA: {candidate.reference}"
     if candidate.quote:
         line += f"\n    citazione: “{candidate.quote[:200]}”"
     return line
@@ -284,7 +340,11 @@ def build_organ_prompt(
         "ogni candidato. Per ciascun irAE identifica tipo, grado CTCAE, "
         "data di prima insorgenza, probabilità di origine immuno-correlata, "
         "insorgenza nuova vs riacutizzazione di condizione preesistente, "
-        "cause alternative e gli [#id] delle evidenze chiave. Se l'organo "
+        "cause alternative e gli [#id] delle evidenze chiave. Indica per ogni "
+        "irAE il campo obbligatorio diagnostic_support: "
+        "conferma_clinica_scritta | trend_evidenze_multiple | "
+        "risposta_a_steroidi_o_sospensione | valore_isolato | "
+        "preesistente_baseline | non_specificato. Se l'organo "
         "non presenta veri irAE (es. reperti della malattia tumorale), "
         "restituisci una lista vuota o voci con probabilità IMPROBABILE "
         "motivando le cause alternative."
@@ -316,6 +376,16 @@ def run_organ_call(
         }
 
 
+def _evidence_ref(value) -> str:
+    """Normalize a model-cited evidence reference (``#EVD_x`` → ``EVD_x``).
+
+    The registry stores ids without the leading ``#`` that the model echoes
+    (the prompt cites ``[#id]``); every lookup and display must strip it so
+    the cited evidence resolves against ``clinical_evidence.evidence_id``.
+    """
+    return str(value or "").strip().lstrip("#")
+
+
 def _finding_label(item: dict[str, Any]) -> str:
     """One-line summary of a per-organ (Layer 3) finding for Layer 4."""
     grade = item.get("ctcae_grade", "?")
@@ -326,8 +396,79 @@ def _finding_label(item: dict[str, Any]) -> str:
         f"{item.get('irAE_type', '?')} · {grade} · insorgenza {onset} · {prob}"
     )
     if ev:
-        label += f" · evidenze [#{' #'.join(ev[:8])}]"
+        label += (
+            " · evidenze [#"
+            + " #".join(_evidence_ref(e) for e in ev[:8])
+            + "]"
+        )
     return label
+
+
+# Probability levels kept in the definitive list vs the "suspects" watchlist.
+_FINAL_PROBS = {"CERTA_CONFERMATA", "PROBABILE"}
+_SUSPECT_PROBS = {"POSSIBILE"}
+_EXCLUDED_PROBS = {"IMPROBABILE", "INDETERMINATA"}
+
+
+def _final_partition(
+    findings: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split per-organ findings into the definitive list and the suspects.
+
+    ``definitive`` = CERTA_CONFERMATA / PROBABILE (a missing or empty
+    ``probability_immune`` is treated as definitive — conservative, so
+    findings with an anomalous schema are never lost); ``suspects`` =
+    POSSIBILE.  IMPROBABILE / INDETERMINATA are excluded from both.
+    """
+    definitive = [
+        f for f in findings
+        if (not f.get("probability_immune")
+            or f.get("probability_immune") in _FINAL_PROBS)
+    ]
+    suspects = [
+        f for f in findings
+        if f.get("probability_immune") in _SUSPECT_PROBS
+    ]
+    return definitive, suspects
+
+
+_CITED_ID_RE = re.compile(r"#?\bEVD_[0-9a-f]+", re.IGNORECASE)
+
+
+def _backfill_cited_ids(
+    items: list[dict[str, Any]],
+    findings_by_organ: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Ensure every consolidated irAE carries ``key_evidence_ids``.
+
+    The model occasionally omits the structured citations and writes them as
+    ``#EVD_...`` tokens inside ``notes`` instead (see ``_evidence_ref``); when
+    neither the structured field nor the notes carry ids, fall back to the
+    union of the per-organ Layer 3 findings' citations for the entry's
+    ``source_organs``.  Ids are normalized and deduplicated preserving order;
+    ids the model did provide are never removed.
+    """
+    for item in items:
+        ids = [
+            _evidence_ref(e)
+            for e in (item.get("key_evidence_ids") or [])
+        ]
+        if not ids:
+            ids = [
+                match.group(0).lstrip("#")
+                for match in _CITED_ID_RE.finditer(str(item.get("notes") or ""))
+            ]
+        if not ids:
+            for organ in set(str(o) for o in (item.get("source_organs") or [])):
+                for finding in findings_by_organ.get(organ, []):
+                    ids.extend(
+                        _evidence_ref(e)
+                        for e in (finding.get("key_evidence_ids") or [])
+                    )
+        ids = list(dict.fromkeys(i for i in ids if i))
+        if ids:
+            item["key_evidence_ids"] = ids
+    return items
 
 
 def build_consolidation_prompt(
@@ -337,13 +478,16 @@ def build_consolidation_prompt(
     max_findings: int = DEFAULT_MAX_CONSOLIDATION_FINDINGS,
 ) -> tuple[str, int]:
     """Layer 4 prompt: the consolidated, final list over the per-organ
-    findings.  Returns ``(prompt, truncated)`` where ``truncated`` counts the
-    findings omitted over ``max_findings``."""
+    findings.  Findings are listed in three blocks — definitive, suspects,
+    excluded — so the model merges the definitive ones and only promotes a
+    suspect with confirmatory evidence.  Returns ``(prompt, truncated)`` where
+    ``truncated`` counts the findings omitted over ``max_findings``."""
     truncated = 0
-    kept = findings
-    if len(kept) > max_findings:
-        truncated = len(kept) - max_findings
-        kept = kept[:max_findings]
+    if len(findings) > max_findings:
+        truncated = len(findings) - max_findings
+        findings = findings[:max_findings]
+
+    definitive, suspects = _final_partition(findings)
 
     lines = []
     if anchor is not None:
@@ -358,13 +502,35 @@ def build_consolidation_prompt(
     lines.append("")
     lines.append(
         f"IRAE IDENTIFICATI PER SINGOLO ORGANO (FASE FINALE): "
-        f"{len(kept)} reperto/i da consolidare."
+        f"{len(definitive)} definitivi, {len(suspects)} sospetti, "
+        f"{len(findings) - len(definitive) - len(suspects)} esclusi."
     )
-    for index, item in enumerate(kept, start=1):
-        organ = item.get("organ", "?")
-        lines.append(
-            f"[{index}] Organo: {organ} — {_finding_label(item)}"
-        )
+
+    if definitive:
+        lines.append("REPERTI DEFINITIVI (CERTA_CONFERMATA / PROBABILE):")
+        for index, item in enumerate(definitive, start=1):
+            organ = item.get("organ", "?")
+            lines.append(
+                f"[{index}] Organo: {organ} — {_finding_label(item)}"
+            )
+    if suspects:
+        lines.append("SOSPETTI (POSSIBILE — da confermare):")
+        for index, item in enumerate(suspects, start=1):
+            organ = item.get("organ", "?")
+            lines.append(
+                f"[S{index}] Organo: {organ} — {_finding_label(item)}"
+            )
+    excluded = [
+        f for f in findings
+        if f.get("probability_immune") in _EXCLUDED_PROBS
+    ]
+    if excluded:
+        lines.append("ESCLUSI (IMPROBABILE / INDETERMINATA):")
+        for index, item in enumerate(excluded, start=1):
+            organ = item.get("organ", "?")
+            lines.append(
+                f"[X{index}] Organo: {organ} — {_finding_label(item)}"
+            )
     if truncated:
         lines.append(
             f"(Nota: {truncated} reperti aggiuntivi oltre il tetto di "
@@ -373,20 +539,24 @@ def build_consolidation_prompt(
     lines.append("")
     lines.append(
         "FASE FINALE: produci la lista DEFINITIVA e approfondita degli irAE "
-        "del paziente. UNISCI i duplicati: due voci che descrivono lo stesso "
-        "evento clinico anche in organi diversi (es. «Elevazione della "
-        "troponina» in Miocardite e «Miocardite da ICI» in "
+        "del paziente. La lista contiene SOLO irAE confermati "
+        "(CERTA_CONFERMATA o PROBABILE). UNISCI i duplicati: due voci che "
+        "descrivono lo stesso evento clinico anche in organi diversi (es. "
+        "«Elevazione della troponina» in Miocardite e «Miocardite da ICI» in "
         "Cardiotossicità) devono diventare UNA sola voce, indicando in "
         "source_organs tutti gli organi in cui è stato rilevato. NON "
-        "inventare irAE nuovi e NON riprodurre voci come doppioni. "
-        "Escludi dalla lista definitiva gli irAE con probabilità IMPROBABILE "
-        "che rappresentano reperti della malattia tumorale (es. lesioni "
-        "cutanee del melanoma), motivandone l'esclusione in alternative_causes. "
-        "Approfondisci ogni voce residua con notes: caratterizzazione clinica, "
-        "decorso, correlazione temporale con l'immunoterapia. Mantieni grado "
-        "CTCAE, data di prima insorgenza, probabilità immuno-correlata, "
-        "insorgenza nuova vs riacutizzazione e gli [#id] delle evidenze "
-        "chiave, aggregando quelli delle voci unite."
+        "inventare irAE nuovi e NON riprodurre voci come doppioni. Un "
+        "sospetto POSSIBILE è promuovibile solo con evidenza di conferma "
+        "(seconda rilevazione o trend, risposta a steroidi o sospensione "
+        "dell'immunoterapia); altrimenti OMETTILO dalla lista finale. I "
+        "reperti esclusi (IMPROBABILE / INDETERMINATA) rappresentano "
+        "tipicamente la malattia tumorale: non riportarli, motivando "
+        "l'esclusione in alternative_causes. Approfondisci ogni voce residua "
+        "con notes: caratterizzazione clinica, decorso, correlazione "
+        "temporale con l'immunoterapia. Mantieni grado CTCAE, data di prima "
+        "insorgenza, probabilità immuno-correlata, insorgenza nuova vs "
+        "riacutizzazione e gli [#id] delle evidenze chiave, aggregando quelli "
+        "delle voci unite."
     )
     return "\n".join(lines), truncated
 
@@ -402,13 +572,17 @@ def consolidate_iraes(
     """Layer 4: one structured call that merges cross-organ duplicates and
     deepens each final irAE's characterization.
 
-    Always returns a dict ``{iraes, applied, error, input_count,
-    output_count}``; on failure ``iraes`` falls back to the input findings so
-    the analysis is never lost.
+    The returned ``iraes`` are only the definitive findings
+    (CERTA_CONFERMATA / PROBABILE); ``suspects`` carries the POSSIBILE ones
+    that lacked confirmation.  Always returns a dict ``{iraes, suspects,
+    applied, error, input_count, output_count}``; on failure ``iraes`` falls
+    back to the definitive partition of the input findings so the analysis is
+    never lost.
     """
     if not findings:
         return {
             "iraes": [],
+            "suspects": [],
             "applied": False,
             "error": None,
             "input_count": 0,
@@ -427,20 +601,31 @@ def consolidate_iraes(
         ):
             raise ValueError("schema violato: manca la lista 'iraes'")
         consolidated = data["iraes"]
+        definitive, suspects = _final_partition(consolidated)
+        findings_by_organ: dict[str, list[dict[str, Any]]] = {}
+        for finding in findings:
+            findings_by_organ.setdefault(
+                str(finding.get("organ") or ""), []
+            ).append(finding)
+        _backfill_cited_ids(definitive, findings_by_organ)
+        _backfill_cited_ids(suspects, findings_by_organ)
         return {
-            "iraes": consolidated,
+            "iraes": definitive,
+            "suspects": suspects,
             "applied": True,
             "error": None,
             "input_count": len(findings),
-            "output_count": len(consolidated),
+            "output_count": len(definitive),
         }
     except Exception as exc:
+        definitive, suspects = _final_partition(findings)
         return {
-            "iraes": findings,
+            "iraes": definitive,
+            "suspects": suspects,
             "applied": False,
             "error": f"{type(exc).__name__}: {exc}",
             "input_count": len(findings),
-            "output_count": len(findings),
+            "output_count": len(definitive),
         }
 
 
@@ -463,6 +648,14 @@ def analyze_irae(
     started = time.perf_counter()
     anchor = find_ici_anchor(rows)
     candidates = scan_for_irae(rows, anchor)
+
+    baseline_excluded = 0
+    if anchor is not None:
+        baseline_excluded = sum(
+            1
+            for c in scan_for_irae(rows, anchor, drop_baseline=False)
+            if c.band == "pre_ici"
+        )
 
     report: dict[str, Any] = {
         "anchor": (
@@ -489,6 +682,7 @@ def analyze_irae(
         ),
         "candidates_total": len(candidates),
         "candidates_by_organ": summarize_candidates(candidates),
+        "baseline_excluded": baseline_excluded,
         "timing_seconds": {},
     }
 
@@ -537,6 +731,22 @@ def analyze_irae(
     report["iraes"] = consolidation["iraes"]
     report["consolidation"] = consolidation
     report["organ_results"] = organ_results
+
+    # Inspection payload: the Layer 2 candidates (bounded, in clinical order)
+    # plus the compact provenance of every evidence the model cited, so the
+    # inspector can show and open them regardless of whether they were
+    # deterministic candidates.
+    report["candidates"] = [asdict(c) for c in candidates[:max_candidates]]
+    cited_ids: list[str] = []
+    for item in findings:
+        cited_ids.extend(_evidence_ref(eid) for eid in (item.get("key_evidence_ids") or []))
+    for item in consolidation.get("iraes", []) + consolidation.get("suspects", []):
+        cited_ids.extend(_evidence_ref(eid) for eid in (item.get("key_evidence_ids") or []))
+    evidence_by_id = {str(row.get("evidence_id")): row for row in rows}
+    report["evidence"] = _compact_evidence([
+        evidence_by_id[eid] for eid in cited_ids if eid in evidence_by_id
+    ])
+
     report["timing_seconds"]["total"] = round(time.perf_counter() - started, 1)
     return report
 
@@ -566,9 +776,13 @@ def _append_per_organ(lines: list[str], report: dict[str, Any]) -> None:
                 lines.append(f"  - {item['new_onset_vs_exacerbation']}")
             if item.get("alternative_causes"):
                 lines.append(f"  - Cause alt.: {item['alternative_causes']}")
+            if item.get("diagnostic_support"):
+                lines.append(f"  - Supporto: {item['diagnostic_support']}")
             ev = item.get("key_evidence_ids", [])
             if ev:
-                lines.append(f"  - Evidenze: [#{' #'.join(ev[:8])}]")
+                lines.append(
+                f"  - Evidenze: [#{' #'.join(_evidence_ref(e) for e in ev[:8])}]"
+            )
         lines.append("")
 
 
@@ -612,7 +826,30 @@ def _append_consolidated(lines: list[str], report: dict[str, Any]) -> None:
             lines.append(f"  - Approfondimento: {item['notes']}")
         ev = item.get("key_evidence_ids", [])
         if ev:
-            lines.append(f"  - Evidenze: [#{' #'.join(ev[:8])}]")
+            lines.append(
+                f"  - Evidenze: [#{' #'.join(_evidence_ref(e) for e in ev[:8])}]"
+            )
+
+    suspects = consolidation.get("suspects") or []
+    if suspects:
+        lines.append("### 🔎 Sospetti da monitorare (non confermati)")
+        for item in suspects:
+            grade = item.get("ctcae_grade", "?")
+            prob = item.get("probability_immune", "?")
+            onset = item.get("first_onset_date", "?")
+            organs = item.get("source_organs") or []
+            organ_txt = ", ".join(organs) if organs else item.get("organ", "?")
+            lines.append(
+                f"- **{item.get('irAE_type', '?')}** · {grade} · "
+                f"insorgenza {onset} · {prob} · organi: {organ_txt}"
+            )
+            if item.get("alternative_causes"):
+                lines.append(f"  - Cause alt.: {item['alternative_causes']}")
+            ev = item.get("key_evidence_ids", [])
+            if ev:
+                lines.append(
+                f"  - Evidenze: [#{' #'.join(_evidence_ref(e) for e in ev[:8])}]"
+            )
     lines.append("")
 
 
@@ -637,3 +874,41 @@ def render_irae_markdown(report: dict[str, Any]) -> str:
     _append_per_organ(lines, report)
     _append_consolidated(lines, report)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def parallel_instance_count(client, *, override=0) -> int:
+    """How many llama-server instances the irAE queue may run in parallel.
+
+    ``override > 0`` pins the count (``0``/default = auto from the memory
+    budget).  Multi-instance is only possible when the client can clone
+    itself (:meth:`~emr_analyzer.extraction.llm_client.LlmClient.for_instance`)
+    on the ``llama_cpp`` backend; vLLM has no instance dimension and fakes
+    used by tests return 1.  The model's on-disk size and the *real*
+    (memory-capped) worker count are read through the backend so the budget
+    reflects the actual per-server KV cache.
+    """
+    if not hasattr(client, "for_instance"):
+        return 1
+    if getattr(client, "backend_type", "llama_cpp") != "llama_cpp":
+        return 1
+    if override > 0:
+        return max(1, int(override))
+    try:
+        size = int(
+            (client.backend.model_info(client.model) or {}).get("size_bytes") or 0
+        )
+        if size <= 0:
+            # Unknown model: a size of 0 would over-allocate instances (the
+            # budget would omit the weights); stay conservative.
+            return 1
+        workers = client.backend.key_for(client).np
+    except Exception:
+        return 1
+    from ..utils import hardware
+
+    return max(
+        1,
+        hardware.max_llm_instances(
+            size, client.context_length, workers
+        ),
+    )

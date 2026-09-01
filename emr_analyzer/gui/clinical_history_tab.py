@@ -2002,14 +2002,36 @@ class ClinicalHistoryTab(QWidget):
             self._render_chat()
 
     def _on_irae_analysis(self) -> None:
-        """Run the irAE protocol over the WHOLE registry, chunk by chunk."""
+        """Run the structured 3-layer irAE analysis over the atomic evidence.
+
+        Mirrors the batch queue: the deterministic Layers 1-2 filter the
+        atomic evidence, then per-organ structured LLM calls (NCTCAE 6.0) and
+        the Layer 4 consolidation produce the same structured report the queue
+        shows — so the single-patient result dialog is fully inspectable and
+        manually correctable.
+        """
         if self._guard_busy():
             return
-        if not self._timeline_entries:
+
+        patient_id = self._current_patient_id or ""
+        if not patient_id:
+            return
+
+        # The 3-layer pipeline needs the atomic evidence, not the timeline:
+        # gate on the data prerequisite first (like the old registry check
+        # before the LLM), so the user sees the real blocker immediately.
+        from ..clinical import irae_layers
+
+        evidence_repo = self._services.get("evidence_repo")
+        rows = irae_layers.evidence_rows_from_models(
+            evidence_repo.get_by_patient(patient_id)
+            if evidence_repo is not None else []
+        )
+        if not rows:
             QMessageBox.information(
-                self, "Nessun registro",
-                "Nessuna storia clinica disponibile per questo paziente. "
-                "Genera prima il registro cronologico.",
+                self, "Nessuna evidenza atomica",
+                "Nessuna evidenza atomica disponibile per questo paziente. "
+                "Esegui prima lo stadio 'Estrai evidenze'.",
             )
             return
 
@@ -2021,45 +2043,19 @@ class ClinicalHistoryTab(QWidget):
             )
             return
 
-        from ..clinical import irae_analysis
+        from .workers import SinglePatientIraeWorker
 
-        try:
-            prompt_path = irae_analysis.ensure_prompt()
-            protocol = irae_analysis.load_prompt(prompt_path)
-            entries_data = [e.to_dict() for e in self._timeline_entries]
-            prompts = irae_analysis.build_analysis_plan(
-                entries_data, self._clinical_profile, protocol
-            )
-        except OSError as exc:
-            QMessageBox.warning(
-                self, "Protocollo non disponibile", str(exc)
-            )
-            return
-        except Exception as exc:
-            QMessageBox.critical(
-                self, "Analisi irAE non riuscita",
-                f"Errore durante la preparazione dell'analisi: {exc}",
-            )
-            return
-        if not protocol:
-            QMessageBox.warning(
-                self, "Protocollo non disponibile",
-                f"Il file del protocollo irAE è vuoto: {prompt_path}",
-            )
-            return
-
-        from .workers import IraeAnalysisWorker
-
-        self._irae_worker = IraeAnalysisWorker(llm, prompts)
-        self._irae_worker.progress.connect(self._on_irae_progress)
-        self._irae_worker.result_ready.connect(self._on_irae_finished)
+        self._irae_worker = SinglePatientIraeWorker(llm, rows)
+        self._irae_worker.structured_ready.connect(
+            self._on_irae_structured_ready
+        )
         self._irae_worker.error.connect(self._on_irae_error)
         self._irae_worker.finished.connect(self._release_irae_worker)
         self._irae_btn.setEnabled(False)
         self._progress_bar.setVisible(True)
-        self._progress_bar.setMaximum(len(prompts))
+        self._progress_bar.setMaximum(0)
         self._progress_bar.setValue(0)
-        self._status_label.setText("Analisi irAE del registro completo...")
+        self._status_label.setText("Analisi irAE (NCTCAE) in corso...")
         self._irae_worker.start()
         self._update_busy_ui()
 
@@ -2077,6 +2073,20 @@ class ClinicalHistoryTab(QWidget):
 
         dialog = IraeResultDialog(
             combined_markdown, patient_id=self._current_patient_id or "",
+            parent=self,
+        )
+        dialog.exec_()
+
+    def _on_irae_structured_ready(self, report: dict) -> None:
+        self._progress_bar.setVisible(False)
+        self._status_label.setText("")
+        self._irae_btn.setEnabled(bool(self._timeline_entries))
+        from .irae_result_dialog import IraeResultDialog
+
+        dialog = IraeResultDialog(
+            report,
+            patient_id=self._current_patient_id or "",
+            services=self._services,
             parent=self,
         )
         dialog.exec_()

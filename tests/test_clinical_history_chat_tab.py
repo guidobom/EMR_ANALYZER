@@ -360,11 +360,14 @@ class IraeNoRegistryTest(ClinicalHistoryChatTabTest):
         )
         self.assertFalse(self.tab._irae_btn.isEnabled())
 
-    def test_direct_call_without_registry_shows_message(self):
+    def test_direct_call_without_evidence_shows_message(self):
+        # The single-patient button now runs the 3-layer pipeline, whose data
+        # prerequisite is the ATOMIC EVIDENCE (not the timeline registry): a
+        # direct call without any must explain the blocker, never no-op.
         self._without_registry()
         with mock.patch.object(
             QMessageBox, "information", return_value=None
         ) as info:
             self.tab._on_irae_analysis()
-        self.assertIn("Nessun registro", info.call_args[0][1])
+        self.assertIn("Nessuna evidenza atomica", info.call_args[0][1])
         self.assertIsNone(self.tab._irae_worker)

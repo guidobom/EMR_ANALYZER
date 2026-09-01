@@ -14,6 +14,7 @@ from emr_analyzer.utils.hardware import (
     ModelProfile,
     RecommendedParams,
     calculate_max_workers,
+    max_llm_instances,
     recommend_output_tokens,
 )
 
@@ -247,3 +248,27 @@ def test_atomic_output_guidance_matches_the_role_preset():
 
     assert output == ATOMIC_EVIDENCE_OUTPUT_TARGET
     assert "Preset atomico" in rationale
+
+
+def test_max_llm_instances_is_kv_aware_on_dgx_budget():
+    # DGX Spark-like pool: ~116 GiB available, 18.6 GiB model, ctx 16384,
+    # np 8 → KV = 16384 × 8 × 100 KB ≈ 13.1 GiB; per instance ≈
+    # 18.6 + 13.1 + 3 + 2 ≈ 36.7 GiB → floor(116 / 36.7) = 3.
+    with patch("emr_analyzer.utils.hardware.psutil.virtual_memory") as vm:
+        vm.return_value.available = 116 * 1024 ** 3
+        assert max_llm_instances(18.6 * 1024 ** 3, 16384, 8) == 3
+
+
+def test_max_llm_instances_respects_cap():
+    with patch("emr_analyzer.utils.hardware.psutil.virtual_memory") as vm:
+        vm.return_value.available = 116 * 1024 ** 3
+        assert (
+            max_llm_instances(18.6 * 1024 ** 3, 16384, 8, cap=2) == 2
+        )
+
+
+def test_max_llm_instances_never_below_one():
+    # A model larger than the whole available pool still yields one instance.
+    with patch("emr_analyzer.utils.hardware.psutil.virtual_memory") as vm:
+        vm.return_value.available = 2 * 1024 ** 3
+        assert max_llm_instances(100 * 1024 ** 3, 0, 1) == 1

@@ -5,7 +5,7 @@ from __future__ import annotations
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QHeaderView, QPushButton, QLabel, QAbstractItemView,
+    QHeaderView, QPushButton, QLabel, QAbstractItemView, QComboBox,
 )
 
 
@@ -36,21 +36,43 @@ def merge_irae_queue_summaries(
 class IraeQueueDialog(QDialog):
     """Checkbox list of the patients that HAVE a chronological registry."""
 
-    def __init__(self, summaries: list[dict], parent=None):
+    def __init__(
+        self, summaries: list[dict], max_instances: int = 1, parent=None
+    ):
         super().__init__(parent)
         self.setWindowTitle("Analisi irAE multi-paziente")
         self.resize(720, 480)
         self._summaries = summaries
         self._selected: set[str] = set(s["id"] for s in summaries)
+        self._max_instances = max(1, int(max_instances or 1))
 
         layout = QVBoxLayout(self)
         intro = QLabel(
             "Seleziona i pazienti da analizzare con il protocollo irAE. "
-            "La coda elabora un paziente alla volta; al termine si apre "
-            "un riepilogo con una scheda per paziente."
+            "Se la memoria lo consente la coda elabora più pazienti in "
+            "parallelo, ognuno su una propria istanza del modello; al "
+            "termine si apre un riepilogo con una scheda per paziente."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
+
+        self._instance_combo = QComboBox()
+        self._instance_combo.addItem("Auto (memoria)", 0)
+        if self._max_instances > 1:
+            for count in range(1, min(self._max_instances, 6) + 1):
+                self._instance_combo.addItem(f"{count} istanze", count)
+        else:
+            # Only one runtime fits: the choice is forced, keep the combo
+            # visible but inert so the layout stays stable across machines.
+            self._instance_combo.setEnabled(False)
+        self._instance_combo.setCurrentIndex(0)
+        instance_row = QHBoxLayout()
+        instance_row.addWidget(
+            QLabel("Istanze LLM parallele (una per paziente):")
+        )
+        instance_row.addWidget(self._instance_combo)
+        instance_row.addStretch()
+        layout.addLayout(instance_row)
 
         self._table = QTableWidget()
         self._table.setColumnCount(4)
@@ -136,3 +158,7 @@ class IraeQueueDialog(QDialog):
         return [
             s["id"] for s in self._summaries if s["id"] in self._selected
         ]
+
+    def selected_instances(self) -> int:
+        """Parallel instances for the queue: 0 = auto (from memory)."""
+        return int(self._instance_combo.currentData() or 0)

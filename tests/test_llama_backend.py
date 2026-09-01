@@ -5,6 +5,7 @@ import os
 import struct
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -240,7 +241,7 @@ class TestServerManager(unittest.TestCase):
         self.patches.append(health_patch)
         port_patch = mock.patch(
             "emr_analyzer.llm_backend.server_manager._port_is_free",
-            side_effect=lambda port: port in (11435, 11436),
+            side_effect=lambda port: port in (11435, 11436, 11437),
         )
         self.fake_port = port_patch.start()
         self.patches.append(port_patch)
@@ -325,6 +326,25 @@ class TestServerManager(unittest.TestCase):
             second_argv[second_argv.index("--port") + 1], "11436",
             "la seconda istanza non deve riutilizzare la porta 11435",
         )
+
+    def test_same_config_different_instance_spawn_separate_servers(self):
+        # The multi-patient irAE queue: two clients with the same model,
+        # context and slots but a different ``instance`` must get their own
+        # process and port, and stopping the sibling leaves instance 0 warm.
+        self._patch_spawn_and_health()
+        self.manager.ensure(self.key, load_timeout=5)
+        sibling = ServerKey(str(self._model_path), 32768, 4, instance=1)
+        self.manager.ensure(sibling, load_timeout=5)
+        self.assertEqual(self.fake_popen.call_count, 2)
+        second_argv = self.fake_popen.call_args_list[1][0][0]
+        self.assertEqual(
+            second_argv[second_argv.index("--port") + 1], "11436",
+            "un'istanza diversa richiede una porta propria",
+        )
+        self.assertTrue(self.manager.stop(sibling))
+        self.assertFalse(self.manager.stop(sibling))  # idempotent
+        self.assertIn(self.key, self.manager.running_keys())
+        self.assertNotIn(sibling, self.manager.running_keys())
 
     def test_reap_port_only_kills_orphaned_llama_servers(self):
         app_pid = os.getpid()
@@ -424,6 +444,56 @@ class TestServerManager(unittest.TestCase):
         self._patch_spawn_and_health(healthy=False)
         with self.assertRaises(BackendError):
             self.manager.ensure(self.key, load_timeout=0.5)
+
+
+class TestBackendKeyDerivation(unittest.TestCase):
+    """``instance_id`` must reach ServerKey and never collapse the cache."""
+
+    @contextmanager
+    def _backend(self):
+        # ``_derive_key`` does a function-local ``import psutil``, so the real
+        # top-level module attribute is the right patch target.  The resolve
+        # patch must stay active for the ``key_for`` calls, not only during
+        # construction.
+        with mock.patch(
+            "emr_analyzer.llm_backend.backend.model_store.resolve",
+            return_value={
+                "file": "/models/qwen.gguf",
+                "size_bytes": 20 * 1024 ** 3,
+            },
+        ), mock.patch("psutil.virtual_memory") as vm:
+            vm.return_value.total = 128 * 1024 ** 3
+            backend = LlamaBackend()
+            try:
+                yield backend
+            finally:
+                backend.shutdown()
+
+    @staticmethod
+    def _cfg(instance_id=0):
+        return mock.Mock(
+            model="qwen",
+            context_length=16384,
+            parallel_workers=4,
+            speculative_decoding=False,
+            instance_id=instance_id,
+        )
+
+    def test_key_for_includes_instance(self):
+        with self._backend() as backend:
+            base = backend.key_for(self._cfg(instance_id=0))
+            sibling = backend.key_for(self._cfg(instance_id=1))
+            self.assertEqual(base.instance, 0)
+            self.assertEqual(sibling.instance, 1)
+            self.assertNotEqual(base, sibling)
+            # Cache must NOT collapse two instances onto one ServerKey.
+            again = backend.key_for(self._cfg(instance_id=1))
+            self.assertIs(again, sibling)
+
+    def test_runtime_identity_carries_instance(self):
+        with self._backend() as backend:
+            identity = backend.runtime_identity(self._cfg(instance_id=2))
+            self.assertEqual(identity, ("/models/qwen.gguf", 16384, 4, "none", 2))
 
 
 if __name__ == "__main__":

@@ -45,6 +45,18 @@ _DAYS_14 = 14
 _DAYS_112 = 112
 _DAYS_365 = 365
 
+# Organ domains driven by quantitative lab markers: a candidate in one of
+# these is dropped (specificity gate) when its value sits at or below the
+# report's own reference upper limit (not even CTCAE grade 1).  Symptom-driven
+# organs and the endocrine/haematological labs stay under the LLM's judgment.
+LAB_THRESHOLD_ORGANS = frozenset({
+    "Epatite",
+    "Pancreatite",
+    "Miocardite/Cardiotossicità",
+    "Miosite/CPK",
+    "Nefrite",
+})
+
 # Organ -> toxicity tokens, matched against the normalized entity and the
 # atomic quote.  Full Italian laboratory names are included because the
 # extractor stores "alanina_aminotransferasi" rather than "ALT".
@@ -217,7 +229,12 @@ class IciAnchor:
 
 @dataclass(frozen=True)
 class ToxicityCandidate:
-    """One registry evidence flagged by the organ lexicon (Layer 2)."""
+    """One registry evidence flagged by the organ lexicon (Layer 2).
+
+    The last four fields carry the exact document provenance of the
+    underlying evidence, so the inspector can open the original PDF at the
+    highlighted passage (see ``IraeEvidenceInspector``).
+    """
 
     organ: str
     evidence_id: str
@@ -229,6 +246,11 @@ class ToxicityCandidate:
     quote: str
     generic: bool = False
     value: str = ""
+    reference: str = ""
+    document_id: str = ""
+    source_page: int | None = None
+    bbox: list | None = None
+    source_text: str = ""
 
 
 def _parse_evidence_date(raw: str | None) -> date | None:
@@ -309,6 +331,9 @@ def band_for_offset(offset: int | None) -> str:
 def scan_for_irae(
     rows: Iterable[dict[str, Any]],
     anchor: IciAnchor | None,
+    *,
+    drop_baseline: bool = True,
+    apply_lab_threshold: bool = True,
 ) -> list[ToxicityCandidate]:
     """Layer 2 — organ lexicon scan over the registry.
 
@@ -316,6 +341,15 @@ def scan_for_irae(
     (``offset_days``) and bucketed into a time band.  Candidates are sorted by
     band (pre-ICI first, undated last) then by offset so the LLM layer reads
     them in clinical order.
+
+    Two deterministic specificity gates (both on by default):
+
+    * ``drop_baseline`` — events dated before the first ICI dose (band
+      ``pre_ici``) are baseline and never reach the LLM layer.
+    * ``apply_lab_threshold`` — for the quantitative marker organs in
+      ``LAB_THRESHOLD_ORGANS``, lab values at or below the report's own
+      reference upper limit (not even CTCAE grade 1) are dropped; values above
+      it, or rows without a reliable number/reference, are kept.
     """
     candidates: list[ToxicityCandidate] = []
     for row in rows:
@@ -335,6 +369,16 @@ def scan_for_irae(
         offset = None
         if parsed is not None and anchor is not None:
             offset = (parsed - anchor.first_date).days
+        band = band_for_offset(offset)
+        if drop_baseline and band == "pre_ici":
+            continue
+        if (
+            apply_lab_threshold
+            and matched_organ is not None
+            and matched_organ in LAB_THRESHOLD_ORGANS
+            and _within_reference_range(row)
+        ):
+            continue
         candidates.append(
             ToxicityCandidate(
                 organ=matched_organ or "Sintomi aspecifici",
@@ -343,10 +387,15 @@ def scan_for_irae(
                 entity=row.get("normalized_entity") or "",
                 observed_raw=row.get("observed_date") or "",
                 offset_days=offset,
-                band=band_for_offset(offset),
+                band=band,
                 quote=_quote_from_row(row),
                 generic=generic,
                 value=_value_from_row(row),
+                reference=_reference_from_row(row),
+                document_id=row.get("document_id") or "",
+                source_page=row.get("source_page"),
+                bbox=row.get("bbox"),
+                source_text=row.get("source_text") or "",
             )
         )
     band_rank = {name: index for index, name in enumerate(BAND_ORDER)}
@@ -383,6 +432,55 @@ def _value_from_row(row: dict[str, Any]) -> str:
     if isinstance(numeric_value, float) and numeric_value.is_integer():
         numeric_value = int(numeric_value)
     return f"{numeric_value} {unit}".strip()
+
+
+def _reference_from_row(row: dict[str, Any]) -> str:
+    """Compact reference range for the prompt, from the report's own data.
+
+    Prefers ``reference_text`` (e.g. ``< 35``), then builds one from
+    ``reference_low``/``reference_high``.  Returns "" when neither is present.
+    """
+    data_json = row.get("data_json")
+    if not isinstance(data_json, dict):
+        return ""
+    text = data_json.get("reference_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    low = data_json.get("reference_low")
+    high = data_json.get("reference_high")
+    if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+        return f"{low} - {high}"
+    if isinstance(high, (int, float)):
+        return f"< {high}"
+    if isinstance(low, (int, float)):
+        return f"> {low}"
+    return ""
+
+
+def _within_reference_range(row: dict[str, Any]) -> bool:
+    """True when a quantitative lab row is at or below its reference upper
+    limit — i.e. not even CTCAE grade 1 (G1 starts above ULN).
+
+    Conservative on purpose: rows without a numeric value, without a parseable
+    ``reference_high``, or whose ``operator`` is a lower bound (``>``/``>=`` —
+    the number is a measurement floor, not the true value) are never dropped.
+    """
+    numeric = row.get("numeric_value")
+    data_json = row.get("data_json")
+    if not isinstance(numeric, (int, float)) or not isinstance(data_json, dict):
+        return False
+    operator = str(data_json.get("operator") or "").strip()
+    operator = (
+        operator.replace("&gt;", ">").replace("&lt;", "<")
+        if operator
+        else operator
+    )
+    if operator in (">", ">="):
+        return False
+    high = data_json.get("reference_high")
+    if not isinstance(high, (int, float)):
+        return False
+    return numeric <= high
 
 
 def summarize_candidates(candidates: list[ToxicityCandidate]) -> list[dict[str, Any]]:

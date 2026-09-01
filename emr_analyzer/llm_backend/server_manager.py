@@ -45,12 +45,19 @@ class BackendError(RuntimeError):
 
 @dataclass(frozen=True)
 class ServerKey:
-    """Identity of one server process: model file, context, parallel slots."""
+    """Identity of one server process: model file, context, parallel slots.
+
+    ``instance`` discriminates otherwise identical configurations so the
+    multi-patient irAE queue can run one llama-server per patient: two keys
+    with the same model/context/slots but a different ``instance`` spawn
+    separate processes on separate ports.
+    """
 
     gguf_path: str
     ctx_size: int
     np: int
     speculative_mode: str = "none"
+    instance: int = 0
 
 
 @dataclass
