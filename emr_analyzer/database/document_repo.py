@@ -1,6 +1,5 @@
 """Document repository — CRUD operations for documents table."""
 
-import json
 from typing import Optional
 
 from .engine import DatabaseEngine
@@ -121,7 +120,9 @@ class DocumentRepository:
     def get_next_id(self) -> str:
         """Generate the next document ID (DOC_000001, DOC_000002, ...)."""
         cursor = self.db.execute(
-            "SELECT id FROM documents ORDER BY id DESC LIMIT 1"
+            """SELECT id FROM documents
+               WHERE id GLOB 'DOC_[0-9]*' AND substr(id, 5) NOT GLOB '*[^0-9]*'
+               ORDER BY CAST(substr(id, 5) AS INTEGER) DESC LIMIT 1"""
         )
         row = cursor.fetchone()
         if row:

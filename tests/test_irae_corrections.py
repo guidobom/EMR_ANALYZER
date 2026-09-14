@@ -19,6 +19,7 @@ from emr_analyzer.clinical.irae_corrections import (
     annotate_report,
     corrections_path,
     load_corrections,
+    remove_correction,
     save_corrections,
 )
 from emr_analyzer.config import active_workspace
@@ -131,6 +132,43 @@ class PersistenceTest(unittest.TestCase):
     def test_from_dict_rejects_unknown_action(self):
         self.assertIsNone(IraeCorrection.from_dict({"action": "explode"}))
 
+    def test_remove_correction_deletes_only_matching_remove(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(active_workspace, "path", Path(tmp)):
+                add_correction("P001", IraeCorrection(
+                    action="remove", irAE_type="Miocardite da ICI",
+                    first_onset_date="2022-11-22", finding_id="irAE-1",
+                ))
+                add_correction("P001", IraeCorrection(
+                    action="remove", irAE_type="Rash sospetto",
+                    first_onset_date="2022-12-13", finding_id="irAE-2",
+                ))
+                add_correction("P001", IraeCorrection(
+                    action="edit", irAE_type="Epatite", finding_id="irAE-3",
+                ))
+                remaining = remove_correction("P001", finding_id="irAE-1")
+        self.assertEqual(len(remaining), 2)
+        self.assertTrue(all(
+            not (c.action == "remove" and c.finding_id == "irAE-1")
+            for c in remaining
+        ))
+        self.assertTrue(any(c.action == "remove" for c in remaining))
+
+    def test_remove_correction_matches_type_and_date_without_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(active_workspace, "path", Path(tmp)):
+                add_correction("P001", IraeCorrection(
+                    action="remove", irAE_type="Rash sospetto",
+                    first_onset_date="2022-12-13",
+                ))
+                remaining = remove_correction(
+                    "P001", irAE_type="Rash sospetto",
+                    first_onset_date="2022-12-13",
+                )
+                loaded = load_corrections("P001")
+        self.assertEqual(remaining, [])
+        self.assertEqual(loaded, [])
+
 
 class AnnotateReportTest(unittest.TestCase):
     def test_assigns_stable_finding_ids(self):
@@ -150,6 +188,22 @@ class AnnotateReportTest(unittest.TestCase):
         annotate_report(report)
         self.assertEqual(report, before)
 
+    def test_defensive_copy_of_preexisting_removed_bucket(self):
+        report = _report()
+        report["consolidation"]["removed"] = [
+            {"irAE_type": "Rash rimosso", "finding_id": "irAE-9"}
+        ]
+        corrected = annotate_report(report)
+        self.assertIsNot(
+            corrected["consolidation"]["removed"],
+            report["consolidation"]["removed"],
+        )
+        corrected["consolidation"]["removed"][0]["irAE_type"] = "mutato"
+        self.assertEqual(
+            report["consolidation"]["removed"][0]["irAE_type"],
+            "Rash rimosso",
+        )
+
 
 class ApplyIraeCorrectionsTest(unittest.TestCase):
     def test_remove_from_iraes_and_mirrors_organ_results(self):
@@ -166,6 +220,89 @@ class ApplyIraeCorrectionsTest(unittest.TestCase):
         # the suspect is untouched.
         suspects = corrected["consolidation"]["suspects"]
         self.assertEqual([s["irAE_type"] for s in suspects], ["Rash sospetto"])
+
+    def test_remove_moves_finding_to_removed_bucket(self):
+        corrected, log = apply_irae_corrections(_report(), [
+            IraeCorrection(action="remove", irAE_type="Miocardite da ICI",
+                           first_onset_date="2022-11-22",
+                           reason="falso positivo"),
+        ])
+        removed = corrected["consolidation"]["removed"]
+        self.assertEqual(len(removed), 1)
+        self.assertTrue(removed[0]["removed"])
+        self.assertEqual(removed[0]["removed_from"], "iraes")
+        self.assertEqual(removed[0]["removed_reason"], "falso positivo")
+        # the id assigned before the removal is preserved.
+        self.assertEqual(removed[0]["finding_id"], "irAE-1")
+        self.assertEqual(log[0]["moved_to"], "removed")
+        # the finding no longer lives in the visible lists.
+        self.assertEqual(corrected["iraes"], [])
+        self.assertIs(
+            corrected["iraes"], corrected["consolidation"]["iraes"]
+        )
+
+    def test_remove_suspect_lands_in_removed_bucket(self):
+        corrected, _ = apply_irae_corrections(_report(), [
+            IraeCorrection(action="remove", irAE_type="Rash sospetto",
+                           first_onset_date="2022-12-13"),
+        ])
+        removed = corrected["consolidation"]["removed"]
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0]["removed_from"], "suspects")
+        self.assertEqual(
+            [s["irAE_type"] for s in corrected["consolidation"]["suspects"]],
+            [],
+        )
+        self.assertEqual(len(corrected["iraes"]), 1)
+
+    def test_remove_does_not_renumber_remaining_findings(self):
+        corrected, _ = apply_irae_corrections(_report(), [
+            IraeCorrection(action="remove", irAE_type="Miocardite da ICI",
+                           first_onset_date="2022-11-22"),
+        ])
+        suspects = corrected["consolidation"]["suspects"]
+        self.assertEqual(suspects[0]["finding_id"], "irAE-2")
+
+    def test_remove_idempotent_over_fresh_report(self):
+        corrections = [
+            IraeCorrection(action="remove", irAE_type="Miocardite da ICI",
+                           first_onset_date="2022-11-22",
+                           reason="duplicato clinico"),
+        ]
+        corrected1, _ = apply_irae_corrections(_report(), corrections)
+        corrected2, _ = apply_irae_corrections(_report(), corrections)
+        self.assertEqual(corrected1, corrected2)
+        self.assertEqual(
+            corrected1["consolidation"]["removed"][0]["removed_reason"],
+            "duplicato clinico",
+        )
+
+    def test_second_remove_of_same_finding_is_noop(self):
+        corrected, log = apply_irae_corrections(_report(), [
+            IraeCorrection(action="remove", irAE_type="Miocardite da ICI",
+                           first_onset_date="2022-11-22"),
+            IraeCorrection(action="remove", irAE_type="Miocardite da ICI",
+                           first_onset_date="2022-11-22"),
+        ])
+        self.assertTrue(log[0]["applied"])
+        self.assertFalse(log[1]["applied"])
+        self.assertEqual(len(corrected["consolidation"]["removed"]), 1)
+
+    def test_add_after_remove_gets_non_colliding_id(self):
+        corrected, _ = apply_irae_corrections(_report(), [
+            IraeCorrection(action="remove", irAE_type="Miocardite da ICI",
+                           first_onset_date="2022-11-22"),
+            IraeCorrection(action="add", irAE_type="Colite da ICI",
+                           fields={"probability_immune": "PROBABILE"}),
+        ])
+        added = next(
+            f for f in corrected["iraes"] if f["irAE_type"] == "Colite da ICI"
+        )
+        self.assertEqual(added["finding_id"], "irAE-3")
+        removed_ids = [
+            r["finding_id"] for r in corrected["consolidation"]["removed"]
+        ]
+        self.assertNotIn(added["finding_id"], removed_ids)
 
     def test_edit_merges_whitelisted_fields(self):
         corrected, log = apply_irae_corrections(_report(), [
@@ -205,6 +342,8 @@ class ApplyIraeCorrectionsTest(unittest.TestCase):
             corrected["organ_results"]["Miocardite/Cardiotossicità"]["iraes"],
             [],
         )
+        # the excluded path never populates the removed bucket.
+        self.assertNotIn("removed", corrected["consolidation"])
 
     def test_add_places_by_probability(self):
         corrected, log = apply_irae_corrections(_report(), [

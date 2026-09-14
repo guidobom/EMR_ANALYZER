@@ -22,10 +22,7 @@ from .atomic_evidence import (
     deduplicate_atomic_evidence,
     locate_quote,
 )
-from .aggregate_v4 import (
-    AggregateV4CandidateBuilder,
-    build_coverage_ledger,
-)
+from .embedding_candidates import embedding_duplicate_pairs
 from .block_reuse import (
     build_targeted_reuse_text,
     clone_reused_evidence,
@@ -36,11 +33,9 @@ from .block_reuse import (
 from .consolidation import ClinicalConsolidator, stable_id
 from .evidence_graph import EvidenceGraphBuilder, EvidenceGraphCancelled
 from .episode_assembler import (
-    attach_contextual_evidence,
     build_event_relations,
 )
 from .episode_synthesis import (
-    ClinicalEpisodeSynthesizer,
     EpisodeSynthesisStats,
 )
 from .event_dedup import deduplicate_bundles
@@ -215,7 +210,8 @@ class ClinicalRegistryBuilder:
                 "atomic_prompt_digest": ATOMIC_PROMPT_DIGEST,
                 "atomic_model": getattr(self.atomic_llm, "model", None),
                 "event_model": getattr(self.event_llm, "model", None),
-                "aggregation_engine": self.pipeline_policy.aggregation_engine,
+                "aggregation_engine": "v3",
+                "requested_aggregation_engine": self.pipeline_policy.aggregation_engine,
             },
         )
         self.processing_repo.start_run(run)
@@ -363,8 +359,7 @@ class ClinicalRegistryBuilder:
             def extract_one(doc, text, input_hash):
                 task_started = time.monotonic()
                 geometry_path = (
-                    active_workspace.path / patient_id / "extraction" /
-                    f"{doc.id}.json"
+                    _geometry_source(doc, active_workspace.path)
                 )
                 evidence = extract_atomic_document(
                     patient_id=patient_id, document_id=doc.id,
@@ -567,8 +562,7 @@ class ClinicalRegistryBuilder:
                 combined = list(partial[1])
                 unresolved_links = []
                 target_geometry = self.atomic_extractor._load_geometry(
-                    active_workspace.path / patient_id / "extraction" /
-                    f"{doc.id}.json"
+                    _geometry_source(doc, active_workspace.path)
                 )
                 cloned_items = []
                 for link in plan.reuse_links:
@@ -617,8 +611,7 @@ class ClinicalRegistryBuilder:
                 source_original = source_text_by_doc[source_doc.id]
                 started_batch = time.monotonic()
                 geometry_path = (
-                    active_workspace.path / patient_id / "extraction" /
-                    f"{source_doc.id}.json"
+                    _geometry_source(source_doc, active_workspace.path)
                 )
                 metrics: dict = {}
 
@@ -791,8 +784,7 @@ class ClinicalRegistryBuilder:
             for doc_id, links in unresolved_by_doc.items():
                 doc, original_text, _ = task_by_id[doc_id]
                 target_geometry = self.atomic_extractor._load_geometry(
-                    active_workspace.path / patient_id / "extraction" /
-                    f"{doc.id}.json"
+                    _geometry_source(doc, active_workspace.path)
                 )
                 combined = combined_by_doc[doc_id]
                 cloned_items = []
@@ -841,8 +833,7 @@ class ClinicalRegistryBuilder:
                 segment = build_targeted_reuse_text(links)
                 started_segment = time.monotonic()
                 geometry_path = (
-                    active_workspace.path / patient_id / "extraction" /
-                    f"{doc.id}.json"
+                    _geometry_source(doc, active_workspace.path)
                 )
                 try:
                     evidence = extract_atomic_document(
@@ -1132,6 +1123,15 @@ class ClinicalRegistryBuilder:
                 uncertain_duplicates = _uncertain_duplicate_pairs(
                     stored_evidence
                 )
+                if self.pipeline_policy.embedding_dedup_enabled:
+                    uncertain_duplicates = [
+                        *uncertain_duplicates,
+                        *embedding_duplicate_pairs(
+                            stored_evidence,
+                            threshold=self.pipeline_policy.embedding_threshold,
+                            repo=self.pipeline_repo,
+                        ),
+                    ]
                 pending_duplicate_groups = (
                     self.pipeline_repo.replace_duplicate_groups(
                         patient_id, source_evidence, uncertain_duplicates
@@ -1274,7 +1274,7 @@ class ClinicalRegistryBuilder:
 
             if progress_callback:
                 progress_callback(
-                    97, "Assemblaggio LLM dei problemi/episodi clinici..."
+                    97, "Finalizzazione delle relazioni fra eventi clinici..."
                 )
             # The v3 graph already defines event membership. A second semantic
             # absorption pass would be able to merge evidence without a graph
@@ -2094,10 +2094,19 @@ class ClinicalRegistryBuilder:
                 if group is None or len(members) < 2:
                     continue
                 similarity_text = str(group["decision_reason"] or "")
+                method = (
+                    "embedding"
+                    if similarity_text.startswith("embedding_") else "text"
+                )
                 try:
                     similarity = float(similarity_text.rsplit("=", 1)[1])
                 except (IndexError, ValueError):
                     similarity = None
+                issue = (
+                    "Possibile duplicato semantico (embedding) da confermare"
+                    if method == "embedding"
+                    else "Possibile copia cross-documento da confermare"
+                )
                 self.db.execute(
                     """INSERT INTO validation_queue
                        (patient_id, item_type, item_id, issue, severity,
@@ -2105,12 +2114,12 @@ class ClinicalRegistryBuilder:
                        VALUES (?, 'atomic_duplicate_v3', ?, ?, 'high',
                                'pending', ?, ?)""",
                     (
-                        patient_id, group_id,
-                        "Possibile copia cross-documento da confermare",
+                        patient_id, group_id, issue,
                         json.dumps({
                             "left_evidence_id": members[0]["evidence_id"],
                             "right_evidence_id": members[1]["evidence_id"],
                             "similarity": similarity,
+                            "method": method,
                         }, ensure_ascii=False),
                         datetime.now(timezone.utc).isoformat(),
                     ),
@@ -2462,27 +2471,6 @@ def _uncertain_duplicate_pairs(evidence) -> list[tuple[str, str, float]]:
                 ))
         previous.append(item)
     return result
-    return ExcludedEvidence(
-        excluded_id=excluded_id,
-        patient_id=item.patient_id,
-        document_id=item.document_id,
-        disposition=item.clinical_relevance,
-        reason_code=reason,
-        fact_type=item.fact_type,
-        concept=item.concept_original or item.normalized_entity,
-        source_page=item.source_page,
-        bbox=item.bbox,
-        sentence_refs=list((item.data or {}).get("sentence_refs") or []),
-        source_text=item.source_text,
-        extraction_method=item.extraction_method,
-        model_name=item.model_name,
-        prompt_version=item.prompt_version,
-        review_status=(
-            "pending" if item.status == "needs_review" else "auto"
-        ),
-        data={"source_evidence_id": item.evidence_id},
-        created_at=item.created_at,
-    )
 
 
 def _evidence_hash(evidence) -> str:
@@ -2556,3 +2544,11 @@ def _unique_bundles(bundles):
         if current is None or len(bundle.links) > len(current.links):
             result[bundle.event.event_id] = bundle
     return list(result.values())
+
+
+def _geometry_source(doc, workspace_root):
+    """Legacy geometry remains readable; new projects reparse the original."""
+    from pathlib import Path
+    from ..utils.document_paths import resolve_document_path
+    legacy = Path(workspace_root) / doc.patient_id / "extraction" / f"{doc.id}.json"
+    return legacy if legacy.is_file() else Path(resolve_document_path(doc, workspace_root))

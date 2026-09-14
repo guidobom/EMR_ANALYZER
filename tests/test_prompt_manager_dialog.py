@@ -18,7 +18,7 @@ def test_prompt_manager_lists_tasks_and_active_versions(monkeypatch, tmp_path):
     dialog = PromptManagerDialog()
     try:
         assert dialog.task_combo.count() == len(
-            prompt_catalog.prompt_definitions()
+            [d for d in prompt_catalog.prompt_definitions() if not d.key.startswith("clinical_text_")]
         )
         assert dialog.version_combo.count() >= 1
         assert "ATTIVO" in dialog.version_combo.currentText()

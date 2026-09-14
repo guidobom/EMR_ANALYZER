@@ -970,6 +970,32 @@ def _append_consolidated(lines: list[str], report: dict[str, Any]) -> None:
     lines.append("")
 
 
+def _append_removed(lines: list[str], report: dict[str, Any]) -> None:
+    """Manually removed findings, kept visible (struck through) in the
+    complete registry.  Independent of the consolidation ``applied`` flag:
+    corrections can remove findings from legacy reports too."""
+    consolidation = report.get("consolidation")
+    removed = (
+        consolidation.get("removed")
+        if isinstance(consolidation, dict) else None
+    )
+    if not removed:
+        return
+    lines.append("### ~~Rimossi manualmente~~")
+    lines.append("")
+    for item in removed:
+        grade = item.get("ctcae_grade", "?")
+        prob = item.get("probability_immune", "?")
+        onset = item.get("first_onset_date", "?")
+        reason = item.get("removed_reason") or "motivo non specificato"
+        lines.append(
+            f"- ~~[rimosso] **{item.get('irAE_type', '?')}** · {grade} · "
+            f"insorgenza {onset} · {prob}~~"
+        )
+        lines.append(f"  - Motivo: {reason}")
+    lines.append("")
+
+
 def render_irae_markdown(report: dict[str, Any]) -> str:
     """Render the structured report as the Markdown the queue dialog shows."""
     lines = ["# Analisi irAE strutturata — NCTCAE 6.0", ""]
@@ -990,6 +1016,7 @@ def render_irae_markdown(report: dict[str, Any]) -> str:
 
     _append_per_organ(lines, report)
     _append_consolidated(lines, report)
+    _append_removed(lines, report)
     return "\n".join(lines).rstrip() + "\n"
 
 

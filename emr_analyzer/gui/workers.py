@@ -350,6 +350,8 @@ class ClinicalHistoryQueryWorker(QThread):
             # built from atomic evidence.  The LLM never reconstructs the
             # chronology itself.
             return self._run_timeline_query(system_prompt)
+        if not details:
+            return "Nessuna evidenza disponibile nel registro per rispondere alla domanda."
         valid_ids = {
             detail["event"]["event_id"] for detail in details
         }
@@ -358,15 +360,20 @@ class ClinicalHistoryQueryWorker(QThread):
             for detail in details for evidence in detail.get("evidence", [])
             if evidence.get("document_id")
         }
-        context_length = int(
-            getattr(self.llm_client, "context_length", 32768) or 32768
-        )
-        output_tokens = int(
-            getattr(self.llm_client, "max_output_tokens", 4096) or 4096
-        )
-        context_chars = max(
-            12_000,
-            int(max(4000, context_length - output_tokens - 2500) * 2.3),
+        valid_pages = {
+            (detail["event"]["event_id"], str(evidence.get("document_id")),
+             str(evidence.get("source_page") or "n.d."))
+            for detail in details for evidence in detail.get("evidence", [])
+            if evidence.get("document_id")
+        }
+        from ..clinical.query_context import context_budget
+        context_chars = context_budget(
+            self.llm_client,
+            overhead=system_prompt + build_query_prompt(
+                self.clinical_profile, "", self.question,
+                conversation=self.conversation,
+                use_conversation_context=self.use_conversation_context,
+            ),
         )
         chunks = service.format_chunks(details, max_chars=context_chars)
         partials = []
@@ -400,26 +407,16 @@ class ClinicalHistoryQueryWorker(QThread):
                 max_chars=context_chars,
             )
         if valid_ids and not answer_has_valid_citations(
-            answer, valid_ids, valid_pairs
+            answer, valid_ids, valid_pairs, valid_pages
         ):
-            retry = (
-                "La risposta seguente non contiene citazioni di registro "
-                "verificabili. Riformulala senza aggiungere contenuto e cita "
-                "ogni affermazione con uno degli ID validi nel formato "
-                "[#EVT_...; DOC_...:p.N].\n\n"
-                f"RISPOSTA DA CORREGGERE:\n{answer}\n\n"
-                "CONTESTO VERIFICABILE:\n" + "\n\n".join(chunks)
+            # Never concatenate the entire dossier into a citation repair
+            # request: it can exceed the context that required chunking.
+            answer = (
+                "La risposta generativa non ha superato il controllo delle "
+                "citazioni. Eventi del registro disponibili per verifica:\n\n"
+                + "\n".join(_deterministic_cited_event(detail)
+                            for detail in details)
             )
-            corrected = self.llm_client.generate_text(retry, system_prompt)
-            if answer_has_valid_citations(corrected, valid_ids, valid_pairs):
-                answer = corrected
-            else:
-                answer = (
-                    "La risposta generativa non ha superato il controllo delle "
-                    "citazioni. Eventi pertinenti recuperati:\n\n"
-                    + "\n".join(_deterministic_cited_event(detail)
-                                for detail in details)
-                )
         return answer
 
     def _run_timeline_query(self, system_prompt: str) -> str:
@@ -428,40 +425,31 @@ class ClinicalHistoryQueryWorker(QThread):
         The chronology is built and filtered by code; the LLM only reads
         the already-ordered compact text.
         """
-        from ..clinical.query_service import (
-            build_query_prompt, infer_intents, is_broad_question,
-        )
-        from ..clinical.timeline_serializer import (
-            INTENT_TYPES, build_timeline, filter_entries, format_compact,
-        )
+        from ..clinical.query_context import context_budget, split_text
+        from ..clinical.timeline_serializer import build_timeline, format_compact
 
         evidence = self.evidence_repo.get_by_patient(self.patient_id)
         entries = build_timeline(evidence)
-        intents = infer_intents(self.question)
-        if not is_broad_question(self.question) and intents:
-            types = set().union(*(
-                INTENT_TYPES.get(intent, set()) for intent in intents
-            ))
-            entries = filter_entries(entries, types=types)
-        context_length = int(
-            getattr(self.llm_client, "context_length", 32768) or 32768
-        )
-        output_tokens = int(
-            getattr(self.llm_client, "max_output_tokens", 4096) or 4096
-        )
-        context_chars = max(
-            12_000,
-            int(max(4000, context_length - output_tokens - 2500) * 2.3),
-        )
-        timeline_text = format_compact(entries, max_chars=context_chars)
-        user_prompt = build_query_prompt(
-            "",
-            timeline_text or "Nessuna evidenza atomica disponibile.",
-            self.question,
-            conversation=self.conversation,
+        if not entries:
+            return "Nessuna evidenza disponibile: impossibile rispondere dai dati del paziente."
+        overhead = system_prompt + build_query_prompt(
+            "", "", self.question, conversation=self.conversation,
             use_conversation_context=self.use_conversation_context,
         )
-        return self.llm_client.generate_text(user_prompt, system_prompt)
+        context_chars = context_budget(self.llm_client, overhead=overhead)
+        # Query every entry: intent heuristics must not hide a relevant fact.
+        chunks = split_text(format_compact(entries), context_chars)
+        partials = []
+        for chunk in chunks:
+            prompt = build_query_prompt(
+                "", chunk, self.question, conversation=self.conversation,
+                use_conversation_context=self.use_conversation_context,
+            )
+            partials.append(self.llm_client.generate_text(prompt, system_prompt))
+        return _reconcile_query_partials(
+            self.llm_client, partials, self.question, system_prompt,
+            max_chars=context_chars,
+        )
 
 
 def _deterministic_cited_event(detail: dict) -> str:
@@ -480,41 +468,10 @@ def _reconcile_query_partials(
     llm_client, partials: list[str], question: str, system_prompt: str,
     *, max_chars: int,
 ) -> str:
-    """Hierarchically reconcile arbitrarily many complete registry chunks."""
-    current = list(partials)
-    while len(current) > 1:
-        groups, group, size = [], [], 0
-        for part in current:
-            added = len(part) + 20
-            if group and size + added > max_chars:
-                groups.append(group)
-                group, size = [], 0
-            group.append(part)
-            size += added
-        if group:
-            groups.append(group)
-        # Ensure progress even when every partial nearly fills the budget.
-        if len(groups) == len(current):
-            groups = [current[index:index + 2] for index in range(0, len(current), 2)]
-        reduced = []
-        for group in groups:
-            if len(group) == 1:
-                reduced.append(group[0])
-                continue
-            prompt = (
-                f"DOMANDA: {question}\n\n"
-                "SINTESI PARZIALI DA RICONCILIARE:\n"
-                + "\n\n".join(
-                    f"PARTE {index}:\n{part}"
-                    for index, part in enumerate(group, start=1)
-                )
-                + "\n\nProduci una risposta unica, elimina ripetizioni, "
-                  "conserva discordanze e tutte le citazioni verificabili. "
-                  "Non introdurre affermazioni nuove."
-            )
-            reduced.append(llm_client.generate_text(prompt, system_prompt))
-        current = reduced
-    return current[0]
+    from ..clinical.query_context import reconcile_partials
+    return reconcile_partials(
+        llm_client, partials, question, system_prompt, max_chars=max_chars,
+    )
 
 
 class IraeQueueWorker(QThread):

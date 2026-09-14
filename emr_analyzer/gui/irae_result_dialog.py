@@ -63,7 +63,8 @@ class IraeResultDialog(QDialog):
         self._recon_btn = QPushButton("🔄 Rianalizza consolidamento")
         self._recon_btn.setToolTip(
             "Riesegue il solo consolidamento finale (Layer 4) con un budget di "
-            "token più alto, per i pazienti in cui era fallito."
+            "token più alto. Usato per i pazienti in cui era fallito o per "
+            "riapplicare il prompt corrente ai report già consolidati."
         )
         self._recon_btn.clicked.connect(self._on_reconsolidate)
         buttons.addWidget(self._recon_btn)
@@ -87,15 +88,14 @@ class IraeResultDialog(QDialog):
         self._markdown = self._tab.markdown() if self._tab else self._markdown
 
     def _can_reconsolidate(self) -> bool:
-        """Button enabled: a failed consolidation, per-organ results, an
-        available clinical-state LLM and no run already in flight."""
+        """Button enabled: per-organ results, an available clinical-state LLM
+        and no run already in flight.  Re-runs are allowed also on reports
+        whose consolidation succeeded (to re-apply the current Layer 4
+        prompt); the confirm dialog warns before overwriting."""
         if self._recon_worker is not None and self._recon_worker.isRunning():
             return False
         report = self._structured_report
         if not isinstance(report, dict) or not report.get("organ_results"):
-            return False
-        consolidation = report.get("consolidation") or {}
-        if consolidation.get("applied"):
             return False
         llm = (self._services or {}).get("clinical_state_llm_client")
         return bool(llm is not None and getattr(llm, "is_available", False))
@@ -103,12 +103,25 @@ class IraeResultDialog(QDialog):
     def _on_reconsolidate(self) -> None:
         if not self._can_reconsolidate():
             return
+        consolidation = (
+            (self._structured_report or {}).get("consolidation") or {}
+        )
+        if consolidation.get("applied"):
+            text = (
+                "Il consolidamento di questo paziente è già riuscito. "
+                "Verrà rieseguito con il prompt corrente del Layer 4, "
+                "sovrascrivendo i risultati attuali. Continuare?"
+            )
+        else:
+            text = (
+                "Rieseguirà SOLO il consolidamento finale (Layer 4) di questo "
+                "paziente con un budget di token più alto, sovrascrivendo i "
+                "risultati parziali. Continuare?"
+            )
         answer = QMessageBox.question(
             self,
             "Rianalizza consolidamento",
-            "Rieseguirà SOLO il consolidamento finale (Layer 4) di questo "
-            "paziente con un budget di token più alto, sovrascrivendo i "
-            "risultati parziali. Continuare?",
+            text,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )

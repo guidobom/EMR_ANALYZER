@@ -1,0 +1,40 @@
+emr_analyzer/app.py:99:15: f-string is missing placeholders
+emr_analyzer/app.py:151:15: f-string is missing placeholders
+emr_analyzer/app.py:308:15: f-string is missing placeholders
+emr_analyzer/database/lab_repo.py:3:1: 'json' imported but unused
+emr_analyzer/database/lab_repo.py:4:1: 'typing.Optional' imported but unused
+emr_analyzer/pipeline/classifier.py:601:9: local variable 'numeric_count' is assigned to but never used
+emr_analyzer/pipeline/converter.py:22:13: 'docling' imported but unused
+emr_analyzer/pipeline/cleaner.py:7:1: 'typing.Optional' imported but unused
+emr_analyzer/pipeline/pdf_extractor.py:204:13: 'pdfplumber' imported but unused
+emr_analyzer/utils/file_utils.py:7:1: 'typing.Optional' imported but unused
+emr_analyzer/models/chat_message.py:6:1: 'typing.Optional' imported but unused
+emr_analyzer/llm_backend/model_installer.py:27:1: '..config.LLM_MODEL_INDEX_PATH' imported but unused
+emr_analyzer/llm_backend/model_store.py:19:1: '..config.LLM_MODELS_DIR' imported but unused
+emr_analyzer/gui/main_window.py:3:1: 'os' imported but unused
+emr_analyzer/gui/main_window.py:6:1: 'PyQt5.QtWidgets.QApplication' imported but unused
+emr_analyzer/gui/context_panel.py:191:13: 'pathlib.Path' imported but unused
+emr_analyzer/gui/workspace_tabs.py:5:1: 'PyQt5.QtWidgets.QWidget' imported but unused
+emr_analyzer/gui/workspace_tabs.py:5:1: 'PyQt5.QtWidgets.QVBoxLayout' imported but unused
+emr_analyzer/gui/workspace_tabs.py:5:1: 'PyQt5.QtWidgets.QLabel' imported but unused
+emr_analyzer/gui/workspace_tabs.py:8:1: 'PyQt5.QtCore.Qt' imported but unused
+emr_analyzer/gui/import_dialog.py:13:1: 'PyQt5.QtCore.QThread' imported but unused
+emr_analyzer/gui/import_patient_dialog.py:10:1: 'PyQt5.QtCore.Qt' imported but unused
+emr_analyzer/gui/validation_tab.py:14:1: '..models.validation.ValidationStatus' imported but unused
+emr_analyzer/gui/validation_tab.py:14:1: '..models.validation.Severity' imported but unused
+emr_analyzer/gui/documents_tab.py:11:1: 'PyQt5.QtWidgets.QAction' imported but unused
+emr_analyzer/gui/documents_tab.py:1711:9: 'datetime.datetime' imported but unused
+emr_analyzer/gui/export_dialog.py:8:1: 'PyQt5.QtCore.Qt' imported but unused
+emr_analyzer/gui/export_dialog.py:102:13: f-string is missing placeholders
+emr_analyzer/gui/project_dialog.py:16:1: '..config.active_workspace' imported but unused
+emr_analyzer/gui/laboratory_tab.py:212:9: 'time' imported but unused
+emr_analyzer/gui/progress_dialog.py:7:1: 'PyQt5.QtCore.Qt' imported but unused
+emr_analyzer/gui/irae_patient_tab.py:13:1: 'PyQt5.QtGui.QFont' imported but unused
+emr_analyzer/clinical/clinical_history_builder.py:238:13: local variable 'narrative' is assigned to but never used
+emr_analyzer/clinical/event_dedup.py:37:1: '.evidence_relevance.is_administrative_evidence' imported but unused
+emr_analyzer/clinical/event_dedup.py:38:1: '..models.clinical_registry.ClinicalEpisode' imported but unused
+emr_analyzer/clinical/correlation.py:9:1: '.consolidation.display_entity' imported but unused
+emr_analyzer/extraction/llm_client.py:807:9: 're as _re' imported but unused
+emr_analyzer/extraction/lab_parser.py:9:1: '.patterns.LAB_TABULAR_PATTERN' imported but unused
+emr_analyzer/extraction/lab_parser.py:9:1: '.patterns.LAB_INLINE_PATTERN' imported but unused
+emr_analyzer/extraction/lab_parser.py:9:1: '.patterns.build_known_param_pattern' imported but unused

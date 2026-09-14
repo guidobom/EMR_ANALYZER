@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
 import json
 import re
 from typing import Iterable
 
+from .clinical_text_result import ClinicalTextIsolationResult, ClinicalTextIsolationError
 from ..prompt_catalog import load_prompt, prompts_digest
 from ..pipeline.sensitive_data import (
-    DEIDENTIFICATION_VERSION,
     SensitiveDataSanitizer,
 )
 
@@ -54,25 +53,6 @@ PROMPT_DIGEST = prompts_digest(_SYSTEM_PROMPT, _PROMPT_INSTRUCTIONS)
 PROMPT_VERSION = "clinical_text_isolation_v6-" + PROMPT_DIGEST[:12]
 
 
-@dataclass
-class ClinicalTextIsolationResult:
-    text: str
-    model_name: str
-    prompt_version: str = PROMPT_VERSION
-    chunk_count: int = 0
-    warnings: list[str] = field(default_factory=list)
-    redaction_counts: dict[str, int] = field(default_factory=dict)
-    deidentification_version: str = DEIDENTIFICATION_VERSION
-
-
-class ClinicalTextIsolationError(RuntimeError):
-    """The document model did not produce a complete safe text."""
-
-    def __init__(self, message: str, *, systemic: bool = False):
-        super().__init__(message)
-        self.systemic = systemic
-
-
 class ClinicalTextValidationError(ValueError):
     """All validation attempts for one source block failed."""
 
@@ -113,6 +93,7 @@ class ClinicalTextIsolator:
         document_date: str | None = None,
         parsing_result=None,
         sensitive_identity=None,
+        cancel_check=None,
     ) -> ClinicalTextIsolationResult:
         if not self.llm or not self.llm.is_available:
             raise ClinicalTextIsolationError(
@@ -136,6 +117,8 @@ class ClinicalTextIsolator:
         warnings = []
         processing_units = 0
         for index, chunk in enumerate(chunks, start=1):
+            if cancel_check and cancel_check():
+                raise ClinicalTextIsolationError("Normalizzazione interrotta")
             try:
                 normalized, corrections = self._normalize_chunk(
                     chunk, document_date
@@ -194,6 +177,7 @@ class ClinicalTextIsolator:
         return ClinicalTextIsolationResult(
             text=final_sanitization.text,
             model_name=self.llm.model,
+            prompt_version=PROMPT_VERSION,
             chunk_count=processing_units,
             warnings=warnings,
             redaction_counts=dict(redaction_counts),

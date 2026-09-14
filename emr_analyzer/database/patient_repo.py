@@ -1,6 +1,5 @@
 """Patient repository — CRUD operations for patients table."""
 
-import json
 from typing import Optional
 
 from .engine import DatabaseEngine
@@ -80,7 +79,9 @@ class PatientRepository:
     def get_next_id(self) -> str:
         """Generate the next patient ID (P001, P002, ...)."""
         cursor = self.db.execute(
-            "SELECT id FROM patients ORDER BY id DESC LIMIT 1"
+            """SELECT id FROM patients
+               WHERE id GLOB 'P[0-9]*' AND substr(id, 2) NOT GLOB '*[^0-9]*'
+               ORDER BY CAST(substr(id, 2) AS INTEGER) DESC LIMIT 1"""
         )
         row = cursor.fetchone()
         if row:

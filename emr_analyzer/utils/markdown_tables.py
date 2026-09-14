@@ -72,12 +72,28 @@ def markdown_tables_to_html(text: str) -> str:
     return "\n".join(output)
 
 
+def _escape_with_strike(line: str) -> str:
+    """Escape *line* keeping ``~~text~~`` spans as ``<s>text</s>``."""
+    parts: list[str] = []
+    for fragment in re.split(r"(~~.*?~~)", line):
+        if (
+            fragment.startswith("~~")
+            and fragment.endswith("~~")
+            and len(fragment) >= 4
+        ):
+            parts.append(f"<s>{html.escape(fragment[2:-2])}</s>")
+        else:
+            parts.append(html.escape(fragment))
+    return "".join(parts)
+
+
 def render_markdown_to_html(text: str) -> str:
     """Render chat content for QTextBrowser: tables as HTML, text escaped.
 
     The chat panel feeds raw HTML to ``QTextBrowser``; this produces safe
     output where pipe-tables become real ``<table>`` blocks and every
-    other line is HTML-escaped (newlines become ``<br>``).
+    other line is HTML-escaped (``~~struck~~`` spans become ``<s>``,
+    newlines become ``<br>``).
     """
     lines = str(text or "").split("\n")
     output: list[str] = []
@@ -94,6 +110,6 @@ def render_markdown_to_html(text: str) -> str:
             if table_html:
                 output.append(table_html)
         else:
-            output.append(html.escape(line))
+            output.append(_escape_with_strike(line))
             index += 1
     return "<br>".join(output)

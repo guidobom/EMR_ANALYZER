@@ -112,6 +112,10 @@ class MainWindow(QMainWindow):
         # Tools menu
         tools_menu = menubar.addMenu("&Strumenti")
 
+        dossier_query_action = QAction("Interroga referti: paziente o coorte...", self)
+        dossier_query_action.triggered.connect(self._on_dossier_query)
+        tools_menu.addAction(dossier_query_action)
+
         reprocess_action = QAction("&Rielabora Documento", self)
         reprocess_action.triggered.connect(self._on_reprocess)
         tools_menu.addAction(reprocess_action)
@@ -515,6 +519,19 @@ class MainWindow(QMainWindow):
             self.workspace_tabs.run_irae_queue(
                 selected, instances=instances
             )
+
+    def _on_dossier_query(self):
+        from .dossier_query_dialog import DossierQueryDialog
+
+        if self.workspace_tabs.llm_operation_running():
+            QMessageBox.information(self, "Elaborazione in corso",
+                                    "Attendi il termine dell'elaborazione prima di avviare una nuova analisi.")
+            return
+        dialog = DossierQueryDialog(
+            self._services, active_workspace.path,
+            patient_id=self._current_patient_id, parent=self,
+        )
+        dialog.exec_()
 
     def _on_show_registry_queue(self):
         """Select patients and launch sequential registry generation."""

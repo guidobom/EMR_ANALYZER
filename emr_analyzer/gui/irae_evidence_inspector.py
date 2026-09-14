@@ -17,9 +17,10 @@ import html
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
-    QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QPushButton, QSplitter, QTextBrowser, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from .pdf_viewer import DocumentEvidencePreview
@@ -159,15 +160,21 @@ class IraeEvidenceInspector(QDialog):
         if not finding_id:
             return None
         consolidation = corrected.get("consolidation") or {}
-        for item in list(corrected.get("iraes") or []) + list(
-            consolidation.get("suspects") or []
+        for item in (
+            list(corrected.get("iraes") or [])
+            + list(consolidation.get("suspects") or [])
+            + list(consolidation.get("removed") or [])
         ):
             if item.get("finding_id") == finding_id:
                 return item
         return None
 
     def _persist_correction(self, correction) -> None:
-        from ..clinical.irae_corrections import add_correction, load_corrections
+        from ..clinical.irae_corrections import (
+            add_correction,
+            apply_irae_corrections,
+            load_corrections,
+        )
 
         add_correction(self._patient_id, correction)
         self._corrected, _ = apply_irae_corrections(
@@ -215,12 +222,20 @@ class IraeEvidenceInspector(QDialog):
         self._persist_correction(correction)
 
     def _on_remove(self) -> None:
-        if self._finding is None:
+        if self._finding is None or self._finding.get("removed"):
             return
         if not self._ask_confirm(
             "Rimuovi irAE",
             f"Rimuovere «{self._finding.get('irAE_type')}» dal report?",
         ):
+            return
+        reason, accepted = QInputDialog.getMultiLineText(
+            self,
+            "Motivo della rimozione",
+            "Motivo della rimozione (mostrato nel registro):",
+            "",
+        )
+        if not accepted:
             return
         from ..clinical.irae_corrections import IraeCorrection
 
@@ -229,8 +244,31 @@ class IraeEvidenceInspector(QDialog):
             irAE_type=str(self._finding.get("irAE_type") or ""),
             first_onset_date=str(self._finding.get("first_onset_date") or ""),
             finding_id=self._finding_id,
+            reason=reason.strip(),
         )
         self._persist_correction(correction)
+
+    def _on_restore(self) -> None:
+        if self._finding is None or not self._finding.get("removed"):
+            return
+        from ..clinical.irae_corrections import (
+            apply_irae_corrections,
+            load_corrections,
+            remove_correction,
+        )
+
+        remove_correction(
+            self._patient_id,
+            finding_id=self._finding_id,
+            irAE_type=str(self._finding.get("irAE_type") or ""),
+            first_onset_date=str(self._finding.get("first_onset_date") or ""),
+        )
+        self._corrected, _ = apply_irae_corrections(
+            self._raw_report, load_corrections(self._patient_id)
+        )
+        self._finding = self._locate_finding(self._corrected, self._finding_id)
+        self.report_updated.emit(self._corrected)
+        self._populate()
 
     def _on_add(self) -> None:
         dialog = _FindingForm(self, "Aggiungi irAE manuale")
@@ -280,12 +318,19 @@ class IraeEvidenceInspector(QDialog):
         layout.addWidget(splitter, stretch=1)
 
         buttons = QHBoxLayout()
-        edit_btn = QPushButton("✏️ Modifica irAE")
-        edit_btn.clicked.connect(self._on_edit)
-        buttons.addWidget(edit_btn)
-        remove_btn = QPushButton("🗑️ Rimuovi irAE")
-        remove_btn.clicked.connect(self._on_remove)
-        buttons.addWidget(remove_btn)
+        self._edit_btn = QPushButton("✏️ Modifica irAE")
+        self._edit_btn.clicked.connect(self._on_edit)
+        buttons.addWidget(self._edit_btn)
+        self._remove_btn = QPushButton("🗑️ Rimuovi irAE")
+        self._remove_btn.clicked.connect(self._on_remove)
+        buttons.addWidget(self._remove_btn)
+        self._restore_btn = QPushButton("↩️ Ripristina irAE")
+        self._restore_btn.setToolTip(
+            "Annulla la rimozione: il finding torna nell'elenco attivo."
+        )
+        self._restore_btn.clicked.connect(self._on_restore)
+        self._restore_btn.setVisible(False)
+        buttons.addWidget(self._restore_btn)
         add_btn = QPushButton("➕ Aggiungi irAE manuale")
         add_btn.clicked.connect(self._on_add)
         buttons.addWidget(add_btn)
@@ -302,11 +347,21 @@ class IraeEvidenceInspector(QDialog):
         grade = finding.get("ctcae_grade") or "?"
         prob = finding.get("probability_immune") or "?"
         onset = finding.get("first_onset_date") or "?"
-        self._header.setText(
+        removed = bool(finding.get("removed"))
+        header = (
             f"<b>{html.escape(str(finding.get('irAE_type') or 'irAE'))}</b>"
             f" · {grade} · insorgenza {html.escape(str(onset))} · {prob}"
             f" · <code>{html.escape(self._finding_id)}</code>"
         )
+        if removed:
+            reason = str(finding.get("removed_reason") or "")
+            header += " · <b style='color:#808080'>rimosso</b>"
+            if reason:
+                header += f" — {html.escape(reason)}"
+        self._header.setText(header)
+        self._edit_btn.setEnabled(not removed)
+        self._remove_btn.setEnabled(not removed)
+        self._restore_btn.setVisible(removed)
         if finding.get("notes"):
             self._header.setToolTip(str(finding["notes"]))
 

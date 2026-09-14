@@ -100,11 +100,28 @@ class ReconsolidateDialogTest(unittest.TestCase):
         dialog = self._dialog(services={"clinical_state_llm_client": None})
         self.assertFalse(dialog._can_reconsolidate())
 
-    def test_button_disabled_when_consolidation_applied(self):
-        # A patient whose consolidation already succeeded must NOT be touched.
+    def test_button_enabled_when_consolidation_applied(self):
+        # Re-runs are allowed also on already-consolidated reports, to
+        # re-apply the current Layer 4 prompt.
         dialog = self._dialog(report=_report(applied=True))
-        self.assertFalse(dialog._can_reconsolidate())
-        self.assertFalse(dialog._recon_btn.isEnabled())
+        self.assertTrue(dialog._can_reconsolidate())
+        self.assertTrue(dialog._recon_btn.isEnabled())
+
+    def test_confirm_warns_when_consolidation_already_applied(self):
+        import emr_analyzer.gui.workers as workers
+
+        llm = FakeLlm()
+        dialog = self._dialog(
+            report=_report(applied=True),
+            services={"clinical_state_llm_client": llm},
+        )
+        with mock.patch.object(
+            QMessageBox, "question", return_value=QMessageBox.Yes
+        ) as question, mock.patch.object(
+            workers, "IraeReconsolidateWorker"
+        ):
+            dialog._on_reconsolidate()
+            self.assertIn("già riuscito", question.call_args[0][2])
 
     def test_button_disabled_while_busy(self):
         dialog = self._dialog()

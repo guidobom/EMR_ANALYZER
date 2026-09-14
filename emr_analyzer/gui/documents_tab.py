@@ -5,24 +5,28 @@ from __future__ import annotations
 import os
 import json
 import traceback
+from pathlib import Path
 from datetime import datetime
+from threading import Lock
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QLabel,
-    QFileDialog, QMessageBox, QMenu, QAction,
+    QFileDialog, QMessageBox, QMenu,
 )
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer, QUrl
 from PyQt5.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 
 from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
-from ..extraction.clinical_text_isolator import ClinicalTextIsolationError
-from ..pipeline.sensitive_data import SensitiveDataSanitizer
+from ..extraction.clinical_text_result import ClinicalTextIsolationError
 from ..config import ATTRIBUTION_VERIFICATION_ENABLED
 from ..utils.document_paths import resolve_document_path
 from ..utils.file_utils import is_supported_file, supported_file_dialog_filter
 from .quick_look import QuickLook
 from .qt_utils import process_gui_events
+
+
+_FALLBACK_PARSER_LOCK = Lock()
 
 
 class AttributionMismatchError(RuntimeError):
@@ -171,7 +175,7 @@ class DocumentsTab(QWidget):
 
         # The parser layers are deliberately transparent to the user: this
         # single action runs native extraction, OCR if needed, laboratory
-        # parsing and LLM clinical-text normalization.
+        # parsing and deterministic clinical-text filtering.
         self._extract_clinical_text_btn = QPushButton("🧠 Estrai testo clinico")
         self._extract_clinical_text_btn.setObjectName("successButton")
         self._extract_clinical_text_btn.clicked.connect(
@@ -179,9 +183,21 @@ class DocumentsTab(QWidget):
         )
         self._extract_clinical_text_btn.setEnabled(False)
 
+        self._reextract_selected_btn = QPushButton("Riestrai selezionati")
+        self._reextract_selected_btn.setToolTip(
+            "Rigenera il testo clinico dai PDF originali dei documenti selezionati, "
+            "anche se già elaborati. I PDF vengono conservati."
+        )
+        self._reextract_selected_btn.clicked.connect(self._reextract_selected)
+        self._reextract_selected_btn.setEnabled(False)
+
         self._view_pdf_btn = QPushButton("📖 Apri documento")
         self._view_pdf_btn.clicked.connect(self._on_view_pdf)
         self._view_pdf_btn.setEnabled(False)
+
+        self._compare_btn = QPushButton("Confronta PDF e Markdown")
+        self._compare_btn.clicked.connect(self._on_compare_document)
+        self._compare_btn.setEnabled(False)
 
         self._delete_btn = QPushButton("🗑 Elimina selezionati")
         self._delete_btn.clicked.connect(self._on_delete_selected)
@@ -189,7 +205,9 @@ class DocumentsTab(QWidget):
 
         toolbar.addWidget(self._import_btn)
         toolbar.addWidget(self._extract_clinical_text_btn)
+        toolbar.addWidget(self._reextract_selected_btn)
         toolbar.addWidget(self._view_pdf_btn)
+        toolbar.addWidget(self._compare_btn)
         toolbar.addWidget(self._delete_btn)
         toolbar.addStretch()
         layout.addLayout(toolbar)
@@ -313,7 +331,9 @@ class DocumentsTab(QWidget):
             rows.add(item.row())
         has_selection = len(rows) > 0
         self._view_pdf_btn.setEnabled(has_selection)
+        self._compare_btn.setEnabled(has_selection)
         self._delete_btn.setEnabled(has_selection)
+        self._reextract_selected_btn.setEnabled(has_selection)
 
         if has_selection:
             row = min(rows)
@@ -344,7 +364,7 @@ class DocumentsTab(QWidget):
 
     def extract_clinical_text(self, doc_ids=None, progress=None,
                               patient_label=None):
-        """Track the complete two-phase operation for application shutdown."""
+        """Track the complete extraction operation for application shutdown."""
 
         from .application_shutdown import shutdown_requested
 
@@ -366,15 +386,10 @@ class DocumentsTab(QWidget):
 
         This is the shared entry point used both by the visible button and by
         the extraction queue.  When *progress* is None a single ProgressDialog
-        is created and reused for both phases (the two phases never stack two
-        dialogs); when a shared dialog is passed (extraction queue) it is
+        is created for the complete operation; when a shared dialog is passed it is
         reused and *patient_label* sets its title.
 
-        Two phases so the configured parallel workers are actually used for
-        the GPU-bound LLM step:
-          1. parse + classify + lab for every document that still needs it
-             (CPU-bound, sequential, fast);
-          2. LLM isolation over every parsed document, in parallel.
+        Parse and normalize each original once; no persisted source layers.
         """
         from .progress_dialog import ProgressDialog
 
@@ -424,20 +439,10 @@ class DocumentsTab(QWidget):
         if patient_label:
             progress.setWindowTitle(patient_label)
 
-        if to_parse:
-            # Phase 1 (CPU): parse + classify + lab, no LLM.
-            self._process_documents(to_parse, parse_only=True, progress=progress)
-        from .application_shutdown import shutdown_requested
-        if shutdown_requested() or (
-            callable(getattr(progress, "is_cancelled", None))
-            and progress.is_cancelled()
-        ):
-            return
-        llm_ids = parsed + to_parse
-        if llm_ids:
-            # Phase 2 (LLM): parallel isolation over every parsed document.
+        ids = parsed + to_parse
+        if ids:
             self._process_documents_with_busy_state(
-                llm_ids, llm_only=True, progress=progress
+                ids, progress=progress
             )
 
     def _get_selected_doc_ids(self) -> list[str]:
@@ -445,118 +450,53 @@ class DocumentsTab(QWidget):
         for item in self._table.selectedItems():
             rows.add(item.row())
         return [self._table.item(r, 0).data(Qt.UserRole)
-                for r in rows if self._table.item(r, 0)]
+                for r in sorted(rows) if self._table.item(r, 0)]
 
-    def _process_documents(self, doc_ids: list[str],
-                           parse_only: bool = False,
-                           llm_only: bool = False,
-                           progress=None):
-        """
-        Run the processing pipeline.
+    def _reextract_selected(self):
+        doc_ids = self._get_selected_doc_ids()
+        if doc_ids:
+            self._process_documents_with_busy_state(doc_ids)
 
-        parse_only=True:  pdfplumber + classification + lab (NO LLM)
-        llm_only=True:    normalized clinical text from already-parsed docs
-        both False:       full pipeline (parse + LLM)
-
-        *progress* is an optional shared ProgressDialog (used by the extraction
-        queue).  When given it is reset and reused; when None a fresh dialog is
-        created for the phase.
-        """
+    def _process_documents(self, doc_ids: list[str], progress=None):
+        """Run the single original-to-clinical-Markdown pipeline."""
         from .progress_dialog import ProgressDialog
         from .application_shutdown import shutdown_requested
 
-        if shutdown_requested():
+        if shutdown_requested() or not doc_ids:
             return
-
         self._consecutive_llm_errors = 0
         self._batch_success_count = 0
         self._batch_error_count = 0
-
-        if not parse_only:
-            document_llm = self._services.get("document_llm_client")
-            if not document_llm or not document_llm.is_available:
-                QMessageBox.warning(
-                    self,
-                    "LLM documentale non disponibile",
-                    "Configura e testa il modello per i documenti tramite "
-                    "il pulsante 'Configura LLM' nella barra superiore.",
-                )
-                return
-
-        # Determine parallel workers for the Document model
-        num_workers = 1
-        if not parse_only:
-            llm_configs = self._services.get("llm_configs")
-            if llm_configs:
-                doc_config = llm_configs.get("document")
-                if doc_config:
-                    num_workers = getattr(doc_config, "parallel_workers", 1)
-
-        # Use parallel processing when >1 worker and not parse_only
-        if num_workers > 1 and not parse_only and len(doc_ids) > 1:
-            print(f"[EMR Analyzer] Avvio estrazione parallela: "
-                  f"{len(doc_ids)} doc con {num_workers} worker "
-                  f"(llm_only={llm_only})")
-            self._process_documents_parallel(
-                doc_ids, num_workers,
-                parse_only=parse_only, llm_only=llm_only,
-                progress=progress,
-            )
-            return
-
-        if llm_only:
-            if progress is None:
-                progress = ProgressDialog(
-                    "Isolamento testo clinico", self.window()
-                )
-                progress.show()
-                process_gui_events()
-            else:
-                progress.reset_for_reuse()
-            progress.set_progress(
-                0, f"Normalizzazione LLM di {len(doc_ids)} documento/i..."
-            )
-            self._process_next_document(doc_ids, 0, progress, None,
-                                        parse_only=False, llm_only=True)
-            return
-
         converter = self._services.get("converter")
         if not converter:
-            QMessageBox.warning(self, "Modello non disponibile",
-                                "Parser PDF non disponibile.")
+            QMessageBox.warning(self, "Parser non disponibile", "Parser PDF non disponibile.")
             return
-
-        title = (
-            "Parsing Documenti" if parse_only else "Estrazione testo clinico"
-        )
+        configs = self._services.get("llm_configs")
+        config = configs.get("document") if configs else None
+        workers = getattr(config, "parallel_workers", 1) if config else 1
+        if workers > 1 and len(doc_ids) > 1:
+            self._process_documents_parallel(doc_ids, workers, progress=progress)
+            return
         if progress is None:
-            progress = ProgressDialog(title, self.window())
+            progress = ProgressDialog("Estrazione testo clinico", self.window())
             progress.show()
             process_gui_events()
         else:
             progress.reset_for_reuse()
-        progress.set_progress(
-            0, f"Estrazione del testo clinico da {len(doc_ids)} documento/i..."
-        )
-
-        self._process_next_document(doc_ids, 0, progress, converter,
-                                    parse_only=parse_only, llm_only=False)
+        progress.set_progress(0, f"Estrazione del testo clinico da {len(doc_ids)} documento/i...")
+        self._process_next_document(doc_ids, 0, progress, converter)
 
     def _process_documents_parallel(self, doc_ids: list[str],
                                      num_workers: int,
-                                     parse_only: bool = False,
-                                     llm_only: bool = False,
                                      progress=None):
-        """Run LLM isolation on multiple already-parsed documents in parallel.
-
-        For new documents (llm_only=False), falls back to the standard
-        sequential pipeline which handles parsing + LLM per document.
+        """Parse originals and normalize documents with the configured workers.
 
         *progress* is an optional shared ProgressDialog (used by the extraction
         queue); when given it is reset and reused instead of creating a new one.
         """
         import time
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        from threading import Event
         from .progress_dialog import ProgressDialog
         from PyQt5.QtWidgets import QApplication
         from PyQt5.QtCore import QThread
@@ -565,24 +505,11 @@ class DocumentsTab(QWidget):
         doc_repo = self._services.get("document_repo")
         total = len(doc_ids)
 
-        if not llm_only:
-            # New documents need parsing first. Run the standard sequential
-            # pipeline — parsing is CPU-bound and tightly coupled to the
-            # document record. After parsing completes the user can re-run
-            # with llm_only=True to get parallel LLM isolation.
-            converter = self._services.get("converter")
-            progress = ProgressDialog("Estrazione testo clinico", self.window())
-            progress.set_progress(0, f"Analisi sequenziale di {total} doc...")
-            progress.show()
-            self._process_next_document(
-                doc_ids, 0, progress, converter,
-                parse_only=False, llm_only=False,
-            )
-            return
-
         # ---- Parallel LLM isolation ------------------------------------
         t0 = time.monotonic()
-        actual_workers = min(num_workers, total)
+        if not total:
+            return
+        actual_workers = max(1, min(num_workers, total))
         if progress is None:
             progress = ProgressDialog(
                 f"Estrazione parallela ({actual_workers} worker)", self.window()
@@ -591,7 +518,7 @@ class DocumentsTab(QWidget):
         else:
             progress.reset_for_reuse()
         progress.set_progress(
-            50 if not llm_only else 0,
+            0,
             f"LLM su {total} documenti con {actual_workers} worker...",
         )
         app = QApplication.instance()
@@ -599,69 +526,75 @@ class DocumentsTab(QWidget):
             process_gui_events()
 
         completed = 0
+        stopped = Event()
 
         def _llm_isolate_one(doc_id: str):
+            if stopped.is_set():
+                return doc_id, "Interrotto"
             doc = doc_repo.get_by_id(doc_id)
             if doc is None:
                 return doc_id, "documento non trovato"
 
-            extraction_dir = self._get_extraction_dir()
-            source_path = next(
-                (p for p in [
-                    extraction_dir / f"{doc_id}_source.txt",
-                    extraction_dir / f"{doc_id}_cleaned_source.md",
-                    extraction_dir / f"{doc_id}_raw.md",
-                ] if p.exists()), None
-            )
-            if source_path is None:
-                return doc_id, "testo sorgente non trovato"
-
-            source_text = source_path.read_text(encoding="utf-8")
             try:
+                doc.parsing_status = ParsingStatus.PROCESSING.value
+                doc_repo.update_parsing_status(doc_id, "processing")
+                result, source_text, tables, pages = self._read_original(
+                    doc, self._services.get("converter"), _NullProgressLogger()
+                )
+                doc.parsing_status = ParsingStatus.COMPLETED.value
+                doc.page_count = pages
+                doc_repo.update(doc)
                 doc_repo.update_extraction_status(doc_id, "processing")
-                self._run_llm_extraction(doc, source_text, progress=None)
+                extracted = self._run_extraction(
+                    doc, source_text, result, tables, _NullProgressLogger(), cancel_check=stopped.is_set
+                )
+                doc.lab_value_count = len(extracted.get("lab_values", []))
                 doc.extraction_status = ExtractionStatus.DONE.value
                 doc.event_count = 0
                 doc.error_message = None
                 doc_repo.update(doc)
                 return doc_id, None
             except Exception as e:
+                if doc.parsing_status == ParsingStatus.PROCESSING.value:
+                    doc.parsing_status = ParsingStatus.ERROR.value
                 doc.extraction_status = ExtractionStatus.ERROR.value
                 doc.error_message = str(e)
                 doc_repo.update(doc)
                 return doc_id, str(e)[:200]
 
+        pending_ids = iter(doc_ids)
         with ThreadPoolExecutor(max_workers=actual_workers) as executor:
             futures = {executor.submit(_llm_isolate_one, did): did
-                       for did in doc_ids}
-            for future in as_completed(futures):
-                if shutdown_requested() or (
-                    callable(getattr(progress, "is_cancelled", None))
-                    and progress.is_cancelled()
-                ):
-                    for pending in futures:
-                        pending.cancel()
-                    return
-                completed += 1
-                doc_id, error = future.result()
-                elapsed = time.monotonic() - t0
-                pct = int(50 + (completed / total) * 50) if not llm_only else int((completed / total) * 100)
-
-                if error:
-                    progress.add_log(f"❌ {doc_id}: {error}")
-                    self._batch_error_count += 1
-                else:
-                    progress.add_log(f"✓ {doc_id}: testo clinico normalizzato")
-                    self._batch_success_count += 1
-
-                progress.set_progress(
-                    pct, f"Completati {completed}/{total} ({elapsed:.0f}s)",
-                )
+                       for did in [next(pending_ids, None) for _ in range(actual_workers)]
+                       if did is not None}
+            while futures:
                 process_gui_events()
-                if shutdown_requested():
-                    for pending in futures:
-                        pending.cancel()
-                    return
+                if shutdown_requested() or (
+                    callable(getattr(progress, "is_cancelled", None)) and progress.is_cancelled()
+                ):
+                    stopped.set()
+                done, _ = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in done:
+                    futures.pop(future)
+                    doc_id, error = future.result()
+                    completed += 1
+                    elapsed = time.monotonic() - t0
+                    if error:
+                        progress.add_log(f"❌ {doc_id}: {error}")
+                        self._batch_error_count += 1
+                    else:
+                        progress.add_log(f"✓ {doc_id}: testo clinico normalizzato")
+                        self._batch_success_count += 1
+                    progress.set_progress(int(completed / total * 100),
+                                          f"Completati {completed}/{total} ({elapsed:.0f}s)")
+                    if not stopped.is_set():
+                        did = next(pending_ids, None)
+                        if did is not None:
+                            futures[executor.submit(_llm_isolate_one, did)] = did
+            if stopped.is_set():
+                progress.mark_done()
+                self._refresh_table()
+                return
 
         progress.set_progress(
             100,
@@ -671,10 +604,98 @@ class DocumentsTab(QWidget):
         self.processing_complete.emit(self._current_patient_id)
         self._refresh_table()
 
-    def _process_next_document(self, doc_ids: list[str], index: int,
-                                progress, converter,
-                                parse_only: bool = False,
-                                llm_only: bool = False):
+    def _read_original(self, doc, converter, progress):
+        """Extract a source once into memory; keep only compact parser metadata."""
+        file_path = resolve_document_path(doc)
+        active_parser = converter or self._services.get("converter")
+        try:
+            result = active_parser.convert(file_path)
+            markdown_text = active_parser.export_markdown(result)
+            plain_text = active_parser.export_text(result)
+            tables = active_parser.export_tables(result)
+            page_count = active_parser.get_page_count(result)
+            if not plain_text.strip():
+                raise ValueError("Nessun testo recuperato dal parser primario")
+        except Exception as primary_error:
+            fallback = self._services.get("parser_fallback")
+            if fallback is None:
+                raise
+            progress.add_log(
+                f"⚠️ Estrazione standard non sufficiente ({primary_error}); "
+                "utilizzo fallback Docling standard"
+            )
+            with _FALLBACK_PARSER_LOCK:
+                active_parser = fallback
+                result = active_parser.convert(file_path)
+                markdown_text = active_parser.export_markdown(result)
+                plain_text = active_parser.export_text(result)
+                tables = active_parser.export_tables(result)
+                page_count = active_parser.get_page_count(result)
+
+        parser_name = getattr(result, "method", "docling_fallback")
+        progress.add_log(
+            f"✓ {doc.filename}: estrazione {parser_name} completata "
+            f"({page_count} pagine, {len(tables)} tabelle)"
+        )
+
+        # Extract document date from header
+        doc_date = self._extract_document_date(markdown_text)
+        if doc_date:
+            doc.document_date = doc_date
+            progress.add_log(f"  📅 Data referto: {doc_date}")
+
+        # Parser output lives only in memory. The sole document artifact
+        # is written after successful clinical normalization and sanitization.
+
+        # Extract first-page administrative/clinical metadata before the
+        # cleaner removes institutional headers and service descriptions.
+        header_extractor = self._services.get("header_metadata_extractor")
+        if header_extractor:
+            header = header_extractor.extract(markdown_text)
+            try:
+                metadata = json.loads(doc.metadata_json or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            metadata["header"] = header.to_dict()
+            doc.metadata_json = json.dumps(metadata, ensure_ascii=False)
+            if header.department or header.provenance:
+                origin = header.department or header.provenance
+                progress.add_log(f"  🏥 Reparto/provenienza: {origin}")
+            if header.services:
+                progress.add_log(
+                    f"  📋 Prestazioni erogate: {len(header.services)}"
+                )
+            if header.specialty:
+                progress.add_log(f"  🩺 Specialità: {header.specialty}")
+        try:
+            metadata = json.loads(doc.metadata_json or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        metrics = {"elapsed_seconds": getattr(result, "elapsed_seconds", None)}
+        metadata["parser"] = {
+            "name": parser_name,
+            "page_count": page_count,
+            "table_count": len(tables),
+            "metrics": metrics,
+        }
+        doc.metadata_json = json.dumps(metadata, ensure_ascii=False)
+
+        return result, plain_text or markdown_text, tables, page_count
+
+    def _process_next_document(self, doc_ids, index, progress, converter):
+        """Iterate without recursive stack growth on large dossiers."""
+        from .application_shutdown import shutdown_requested
+        for current in range(index, len(doc_ids) + 1):
+            if shutdown_requested() or (
+                callable(getattr(progress, "is_cancelled", None)) and progress.is_cancelled()
+            ):
+                return
+            self._process_document_at_index(doc_ids, current, progress, converter)
+            if self._consecutive_llm_errors >= 3:
+                return
+
+    def _process_document_at_index(self, doc_ids: list[str], index: int,
+                                progress, converter):
         """Process one document, then chain to the next."""
         from .application_shutdown import shutdown_requested
 
@@ -706,111 +727,9 @@ class DocumentsTab(QWidget):
         if not doc:
             progress.add_log(f"⚠️ Documento {doc_id} non trovato, skip")
             self._batch_error_count += 1
-            self._process_next_document(doc_ids, index + 1, progress, converter,
-                                        parse_only, llm_only)
             return
 
-        file_path = resolve_document_path(doc)
         base_msg = f"[{index + 1}/{len(doc_ids)}] {doc.filename}"
-
-        # ============================================================
-        # LLM-ONLY PATH
-        # ============================================================
-        if llm_only:
-            doc_repo.update_extraction_status(doc_id, "processing")
-            self._refresh_table()
-
-            # Load the immutable parser source, never a previous LLM output.
-            extraction_dir = self._get_extraction_dir()
-            parsing_result = None
-            extraction_json = extraction_dir / f"{doc_id}.json"
-            if extraction_json.exists():
-                try:
-                    from ..pipeline.pdf_extractor import PdfExtractionResult
-                    parsing_result = PdfExtractionResult.from_dict(
-                        json.loads(extraction_json.read_text(encoding="utf-8"))
-                    )
-                except Exception:
-                    parsing_result = None
-
-            source_candidates = [
-                extraction_dir / f"{doc_id}_source.txt",
-                extraction_dir / f"{doc_id}_cleaned_source.md",
-                extraction_dir / f"{doc_id}_raw.md",
-            ]
-            # Backward compatibility for reports parsed before pdfplumber.
-            from ..config import active_workspace
-            source_candidates.append(
-                active_workspace.path / self._current_patient_id / "docling" /
-                f"{doc_id}.md"
-            )
-            source_path = next(
-                (path for path in source_candidates if path.exists()), None
-            )
-            if source_path is not None:
-                source_text = source_path.read_text(encoding="utf-8")
-            elif parsing_result is not None:
-                source_text = parsing_result.plain_text
-            else:
-                progress.add_log(f"⚠️ {doc.filename}: testo non trovato, fai prima il parsing")
-                doc.extraction_status = ExtractionStatus.ERROR.value
-                doc.error_message = "Testo sorgente non trovato"
-                doc_repo.update(doc)
-                self._batch_error_count += 1
-                self._process_next_document(doc_ids, index + 1, progress, converter,
-                                            parse_only, llm_only)
-                return
-
-            # Run LLM extraction with granular progress
-            pct_base = int((index / len(doc_ids)) * 100)
-            progress.set_progress(pct_base, f"{base_msg} — estrazione LLM...")
-            process_gui_events()
-
-            try:
-                progress.set_progress(pct_base + 2, f"{base_msg} — chiamata al modello locale...")
-                process_gui_events()
-
-                self._run_llm_extraction(
-                    doc, source_text, progress, parsing_result=parsing_result
-                )
-                progress.set_progress(
-                    min(99, pct_base + 8),
-                    f"{base_msg} — salvataggio testo clinico...",
-                )
-                process_gui_events()
-
-                doc.extraction_status = ExtractionStatus.DONE.value
-                doc.event_count = 0
-                doc.error_message = None
-                doc_repo.update(doc)
-                self._consecutive_llm_errors = 0
-                self._batch_success_count += 1
-                progress.add_log(f"✓ {doc.filename}: testo clinico normalizzato")
-            except Exception as e:
-                progress.add_log(f"⚠️ {doc.filename}: errore LLM — {e}")
-                doc.extraction_status = ExtractionStatus.ERROR.value
-                doc.error_message = str(e)
-                doc_repo.update(doc)
-                if (
-                    isinstance(e, ClinicalTextIsolationError)
-                    and getattr(e, "systemic", False)
-                ):
-                    self._consecutive_llm_errors += 1
-                else:
-                    self._consecutive_llm_errors = 0
-                self._batch_error_count += 1
-
-            if self._consecutive_llm_errors >= 3:
-                self._abort_llm_batch(
-                    progress, remaining=len(doc_ids) - index - 1
-                )
-                return
-
-            self._refresh_table()
-            process_gui_events()
-            self._process_next_document(doc_ids, index + 1, progress, converter,
-                                        parse_only, llm_only)
-            return
 
         # ============================================================
         # PARSE PATH (with or without LLM follow-up)
@@ -827,156 +746,13 @@ class DocumentsTab(QWidget):
         )
 
         try:
-            active_parser = converter
-            try:
-                result = active_parser.convert(file_path)
-                markdown_text = active_parser.export_markdown(result)
-                plain_text = active_parser.export_text(result)
-                tables = active_parser.export_tables(result)
-                page_count = active_parser.get_page_count(result)
-                if not plain_text.strip():
-                    raise ValueError("Nessun testo recuperato dal parser primario")
-            except Exception as primary_error:
-                fallback = self._services.get("parser_fallback")
-                if fallback is None:
-                    raise
-                progress.add_log(
-                    f"⚠️ Estrazione standard non sufficiente ({primary_error}); "
-                    "utilizzo fallback Docling standard"
-                )
-                active_parser = fallback
-                result = active_parser.convert(file_path)
-                markdown_text = active_parser.export_markdown(result)
-                plain_text = active_parser.export_text(result)
-                tables = active_parser.export_tables(result)
-                page_count = active_parser.get_page_count(result)
-
-            parser_name = getattr(result, "method", "docling_fallback")
-            progress.add_log(
-                f"✓ {doc.filename}: estrazione {parser_name} completata "
-                f"({page_count} pagine, {len(tables)} tabelle)"
-            )
-
-            # Extract document date from header
-            doc_date = self._extract_document_date(markdown_text)
-            if doc_date:
-                doc.document_date = doc_date
-                progress.add_log(f"  📅 Data referto: {doc_date}")
-
-            # Persist immutable parser layers separately from the active text.
-            extraction_dir = self._get_extraction_dir()
-            extraction_dir.mkdir(parents=True, exist_ok=True)
-
-            # The raw parser layers still carry the patient header (name, CF,
-            # address) and the hash-only invariant does not cover these disk
-            # artifacts. De-identify them deterministically before persisting:
-            # the LLM-only re-processing path reads them back as input, so the
-            # LLM must never receive the raw identity either.
-            sanitizer = SensitiveDataSanitizer()
-            sensitive_identity = self._sensitive_identity_for_document(
-                doc, plain_text, parsing_result=result
-            )
-            raw_path = extraction_dir / f"{doc_id}_raw.md"
-            raw_path.write_text(
-                sanitizer.sanitize(markdown_text, sensitive_identity).text,
-                encoding="utf-8",
-            )
-            # Exact plain-text input for the document LLM. This remains
-            # immutable when the active .md is replaced by normalized text.
-            (extraction_dir / f"{doc_id}_source.txt").write_text(
-                sanitizer.sanitize(plain_text, sensitive_identity).text,
-                encoding="utf-8",
-            )
-
-            extraction_dict = active_parser.export_dict(result)
-            if isinstance(extraction_dict, dict):
-                extraction_dict["source_path"] = f"{doc_id}{file_path.suffix.lower()}"
-            extraction_dict = sanitizer.sanitize_payload(
-                extraction_dict, sensitive_identity
-            )
-            json_path = extraction_dir / f"{doc_id}.json"
-            json_path.write_text(
-                json.dumps(extraction_dict, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            pages = extraction_dict.get("pages", []) if isinstance(extraction_dict, dict) else []
-            page_records = []
-            word_records = []
-            table_records = []
-            for page_record in pages:
-                page_records.append({
-                    key: value for key, value in page_record.items()
-                    if key not in {"words", "tables"}
-                })
-                for word in page_record.get("words", []):
-                    word_records.append({"page": page_record.get("page"), **word})
-                table_records.extend(page_record.get("tables", []))
-            (extraction_dir / f"{doc_id}_pages.jsonl").write_text(
-                "\n".join(json.dumps(item, ensure_ascii=False) for item in page_records),
-                encoding="utf-8",
-            )
-            (extraction_dir / f"{doc_id}_words.jsonl").write_text(
-                "\n".join(json.dumps(item, ensure_ascii=False) for item in word_records),
-                encoding="utf-8",
-            )
-            (extraction_dir / f"{doc_id}_tables.json").write_text(
-                json.dumps(table_records, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-            # Extract first-page administrative/clinical metadata before the
-            # cleaner removes institutional headers and service descriptions.
-            header_extractor = self._services.get("header_metadata_extractor")
-            if header_extractor:
-                header = header_extractor.extract(markdown_text)
-                try:
-                    metadata = json.loads(doc.metadata_json or "{}")
-                except (TypeError, ValueError):
-                    metadata = {}
-                metadata["header"] = header.to_dict()
-                doc.metadata_json = json.dumps(metadata, ensure_ascii=False)
-                if header.department or header.provenance:
-                    origin = header.department or header.provenance
-                    progress.add_log(f"  🏥 Reparto/provenienza: {origin}")
-                if header.services:
-                    progress.add_log(
-                        f"  📋 Prestazioni erogate: {len(header.services)}"
-                    )
-                if header.specialty:
-                    progress.add_log(f"  🩺 Specialità: {header.specialty}")
-            try:
-                metadata = json.loads(doc.metadata_json or "{}")
-            except (TypeError, ValueError):
-                metadata = {}
-            metrics = extraction_dict.get("metrics", {}) if isinstance(extraction_dict, dict) else {}
-            metadata["parser"] = {
-                "name": parser_name,
-                "page_count": page_count,
-                "table_count": len(tables),
-                "metrics": metrics,
-            }
-            doc.metadata_json = json.dumps(metadata, ensure_ascii=False)
-
-            # Clean the text (remove boilerplate)
-            cleaner = self._services.get("cleaner")
-            cleaned_text = cleaner.clean(markdown_text) if cleaner else markdown_text
-
-            # Save CLEANED markdown
-            (extraction_dir / f"{doc_id}_cleaned_source.md").write_text(
-                cleaned_text, encoding="utf-8"
-            )
-            md_path = extraction_dir / f"{doc_id}.md"
-            md_path.write_text(cleaned_text, encoding="utf-8")
+            result, plain_text, tables, page_count = self._read_original(doc, converter, progress)
 
         except Exception as e:
             traceback.print_exc()
             progress.add_log(f"❌ {doc.filename}: errore conversione — {e}")
             doc_repo.update_parsing_status(doc_id, ParsingStatus.ERROR.value, str(e))
             self._batch_error_count += 1
-            self._process_next_document(
-                doc_ids, index + 1, progress, converter,
-                parse_only=parse_only, llm_only=llm_only,
-            )
             return
 
         # Update doc metadata
@@ -989,22 +765,17 @@ class DocumentsTab(QWidget):
             self._batch_stage_progress(
                 index, len(doc_ids), phase_fraction=0.55
             ),
-            f"{base_msg} — Estrazione..." + (" (solo lab)" if parse_only else "")
+            f"{base_msg} — Estrazione..."
         )
 
         try:
             extraction_result = self._run_extraction(
-                doc, plain_text if plain_text else markdown_text,
+                doc, plain_text,
                 result, tables, progress,
-                skip_llm=parse_only
+                cancel_check=getattr(progress, "is_cancelled", None)
             )
 
-            # Parsing-only must leave the document available to the later LLM
-            # batch. Previously it was incorrectly marked as fully extracted.
-            doc.extraction_status = (
-                ExtractionStatus.PENDING.value
-                if parse_only else ExtractionStatus.DONE.value
-            )
+            doc.extraction_status = ExtractionStatus.DONE.value
             doc.event_count = len(extraction_result.get("events", []))
             doc.lab_value_count = len(extraction_result.get("lab_values", []))
             doc.error_message = None
@@ -1014,7 +785,7 @@ class DocumentsTab(QWidget):
 
             progress.add_log(
                 f"✓ {doc.filename}: testo clinico "
-                f"{'creato' if not parse_only else 'in attesa'}, "
+                f"creato, "
                 f"{doc.lab_value_count} valori lab"
             )
         except Exception as e:
@@ -1024,15 +795,14 @@ class DocumentsTab(QWidget):
             doc_repo.update(doc)
             self._batch_error_count += 1
             if (
-                not parse_only
-                and isinstance(e, ClinicalTextIsolationError)
+                isinstance(e, ClinicalTextIsolationError)
                 and getattr(e, "systemic", False)
             ):
                 self._consecutive_llm_errors += 1
             else:
                 self._consecutive_llm_errors = 0
 
-        if not parse_only and self._consecutive_llm_errors >= 3:
+        if self._consecutive_llm_errors >= 3:
             self._abort_llm_batch(
                 progress, remaining=len(doc_ids) - index - 1
             )
@@ -1041,8 +811,6 @@ class DocumentsTab(QWidget):
         self._refresh_table()
         process_gui_events()
 
-        self._process_next_document(doc_ids, index + 1, progress, converter,
-                                    parse_only=parse_only)
 
     @staticmethod
     def _batch_stage_progress(
@@ -1070,13 +838,11 @@ class DocumentsTab(QWidget):
 
     def _run_extraction(self, doc, text: str, parsing_result,
                         tables: list, progress,
-                        skip_llm: bool = False) -> dict:
-        """Run extraction: always lab (deterministic), optionally LLM."""
+                        cancel_check=None) -> dict:
+        """Extract laboratory values and publish the clinical Markdown."""
         patient_id = doc.patient_id
         doc_id = doc.id
 
-        cleaner = self._services.get("cleaner")
-        cleaned = cleaner.clean(text) if cleaner else text
 
         classifier = self._services.get("classifier")
         try:
@@ -1137,30 +903,25 @@ class DocumentsTab(QWidget):
         # "Estrai evidenze atomiche" (ClinicalRegistryBuilder.
         # _sync_abnormal_lab_evidence, from lab_values).
         events = []
-        # Lab reports have no clinical narrative — only structured values.
-        # The ClinicalTextIsolator would hallucinate numbers on a table of
-        # parameters and fail validation.
-        is_lab = doc.document_type == DocumentType.LABORATORIO.value
-        if skip_llm or is_lab:
-            reason = "parsing only" if skip_llm else "documento laboratoristico"
-            progress.add_log(f"  ⏭️  LLM saltato ({reason})")
-            if is_lab and not skip_llm:
-                doc_repo = self._services.get("document_repo")
-                if doc_repo:
-                    doc.extraction_status = ExtractionStatus.DONE.value
-                    doc.event_count = 0
-                    doc.error_message = None
-                    doc_repo.update(doc)
-                    self._batch_success_count += 1
+        if doc.document_type == DocumentType.LABORATORIO.value:
+            from ..extraction.document_normalization import normalize_document
+            identity = self._sensitive_identity_for_document(doc, text, parsing_result)
+            self._verify_document_attribution(doc, text, parsing_result, progress)
+            lab_result = normalize_document(
+                None, text, document_date=doc.document_date,
+                parsing_result=parsing_result, sensitive_identity=identity, cancel_check=cancel_check,
+            )
+            self._save_normalized_clinical_text(doc, lab_result)
+
         else:
             events = self._run_llm_extraction(
-                doc, cleaned, progress, parsing_result=parsing_result
+                doc, text, progress, parsing_result=parsing_result, cancel_check=cancel_check
             )
 
         return {"events": events, "lab_values": lab_values}
 
     def _run_llm_extraction(self, doc, text: str, progress,
-        parsing_result=None) -> list:
+        parsing_result=None, cancel_check=None) -> list:
         """Replace the active parser text with normalized clinical prose."""
         doc_id = doc.id
 
@@ -1170,18 +931,9 @@ class DocumentsTab(QWidget):
             progress = _NullProgressLogger()
 
         isolator = self._services.get("clinical_text_isolator")
-        llm_client = self._services.get("document_llm_client")
-        if not isolator or not llm_client or not llm_client.is_available:
-            raise ClinicalTextIsolationError(
-                "Il motore locale o il modello documentale non sono disponibili"
-            )
-
-        progress.add_log(
-            f"  🧠 {llm_client.model}: isolamento del testo clinico..."
-        )
-        progress.add_log(
-            "  🔒 Controllo deterministico dei dati sensibili..."
-        )
+        if not isolator:
+            raise ClinicalTextIsolationError("Il filtro del testo clinico non è disponibile")
+        progress.add_log("  Filtraggio amministrativo e anonimizzazione deterministici...")
         sensitive_identity = self._sensitive_identity_for_document(
             doc, text, parsing_result
         )
@@ -1193,11 +945,12 @@ class DocumentsTab(QWidget):
         self._verify_document_attribution(
             doc, text, parsing_result, progress
         )
-        result = isolator.isolate(
+        from ..extraction.document_normalization import normalize_document
+        result = normalize_document(isolator,
             text,
             document_date=doc.document_date,
             parsing_result=parsing_result,
-            sensitive_identity=sensitive_identity,
+            sensitive_identity=sensitive_identity, cancel_check=cancel_check,
         )
         for warning in result.warnings:
             progress.add_log(f"  ↻ {warning}")
@@ -1245,6 +998,7 @@ class DocumentsTab(QWidget):
                         "prompt_version": result.prompt_version,
                         "chunk_count": result.chunk_count,
                         "character_count": len(result.text),
+                        "report_date_metadata_version": "v1",
                         "output_format": "normalized_plain_text",
                         "deidentification_version": (
                             result.deidentification_version
@@ -1259,7 +1013,7 @@ class DocumentsTab(QWidget):
 
         progress.add_log(
             f"  ✓ Testo clinico normalizzato: {len(result.text)} caratteri, "
-            f"{result.chunk_count} chunk"
+            "Markdown continuo"
         )
         return []
 
@@ -1673,13 +1427,18 @@ class DocumentsTab(QWidget):
         db.commit()
 
     def _save_normalized_clinical_text(self, doc, result) -> None:
-        """Atomically replace the active text while preserving source layers."""
+        """Publish only the final clinical Markdown; metadata stays in SQLite."""
         output_dir = self._get_extraction_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         active_path = output_dir / f"{doc.id}.md"
         temporary_path = output_dir / f"{doc.id}.md.tmp"
-        temporary_path.write_text(result.text, encoding="utf-8")
-        temporary_path.replace(active_path)
+        from ..clinical.report_metadata import with_report_date
+        persisted_text = with_report_date(result.text, doc.document_date)
+        try:
+            temporary_path.write_text(persisted_text, encoding="utf-8")
+            temporary_path.replace(active_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
         try:
             metadata = json.loads(doc.metadata_json or "{}")
@@ -1689,11 +1448,14 @@ class DocumentsTab(QWidget):
             "model": result.model_name,
             "prompt_version": result.prompt_version,
             "chunk_count": result.chunk_count,
-            "character_count": len(result.text),
-            "output_format": "normalized_plain_text",
+            "character_count": len(persisted_text),
+            "report_date_metadata_version": "v1",
+            "output_format": "clinical_markdown",
+            "storage_policy": "original-plus-clinical-markdown-v1",
             "deidentification_version": result.deidentification_version,
             "redaction_counts": result.redaction_counts,
             "redaction_total": sum(result.redaction_counts.values()),
+            "retention_audit": result.retention_audit,
             "created_at": datetime.now().isoformat(),
         }
         doc.metadata_json = json.dumps(metadata, ensure_ascii=False)
@@ -1707,7 +1469,6 @@ class DocumentsTab(QWidget):
         """
         import re as re_m
         from ..utils.date_utils import parse_italian_date
-        from datetime import datetime
 
         # Strategy 1: Date immediately after REFERTO heading (most reliable)
         match = re_m.search(
@@ -1784,7 +1545,6 @@ class DocumentsTab(QWidget):
 
     def _get_extraction_dir(self) -> 'Path':
         """Get deterministic extraction output directory for the patient."""
-        from pathlib import Path
         from ..config import active_workspace
         return active_workspace.path / self._current_patient_id / "extraction"
 
@@ -1849,7 +1609,7 @@ class DocumentsTab(QWidget):
             else "🧠 Estrai testo clinico"
         )
         open_action = menu.addAction("📖 Apri documento")
-        view_text_action = menu.addAction("📝 Visualizza testo clinico")
+        view_text_action = menu.addAction("Confronta PDF e Markdown")
         menu.addSeparator()
         edit_action = menu.addAction("✏️ Modifica tipo/metadati")
         menu.addSeparator()
@@ -1868,47 +1628,18 @@ class DocumentsTab(QWidget):
             self._delete_documents([doc_id])
 
     def _view_extracted_text(self, doc_id: str, doc_data: dict):
-        """Show the extracted markdown text in a dialog."""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QHBoxLayout
-
-        extraction_dir = self._get_extraction_dir()
-        md_path = extraction_dir / f"{doc_id}.md"
-        if not md_path.exists():
-            from ..config import active_workspace
-            md_path = (
-                active_workspace.path / self._current_patient_id / "docling" /
-                f"{doc_id}.md"
-            )
-
-        if not md_path.exists():
-            QMessageBox.information(self, "Non disponibile",
-                                    "Il testo estratto non è ancora disponibile.\n"
-                                    "Estrai prima il testo clinico del documento.")
-            return
-
-        text = md_path.read_text(encoding="utf-8")
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle(
-            f"Testo clinico attivo — {doc_data.get('filename', doc_id)}"
-        )
-        dialog.resize(800, 600)
-
-        dlg_layout = QVBoxLayout(dialog)
-        text_edit = QTextEdit()
-        text_edit.setReadOnly(True)
-        text_edit.setPlainText(text)
-        text_edit.setStyleSheet("font-family: Menlo, Monaco, monospace; font-size: 12px;")
-        dlg_layout.addWidget(text_edit)
-
-        btn_layout = QHBoxLayout()
-        close_btn = QPushButton("Chiudi")
-        close_btn.clicked.connect(dialog.accept)
-        btn_layout.addStretch()
-        btn_layout.addWidget(close_btn)
-        dlg_layout.addLayout(btn_layout)
-
+        """Inspect active Markdown next to its original document."""
+        from .document_comparison_dialog import DocumentComparisonDialog
+        data = dict(doc_data, id=doc_id)
+        data.setdefault("patient_id", self._current_patient_id)
+        dialog = DocumentComparisonDialog(data, self._services, self)
         dialog.exec_()
+
+    def _on_compare_document(self):
+        row = self._table.currentRow()
+        item = self._table.item(row, 0) if row >= 0 else None
+        if item:
+            self._view_extracted_text(item.data(Qt.UserRole), item.data(Qt.UserRole + 1))
 
     def _edit_document_metadata(self, doc_id: str, doc_data: dict):
         from PyQt5.QtWidgets import QInputDialog

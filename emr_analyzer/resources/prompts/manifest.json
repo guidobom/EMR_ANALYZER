@@ -69,6 +69,25 @@
       "minimum_length": 80
     },
     {
+      "key": "atomic_evidence_sentence_system",
+      "label": "Evidenze atomiche frase — ruolo",
+      "pipeline": "2 · Estrazione evidenze atomiche",
+      "institutional_version": "institutional-v13",
+      "minimum_length": 80
+    },
+    {
+      "key": "atomic_evidence_sentence_it",
+      "label": "Evidenze atomiche frase — istruzioni complete",
+      "pipeline": "2 · Estrazione evidenze atomiche",
+      "institutional_version": "institutional-v13",
+      "required_markers": [
+        "Vincoli obbligatori",
+        "source_refs",
+        "laboratory_test"
+      ],
+      "minimum_length": 400
+    },
+    {
       "key": "clinical_fusion_system",
       "label": "Fusione eventi clinici — ruolo",
       "pipeline": "3 · Creazione eventi clinici",

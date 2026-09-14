@@ -29,7 +29,7 @@ from .pipeline.patient_routing import PatientRoutingService
 from .extraction.lab_parser import LabParser
 from .extraction.normalizer import LabNormalizer
 from .extraction.llm_client import LlmClient
-from .extraction.clinical_text_isolator import ClinicalTextIsolator
+from .extraction.clinical_text_filter import ClinicalTextFilter
 from .clinical.clinical_history_builder import ClinicalHistoryBuilder
 from .clinical.registry_builder import ClinicalRegistryBuilder
 from .clinical.document_deletion import DocumentDeletionService
@@ -254,7 +254,7 @@ class EMRAnalyzerApp:
         self._services.update({
             "normalizer": normalizer,
             "lab_parser": lab_parser,
-            "clinical_text_isolator": ClinicalTextIsolator(
+            "clinical_text_isolator": ClinicalTextFilter(
                 self._services.get("document_llm_client")
             ),
         })

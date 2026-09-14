@@ -364,9 +364,14 @@ class ClinicalPipelineRepository:
         self,
         patient_id: str,
         canonical_evidence,
-        uncertain_pairs: list[tuple[str, str, float]] = (),
+        uncertain_pairs: list = (),
     ) -> list[str]:
-        """Persist exact copy groups plus conservative near-copy candidates."""
+        """Persist exact copy groups plus conservative near-copy candidates.
+
+        ``uncertain_pairs`` entries are 3-tuples ``(left, right, similarity)``
+        (SequenceMatcher text candidates) or 4-tuples with a trailing source
+        label ``"embedding"`` (semantic candidates)."""
+
         reviewed = {
             row["duplicate_group_id"] for row in self.db.execute(
                 """SELECT duplicate_group_id FROM evidence_duplicate_groups
@@ -401,11 +406,21 @@ class ClinicalPipelineRepository:
                 key = "exact:" + ":".join(sorted(members))
                 groups.append((item.evidence_id, members, key,
                                "exact_cross_document_copy", "auto"))
-            for left, right, similarity in uncertain_pairs:
+            for pair in uncertain_pairs:
+                left, right = str(pair[0]), str(pair[1])
+                similarity = float(pair[2])
+                source = (
+                    str(pair[3]).strip().casefold()
+                    if len(pair) > 3 else "text"
+                )
                 members = sorted({left, right})
                 key = "candidate:" + ":".join(members)
-                groups.append((members[0], members, key,
-                               f"near_copy_similarity={similarity:.3f}", "pending"))
+                prefix = "embedding_" if source == "embedding" else ""
+                groups.append((
+                    members[0], members, key,
+                    f"{prefix}near_copy_similarity={similarity:.3f}",
+                    "pending",
+                ))
 
             for canonical_id, members, key, reason, status in groups:
                 group_id = "DUP_" + uuid.uuid5(
@@ -480,6 +495,44 @@ class ClinicalPipelineRepository:
                 **dict(row), "members": [dict(member) for member in members],
             })
         return result
+
+    # ---------------------------------------------------------- embeddings
+
+    def get_embeddings(
+        self, evidence_ids, *, model_name: str
+    ) -> dict[str, bytes]:
+        """Return cached raw float32 vectors for the given evidence ids."""
+        if not evidence_ids:
+            return {}
+        rows = self.db.execute(
+            "SELECT evidence_id, vector FROM evidence_embeddings "
+            "WHERE model_name=? AND evidence_id IN ("
+            + ",".join("?" for _ in evidence_ids) + ")",
+            (model_name, *evidence_ids),
+        ).fetchall()
+        return {row["evidence_id"]: bytes(row["vector"]) for row in rows}
+
+    def put_embeddings(
+        self, rows: list[tuple[str, str, bytes]]
+    ) -> None:
+        """Upsert (evidence_id, model_name, raw float32 blob) rows."""
+        if not rows:
+            return
+        now = _now()
+        with self.db:
+            self.db.executemany(
+                """INSERT INTO evidence_embeddings
+                   (evidence_id, model_name, vector, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(evidence_id) DO UPDATE SET
+                     model_name=excluded.model_name,
+                     vector=excluded.vector,
+                     updated_at=excluded.updated_at""",
+                [
+                    (evidence_id, model_name, vector, now)
+                    for evidence_id, model_name, vector in rows
+                ],
+            )
 
     # -------------------------------------------------------------- graph
 

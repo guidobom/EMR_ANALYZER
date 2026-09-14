@@ -8,15 +8,13 @@ from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
-import re
-import unicodedata
 import uuid
 
 from .temporal import date_bounds, temporal_distance_days
+from .terminology import normalize_concept as _fold
 from ..models.clinical_pipeline import (
     CLUSTER_EFFECTS,
     EVIDENCE_RELATION_TYPES,
-    EVENT_EVIDENCE_ROLES,
     EvidenceRelation,
 )
 from ..settings import ClinicalPipelinePolicy
@@ -995,12 +993,6 @@ def _semantic_terms(item) -> set[str]:
         token for token in _fold(value).split("_")
         if len(token) >= 4 and token not in _STOPWORDS
     }
-
-
-def _fold(value) -> str:
-    text = unicodedata.normalize("NFKD", str(value or "").casefold())
-    text = "".join(char for char in text if not unicodedata.combining(char))
-    return "_".join(re.findall(r"[a-z0-9]+", text))
 
 
 def _prompt_evidence(item) -> dict:

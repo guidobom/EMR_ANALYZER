@@ -176,12 +176,10 @@ class PatientImportService:
             if src_doc.exists():
                 shutil.copy2(src_doc, target_docs / src_doc.name)
 
-            # Copy extraction files
-            for suffix in [".md", "_raw.md", "_source.txt", "_cleaned_source.md",
-                           ".json", "_tables.json", "_pages.jsonl", "_words.jsonl"]:
-                src_file = source / patient_id / "extraction" / f"{doc_row['id']}{suffix}"
-                if src_file.exists():
-                    shutil.copy2(src_file, target_extraction / f"{new_doc_id}{suffix}")
+            # Only the final clinical Markdown belongs to the active pipeline.
+            src_file = source / patient_id / "extraction" / f"{doc_row['id']}.md"
+            if src_file.is_file():
+                shutil.copy2(src_file, target_extraction / f"{new_doc_id}.md")
 
             stats["documents"] += 1
 

@@ -201,3 +201,42 @@ class ExistingRedactionsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_report_dates_and_times_are_not_phone_numbers():
+    sanitizer = SensitiveDataSanitizer()
+    for source in ('04.07.2024 12:24:16', '21.06.2023    21.06.2023',
+                   '01/02/2024 09:30', '2024-07-04 12:24:16',
+                   'Valore 034\n1234567'):
+        assert sanitizer.sanitize(source, preserve_layout=True).text == source
+
+
+def test_phone_redaction_does_not_consume_following_date_or_line():
+    sanitizer = SensitiveDataSanitizer()
+    source = 'Tel. 333 1234567\n04.07.2024 12:24:16'
+    result = sanitizer.sanitize(source).text
+    assert '333' not in result
+    assert '04.07.2024 12:24:16' in result
+    assert sanitizer.sanitize('+39 0541 123456').text == '[TELEFONO RIMOSSO]'
+
+
+def test_known_birth_date_variants_are_redacted_without_removing_exam_date():
+    result = SensitiveDataSanitizer().sanitize(
+        'Paziente (5/3/1964). Nato il 05.03.1964. Esame 05/03/2024.',
+        {'birth_date': '1964-03-05'})
+    assert '1964' not in result.text
+    assert '05/03/2024' in result.text
+
+
+def test_phone_with_spaced_punctuation_retains_clinical_tail():
+    for phone in ('Tel 0532 - 237138', 'T. +39.0532. 236.111'):
+        result = SensitiveDataSanitizer().sanitize(phone + '    Nega febbre.')
+        assert '0532' not in result.text
+        assert 'Nega febbre.' in result.text
+
+
+def test_dose_next_to_complete_phone_is_not_swallowed():
+    for source in ('Tel. 3331234567 5 mg', '3331234567 5 mg'):
+        out = SensitiveDataSanitizer().sanitize(source).text
+        assert '5 mg' in out
+        assert '3331234567' not in out

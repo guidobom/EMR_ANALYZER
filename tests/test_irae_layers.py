@@ -696,6 +696,41 @@ class RenderMarkdownTest(unittest.TestCase):
         self.assertIn("ripresa con prednisone 1 mg/kg", markdown)
         self.assertIn("Uniti 2 reperti per organo in 1 irAE definitivi", markdown)
 
+    def test_renders_removed_section(self):
+        report = {
+            "anchor": None,
+            "organ_results": {},
+            "consolidation": {
+                "applied": True,
+                "iraes": [],
+                "suspects": [],
+                "removed": [{
+                    "irAE_type": "Miocardite da ICI",
+                    "ctcae_grade": "G2",
+                    "first_onset_date": "2022-11-22",
+                    "probability_immune": "PROBABILE",
+                    "removed_reason": "falso positivo",
+                }],
+            },
+        }
+        markdown = irae_layers.render_irae_markdown(report)
+        self.assertIn("Rimossi manualmente", markdown)
+        self.assertIn("~~[rimosso] **Miocardite da ICI**", markdown)
+        self.assertIn("Motivo: falso positivo", markdown)
+
+    def test_no_removed_section_without_removed(self):
+        report = {
+            "anchor": None,
+            "organ_results": {},
+            "consolidation": {
+                "applied": True,
+                "iraes": [],
+                "suspects": [],
+            },
+        }
+        markdown = irae_layers.render_irae_markdown(report)
+        self.assertNotIn("Rimossi manualmente", markdown)
+
     def test_renders_diagnostic_support_and_suspects(self):
         report = {
             "anchor": None,

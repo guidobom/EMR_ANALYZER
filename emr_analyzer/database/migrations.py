@@ -5,7 +5,7 @@ import re
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -609,6 +609,15 @@ CREATE_TABLES_SQL = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS evidence_embeddings (
+        evidence_id TEXT PRIMARY KEY
+            REFERENCES clinical_evidence(evidence_id) ON DELETE CASCADE,
+        model_name TEXT NOT NULL,
+        vector BLOB NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS evidence_relations (
         relation_id TEXT PRIMARY KEY,
         patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
@@ -1119,6 +1128,7 @@ def drop_all_tables(db: DatabaseEngine) -> None:
         "clinical_aggregation_coverage",
         "evidence_relation_adjudication_cache",
         "evidence_duplicate_members", "evidence_duplicate_groups",
+        "evidence_embeddings",
         "evidence_source_refs", "excluded_evidence",
         "terminology_mappings", "gold_atomic_annotations",
         "clinical_category_registry",

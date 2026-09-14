@@ -33,12 +33,14 @@ class ClinicalQueryService:
         self.registry_repo = registry_repo
 
     def retrieve(
-        self, patient_id: str, question: str, *, limit: int = 500
+        self, patient_id: str, question: str, *, limit: int | None = None
     ) -> list[dict]:
         intents = infer_intents(question)
         broad = is_broad_question(question)
         selected = {}
-        if broad:
+        if limit is not None and limit <= 0:
+            return []
+        if broad or limit is None:
             for event in self.registry_repo.get_events(patient_id):
                 selected[event.event_id] = event
         else:
@@ -100,16 +102,26 @@ class ClinicalQueryService:
 
 def _split_oversized_event(block: str, max_chars: int) -> list[str]:
     """Split a source-rich event without dropping evidence or its event ID."""
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
     if len(block) <= max_chars:
         return [block]
     lines = block.splitlines()
     header = lines[0] if lines else "[evento]"
+    if len(header) + 2 >= max_chars:
+        # An unusually long summary cannot be repeated as a chunk header.
+        # Retain the event identifier and split the summary with the body.
+        identifier = header.split(" ", 1)[0]
+        if len(identifier) + 2 >= max_chars:
+            raise ValueError("max_chars is too small to retain the event ID")
+        lines = [identifier, header[len(identifier):], *lines[1:]]
+        header = identifier
     units = []
     for line in lines[1:]:
         if len(line) <= max_chars - len(header) - 2:
             units.append(line)
             continue
-        width = max(1000, max_chars - len(header) - 2)
+        width = max_chars - len(header) - 2
         units.extend(line[start:start + width] for start in range(0, len(line), width))
     result, current, size = [], [header], len(header)
     for unit in units:
@@ -221,8 +233,9 @@ def answer_has_valid_citations(
     answer: str,
     valid_event_ids: set[str],
     valid_event_document_pairs: set[tuple[str, str]] | None = None,
+    valid_event_document_pages: set[tuple[str, str, str]] | None = None,
 ) -> bool:
-    cited = set(re.findall(r"#(EVT_[A-Fa-f0-9]+)", str(answer or "")))
+    cited = set(re.findall(r"#(EVT_[\w-]+)", str(answer or "")))
     if not cited or not cited.issubset(valid_event_ids):
         return False
     if valid_event_document_pairs is None:
@@ -231,4 +244,16 @@ def answer_has_valid_citations(
         r"\[#(EVT_[A-Fa-f0-9]+)\s*;\s*([^\]:;]+)\s*:p\.",
         str(answer or ""),
     ))
-    return bool(pairs) and pairs.issubset(valid_event_document_pairs)
+    if not pairs or not pairs.issubset(valid_event_document_pairs):
+        return False
+    if {event for event, _ in pairs} != cited:
+        return False
+    if valid_event_document_pages is not None:
+        pages = set(re.findall(
+            r"\[#(EVT_[A-Fa-f0-9]+)\s*;\s*([^\]:;]+)\s*:p\.([^\]\s]+)\s*\]",
+            str(answer or ""),
+        ))
+        return bool(pages) and pages.issubset(valid_event_document_pages) and (
+            {(event, document) for event, document, _ in pages} == pairs
+        )
+    return True

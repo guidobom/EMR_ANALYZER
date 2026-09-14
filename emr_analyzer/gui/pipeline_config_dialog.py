@@ -130,9 +130,6 @@ class PipelineConfigDialog(QDialog):
         self._aggregation_engine.addItem(
             "v3 — grafo di coppie (compatibilità)", "v3"
         )
-        self._aggregation_engine.addItem(
-            "v4 — gruppi clinici compatti (sperimentale)", "v4"
-        )
         self._aggregation_engine.setCurrentIndex(max(
             0,
             self._aggregation_engine.findData(
@@ -140,9 +137,8 @@ class PipelineConfigDialog(QDialog):
             ),
         ))
         self._aggregation_engine.setToolTip(
-            "v4 evita la valutazione LLM di tutte le coppie, conserva ogni "
-            "evidenza eleggibile e usa il modello soltanto sui gruppi "
-            "multimodali plausibili."
+            "Il registro utilizza il grafo v3. Il prototipo v4 non è "
+            "collegato all’orchestratore e non è selezionabile."
         )
         self._consensus = QComboBox()
         for label, value in (

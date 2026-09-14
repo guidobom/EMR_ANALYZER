@@ -56,7 +56,13 @@ class DatabaseEngine:
         return self.connection.executemany(sql, params_list)
 
     def commit(self) -> None:
-        """Commit the current transaction."""
+        """Commit unless an enclosing managed transaction owns the boundary.
+
+        Repository methods may commit when called alone, but must not release
+        an outer transaction (or its savepoints) when composed by a service.
+        """
+        if getattr(self._local, "transaction_depth", 0):
+            return
         self.connection.commit()
 
     def rollback(self) -> None:

@@ -9,8 +9,9 @@ always yields the same corrected report.  The raw report is never mutated —
 
 Correction actions:
 
-* ``remove`` — drop a finding (definitive or suspect); sticky, restoring it
-  means adding it back manually.
+* ``remove`` — move a finding (definitive or suspect) into
+  ``consolidation.removed`` (struck through in the UI); sticky, restoring it
+  means deleting the correction via ``remove_correction``.
 * ``edit`` — merge whitelisted fields and re-partition the finding when the
   edited ``probability_immune`` crosses the definitive/suspect boundary.
 * ``add`` — introduce a manually identified irAE, placed in the definitive or
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -152,6 +154,39 @@ def add_correction(patient_id: str, correction: IraeCorrection) -> list[IraeCorr
     return corrections
 
 
+def remove_correction(
+    patient_id: str,
+    *,
+    finding_id: str = "",
+    irAE_type: str = "",
+    first_onset_date: str = "",
+) -> list[IraeCorrection]:
+    """Delete the persisted ``remove`` corrections targeting a finding and
+    persist the survivors (restore backend).  Matching mirrors the apply
+    fallback: ``finding_id`` first, then ``(irAE_type, first_onset_date)``,
+    then ``irAE_type`` alone.  Returns the remaining corrections."""
+    corrections = load_corrections(patient_id)
+    remaining: list[IraeCorrection] = []
+
+    def _matches(correction: IraeCorrection) -> bool:
+        if finding_id and correction.finding_id == finding_id:
+            return True
+        if irAE_type and correction.irAE_type == irAE_type:
+            if (
+                not first_onset_date
+                or correction.first_onset_date == first_onset_date
+            ):
+                return True
+        return False
+
+    for correction in corrections:
+        if correction.action == "remove" and _matches(correction):
+            continue
+        remaining.append(correction)
+    save_corrections(patient_id, remaining)
+    return remaining
+
+
 def annotate_report(report: dict[str, Any]) -> dict[str, Any]:
     """Return an editable copy of *report* with a stable ``finding_id`` on
     every definitive irAE and suspect (``irAE-1``, ``irAE-2`` ...).
@@ -168,6 +203,12 @@ def annotate_report(report: dict[str, Any]) -> dict[str, Any]:
         corrected["consolidation"] = consolidation
     else:
         consolidation = {}
+    if isinstance(consolidation.get("removed"), list):
+        # Defensive copy: a raw report carrying a removed bucket (e.g. a
+        # persisted corrected report) must never share its nested list.
+        consolidation["removed"] = [
+            dict(item) for item in consolidation["removed"]
+        ]
 
     organ_results = corrected.get("organ_results")
     if isinstance(organ_results, dict):
@@ -315,13 +356,22 @@ def _apply_one(
     target = findings[index]
 
     if correction.action == "remove":
+        removed = dict(target)
+        removed["removed"] = True
+        removed["removed_from"] = kind
+        removed["removed_reason"] = str(correction.reason or "")
         del findings[index]
         _mirror_remove(corrected, target)
+        if not isinstance(consolidation, dict):
+            consolidation = {}
+            corrected["consolidation"] = consolidation
+        consolidation.setdefault("removed", []).append(removed)
         return {
             "action": "remove",
             "irAE_type": correction.irAE_type,
             "kind": kind,
             "finding_id": target.get("finding_id", ""),
+            "moved_to": "removed",
             "ambiguous": ambiguous,
             "applied": True,
         }
@@ -368,6 +418,22 @@ def _apply_one(
     return None
 
 
+def _next_finding_id(corrected: dict[str, Any]) -> str:
+    """Next free positional id across visible AND removed findings, so a
+    manually added irAE never shadows a removed item's id."""
+    consolidation = corrected.get("consolidation") or {}
+    highest = 0
+    for item in (
+        list(corrected.get("iraes") or [])
+        + list(consolidation.get("suspects") or [])
+        + list(consolidation.get("removed") or [])
+    ):
+        match = re.fullmatch(r"irAE-(\d+)", str(item.get("finding_id") or ""))
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return f"irAE-{highest + 1}"
+
+
 def _apply_add(corrected: dict[str, Any], correction: IraeCorrection) -> dict[str, Any]:
     """Introduce a manually identified irAE (definitive or suspect by
     probability); refuses duplicates of an existing finding."""
@@ -402,11 +468,11 @@ def _apply_add(corrected: dict[str, Any], correction: IraeCorrection) -> dict[st
         corrected["consolidation"] = consolidation
     if partition == "iraes":
         iraes = corrected.setdefault("iraes", [])
-        new_item["finding_id"] = f"irAE-{len(iraes) + len(consolidation.get('suspects') or []) + 1}"
+        new_item["finding_id"] = _next_finding_id(corrected)
         iraes.append(new_item)
     else:
         suspects = consolidation.setdefault("suspects", [])
-        new_item["finding_id"] = f"irAE-{len(corrected.get('iraes') or []) + len(suspects) + 1}"
+        new_item["finding_id"] = _next_finding_id(corrected)
         suspects.append(new_item)
     return {
         "action": "add",

@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..models.document import (
-    DocumentRecord, DocumentType, ExtractionStatus, ParsingStatus,
+    DocumentRecord, ExtractionStatus, ParsingStatus,
 )
 from ..utils.document_paths import resolve_document_path
 from .pdf_viewer import PDFViewerDialog
@@ -65,15 +65,14 @@ def classify_pending_documents(docs) -> PendingClassification:
     """Classify documents as pending normalization and/or errored.
 
     Pure function (no Qt) so it can be unit-tested headlessly.  A document is
-    pending when it is non-laboratory and still lacks a normalized
+    pending when it still lacks a normalized
     ``clinical_text``, or when its parsing or extraction ended in ``error``.
-    Laboratory documents are intentionally never LLM-normalized, so they are
-    listed only when they carry an error.
+    Laboratory documents also need a persisted anonymized Markdown, produced
+    deterministically without LLM rewriting.
     """
     result = PendingClassification()
     for doc in docs:
-        is_lab = doc.document_type == DocumentType.LABORATORIO.value
-        needs_norm = (not is_lab) and not _has_clinical_text(doc)
+        needs_norm = not _has_clinical_text(doc)
         has_error = (
             doc.parsing_status == ParsingStatus.ERROR.value
             or doc.extraction_status == ExtractionStatus.ERROR.value

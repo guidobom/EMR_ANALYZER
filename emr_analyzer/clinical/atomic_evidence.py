@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass
 import hashlib
@@ -14,6 +15,10 @@ from typing import Any, Callable, Iterable
 import unicodedata
 import uuid
 
+from .concept_canonicalization import (
+    canonical_concept,
+    canonical_severity,
+)
 from .evidence_relevance import (
     annotate_evidence_disposition,
     classify_nonclinical_passage,
@@ -64,6 +69,19 @@ _ATOMIC_VALIDATION_REPAIR_SYSTEM_PROMPT = (
 
 _ATOMIC_COVERAGE_RECOVERY_SYSTEM_PROMPT = (
     _ATOMIC_COVERAGE_BASE_SYSTEM_PROMPT + "\n\n" + _ATOMIC_TASK
+)
+
+_ATOMIC_SENTENCE_TASK = load_prompt(
+    "atomic_evidence_sentence_it",
+    required_markers=(
+        "source_refs", "medication", "radiology_finding",
+        "vital_sign", "laboratory_test",
+    ),
+    minimum_length=200,
+)
+
+_ATOMIC_SENTENCE_BASE_SYSTEM_PROMPT = load_prompt(
+    "atomic_evidence_sentence_system"
 )
 
 _THERAPY_LIFECYCLE_STATUSES = (
@@ -395,6 +413,54 @@ class AtomicExtractionCancelled(RuntimeError):
     """Raised at a safe document/chunk boundary after a stop request."""
 
 
+def _new_extraction_metrics() -> dict[str, int | float]:
+    """Counters for one extraction session (document or worker thread)."""
+    return {
+        "llm_calls": 0,
+        "output_limit_retries": 0,
+        "validation_retries": 0,
+        "coverage_retries": 0,
+        "uncovered_signal_groups": 0,
+        "invalid_items": 0,
+        "normalized_items": 0,
+        "unresolved_invalid_items": 0,
+        "source_chunks": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "prompt_ms": 0.0,
+        "predicted_ms": 0.0,
+        "prefiltered_nonclinical": 0,
+        "initial_items": 0,
+        "repaired_items": 0,
+        "coverage_items": 0,
+        "items_before_deduplication": 0,
+        "within_document_duplicates": 0,
+        "final_items": 0,
+        "sentence_calls": 0,
+    }
+
+
+_METRIC_ACCUMULATOR_KEYS = (
+    "llm_calls", "output_limit_retries", "validation_retries",
+    "coverage_retries", "uncovered_signal_groups", "invalid_items",
+    "normalized_items", "unresolved_invalid_items",
+    "prompt_tokens", "completion_tokens", "total_tokens",
+    "prompt_ms", "predicted_ms", "initial_items", "repaired_items",
+    "coverage_items",
+)
+
+
+def _accumulate_metrics(
+    total: dict[str, int | float], extra: dict
+) -> None:
+    """Fold worker-thread counters into the document-level totals."""
+    for key in _METRIC_ACCUMULATOR_KEYS:
+        value = extra.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total[key] = total.get(key, 0) + value
+
+
 class AtomicEvidenceExtractor:
     """Extract every observation before any deduplication or synthesis."""
 
@@ -407,9 +473,16 @@ class AtomicEvidenceExtractor:
         system_prompt: str | None = None,
         repair_system_prompt: str | None = None,
         coverage_system_prompt: str | None = None,
+        strategy: str | None = None,
     ):
         self.llm = llm_client
         self.policy = policy or ClinicalPipelinePolicy()
+        effective_strategy = str(
+            strategy or getattr(self.policy, "atomic_strategy", None) or ""
+        ).strip().casefold()
+        if effective_strategy not in {"chunked", "sentence"}:
+            effective_strategy = "chunked"
+        self.strategy = effective_strategy
         effective_task = task_prompt or _ATOMIC_TASK
         self._system_prompt = (
             (system_prompt or _ATOMIC_BASE_SYSTEM_PROMPT)
@@ -428,6 +501,18 @@ class AtomicEvidenceExtractor:
                 or _ATOMIC_COVERAGE_BASE_SYSTEM_PROMPT
             )
             + "\n\n" + effective_task
+        )
+        effective_sentence_task = task_prompt or _ATOMIC_SENTENCE_TASK
+        self._sentence_system_prompt = (
+            (system_prompt or _ATOMIC_SENTENCE_BASE_SYSTEM_PROMPT)
+            + "\n\n" + effective_sentence_task
+        )
+        self._sentence_repair_system_prompt = (
+            (
+                repair_system_prompt
+                or _ATOMIC_REPAIR_BASE_SYSTEM_PROMPT
+            )
+            + "\n\n" + effective_sentence_task
         )
         # One extractor instance is shared by all registry workers.  Keep
         # request counters thread-local so timings/tokens from simultaneous
@@ -487,29 +572,7 @@ class AtomicEvidenceExtractor:
         cancel_check: Callable[[], bool] | None = None,
         chunk_progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[ClinicalEvidence]:
-        self._metrics_local.value = {
-            "llm_calls": 0,
-            "output_limit_retries": 0,
-            "validation_retries": 0,
-            "coverage_retries": 0,
-            "uncovered_signal_groups": 0,
-            "invalid_items": 0,
-            "normalized_items": 0,
-            "unresolved_invalid_items": 0,
-            "source_chunks": 0,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "prompt_ms": 0.0,
-            "predicted_ms": 0.0,
-            "prefiltered_nonclinical": 0,
-            "initial_items": 0,
-            "repaired_items": 0,
-            "coverage_items": 0,
-            "items_before_deduplication": 0,
-            "within_document_duplicates": 0,
-            "final_items": 0,
-        }
+        self._metrics_local.value = _new_extraction_metrics()
         geometry = self._load_geometry(geometry_path)
         text_for_llm, deterministic_nonclinical = _isolate_nonclinical_lines(
             text,
@@ -519,47 +582,60 @@ class AtomicEvidenceExtractor:
             geometry=geometry,
         )
         evidence: list[ClinicalEvidence] = list(deterministic_nonclinical)
-        position = 0
-        chunks = split_text_chunks(text_for_llm, self._text_budget())
-        self._current_metrics()["source_chunks"] = len(chunks)
         self._current_metrics()["prefiltered_nonclinical"] = len(
             deterministic_nonclinical
         )
-        for chunk_number, chunk in enumerate(chunks, start=1):
-            if cancel_check is not None and cancel_check():
-                raise AtomicExtractionCancelled(
-                    "Estrazione interrotta su richiesta dell'utente"
-                )
-            extracted_chunks = self._extract_chunk_adaptive(
-                chunk, document_type=document_type,
+        if self.strategy == "sentence":
+            evidence.extend(self._extract_sentence_evidence(
+                text_for_llm,
+                patient_id=patient_id,
+                document_id=document_id,
+                document_type=document_type,
                 document_date=document_date,
+                geometry=geometry,
+                full_text=text,
                 cancel_check=cancel_check,
-            )
-            if cancel_check is not None and cancel_check():
-                raise AtomicExtractionCancelled(
-                    "Estrazione interrotta su richiesta dell'utente"
-                )
-            for resolved_chunk, payload, sentence_spans, retry_depth in (
-                extracted_chunks
-            ):
-                for item in payload:
-                    parsed = self._to_evidence(
-                        _expand_atomic_item(item),
-                        patient_id=patient_id,
-                        document_id=document_id,
-                        document_date=document_date,
-                        chunk=resolved_chunk,
-                        position=position,
-                        full_text=text,
-                        geometry=geometry,
-                        sentence_spans=sentence_spans,
-                        retry_depth=retry_depth,
+                chunk_progress_callback=chunk_progress_callback,
+            ))
+        else:
+            position = 0
+            chunks = split_text_chunks(text_for_llm, self._text_budget())
+            self._current_metrics()["source_chunks"] = len(chunks)
+            for chunk_number, chunk in enumerate(chunks, start=1):
+                if cancel_check is not None and cancel_check():
+                    raise AtomicExtractionCancelled(
+                        "Estrazione interrotta su richiesta dell'utente"
                     )
-                    position += 1
-                    if parsed is not None:
-                        evidence.append(parsed)
-            if chunk_progress_callback is not None:
-                chunk_progress_callback(chunk_number, len(chunks))
+                extracted_chunks = self._extract_chunk_adaptive(
+                    chunk, document_type=document_type,
+                    document_date=document_date,
+                    cancel_check=cancel_check,
+                )
+                if cancel_check is not None and cancel_check():
+                    raise AtomicExtractionCancelled(
+                        "Estrazione interrotta su richiesta dell'utente"
+                    )
+                for resolved_chunk, payload, sentence_spans, retry_depth in (
+                    extracted_chunks
+                ):
+                    for item in payload:
+                        parsed = self._to_evidence(
+                            _expand_atomic_item(item),
+                            patient_id=patient_id,
+                            document_id=document_id,
+                            document_date=document_date,
+                            chunk=resolved_chunk,
+                            position=position,
+                            full_text=text,
+                            geometry=geometry,
+                            sentence_spans=sentence_spans,
+                            retry_depth=retry_depth,
+                        )
+                        position += 1
+                        if parsed is not None:
+                            evidence.append(parsed)
+                if chunk_progress_callback is not None:
+                    chunk_progress_callback(chunk_number, len(chunks))
         evidence.extend(_explicit_performed_procedure_evidence(
             patient_id=patient_id,
             document_id=document_id,
@@ -807,6 +883,234 @@ class AtomicEvidenceExtractor:
             sentence_spans,
         )
 
+    def _sentence_window_schema(
+        self,
+        context_count: int,
+        *,
+        fact_types: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Bucket schema whose citations are limited to the target sentence."""
+        selected = tuple(
+            fact_type for fact_type in (
+                fact_types or LLM_ATOMIC_FACT_TYPES
+            )
+            if fact_type in LLM_ATOMIC_FACT_TYPES
+        )
+        key = ("sentence", max(0, int(context_count)), selected)
+        with self._schema_cache_lock:
+            cached = self._schema_cache.get(key)
+            if cached is None:
+                target_id = max(0, int(context_count)) + 1
+                schema = build_atomic_evidence_schema(
+                    target_id, fact_types=selected
+                )
+                for bucket in schema["properties"].values():
+                    refs = bucket["items"]["properties"]["source_refs"]
+                    refs["items"] = {
+                        "type": "integer", "enum": [target_id],
+                    }
+                self._schema_cache[key] = schema
+                cached = schema
+            return cached
+
+    def _extract_sentence_call(
+        self,
+        target: SentenceSpan,
+        context: list[SentenceSpan],
+        *,
+        document_type: str,
+        document_date: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, int | float]]:
+        """Generate and repair one sentence window on a worker thread.
+
+        The pool reuses threads, so the thread-local counter dict is reset at
+        the start of every call and returned to the caller, which aggregates
+        it into the document-level totals.
+        """
+        self._metrics_local.value = _new_extraction_metrics()
+        spans = [
+            SentenceSpan(index, span.start, span.end, span.text)
+            for index, span in enumerate([*context, target], start=1)
+        ]
+        prompt = build_atomic_sentence_prompt(
+            target, context,
+            document_type=document_type,
+            document_date=document_date,
+        )
+        base_schema = self._sentence_window_schema(len(context))
+        generator = self.llm.generate_structured
+
+        def generate(
+            system_prompt: str,
+            repair_note: str = "",
+            *,
+            schema: dict[str, Any],
+            output_budget: int | None = None,
+        ):
+            effective_prompt = prompt + repair_note
+            try:
+                if self._supports_generation_limit:
+                    return generator(
+                        effective_prompt, system_prompt, schema,
+                        max_tokens=(
+                            output_budget or self._output_budget(spans)
+                        ),
+                    )
+                return generator(effective_prompt, system_prompt, schema)
+            finally:
+                self._record_last_generation()
+
+        data = generate(self._sentence_system_prompt, schema=base_schema)
+        validation = _validate_wire_response(data, spans)
+        items = list(validation.items)
+        pending = list(validation.issues)
+        metrics = self._current_metrics()
+        metrics["invalid_items"] += len(pending)
+        metrics["normalized_items"] += validation.normalized_items
+        metrics["initial_items"] += len(validation.items)
+        retries = (
+            self.policy.max_specialized_retries
+            if self.policy.adaptive_specialized_retry and pending else 0
+        )
+        for _attempt in range(retries):
+            metrics["validation_retries"] += 1
+            relevant_types = tuple(dict.fromkeys(
+                issue.fact_type for issue in pending
+                if issue.fact_type in LLM_ATOMIC_FACT_TYPES
+            ))
+            repair_schema = self._sentence_window_schema(
+                len(context),
+                fact_types=relevant_types or LLM_ATOMIC_FACT_TYPES,
+            )
+            issue_payload = [issue.for_prompt() for issue in pending[:24]]
+            repaired = generate(
+                self._sentence_repair_system_prompt,
+                repair_note=(
+                    "\n\nCORREZIONE_MIRATA:\n"
+                    + json.dumps(
+                        issue_payload, ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\nRestituisci soltanto i sostituti degli oggetti "
+                    "sopra; non ripetere le evidenze già valide."
+                ),
+                schema=repair_schema,
+                output_budget=min(
+                    self._output_budget(spans),
+                    max(768, 384 + len(pending) * 384),
+                ),
+            )
+            repaired_validation = _validate_wire_response(repaired, spans)
+            items.extend(repaired_validation.items)
+            metrics["repaired_items"] += len(repaired_validation.items)
+            metrics["invalid_items"] += len(repaired_validation.issues)
+            metrics["normalized_items"] += (
+                repaired_validation.normalized_items
+            )
+            pending = list(repaired_validation.issues)
+            if not pending:
+                break
+        metrics["unresolved_invalid_items"] += len(pending)
+        coalesced = _split_multi_state_medication_items(
+            _coalesce_adjacent_wire_items(items), spans
+        )
+        return (
+            _attach_referential_wire_continuations(coalesced, spans),
+            dict(metrics),
+        )
+
+    def _extract_sentence_evidence(
+        self,
+        text_for_llm: str,
+        *,
+        patient_id: str,
+        document_id: str,
+        document_type: str,
+        document_date: str | None,
+        geometry,
+        full_text: str,
+        cancel_check: Callable[[], bool] | None,
+        chunk_progress_callback: Callable[[int, int], None] | None,
+    ) -> list[ClinicalEvidence]:
+        """Sentence-granular extraction: one focused LLM call per sentence.
+
+        Every clinically relevant sentence becomes its own prompt unit with
+        a small preceding context window; the deterministic tail (negation,
+        dates, quote verification, deduplication) is shared with the chunked
+        path.  Duplicates restated across sentences are absorbed by the
+        existing within-document deduplication, exactly as designed.
+        """
+        spans = split_sentence_spans(text_for_llm)
+        metrics = self._current_metrics()
+        windows = build_sentence_windows(
+            spans, self.policy.atomic_sentence_context
+        )
+        pending: list[tuple[int, SentenceSpan, list[SentenceSpan]]] = []
+        for target_index, (target, context) in enumerate(windows):
+            if cancel_check is not None and cancel_check():
+                raise AtomicExtractionCancelled(
+                    "Estrazione interrotta su richiesta dell'utente"
+                )
+            if _sentence_has_clinical_signal(target):
+                pending.append((target_index, target, context))
+        metrics["source_chunks"] = len(pending)
+        if not pending:
+            return []
+        evidence: list[ClinicalEvidence] = []
+        position = 0
+        workers = max(1, min(8, int(
+            getattr(self.policy, "atomic_sentence_workers", 4) or 4
+        )))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    self._extract_sentence_call, target, context,
+                    document_type=document_type,
+                    document_date=document_date,
+                ): (target_index, target, context)
+                for target_index, target, context in pending
+            }
+            completed = 0
+            for future, (target_index, target, context) in futures.items():
+                if cancel_check is not None and cancel_check():
+                    raise AtomicExtractionCancelled(
+                        "Estrazione interrotta su richiesta dell'utente"
+                    )
+                payload, call_metrics = future.result()
+                _accumulate_metrics(metrics, call_metrics)
+                metrics["sentence_calls"] += 1
+                renumbered = [
+                    SentenceSpan(index, span.start, span.end, span.text)
+                    for index, span in enumerate(
+                        [*context, target], start=1
+                    )
+                ]
+                for item in payload:
+                    parsed = self._to_evidence(
+                        _expand_atomic_item(item),
+                        patient_id=patient_id,
+                        document_id=document_id,
+                        document_date=document_date,
+                        chunk=TextChunk(
+                            index=target_index,
+                            text=target.text,
+                            page_start=None,
+                            page_end=None,
+                        ),
+                        position=position,
+                        full_text=full_text,
+                        geometry=geometry,
+                        sentence_spans=renumbered,
+                        retry_depth=0,
+                    )
+                    position += 1
+                    if parsed is not None:
+                        evidence.append(parsed)
+                completed += 1
+                if chunk_progress_callback is not None:
+                    chunk_progress_callback(completed, len(pending))
+        return evidence
+
     def last_extraction_metrics(self) -> dict[str, int | float]:
         """Metrics for the document most recently handled by this thread."""
         return dict(self._current_metrics())
@@ -837,29 +1141,7 @@ class AtomicEvidenceExtractor:
     def _current_metrics(self) -> dict[str, int | float]:
         metrics = getattr(self._metrics_local, "value", None)
         if metrics is None:
-            metrics = {
-                "llm_calls": 0,
-                "output_limit_retries": 0,
-                "validation_retries": 0,
-                "coverage_retries": 0,
-                "uncovered_signal_groups": 0,
-                "invalid_items": 0,
-                "normalized_items": 0,
-                "unresolved_invalid_items": 0,
-                "source_chunks": 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "prompt_ms": 0.0,
-                "predicted_ms": 0.0,
-                "prefiltered_nonclinical": 0,
-                "initial_items": 0,
-                "repaired_items": 0,
-                "coverage_items": 0,
-                "items_before_deduplication": 0,
-                "within_document_duplicates": 0,
-                "final_items": 0,
-            }
+            metrics = _new_extraction_metrics()
             self._metrics_local.value = metrics
         return metrics
 
@@ -945,6 +1227,10 @@ class AtomicEvidenceExtractor:
             category = "laboratory_finding"
             if not _llm_laboratory_claim_is_relevant(
                 entity=entity, quote=matched_quote, item=item,
+            ):
+                return None
+            if _llm_laboratory_value_in_range(
+                item=item, quote=matched_quote
             ):
                 return None
         fact_type, category = _project_planned_action(
@@ -1406,7 +1692,9 @@ class AtomicEvidenceExtractor:
         if path is None or not path.exists():
             return None
         try:
-            from ..pipeline.pdf_extractor import PdfExtractionResult
+            from ..pipeline.pdf_extractor import PdfExtractionResult, PdfPlumberExtractor
+            if path.suffix.lower() == ".pdf":
+                return PdfPlumberExtractor().convert(path)
             return PdfExtractionResult.from_dict(
                 json.loads(path.read_text(encoding="utf-8"))
             )
@@ -1474,6 +1762,62 @@ def infer_document_content_type(text: str) -> str:
     }
     best = max(scores, key=scores.get)
     return best if scores[best] else "non_classificato"
+
+
+def build_sentence_windows(
+    spans: list[SentenceSpan], context_count: int
+) -> list[tuple[SentenceSpan, list[SentenceSpan]]]:
+    """Pair every sentence with its preceding context window.
+
+    A dated section header is always carried for the first sentence that
+    follows it, so anaphoric dates stay resolvable even when the header
+    falls outside the configured window.
+    """
+    context_count = max(0, int(context_count))
+    windows: list[tuple[SentenceSpan, list[SentenceSpan]]] = []
+    for index, target in enumerate(spans):
+        back = context_count
+        if index > 0 and _looks_like_temporal_heading(spans[index - 1].text):
+            back += 1
+        context = list(spans[max(0, index - back):index])
+        windows.append((target, context))
+    return windows
+
+
+def _sentence_has_clinical_signal(target: SentenceSpan) -> bool:
+    """Conservative gate: skip only provably nonclinical sentences."""
+    text = str(target.text or "").strip()
+    if not text:
+        return False
+    return classify_nonclinical_passage(text) is None
+
+
+def build_atomic_sentence_prompt(
+    target: SentenceSpan,
+    context: list[SentenceSpan],
+    *,
+    document_type: str,
+    document_date: str | None,
+) -> str:
+    """Return a sentence-focused prompt; context is readable, not citable."""
+    inferred_type = infer_document_content_type(target.text)
+    header = (
+        f"CONTESTO: tipo_dichiarato={document_type or 'non classificato'}; "
+        f"contenuto_probabile={inferred_type}; "
+        f"data_documento={document_date or 'non disponibile'}; pagine=n.d."
+    )
+    lines = [header]
+    if context:
+        lines.append(
+            "FRASI DI CONTESTO precedenti (solo per risolvere anafore, "
+            "negazioni e date; non estrarre fatti da qui):"
+        )
+        for index, span in enumerate(context, start=1):
+            lines.append(f"[S{index}] {span.text}")
+    target_id = len(context) + 1
+    lines.append(f"FRASE OBIETTIVO [S{target_id}] {target.text}")
+    lines.append(f"In refs usa solo l'ID {target_id} della frase obiettivo.")
+    return "\n\n".join(lines)
 
 
 def _ground_direct_negation(concept: str, quote: str) -> tuple[str, bool]:
@@ -3242,6 +3586,8 @@ def deduplicate_atomic_evidence(
     grouped: dict[tuple, list[ClinicalEvidence]] = {}
     for item in evidence:
         grouped.setdefault(_atomic_identity_key(item), []).append(item)
+    _absorb_severity_wildcard_groups(grouped)
+    _absorb_undated_wildcard_groups(grouped)
 
     result: list[ClinicalEvidence] = []
     for items in grouped.values():
@@ -3301,7 +3647,7 @@ def _atomic_identity_key(item: ClinicalEvidence) -> tuple:
     return (
         item.patient_id,
         _identity_text(item.category),
-        _identity_text(item.normalized_entity),
+        canonical_concept(item.category, item.normalized_entity),
         date_key,
         date_end_key,
         _identity_text(item.assertion),
@@ -3310,7 +3656,7 @@ def _atomic_identity_key(item: ClinicalEvidence) -> tuple:
         _identity_text(item.unit),
         _identity_text(item.anatomical_site),
         _identity_text(item.laterality),
-        _identity_text(item.severity),
+        canonical_severity(item.severity),
         _identity_text(item.clinical_status),
         _identity_text(therapy.get("lifecycle_status")),
         _identity_text(therapy.get("dose")),
@@ -3321,6 +3667,59 @@ def _atomic_identity_key(item: ClinicalEvidence) -> tuple:
         _identity_text(oncology.get("cycle")),
         _identity_text(oncology.get("modification")),
     )
+
+
+def _absorb_severity_wildcard_groups(
+    grouped: dict[tuple, list[ClinicalEvidence]],
+) -> None:
+    """Merge filler-severity restatements into the informative group.
+
+    The key index 11 is the canonical severity.  A restatement with an
+    empty severity (missing or filler like "none") adds no information: it
+    is absorbed by the single non-empty severity group sharing the rest of
+    the identity, so the registry keeps the informative atom and the
+    provenance of every occurrence.  Ambiguous cases (several distinct
+    non-empty severities) stay split.
+    """
+    by_key_without_severity: dict[tuple, list[tuple]] = {}
+    for key in grouped:
+        by_key_without_severity.setdefault(
+            key[:11] + key[12:], []
+        ).append(key)
+    for keys in by_key_without_severity.values():
+        if len(keys) < 2:
+            continue
+        informative = [key for key in keys if key[11]]
+        empty = [key for key in keys if not key[11]]
+        if len(informative) == 1 and len(empty) == 1:
+            grouped[informative[0]].extend(grouped[empty[0]])
+            del grouped[empty[0]]
+
+
+def _absorb_undated_wildcard_groups(
+    grouped: dict[tuple, list[ClinicalEvidence]],
+) -> None:
+    """Absorb restatements that lost their observation date.
+
+    A state fact restated across visits (``nivolumab ongoing``, a planned
+    biopsy, a diagnosis) is one atom anchored to the documented date; the
+    copies whose model-produced ``observation_date`` is empty add no new
+    clinical information.  The key index 3 is the observation date.  Only
+    groups with a single distinct dated anchor are merged, and
+    measurements (``numeric_value``) never participate: an undated
+    measurement can never be attributed to another value.
+    """
+    by_key_without_date: dict[tuple, list[tuple]] = {}
+    for key, items in grouped.items():
+        if any(item.numeric_value is not None for item in items):
+            continue
+        by_key_without_date.setdefault(key[:3] + key[4:], []).append(key)
+    for keys in by_key_without_date.values():
+        dated = [key for key in keys if key[3]]
+        undated = [key for key in keys if not key[3]]
+        if len(dated) == 1 and len(undated) == 1:
+            grouped[dated[0]].extend(grouped[undated[0]])
+            del grouped[undated[0]]
 
 
 def _identity_text(value: object) -> str:
@@ -3361,9 +3760,13 @@ def _canonical_source_key(item: ClinicalEvidence) -> tuple:
 def _atomic_quality_key(item: ClinicalEvidence) -> tuple:
     populated = sum(value not in (None, "", [], {}) for value in (
         item.observed_date, item.observed_date_end, item.clinical_status,
-        item.anatomical_site, item.laterality, item.severity, item.value_text,
+        item.anatomical_site, item.laterality, item.value_text,
         item.numeric_value, item.unit, item.data,
     ))
+    # A filler severity ("none", "not specified") carries no information:
+    # it must not make a restatement richer than an informative one.
+    if canonical_severity(item.severity):
+        populated += 1
     certainty_rank = {
         "confirmed": 5, "patient_reported": 4, "suspected": 3,
         "inferred": 2, "excluded": 1, "unknown": 0,
@@ -3392,6 +3795,8 @@ def _enrich_canonical_atom(
         canonical.significance = richest.significance
         if canonical.status == "needs_review" and richest.status != "needs_review":
             canonical.status = richest.status
+    if not canonical_severity(canonical.severity) and canonical_severity(richest.severity):
+        canonical.severity = richest.severity
     canonical.data = _merge_missing_evidence_data(
         copy.deepcopy(canonical.data), richest.data
     )
@@ -3507,6 +3912,63 @@ def _llm_laboratory_claim_is_relevant(
         return True
     # Explicit visual flags are common in normalized laboratory tables.
     return bool(re.search(r"(?:^|\s)(?:\*{1,3}|[HL])(?:\s|$)", quote))
+
+
+def _numeric_bound(value: object) -> float | None:
+    """Parse a wire numeric bound, tolerating Italian decimal commas."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return _safe_float(text.replace(",", "."))
+
+
+def _llm_laboratory_value_in_range(
+    *, item: dict[str, Any], quote: str
+) -> bool:
+    """Return True only when the claim is provably a normal measurement.
+
+    Conservative by design: any abnormal signal (explicit flag, direction,
+    operator-bound result, narrative wording, unreadable range or unit
+    mismatch) returns False, so a potentially pathological value is never
+    dropped.  Structured rows remain the authoritative numeric path.
+    """
+    payload = item.get("typed_payload")
+    if not isinstance(payload, dict):
+        payload = item.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    if any(str(payload.get(key) or "").strip() for key in (
+        "flag", "abnormal_direction",
+    )):
+        return False
+    if str(payload.get("operator") or "").strip():
+        return False
+    if _NARRATIVE_LAB_ABNORMALITY_RE.search(str(quote or "")):
+        return False
+    numeric = _numeric_bound(item.get("numeric_value"))
+    if numeric is None:
+        return False
+    low = _numeric_bound(payload.get("reference_low"))
+    high = _numeric_bound(payload.get("reference_high"))
+    if low is None and high is None:
+        return False
+    unit = str(item.get("unit") or "").strip()
+    if unit:
+        reference_text = str(payload.get("reference_text") or "")
+        unit_tokens = re.findall(
+            r"(?i)\d[\d.,]*\s*([a-zµ%]+)", reference_text
+        )
+        if unit_tokens and not any(
+            token.casefold() == unit.casefold() for token in unit_tokens
+        ):
+            return False
+    tolerance = 1e-9
+    if low is not None and high is not None:
+        return low - tolerance <= numeric <= high + tolerance
+    if low is not None:
+        return numeric >= low - tolerance
+    return numeric <= high + tolerance
 
 
 def _measure_from_value_text(

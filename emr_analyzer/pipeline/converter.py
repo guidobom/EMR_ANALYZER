@@ -5,6 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def docling_source_markdown(document, *, page_no=None):
+    """Retain visible source layers until clinical filtering has assessed them.
+
+    A page header may contain an exam date. BODY alone is not a clinical-content
+    classifier and must not silently discard such information at parser level.
+    """
+    from docling_core.types.doc import ContentLayer
+    return document.export_to_markdown(
+        page_no=page_no,
+        included_content_layers={ContentLayer.BODY, ContentLayer.FURNITURE, ContentLayer.NOTES},
+    )
+
+
 class DoclingConverter:
     """Small lazy wrapper around Docling's standard DocumentConverter."""
 
@@ -51,16 +64,13 @@ class DoclingConverter:
     def export_markdown(self, result) -> str:
         """Export conversion result to markdown."""
         if hasattr(result, 'document') and result.document:
-            return result.document.export_to_markdown()
+            return docling_source_markdown(result.document)
         return ""
 
     def export_text(self, result) -> str:
         """Export conversion result to plain text."""
         if hasattr(result, 'document') and result.document:
-            try:
-                return result.document.export_to_text()
-            except AttributeError:
-                return result.document.export_to_markdown()
+            return docling_source_markdown(result.document)
         return ""
 
     def export_dict(self, result) -> dict:

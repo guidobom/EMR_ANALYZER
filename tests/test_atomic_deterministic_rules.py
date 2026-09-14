@@ -171,6 +171,130 @@ def test_date_review_marks_conflicting_date():
     assert "discordanza" in data["date_review"]
 
 
+def _lab_item(quote, *, value, low=None, high=None, unit=None, flag=None,
+              direction=None, operator=None, reference_text=None):
+    return {
+        "normalized_entity": "creatinina",
+        "source_refs": [1],
+        "assertion": "present",
+        "certainty": "confirmed",
+        "polarity": "present",
+        "category": "laboratory_finding",
+        "fact_type": "laboratory_test",
+        "numeric_value": value,
+        "unit": unit,
+        "typed_payload": {
+            "reference_low": low,
+            "reference_high": high,
+            "reference_text": reference_text,
+            "flag": flag,
+            "abnormal_direction": direction,
+            "operator": operator,
+        },
+    }
+
+
+def test_narrative_lab_value_in_range_without_flags_is_dropped():
+    text = "Creatinina 1.1 mg/dL (0.6 - 1.2)."
+    evidence = _to_evidence(
+        _extractor(),
+        _lab_item(
+            text, value=1.1, low=0.6, high=1.2, unit="mg/dL",
+            reference_text="0.6 - 1.2",
+        ),
+        text,
+    )
+    assert evidence is None
+
+
+def test_narrative_lab_value_out_of_range_is_kept():
+    text = "Creatinina 1.9 mg/dL (0.6 - 1.2)."
+    evidence = _to_evidence(
+        _extractor(),
+        _lab_item(
+            text, value=1.9, low=0.6, high=1.2, unit="mg/dL",
+            reference_text="0.6 - 1.2",
+        ),
+        text,
+    )
+    assert evidence is not None
+    assert evidence.numeric_value == 1.9
+
+
+def test_narrative_lab_value_in_range_with_flag_is_kept():
+    text = "Creatinina 1.1 mg/dL (0.6 - 1.2) H."
+    evidence = _to_evidence(
+        _extractor(),
+        _lab_item(
+            text, value=1.1, low=0.6, high=1.2, unit="mg/dL",
+            reference_text="0.6 - 1.2", flag="H",
+        ),
+        text,
+    )
+    assert evidence is not None
+
+
+def test_narrative_lab_value_with_unit_mismatch_is_kept():
+    text = "Creatinina 1.1 mg/dL (0.6 - 1.2 g/L)."
+    evidence = _to_evidence(
+        _extractor(),
+        _lab_item(
+            text, value=1.1, low=0.6, high=1.2, unit="mg/dL",
+            reference_text="0.6 - 1.2 g/L",
+        ),
+        text,
+    )
+    assert evidence is not None
+
+
+def test_narrative_lab_one_sided_range_drops_normal_value():
+    text = "TSH 0.4 mUI/L (< 0.5)."
+    evidence = _to_evidence(
+        _extractor(),
+        _lab_item(
+            text, value=0.4, high=0.5, unit="mUI/L",
+            reference_text="< 0.5",
+        ),
+        text,
+    )
+    assert evidence is None
+
+
+def test_narrative_lab_operator_bound_result_is_never_dropped():
+    text = "TSH < 0.5 mUI/L."
+    evidence = _to_evidence(
+        _extractor(),
+        _lab_item(
+            text, value=0.5, high=0.5, unit="mUI/L", operator="<",
+        ),
+        text,
+    )
+    assert evidence is not None
+
+
+def test_narrative_lab_abnormality_wording_overrides_range():
+    text = "Creatinina aumentata 1.1 mg/dL (0.6 - 1.2)."
+    evidence = _to_evidence(
+        _extractor(),
+        _lab_item(
+            text, value=1.1, low=0.6, high=1.2, unit="mg/dL",
+            reference_text="0.6 - 1.2",
+        ),
+        text,
+    )
+    assert evidence is not None
+
+
+def test_narrative_lab_unreadable_range_is_kept():
+    text = "Creatinina 1.1 mg/dL."
+    evidence = _to_evidence(
+        _extractor(),
+        _lab_item(text, value=1.1, unit="mg/dL", low="n.d.", high="n.d."),
+        text,
+    )
+    assert evidence is not None
+
+
 def test_date_review_silent_when_matching_or_ambiguous():
     data = {}
     _flag_date_review(

@@ -1,0 +1,900 @@
+{
+  "scope": "Python application sources; static scan, not proof of runtime coverage",
+  "file_count": 166,
+  "line_count": 66302,
+  "inventory": [
+    {
+      "path": "emr_analyzer/__init__.py",
+      "lines": 39,
+      "functions": 1
+    },
+    {
+      "path": "emr_analyzer/app.py",
+      "lines": 371,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/clinical/__init__.py",
+      "lines": 1,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/clinical/aggregate_v4.py",
+      "lines": 267,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/clinical/atomic_evidence.py",
+      "lines": 4438,
+      "functions": 104
+    },
+    {
+      "path": "emr_analyzer/clinical/block_reuse.py",
+      "lines": 309,
+      "functions": 8
+    },
+    {
+      "path": "emr_analyzer/clinical/clinical_history_builder.py",
+      "lines": 1318,
+      "functions": 31
+    },
+    {
+      "path": "emr_analyzer/clinical/concept_canonicalization.py",
+      "lines": 186,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/clinical/consolidation.py",
+      "lines": 1223,
+      "functions": 40
+    },
+    {
+      "path": "emr_analyzer/clinical/correlation.py",
+      "lines": 237,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/clinical/document_deletion.py",
+      "lines": 186,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/clinical/document_reattribution.py",
+      "lines": 325,
+      "functions": 5
+    },
+    {
+      "path": "emr_analyzer/clinical/dossier_query.py",
+      "lines": 237,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/clinical/embedding_candidates.py",
+      "lines": 202,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/clinical/episode_assembler.py",
+      "lines": 225,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/clinical/episode_synthesis.py",
+      "lines": 743,
+      "functions": 15
+    },
+    {
+      "path": "emr_analyzer/clinical/event_dedup.py",
+      "lines": 727,
+      "functions": 26
+    },
+    {
+      "path": "emr_analyzer/clinical/evidence_deletion.py",
+      "lines": 196,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/clinical/evidence_graph.py",
+      "lines": 1080,
+      "functions": 33
+    },
+    {
+      "path": "emr_analyzer/clinical/evidence_relevance.py",
+      "lines": 252,
+      "functions": 10
+    },
+    {
+      "path": "emr_analyzer/clinical/hypothesis_discovery.py",
+      "lines": 233,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/clinical/irae_analysis.py",
+      "lines": 119,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/clinical/irae_corrections.py",
+      "lines": 510,
+      "functions": 21
+    },
+    {
+      "path": "emr_analyzer/clinical/irae_evidence.py",
+      "lines": 77,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/clinical/irae_export.py",
+      "lines": 130,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/clinical/irae_layers.py",
+      "lines": 1058,
+      "functions": 22
+    },
+    {
+      "path": "emr_analyzer/clinical/irae_prototype.py",
+      "lines": 568,
+      "functions": 11
+    },
+    {
+      "path": "emr_analyzer/clinical/irae_reconsolidate.py",
+      "lines": 116,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/clinical/irae_reports.py",
+      "lines": 71,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/clinical/lab_evidence.py",
+      "lines": 428,
+      "functions": 16
+    },
+    {
+      "path": "emr_analyzer/clinical/patient_deletion.py",
+      "lines": 269,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/clinical/patient_import.py",
+      "lines": 280,
+      "functions": 5
+    },
+    {
+      "path": "emr_analyzer/clinical/projections.py",
+      "lines": 573,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/clinical/query_context.py",
+      "lines": 75,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/clinical/query_service.py",
+      "lines": 259,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/clinical/registry_builder.py",
+      "lines": 2551,
+      "functions": 48
+    },
+    {
+      "path": "emr_analyzer/clinical/temporal.py",
+      "lines": 278,
+      "functions": 8
+    },
+    {
+      "path": "emr_analyzer/clinical/terminology.py",
+      "lines": 168,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/clinical/timeline_serializer.py",
+      "lines": 216,
+      "functions": 8
+    },
+    {
+      "path": "emr_analyzer/clinical/workspace_merge.py",
+      "lines": 596,
+      "functions": 21
+    },
+    {
+      "path": "emr_analyzer/config.py",
+      "lines": 441,
+      "functions": 1
+    },
+    {
+      "path": "emr_analyzer/database/__init__.py",
+      "lines": 17,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/database/audit_repo.py",
+      "lines": 160,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/database/chat_repo.py",
+      "lines": 75,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/database/clinical_state_repo.py",
+      "lines": 57,
+      "functions": 5
+    },
+    {
+      "path": "emr_analyzer/database/document_repo.py",
+      "lines": 158,
+      "functions": 16
+    },
+    {
+      "path": "emr_analyzer/database/engine.py",
+      "lines": 108,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/database/evidence_repo.py",
+      "lines": 257,
+      "functions": 14
+    },
+    {
+      "path": "emr_analyzer/database/gold_set_repo.py",
+      "lines": 1014,
+      "functions": 39
+    },
+    {
+      "path": "emr_analyzer/database/lab_repo.py",
+      "lines": 131,
+      "functions": 11
+    },
+    {
+      "path": "emr_analyzer/database/migrations.py",
+      "lines": 1150,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/database/overlay_repo.py",
+      "lines": 88,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/database/patient_identity_repo.py",
+      "lines": 313,
+      "functions": 13
+    },
+    {
+      "path": "emr_analyzer/database/patient_repo.py",
+      "lines": 111,
+      "functions": 8
+    },
+    {
+      "path": "emr_analyzer/database/pipeline_repo.py",
+      "lines": 876,
+      "functions": 34
+    },
+    {
+      "path": "emr_analyzer/database/processing_repo.py",
+      "lines": 211,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/database/registry_repo.py",
+      "lines": 884,
+      "functions": 22
+    },
+    {
+      "path": "emr_analyzer/database/review_repo.py",
+      "lines": 110,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/database/timeline_repo.py",
+      "lines": 202,
+      "functions": 13
+    },
+    {
+      "path": "emr_analyzer/evaluation/__init__.py",
+      "lines": 6,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/evaluation/__main__.py",
+      "lines": 25,
+      "functions": 1
+    },
+    {
+      "path": "emr_analyzer/evaluation/metrics.py",
+      "lines": 168,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/evaluation/runner.py",
+      "lines": 61,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/export/__init__.py",
+      "lines": 1,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/export/golden_set.py",
+      "lines": 125,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/export/registry_export.py",
+      "lines": 357,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/extraction/__init__.py",
+      "lines": 14,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/extraction/clinical_text_isolator.py",
+      "lines": 895,
+      "functions": 29
+    },
+    {
+      "path": "emr_analyzer/extraction/golden_fewshot.py",
+      "lines": 111,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/extraction/lab_parser.py",
+      "lines": 1071,
+      "functions": 17
+    },
+    {
+      "path": "emr_analyzer/extraction/llm_client.py",
+      "lines": 1248,
+      "functions": 30
+    },
+    {
+      "path": "emr_analyzer/extraction/normalizer.py",
+      "lines": 235,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/extraction/patterns.py",
+      "lines": 115,
+      "functions": 1
+    },
+    {
+      "path": "emr_analyzer/extraction/specimen.py",
+      "lines": 92,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/gui/__init__.py",
+      "lines": 6,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/gui/application_shutdown.py",
+      "lines": 129,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/gui/atomic_gold_widget.py",
+      "lines": 356,
+      "functions": 15
+    },
+    {
+      "path": "emr_analyzer/gui/batch_import_dialog.py",
+      "lines": 363,
+      "functions": 13
+    },
+    {
+      "path": "emr_analyzer/gui/clinical_history_tab.py",
+      "lines": 2416,
+      "functions": 75
+    },
+    {
+      "path": "emr_analyzer/gui/context_panel.py",
+      "lines": 359,
+      "functions": 10
+    },
+    {
+      "path": "emr_analyzer/gui/documents_tab.py",
+      "lines": 2006,
+      "functions": 52
+    },
+    {
+      "path": "emr_analyzer/gui/dossier_query_dialog.py",
+      "lines": 203,
+      "functions": 13
+    },
+    {
+      "path": "emr_analyzer/gui/event_quick_view.py",
+      "lines": 189,
+      "functions": 5
+    },
+    {
+      "path": "emr_analyzer/gui/event_structure_dialog.py",
+      "lines": 73,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/gui/excluded_evidence_dialog.py",
+      "lines": 137,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/gui/export_dialog.py",
+      "lines": 129,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/gui/gold_set_tab.py",
+      "lines": 1092,
+      "functions": 39
+    },
+    {
+      "path": "emr_analyzer/gui/hypothesis_dialog.py",
+      "lines": 177,
+      "functions": 10
+    },
+    {
+      "path": "emr_analyzer/gui/import_dialog.py",
+      "lines": 469,
+      "functions": 14
+    },
+    {
+      "path": "emr_analyzer/gui/import_patient_dialog.py",
+      "lines": 202,
+      "functions": 11
+    },
+    {
+      "path": "emr_analyzer/gui/irae_evidence_inspector.py",
+      "lines": 509,
+      "functions": 22
+    },
+    {
+      "path": "emr_analyzer/gui/irae_patient_tab.py",
+      "lines": 161,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/gui/irae_queue_dialog.py",
+      "lines": 164,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/gui/irae_queue_result_dialog.py",
+      "lines": 222,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/gui/irae_result_dialog.py",
+      "lines": 253,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/gui/laboratory_tab.py",
+      "lines": 274,
+      "functions": 11
+    },
+    {
+      "path": "emr_analyzer/gui/llm_config_dialog.py",
+      "lines": 2407,
+      "functions": 64
+    },
+    {
+      "path": "emr_analyzer/gui/main_window.py",
+      "lines": 934,
+      "functions": 33
+    },
+    {
+      "path": "emr_analyzer/gui/merge_workspace_dialog.py",
+      "lines": 321,
+      "functions": 14
+    },
+    {
+      "path": "emr_analyzer/gui/model_manager_dialog.py",
+      "lines": 761,
+      "functions": 26
+    },
+    {
+      "path": "emr_analyzer/gui/normalization_dialog.py",
+      "lines": 308,
+      "functions": 15
+    },
+    {
+      "path": "emr_analyzer/gui/patient_panel.py",
+      "lines": 269,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/gui/pdf_viewer.py",
+      "lines": 344,
+      "functions": 21
+    },
+    {
+      "path": "emr_analyzer/gui/pipeline_config_dialog.py",
+      "lines": 306,
+      "functions": 10
+    },
+    {
+      "path": "emr_analyzer/gui/progress_dialog.py",
+      "lines": 91,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/gui/project_dialog.py",
+      "lines": 209,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/gui/prompt_manager_dialog.py",
+      "lines": 896,
+      "functions": 30
+    },
+    {
+      "path": "emr_analyzer/gui/qt_utils.py",
+      "lines": 22,
+      "functions": 1
+    },
+    {
+      "path": "emr_analyzer/gui/quick_look.py",
+      "lines": 304,
+      "functions": 16
+    },
+    {
+      "path": "emr_analyzer/gui/registry_queue_dialog.py",
+      "lines": 271,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/gui/registry_queue_result_dialog.py",
+      "lines": 73,
+      "functions": 1
+    },
+    {
+      "path": "emr_analyzer/gui/styles.py",
+      "lines": 288,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/gui/validation_tab.py",
+      "lines": 599,
+      "functions": 18
+    },
+    {
+      "path": "emr_analyzer/gui/workers.py",
+      "lines": 884,
+      "functions": 35
+    },
+    {
+      "path": "emr_analyzer/gui/workspace_tabs.py",
+      "lines": 952,
+      "functions": 31
+    },
+    {
+      "path": "emr_analyzer/llm_backend/__init__.py",
+      "lines": 81,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/llm_backend/backend.py",
+      "lines": 336,
+      "functions": 22
+    },
+    {
+      "path": "emr_analyzer/llm_backend/diagnostics.py",
+      "lines": 589,
+      "functions": 11
+    },
+    {
+      "path": "emr_analyzer/llm_backend/model_catalog.py",
+      "lines": 619,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/llm_backend/model_download_helper.py",
+      "lines": 77,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/llm_backend/model_installer.py",
+      "lines": 960,
+      "functions": 32
+    },
+    {
+      "path": "emr_analyzer/llm_backend/model_store.py",
+      "lines": 220,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/llm_backend/server_manager.py",
+      "lines": 472,
+      "functions": 23
+    },
+    {
+      "path": "emr_analyzer/llm_backend/server_runtime.py",
+      "lines": 434,
+      "functions": 17
+    },
+    {
+      "path": "emr_analyzer/llm_backend/vllm_backend.py",
+      "lines": 431,
+      "functions": 25
+    },
+    {
+      "path": "emr_analyzer/llm_backend/vllm_server_manager.py",
+      "lines": 319,
+      "functions": 17
+    },
+    {
+      "path": "emr_analyzer/models/__init__.py",
+      "lines": 78,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/models/chat_message.py",
+      "lines": 29,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/models/clinical_evidence.py",
+      "lines": 116,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/models/clinical_pipeline.py",
+      "lines": 187,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/models/clinical_registry.py",
+      "lines": 354,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/models/clinical_state.py",
+      "lines": 209,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/models/clinical_timeline.py",
+      "lines": 145,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/models/document.py",
+      "lines": 106,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/models/gold_set.py",
+      "lines": 126,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/models/lab_result.py",
+      "lines": 154,
+      "functions": 10
+    },
+    {
+      "path": "emr_analyzer/models/patient_identity.py",
+      "lines": 114,
+      "functions": 6
+    },
+    {
+      "path": "emr_analyzer/models/validation.py",
+      "lines": 64,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/pipeline/__init__.py",
+      "lines": 0,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/pipeline/classifier.py",
+      "lines": 686,
+      "functions": 10
+    },
+    {
+      "path": "emr_analyzer/pipeline/cleaner.py",
+      "lines": 632,
+      "functions": 12
+    },
+    {
+      "path": "emr_analyzer/pipeline/converter.py",
+      "lines": 90,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/pipeline/deterministic_attribution.py",
+      "lines": 132,
+      "functions": 3
+    },
+    {
+      "path": "emr_analyzer/pipeline/header_metadata.py",
+      "lines": 238,
+      "functions": 11
+    },
+    {
+      "path": "emr_analyzer/pipeline/import_staging.py",
+      "lines": 128,
+      "functions": 4
+    },
+    {
+      "path": "emr_analyzer/pipeline/patient_identity.py",
+      "lines": 915,
+      "functions": 33
+    },
+    {
+      "path": "emr_analyzer/pipeline/patient_routing.py",
+      "lines": 630,
+      "functions": 24
+    },
+    {
+      "path": "emr_analyzer/pipeline/pdf_extractor.py",
+      "lines": 780,
+      "functions": 40
+    },
+    {
+      "path": "emr_analyzer/pipeline/sensitive_data.py",
+      "lines": 346,
+      "functions": 11
+    },
+    {
+      "path": "emr_analyzer/prompt_catalog.py",
+      "lines": 325,
+      "functions": 15
+    },
+    {
+      "path": "emr_analyzer/security/__init__.py",
+      "lines": 15,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/security/offline.py",
+      "lines": 149,
+      "functions": 11
+    },
+    {
+      "path": "emr_analyzer/security/privacy.py",
+      "lines": 78,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/settings.py",
+      "lines": 542,
+      "functions": 22
+    },
+    {
+      "path": "emr_analyzer/tools/__init__.py",
+      "lines": 1,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/tools/duplicate_audit.py",
+      "lines": 401,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/tools/reclassify_documents.py",
+      "lines": 195,
+      "functions": 7
+    },
+    {
+      "path": "emr_analyzer/utils/__init__.py",
+      "lines": 35,
+      "functions": 0
+    },
+    {
+      "path": "emr_analyzer/utils/date_utils.py",
+      "lines": 81,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/utils/document_paths.py",
+      "lines": 62,
+      "functions": 2
+    },
+    {
+      "path": "emr_analyzer/utils/file_utils.py",
+      "lines": 115,
+      "functions": 8
+    },
+    {
+      "path": "emr_analyzer/utils/hardware.py",
+      "lines": 608,
+      "functions": 22
+    },
+    {
+      "path": "emr_analyzer/utils/markdown_tables.py",
+      "lines": 115,
+      "functions": 5
+    },
+    {
+      "path": "emr_analyzer/utils/nvidia.py",
+      "lines": 206,
+      "functions": 9
+    },
+    {
+      "path": "emr_analyzer/utils/slot_benchmark.py",
+      "lines": 304,
+      "functions": 5
+    },
+    {
+      "path": "emr_analyzer/utils/text_utils.py",
+      "lines": 121,
+      "functions": 5
+    }
+  ],
+  "exact_body_duplicate_candidates": [
+    [
+      {
+        "path": "emr_analyzer/clinical/concept_canonicalization.py",
+        "line": 142,
+        "name": "_fold"
+      },
+      {
+        "path": "emr_analyzer/tools/duplicate_audit.py",
+        "line": 55,
+        "name": "_norm"
+      }
+    ],
+    [
+      {
+        "path": "emr_analyzer/gui/irae_queue_dialog.py",
+        "line": 127,
+        "name": "_on_item_changed"
+      },
+      {
+        "path": "emr_analyzer/gui/registry_queue_dialog.py",
+        "line": 186,
+        "name": "_on_item_changed"
+      }
+    ],
+    [
+      {
+        "path": "emr_analyzer/gui/normalization_dialog.py",
+        "line": 241,
+        "name": "_open_file"
+      },
+      {
+        "path": "emr_analyzer/gui/validation_tab.py",
+        "line": 507,
+        "name": "_open_file"
+      }
+    ],
+    [
+      {
+        "path": "emr_analyzer/gui/normalization_dialog.py",
+        "line": 254,
+        "name": "_quick_look_path"
+      },
+      {
+        "path": "emr_analyzer/gui/validation_tab.py",
+        "line": 520,
+        "name": "_quick_look_path"
+      }
+    ],
+    [
+      {
+        "path": "emr_analyzer/llm_backend/backend.py",
+        "line": 181,
+        "name": "stop_other_runtimes"
+      },
+      {
+        "path": "emr_analyzer/llm_backend/vllm_backend.py",
+        "line": 278,
+        "name": "stop_other_runtimes"
+      }
+    ]
+  ],
+  "unreachable_after_return_or_raise": []
+}

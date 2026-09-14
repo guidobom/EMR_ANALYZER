@@ -164,6 +164,25 @@ I dati runtime vengono salvati fuori dal repository in:
 ~/.emr_analyzer/
 ```
 
+## Domande generiche su pazienti e coorti
+
+Da **Strumenti → Interroga referti: paziente o coorte...** puoi selezionare
+uno o più pazienti e applicare lo stesso prompt ai Markdown clinici attivi (`DOC_….md`),
+anche senza aver costruito il registro clinico. Il modello di analisi locale
+legge i referti per blocchi; le citazioni testuali restituite vengono verificate
+contro il testo sorgente. Documenti mancanti, pagine non verificabili ed errori
+sono indicati nella copertura del report.
+
+Report individuali JSON/Markdown e report di coorte vengono salvati in
+`<workspace>/query_reports/<timestamp_id>/`. La copertura di elaborazione non
+misura la sensibilità clinica e le sintesi richiedono revisione. I file `*_raw.md`, `*_source.txt` e `*_cleaned_source.md` non vengono usati
+come ripiego. Se manca il Markdown attivo, completare la preparazione del referto.
+Le citazioni sono verificate sul Markdown attivo; ciò non certifica la sua
+completezza rispetto al PDF né la sua anonimizzazione.
+
+La [revisione del codice e della pipeline](docs/CODE_AUDIT_2026-09-09.md)
+descrive correzioni, limiti, duplicazioni e priorità successive.
+
 ## Test
 
 ```bash
@@ -191,7 +210,6 @@ emr_analyzer/
 ├── gui/         # interfaccia desktop PyQt5
 ├── models/      # modelli del dominio
 ├── pipeline/    # parsing PDF, routing e pseudonimizzazione
-├── rag/         # recupero delle evidenze per le query
 ├── security/    # vincoli offline
 └── utils/
 ```
@@ -240,3 +258,76 @@ bonifica dei metadati legacy è in
 Il registro viene costruito a valle dell'estrazione: i testi normalizzati e le
 righe di laboratorio preesistenti non vengono modificati. Le decisioni manuali
 sono overlay tracciati e sopravvivono alle ricostruzioni automatiche.
+
+I nuovi Markdown normalizzati riportano una testata deterministica con la data
+del referto (`document_date`), distinta dalle date degli eventi. Date assenti o
+non valide sono indicate come non disponibili. L’interrogazione riceve questo
+metadato dal database per ogni frammento, anche per i Markdown precedenti.
+Per aggiornare i file esistenti: `python tools/add_report_dates.py /percorso/progetto`
+mostra il numero di file; aggiungere `--apply` per applicare la modifica con backup
+in `metadata_backups/`. Sono inclusi solo i documenti con metadati di anonimizzazione.
+
+
+## Estrazione essenziale: PDF originale e Markdown clinico
+
+L’estrazione legge ogni originale una volta per elaborazione e mantiene testo,
+tabelle e geometria in memoria. Salva esclusivamente `extraction/DOC_….md`,
+con data del referto e riferimenti alle pagine quando il parser li fornisce.
+Non produce più `_raw.md`, `_source.txt`, `_cleaned_source.md`, `.json`,
+`_pages.jsonl`, `_words.jsonl` o `_tables.json` per ciascun documento.
+I metadati di elaborazione rimangono nel database del progetto.
+
+Il testo viene anonimizzato e filtrato per pagina con regole deterministiche:
+le porzioni conservate sono copiate dal testo anonimizzato senza riscrittura LLM.
+Righe amministrative riconosciute (anagrafica, recapiti, intestazioni istituzionali,
+firme digitali, informative privacy) vengono eliminate. Le righe miste con
+contenuto clinico o ambiguo vengono conservate e segnalate per revisione: non è
+possibile garantire automaticamente l’eliminazione di ogni amministrativo senza
+rischiare omissioni cliniche. Risultati e righe numeriche cliniche sono conservati.
+Il database registra intervalli conservati/rimossi e hash del testo anonimizzato
+per pagina (`clinical_text.retention_audit`), senza copie del testo identificativo.
+Il filtro v2 riconosce anche celle amministrative affiancate a note o terapie:
+un recapito nella colonna del personale non deve eliminare la posologia nella
+colonna accanto. Rimuove margini vuoti e righe di spazi, conservando la spaziatura
+interna delle tabelle; l'audit distingue esclusioni amministrative e formattazione.
+L'anonimizzazione v2 protegge le date complete dalle false identificazioni come
+numeri telefonici e non unisce numeri su righe diverse.
+Il filtro v3 aggiunge il riconoscimento di avvertenze amministrative su più righe,
+firme nel loro contesto e moduli generici italiani (anche ASL, ASST, IRCCS e case
+di cura). Nei PDF con una colonna del personale chiaramente identificabile,
+usa le coordinate delle parole per separarla dalla colonna clinica, preservando
+le celle della terapia e registrando gli indici esclusi nell'audit. Non applica
+un ritaglio fisso a tutti i documenti. L'anonimizzazione v3 riconosce anche le
+varianti della data di nascita nota, ad esempio ISO e giorno/mese senza zeri.
+Docling rimane un parser di ripiego; la normalizzazione ne conserva ora la
+provenienza per pagina. Le sue intestazioni sono esaminate dal filtro, perché
+possono contenere date cliniche. Il livello BODY di Docling non equivale a
+contenuto clinico: può contenere segreterie e altre informazioni amministrative.
+Il filtro v4 produce Markdown continuo, senza separatori di pagina, e rimuove
+timestamp isolati ripetuti in testa alle pagine. I nomi dei sanitari introdotti
+da titoli o campi espliciti sono sostituiti con `[MEDICO]`; le indicazioni cliniche
+che li accompagnano rimangono. La mappa pagina/intervalli del testo finale e il
+suo hash restano in `clinical_text.retention_audit` nel database. Le interrogazioni
+verificano l'hash prima di usare questa mappa per le citazioni, continuando a
+supportare i vecchi Markdown con separatori. Non vengono creati file aggiuntivi.
+
+Per ispezionare l'estrazione, selezionare un documento e premere **Confronta PDF
+e Markdown** (disponibile anche nel menu contestuale). La finestra mostra PDF e
+Markdown affiancati, con pannelli ridimensionabili, navigazione e zoom del PDF,
+ricerca nel Markdown e ricaricamento del testo. L'ispezione è in sola lettura.
+I Markdown prodotti con il filtro precedente devono essere riestratti dai PDF
+per recuperare eventuali date oscurate o righe cliniche omesse. Le impaginazioni
+con testo già sovrapposto tra colonne possono ancora richiedere revisione.
+
+La coda **Non normalizzati** include anche i documenti di laboratorio. Parsing e
+filtraggio sono un unico passaggio; la concorrenza usa il numero di worker
+configurato per il ruolo documentale. La selezione del testo non richiede un modello.
+L’eventuale verifica di attribuzione del documento può ancora usare il modello
+configurato; interrogazioni e analisi successive continuano a usare i propri LLM.
+La rielaborazione riparte dal PDF originale. Le geometrie per le evidenze sono
+ricostruibili dal PDF senza salvare copie JSON. I vecchi prompt di riscrittura del
+testo clinico non sono più esposti nella finestra dei prompt attivi.
+
+I test automatici verificano file prodotti, anonimizzazione su esempi sintetici,
+provenienza, errori e integrazione. Non dimostrano la sensibilità clinica del modello
+locale sul corpus reale e non costituiscono un benchmark di velocità.

@@ -17,9 +17,14 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QDialog
 
-from emr_analyzer.clinical.irae_corrections import apply_irae_corrections
+from emr_analyzer.clinical.irae_corrections import (
+    IraeCorrection,
+    add_correction,
+    apply_irae_corrections,
+    load_corrections,
+)
 from emr_analyzer.config import active_workspace
 
 
@@ -182,6 +187,69 @@ class IraeEvidenceInspectorTest(unittest.TestCase):
             root.child(candidates_index).child(0).text(2),
         )
         inspector.accept()
+
+    def test_removed_finding_shows_removed_state_and_restore_button(self):
+        from emr_analyzer.gui.irae_evidence_inspector import (
+            IraeEvidenceInspector,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(active_workspace, "path", Path(tmp)):
+            add_correction("P001", IraeCorrection(
+                action="remove", irAE_type="Miocardite da ICI",
+                first_onset_date="2022-11-22", reason="falso positivo",
+            ))
+            corrected, _ = apply_irae_corrections(
+                _report(), load_corrections("P001")
+            )
+            finding = corrected["consolidation"]["removed"][0]
+            inspector = IraeEvidenceInspector(
+                corrected, finding, "P001", {"document_repo": None}
+            )
+            self.assertIn("rimosso", inspector._header.text())
+            self.assertIn("falso positivo", inspector._header.text())
+            self.assertFalse(inspector._edit_btn.isEnabled())
+            self.assertFalse(inspector._remove_btn.isEnabled())
+            # isVisible() is False when the dialog itself is never shown;
+            # assert on the hidden state instead.
+            self.assertFalse(inspector._restore_btn.isHidden())
+            inspector.accept()
+
+    def test_remove_then_restore_roundtrip_keeps_dialog_open(self):
+        from emr_analyzer.gui.irae_evidence_inspector import (
+            IraeEvidenceInspector,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(active_workspace, "path", Path(tmp)):
+            corrected, _ = apply_irae_corrections(_report(), [])
+            finding = next(
+                f for f in corrected["iraes"]
+                if f["irAE_type"] == "Miocardite da ICI"
+            )
+            inspector = IraeEvidenceInspector(
+                corrected, finding, "P001", {"document_repo": None}
+            )
+            correction = IraeCorrection(
+                action="remove", irAE_type="Miocardite da ICI",
+                first_onset_date="2022-11-22",
+                finding_id=finding["finding_id"], reason="falso positivo",
+            )
+            inspector._persist_correction(correction)
+            # the finding now lives in the removed bucket: the dialog must
+            # stay open and show the removed state.
+            self.assertNotEqual(inspector.result(), QDialog.Accepted)
+            self.assertIsNotNone(inspector._finding)
+            self.assertTrue(inspector._finding.get("removed"))
+            self.assertFalse(inspector._restore_btn.isHidden())
+            # restoring brings the finding back to the active list.
+            inspector._on_restore()
+            self.assertIsNotNone(inspector._finding)
+            self.assertFalse(inspector._finding.get("removed"))
+            self.assertTrue(inspector._restore_btn.isHidden())
+            self.assertTrue(inspector._edit_btn.isEnabled())
+            self.assertTrue(inspector._remove_btn.isEnabled())
+            inspector.accept()
 
 
 if __name__ == "__main__":

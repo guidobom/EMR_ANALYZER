@@ -67,14 +67,14 @@ class ClassifyPendingTest(unittest.TestCase):
         self.assertEqual(result.total, 0)
         self.assertEqual(result.count_needs_norm, 0)
 
-    def test_laboratory_doc_never_needs_normalization(self):
+    def test_laboratory_doc_needs_deterministic_markdown(self):
         docs = [_doc(
             "DOC_000004", "P001", doc_type=DocumentType.LABORATORIO.value,
             metadata_json=None,
         )]
         result = classify_pending_documents(docs)
-        self.assertEqual(result.total, 0)
-        self.assertEqual(result.count_needs_norm, 0)
+        self.assertEqual(result.total, 1)
+        self.assertEqual(result.count_needs_norm, 1)
 
     def test_laboratory_doc_with_error_is_pending(self):
         docs = [_doc(
@@ -84,7 +84,7 @@ class ClassifyPendingTest(unittest.TestCase):
         )]
         result = classify_pending_documents(docs)
         self.assertEqual(result.total, 1)
-        self.assertFalse(result.pending[0].needs_norm)
+        self.assertTrue(result.pending[0].needs_norm)
         self.assertTrue(result.pending[0].has_error)
         self.assertEqual(result.count_errors, 1)
 
@@ -135,8 +135,8 @@ class ClassifyPendingTest(unittest.TestCase):
                  parsing_status=ParsingStatus.ERROR.value),               # norm+err
         ]
         result = classify_pending_documents(docs)
-        self.assertEqual(result.total, 2)
-        self.assertEqual(result.count_needs_norm, 2)
+        self.assertEqual(result.total, 3)
+        self.assertEqual(result.count_needs_norm, 3)
         self.assertEqual(result.count_errors, 1)
 
 

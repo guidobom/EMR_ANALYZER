@@ -66,7 +66,7 @@ def highlighted_normalized_html(text: str, quotes: list[str]) -> str:
 class DocumentEvidencePreview(QWidget):
     """Embeddable original-document preview with a normalized-text toggle."""
 
-    def __init__(self, services: dict, parent=None):
+    def __init__(self, services: dict, parent=None, *, show_normalized_toggle=True):
         super().__init__(parent)
         self._services = services
         self._doc_data: dict = {}
@@ -75,6 +75,7 @@ class DocumentEvidencePreview(QWidget):
         self._doc = None
         self._highlights: list[dict] = []
         self._normalized_text = ""
+        self._show_normalized_toggle = show_normalized_toggle
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -96,6 +97,7 @@ class DocumentEvidencePreview(QWidget):
         toolbar.addStretch()
         self._text_toggle = QPushButton("Testo clinico normalizzato")
         self._text_toggle.setCheckable(True)
+        self._text_toggle.setVisible(self._show_normalized_toggle)
         self._text_toggle.setToolTip(
             "Alterna il referto originale e il testo clinico normalizzato"
         )
@@ -139,7 +141,8 @@ class DocumentEvidencePreview(QWidget):
                 selected_evidence_id
                 and item.get("evidence_id") == selected_evidence_id
             )
-        self._load_normalized_text()
+        if self._show_normalized_toggle:
+            self._load_normalized_text()
         self._load_pdf()
         selected = next(
             (item for item in self._highlights if item.get("selected")),

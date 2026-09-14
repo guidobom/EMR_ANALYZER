@@ -212,8 +212,23 @@ class HeaderMetadataExtractor:
         text = " ".join(services).casefold()
         if not text:
             return None
+        # A radiotherapy service is radiotherapy even when the letterhead
+        # trust department is oncology ("RADIOTERAPIA ONCOLOGICA").
+        if "radioterap" in text:
+            return DocumentType.RADIOTERAPIA.value
         if "visita" in text or "controllo" in text or "consulenza" in text:
-            if specialty == "oncologia":
+            # The service names the performed exam: a specialist adjective
+            # (dermatological, surgical, cardiological, ...) wins over the
+            # trust's oncology department name inside the letterhead.
+            specialist_terms = (
+                "dermatolog", "chirurg", "cardiolog", "urolog",
+                "ortoped", "oculist", "oftalmolog", "endocrinolog",
+                "diabetolog", "gastroenterolog", "pneumolog", "neurolog",
+                "reumatolog", "ginecolog", "otorin",
+            )
+            if specialty == "oncologia" and not any(
+                term in text for term in specialist_terms
+            ):
                 return DocumentType.VISITA_ONCOLOGICA.value
             return DocumentType.VISITA_SPECIALISTICA.value
         if any(term in text for term in ("tc ", "tac", "rm ", "rmn", "radiografia", " rx")):

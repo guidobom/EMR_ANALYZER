@@ -236,7 +236,11 @@ class PdfPlumberExtractor:
     def _read_text(path: Path) -> str:
         """Decode institutional text exports without silently dropping bytes."""
         raw = path.read_bytes()
-        for encoding in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        # UTF-16 without a BOM can silently decode a Windows-1252 document
+        # into unrelated characters whenever its byte count is even.
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return raw.decode("utf-16")
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
             try:
                 return raw.decode(encoding)
             except UnicodeError:

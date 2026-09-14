@@ -65,15 +65,21 @@ def chunk_entries(
     overlap: int = _OVERLAP_ENTRIES,
 ) -> list[list[dict]]:
     """Split the registry into character-budgeted chunks with overlap."""
+    if chunk_chars <= 0 or overlap < 0:
+        raise ValueError("chunk_chars must be positive and overlap non-negative")
     chunks: list[list[dict]] = []
     current: list[dict] = []
     size = 0
     for entry in entries:
         line_length = len(format_entry(entry)) + 1
+        if line_length > chunk_chars:
+            raise ValueError("Una voce supera il budget di contesto del registro")
         if current and size + line_length > chunk_chars:
             chunks.append(current)
-            current = list(current[-overlap:])
+            current = list(current[-overlap:]) if overlap else []
             size = sum(len(format_entry(e)) + 1 for e in current)
+            while current and size + line_length > chunk_chars:
+                size -= len(format_entry(current.pop(0))) + 1
         current.append(entry)
         size += line_length
     if current:

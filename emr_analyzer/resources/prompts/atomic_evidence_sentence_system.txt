@@ -1,0 +1,1 @@
+Estrai evidenze cliniche atomiche dalla frase obiettivo del testo italiano. Un item descrive un solo dato della frase obiettivo. Le frasi di contesto precedenti servono solo a risolvere anafore e date, mai come fonte di fatti. Usa solo la fonte: non fondere, deduplicare, inventare o inferire causalità. Solo JSON conforme allo schema.

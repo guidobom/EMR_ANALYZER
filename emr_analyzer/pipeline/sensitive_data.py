@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import date
 import re
 from typing import Mapping
+from .staff_identity import redact_staff_names
 
 
-DEIDENTIFICATION_VERSION = "clinical_text_deidentification_v1"
+DEIDENTIFICATION_VERSION = "clinical_text_deidentification_v5"
 
 _EMAIL_RE = re.compile(
     r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w-])",
@@ -24,11 +26,14 @@ _FISCAL_CODE_RE = re.compile(
 )
 _LABELLED_PHONE_RE = re.compile(
     r"(?i)\b(?P<label>tel(?:efono)?|cell(?:ulare)?|mobile|fax)"
-    r"\s*(?P<sep>[:.]?)\s*(?P<value>(?:\+?\d[\d\s()./-]{5,}\d))"
+    r"[ \t]*(?P<sep>[:.]?)[ \t]*(?P<value>(?:\+?\d(?:(?:[ \t]?[()./-]?[ \t]?)\d){6,12}))"
 )
 _ITALIAN_PHONE_RE = re.compile(
-    r"(?<![\w])(?:\+?39[\s./-]*)?(?:0\d{1,3}|3\d{2})"
-    r"(?:[\s./-]*\d){6,9}(?![\w])"
+    r"(?<![\w])(?:\+?39[ ./-]?)?(?:0\d{1,3}|3\d{2})"
+    r"(?:(?:[ \t]?[./-]?[ \t]?)\d){6,9}(?![\w])"
+)
+_CLINICAL_DATE_RE = re.compile(
+    r"(?<!\d)(?:\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}-\d{2}-\d{2})(?!\d)"
 )
 _LABELLED_ADDRESS_RE = re.compile(
     r"(?im)^[ \t]*(?:indirizzo|residente|residenza|domicilio|domiciliat[oa])"
@@ -98,6 +103,7 @@ class SensitiveDataSanitizer:
         self,
         text: str,
         identity=None,
+        *, preserve_layout: bool = False,
     ) -> SensitiveDataSanitizationResult:
         value = str(text or "")
         counts: Counter[str] = Counter()
@@ -116,7 +122,8 @@ class SensitiveDataSanitizer:
             raw_identifier = identity_values.get(field_name)
             if not raw_identifier:
                 continue
-            pattern = self._flexible_literal_pattern(raw_identifier)
+            pattern = (self._birth_date_pattern(raw_identifier) if field_name == 'birth_date'
+                       else self._flexible_literal_pattern(raw_identifier))
             value, count = pattern.subn(replacement, value)
             counts[field_name] += count
 
@@ -149,7 +156,8 @@ class SensitiveDataSanitizer:
             # Normalise the separator to a single colon: "tel." stays "tel.:",
             # while "tel:" and "tel 123" both become "tel: …".
             normalized = "" if separator in ("", ":") else separator
-            return f"{match.group('label')}{normalized}: [TELEFONO RIMOSSO]"
+            phone, tail = self._phone_value_and_tail(match.group('value'))
+            return f"{match.group('label')}{normalized}: [TELEFONO RIMOSSO]" + tail
 
         value, count = _LABELLED_PHONE_RE.subn(_phone_replacement, value)
         counts["phone"] += count
@@ -173,7 +181,10 @@ class SensitiveDataSanitizer:
         value, count = _PROSE_PAZIENTE_FULLNAME_RE.subn("[PAZIENTE]", value)
         counts["patient_name"] += count
 
-        value = self._clean_spacing(value)
+        value, count = redact_staff_names(value)
+        counts['staff_name'] += count
+        if not preserve_layout:
+            value = self._clean_spacing(value)
         return SensitiveDataSanitizationResult(
             text=value,
             counts={
@@ -312,6 +323,24 @@ class SensitiveDataSanitizer:
         return values
 
     @staticmethod
+    def _birth_date_pattern(raw_value: str) -> re.Pattern:
+        parts = re.findall(r'\d+', raw_value)
+        if len(parts) == 3:
+            try:
+                if len(parts[0]) == 4:
+                    year, month, day = map(int, parts)
+                else:
+                    day, month, year = map(int, parts)
+                date(year, month, day)
+                if year >= 1800:
+                    d, m = (f'0?{v}' if v < 10 else str(v) for v in (day, month))
+                    sep = r'[ \t]*[./-][ \t]*'
+                    return re.compile(r'(?<!\d)(?:' + sep.join((d,m,str(year))) + '|' + sep.join((str(year),m,d)) + r')(?!\d)')
+            except ValueError:
+                pass
+        return SensitiveDataSanitizer._flexible_literal_pattern(raw_value)
+
+    @staticmethod
     def _flexible_literal_pattern(raw_value: str) -> re.Pattern:
         parts = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", raw_value)
         if not parts:
@@ -324,17 +353,30 @@ class SensitiveDataSanitizer:
         )
 
     @staticmethod
+    def _phone_value_and_tail(value: str) -> tuple[str, str]:
+        # A dose immediately after a complete phone number is not another
+        # phone digit ("3331234567 5 mg"). Do not swallow that trailing value.
+        suffix = re.search(r'[ \t]+\d{1,2}$', value)
+        if suffix and len(re.sub(r'\D', '', value[:suffix.start()])) >= 9:
+            return value[:suffix.start()], value[suffix.start():]
+        return value, ''
+
+    @staticmethod
     def _replace_verified_phones(text: str) -> tuple[str, int]:
         count = 0
+        date_spans = [match.span() for match in _CLINICAL_DATE_RE.finditer(text)]
 
         def replacement(match: re.Match) -> str:
             nonlocal count
-            digits = re.sub(r"\D", "", match.group(0))
+            if any(start < match.end() and end > match.start() for start, end in date_spans):
+                return match.group(0)
+            phone, tail = SensitiveDataSanitizer._phone_value_and_tail(match.group(0))
+            digits = re.sub(r"\D", "", phone)
             # Avoid confusing short clinical values and dates with contacts.
             if not 9 <= len(digits) <= 13:
                 return match.group(0)
             count += 1
-            return "[TELEFONO RIMOSSO]"
+            return "[TELEFONO RIMOSSO]" + tail
 
         return _ITALIAN_PHONE_RE.sub(replacement, text), count
 

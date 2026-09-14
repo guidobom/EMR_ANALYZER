@@ -16,6 +16,112 @@ class DocumentClassifier:
     Uses filename patterns, lexical rules, and structural cues.
     """
 
+    # Imaging units issue imaging reports: the department is the document's
+    # own letterhead, while the provenance names the *requesting* unit.
+    _RADIOLOGY_UNIT = re.compile(
+        r"\b(?:RADIOLOGIA|NEURORADIOLOGIA|RADIODIAGNOSTICA|"
+        r"DIAGNOSTICA\s+PER\s+IMMAGINI)\b",
+        re.IGNORECASE,
+    )
+    _NUCLEAR_UNIT = re.compile(r"\bMEDICINA\s+NUCLEARE\b", re.IGNORECASE)
+    # The same units, recognized as letterhead lines inside the document
+    # text itself ("Dipartimento ... di Radiologia", "STRUTTURA COMPLESSA DI
+    # MEDICINA NUCLEARE").  This covers documents whose stored header
+    # metadata is missing or partial; a quoted exam inside an oncology
+    # visit has no such line.
+    _RADIOLOGY_UNIT_LINE = re.compile(
+        r"^\s*(?:DIPARTIMENTO|U\.?O\.?|UNIT[AÀ]\s+OPERATIVA|"
+        r"STRUTTURA\s+(?:COMPLESSA|SEMPLICE)|S\.?C\.?)\s*"
+        r"[^.\n]{0,90}\b(?:RADIOLOGIA|NEURORADIOLOGIA|RADIODIAGNOSTICA|"
+        r"DIAGNOSTICA\s+PER\s+IMMAGINI)\b",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    _NUCLEAR_UNIT_LINE = re.compile(
+        r"^\s*(?:DIPARTIMENTO|U\.?O\.?|UNIT[AÀ]\s+OPERATIVA|"
+        r"STRUTTURA\s+(?:COMPLESSA|SEMPLICE)|S\.?C\.?)\s*"
+        r"[^.\n]{0,90}\bMEDICINA\s+NUCLEARE\b",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    _IMAGING_MODALITY = re.compile(
+        r"\b(?:TC|TAC|RMN?|RX|ECOGRAFIA|ECOTOMOGRAFIA|MAMMOGRAFIA|"
+        r"TOMOGRAFIA\s+COMPUTERIZZATA|RISONANZA\s+MAGNETICA|"
+        r"RADIOGRAFIA|ANGIOGRAFIA|PIELOGRAFIA|UROGRAFIA|"
+        r"COLANGIOGRAFIA|FLEBOGRAFIA|FLUOROSCOPIC\w*)\b",
+        re.IGNORECASE,
+    )
+    # A radiotherapy unit writes radiotherapy notes: the unit name is
+    # prefixed (UO RADIOTERAPIA, AMB. RADIOTERAPICO, DSA RADIOTERAPIA), so
+    # a visit that merely *schedules* radiotherapy does not match.
+    _RADIOTHERAPY_UNIT = re.compile(
+        r"\b(?:U\.?O\.?|AMB\.?|DAY\s+SERVICE|DIPARTIMENTO|"
+        r"UNIT[AÀ]\s+OPERATIVA)\s*[^.\n]{0,60}\bRADIOTERAPIA\b|"
+        r"\bAMB\.\s+RADIOTERAPICO\b|\bDSA\s+RADIOTERAPIA\b",
+        re.IGNORECASE,
+    )
+    # Letterhead of a non-oncology clinical unit: an ambulatory visit or
+    # exam issued by that unit must not become an oncological visit just
+    # because the patient's history is full of oncology terms or the
+    # trust's oncology department name appears in the letterhead line.
+    _SPECIALIST_UNIT = re.compile(
+        r"\b(?:U\.?O\.?|AMB\.?|UNIT[AÀ]\s+OPERATIVA|DAY\s+SERVICE|"
+        r"DIPARTIMENTO)\s*[^.\n]{0,60}\b(?:DERMATOLOGIA|"
+        r"VIDEODERMATOSCOPIA|CHIRURGICO\s+DERMATOLOGICO|"
+        r"CHIRURGIA|SENOLOGIC\w*|"
+        r"CARDIOLOGIA|ECOCARDIOGRAFIA|ECOCARDIACA|"
+        r"O\.?R\.?L\.?)\b|"
+        r"\bECO(?:COLOR)?DOPPLERGRAFIA\s+CARDIACA\b|"
+        r"\bAMB\.\s+VIDEODERMATOSCOPIA\b|\bAMB\.\s+CHIRURGICO\b|"
+        r"\bVALUTAZIONE\s+ANESTESIOLOGICA\s+PREOPERATORIA\b",
+        re.IGNORECASE,
+    )
+    # Documents that must keep their own type even when a specialist unit
+    # line appears in the head (a discharge letter from a surgical ward
+    # mentions the operating room in its decorso, an histology report names
+    # the requesting surgical unit, ...).
+    _LETTERHEAD_GUARD = re.compile(
+        r"\bLETTERA\s+DI\s+DIMISSIONE\b|\bSCHEDA\s+DI\s+DIMISSIONE\s+"
+        r"OSPEDALIERA\b|\bCARTELLA\s+CLINICA\b|\bMOTIVO\s+DEL\s+RICOVERO\b|"
+        r"\bDIARIO\s+(?:MEDICO|INFERMIERISTICO)\b|"
+        r"\bANATOMIA\s+PATOLOGICA\b|\bESAME\s+ISTOLOGICO\b|"
+        r"\bLABORATORIO\s+DI\s+ANALISI\b|\bREFERTO\s+ANATOMO.?PATOLOGICO\b",
+        re.IGNORECASE,
+    )
+    # Emergency-department sheets: the triage block is unmistakable.
+    _PS_SHEET = re.compile(
+        r"\bPRONTO\s+SOCCORSO\b",
+        re.IGNORECASE,
+    )
+    _PS_SHEET_SUPPORT = re.compile(
+        r"\bDATI\s+ACCETTAZIONE\b|\bTRIAGE\b|\bMEZZO\s+TRASPORTO\b|"
+        r"\bDIPARTIMENTO\s+DI\s+EMERGENZA\b|\bDATI\s+EPISODIO\b|"
+        r"\bMED\.?\s+D['\s]URGENZA\b",
+        re.IGNORECASE,
+    )
+    # Surgical intervention sheets ("Blocco Operatorio", "Sala Operatoria").
+    _OP_BLOCK = re.compile(
+        r"\b(?:BLOCCO\s+OPERATORIO|SALA\s+OPERATORIA)\b",
+        re.IGNORECASE,
+    )
+    # Specialist visit markers that a letterhead unit document carries.
+    _SPECIALIST_VISIT_MARKER = re.compile(
+        r"\b(?:VISITA|AMBULATORIALE|PRESTAZIONI\s+EROGATE|REFERTO|"
+        r"MEDICAZIONE|CONTROLLO\s+AMBULATORIALE|ESAME\s+OBIETTIVO)\b",
+        re.IGNORECASE,
+    )
+    _NUCLEAR_MODALITY = re.compile(
+        r"\b(?:PET(?:[-\s]?(?:TC|FDG))?|FDG|SCINTIGRAFIA)\b",
+        re.IGNORECASE,
+    )
+    # Report-structural phrases that accompany the exam title on the first
+    # page of a radiology report.  Deliberately strict: a visit note that
+    # quotes a past exam ("TC total body co mdc: ...") carries the modality
+    # and the contrast abbreviation but none of these phrases.
+    _IMAGING_REPORT_SUPPORT = re.compile(
+        r"\bEsame eseguito\b|\bId\s+Dicom\b|\bDICOM\b|\btomografo\b|"
+        r"\bPrestazioni eseguite\b",
+        re.IGNORECASE,
+    )
+
     def classify(
         self,
         text: str,
@@ -28,11 +134,14 @@ class DocumentClassifier:
         """
         header_metadata = header_metadata or {}
 
+        # The provenance names the requesting unit ("DAY SERVICE
+        # ONCOLOGIA"), not the unit that produced the document — it must
+        # not feed the lexical scores, or every imaging report ordered by
+        # oncology would gain 5 points for `visita_oncologica`.
         header_text = "\n".join(
             str(value)
             for value in (
                 header_metadata.get("department"),
-                header_metadata.get("provenance"),
                 *(header_metadata.get("services") or []),
             )
             if value
@@ -49,6 +158,17 @@ class DocumentClassifier:
         if self._looks_like_lab_result_sheet(combined_text):
             return DocumentType.LABORATORIO.value
 
+        # The issuing unit's letterhead decides for specialist units: a
+        # radiotherapy note or a dermatology visit keeps its type even
+        # when the header hint (which trusts the stored specialty) would
+        # say "oncological visit" — the trust's oncology department name
+        # inside the letterhead line inflates that specialty.
+        letterhead_type = self._letterhead_specialist_type(
+            combined_text, header_metadata
+        )
+        if letterhead_type:
+            return letterhead_type
+
         # An explicit performance listed in the first-page header is more
         # authoritative than diagnoses mentioned in the body. For example,
         # an oncological history must not turn a cardiology visit into an
@@ -56,6 +176,15 @@ class DocumentClassifier:
         header_hint = header_metadata.get("document_type_hint")
         if header_hint in {item.value for item in DocumentType}:
             return header_hint
+
+        # A report issued by a radiology / nuclear-medicine unit is an
+        # imaging report even when the patient's oncology keywords dominate
+        # the body — a CT scan of a melanoma patient is not an oncological
+        # visit. The unit's letterhead is decisive; the exam modality picks
+        # between radiology and nuclear medicine.
+        imaging_type = self._imaging_report_type(combined_text, header_metadata)
+        if imaging_type:
+            return imaging_type
 
         # Accumulate weighted scores from every signal source.
         scores: dict[str, float] = {}
@@ -82,6 +211,102 @@ class DocumentClassifier:
         # Return the type with the highest weighted score
         primary = max(scores, key=scores.get)
         return primary
+
+    @classmethod
+    def _letterhead_specialist_type(
+        cls, text: str, header_metadata: dict
+    ) -> Optional[str]:
+        """The issuing unit's letterhead decides for specialist units.
+
+        A radiotherapy session note, a dermatology / surgery / cardiology
+        ambulatory visit, an emergency sheet or an operating-block sheet
+        must not become an oncological visit just because the patient's
+        history is full of oncology terms.  The guard (checked on the
+        letterhead window only, so quoted histology reports in a visit's
+        anamnesis do not block the rule) keeps discharge letters, clinical
+        charts, histology and lab documents with their own type.
+        """
+        head = text[:800]
+        if cls._RADIOLOGY_UNIT_LINE.search(text[:500]) or cls._NUCLEAR_UNIT_LINE.search(text[:500]):
+            # The imaging short-circuit below owns radiology units.
+            return None
+        if cls._LETTERHEAD_GUARD.search(text[:300]):
+            return None
+        department = str(header_metadata.get("department") or "")
+        if (
+            cls._RADIOTHERAPY_UNIT.search(head)
+            or "radioterap" in department.casefold()
+        ):
+            return DocumentType.RADIOTERAPIA.value
+        if cls._OP_BLOCK.search(head):
+            return DocumentType.VERBALE_OPERATORIO.value
+        if cls._PS_SHEET.search(head) and cls._PS_SHEET_SUPPORT.search(head):
+            return DocumentType.PRONTO_SOCCORSO.value
+        if cls._SPECIALIST_UNIT.search(head):
+            return DocumentType.VISITA_SPECIALISTICA.value
+        # Fallback on the stored specialty when the letterhead line in the
+        # text was not matched (line splits, OCR noise).  Documents with
+        # an imaging exam title (ultrasound ambulatories, ...) keep the
+        # imaging type: the title boost below handles them.
+        non_oncology_specialties = {
+            "dermatologia", "chirurgia", "cardiologia", "urologia",
+            "ortopedia", "oculistica", "endocrinologia",
+            "gastroenterologia", "pneumologia", "neurologia",
+            "reumatologia", "otorinolaringoiatria", "ginecologia",
+        }
+        _first_1500 = text[:1500] if len(text) >= 1500 else text
+        is_imaging = (
+            cls._IMAGING_MODALITY.search(_first_1500)
+            and cls._IMAGING_REPORT_SUPPORT.search(_first_1500)
+        )
+        if (
+            header_metadata.get("specialty") in non_oncology_specialties
+            and cls._SPECIALIST_VISIT_MARKER.search(head)
+            and not is_imaging
+        ):
+            return DocumentType.VISITA_SPECIALISTICA.value
+        return None
+
+    @classmethod
+    def _imaging_report_type(
+        cls, text: str, header_metadata: dict
+    ) -> Optional[str]:
+        """Return the imaging type when the issuing unit is a radiology /
+        nuclear-medicine department and the text names an exam modality.
+
+        The unit is read from the stored header metadata first; when it is
+        missing there, the document's own letterhead lines are scanned
+        ("Dipartimento ... di Radiologia", "STRUTTURA COMPLESSA DI MEDICINA
+        NUCLEARE") so partial metadata does not hide the strongest signal.
+        """
+        department = " ".join(
+            str(value)
+            for value in (
+                header_metadata.get("department"),
+                header_metadata.get("specialty"),
+            )
+            if value
+        )
+        head = text[:800]
+        unit_is_radiology = bool(
+            cls._RADIOLOGY_UNIT.search(department)
+            or cls._RADIOLOGY_UNIT_LINE.search(head)
+            or header_metadata.get("specialty") == "radiologia"
+        )
+        unit_is_nuclear = bool(
+            cls._NUCLEAR_UNIT.search(department)
+            or cls._NUCLEAR_UNIT_LINE.search(head)
+            or header_metadata.get("specialty") == "medicina_nucleare"
+        )
+        if not (unit_is_radiology or unit_is_nuclear):
+            return None
+        has_imaging = bool(cls._IMAGING_MODALITY.search(text))
+        has_nuclear = bool(cls._NUCLEAR_MODALITY.search(text))
+        if not (has_imaging or has_nuclear):
+            return None
+        if unit_is_nuclear and has_nuclear and not unit_is_radiology:
+            return DocumentType.MEDICINA_NUCLEARE.value
+        return DocumentType.RADIOLOGIA.value
 
     @staticmethod
     def _looks_like_lab_result_sheet(text: str) -> bool:
@@ -138,10 +363,12 @@ class DocumentClassifier:
         min_result_lines = 1 if marker_count >= 2 else 2
         result_lines = len(re.findall(
             r"(?im)^\s*(?:\[\d+\]\s*)?"
-            r"[A-ZÀ-Ü][A-ZÀ-Ü0-9 .()/%+-]{1,60}:?\s+"
-            r"\d+(?:[.,]\d+)?\s*(?:\*+\s*)?"
+            r"[A-ZÀ-Ü][A-ZÀ-Ü0-9 .()/%+\-:]{1,60}:?\s+"
+            r"(?:\d+(?:[.,]\d+)?\s*(?:\*+\s*)?"
             r"(?:mg/dl|g/dl|mmol/l|u/l|ng/ml|ng/l|pg/ml|fl|"
-            r"%|x10\^?[36]/[µμu]l|inr|ratio)\b",
+            r"%|x10\^?[36]/[µμu]l|inr|ratio)\b|"
+            r"(?:NEGATIV[OA]|POSITIV[OA]|ASSENTE|PRESENTE|"
+            r"NON\s+RIVELAT[OA]|DEBOLE)\b)",
             text,
             re.IGNORECASE,
         ))
@@ -328,6 +555,26 @@ class DocumentClassifier:
             if re.search(pattern, _first_300, re.IGNORECASE):
                 scores[doc_type] = scores.get(doc_type, 0) + boost
                 break  # Only the first matching heading counts
+
+        # ---- Imaging exam-title boost: the exam title often sits after a
+        #      long institutional letterhead, well beyond the 300-char
+        #      heading window. A modality keyword plus a report-structural
+        #      phrase on the first page marks a radiology / nuclear-medicine
+        #      report; a visit note that merely mentions an upcoming exam
+        #      has the modality without the structural phrase.
+        _first_1500 = text[:1500] if len(text) >= 1500 else text
+        if self._IMAGING_MODALITY.search(
+            _first_1500
+        ) and self._IMAGING_REPORT_SUPPORT.search(_first_1500):
+            scores[DocumentType.RADIOLOGIA.value] = (
+                scores.get(DocumentType.RADIOLOGIA.value, 0) + 40
+            )
+        elif self._NUCLEAR_MODALITY.search(
+            _first_1500
+        ) and self._IMAGING_REPORT_SUPPORT.search(_first_1500):
+            scores[DocumentType.MEDICINA_NUCLEARE.value] = (
+                scores.get(DocumentType.MEDICINA_NUCLEARE.value, 0) + 40
+            )
 
         if not scores:
             return []

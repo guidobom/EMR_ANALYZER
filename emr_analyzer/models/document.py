@@ -10,6 +10,7 @@ class DocumentType(str, Enum):
     LABORATORIO = "laboratorio"
     RADIOLOGIA = "radiologia"
     MEDICINA_NUCLEARE = "medicina_nucleare"
+    RADIOTERAPIA = "radioterapia"
     ANATOMIA_PATOLOGICA = "anatomia_patologica"
     VISITA_ONCOLOGICA = "visita_oncologica"
     VISITA_SPECIALISTICA = "visita_specialistica"

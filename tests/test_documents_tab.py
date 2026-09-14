@@ -124,11 +124,9 @@ class DocumentsTabTest(unittest.TestCase):
         self.assertTrue(tab._extract_clinical_text_btn.isEnabled())
         tab._extract_clinical_text_btn.click()
 
-        # Two-phase: parse-only for docs still needing parsing, then one
-        # parallel LLM pass over every parsed doc (already-parsed first).
+        # One pass from the original for both new documents and retries.
         self.assertEqual(observed, [
-            (["DOC_000001"], {"parse_only": True}),
-            (["DOC_000002", "DOC_000001"], {"llm_only": True}),
+            (["DOC_000002", "DOC_000001"], {}),
         ])
 
         pending.parsing_status = ParsingStatus.COMPLETED.value
@@ -152,13 +150,13 @@ class DocumentsTabTest(unittest.TestCase):
             "lab_repo": lab_repo,
         })
 
+        tab._run_llm_extraction = lambda *args, **kwargs: []
         result = tab._run_extraction(
             document,
             "Emoglobina 10 g/dL citata nella visita.",
             parsing_result=None,
             tables=[],
             progress=progress,
-            skip_llm=True,
         )
 
         self.assertEqual(result["lab_values"], [])
@@ -179,11 +177,12 @@ class DocumentsTabTest(unittest.TestCase):
         parser = _RecordingLabParser()
         lab_repo = _LabRepository()
         tab = DocumentsTab()
+        tab._save_normalized_clinical_text = lambda doc, result: None
         tab.set_services({"lab_parser": parser, "lab_repo": lab_repo})
 
+        tab._run_llm_extraction = lambda *args, **kwargs: []
         tab._run_extraction(
             document, "Emoglobina 10 g/dL", None, [], _Progress(),
-            skip_llm=True,
         )
 
         self.assertEqual(parser.calls, 1)
@@ -211,16 +210,18 @@ class DocumentsTabTest(unittest.TestCase):
         lab_repo = _LabRepository()
         evidence_spy = _EvidenceSpy()
         tab = DocumentsTab()
+        tab._save_normalized_clinical_text = lambda doc, result: None
         tab.set_services({
             "lab_parser": parser,
             "lab_repo": lab_repo,
             "evidence_repo": evidence_spy,
         })
 
+        tab._run_llm_extraction = lambda *args, **kwargs: []
         tab._run_extraction(
             document,
             "Materiale: Urina\nEmoglobina : 0.20 mg/dL Assente",
-            None, [], _Progress(), skip_llm=True,
+            None, [], _Progress(),
         )
 
         self.assertEqual(evidence_spy.calls, [])
@@ -257,6 +258,7 @@ class DocumentsTabTest(unittest.TestCase):
 
         parser = _RecordingTextParser()
         tab = DocumentsTab()
+        tab._save_normalized_clinical_text = lambda doc, result: None
         tab.set_services({
             "lab_parser": parser,
             "lab_repo": _LabRepository(),
@@ -264,8 +266,9 @@ class DocumentsTabTest(unittest.TestCase):
         })
 
         raw_text = "Materiale: Urina\nEmoglobina 0.20 mg/dL"
+        tab._run_llm_extraction = lambda *args, **kwargs: []
         tab._run_extraction(
-            document, raw_text, None, [], _Progress(), skip_llm=True,
+            document, raw_text, None, [], _Progress(),
         )
 
         self.assertEqual(parser.calls, 1)
@@ -288,7 +291,7 @@ class DocumentsTabTest(unittest.TestCase):
         self.assertLess(values[-1], 100)
 
     def test_extract_clinical_text_reuses_shared_progress(self):
-        """A shared progress dialog is passed through to both phases."""
+        """The single extraction pass reuses the shared progress dialog."""
         pending = DocumentRecord(
             id="DOC_000021", patient_id="P001", filename="pending.pdf",
             original_path="/nonexistent/pending.pdf", file_hash="pending",
@@ -317,15 +320,14 @@ class DocumentsTabTest(unittest.TestCase):
 
         self.assertEqual(
             [ids for ids, _ in observed],
-            [["DOC_000021"], ["DOC_000021"]],
+            [["DOC_000021"]],
         )
-        self.assertEqual([p for _, p in observed], [progress, progress])
+        self.assertEqual([p for _, p in observed], [progress])
         self.assertEqual(progress.titles, ["Paziente 1/2: P001"])
         tab.deleteLater()
 
     def test_extract_clinical_text_creates_single_dialog_when_none(self):
-        """With progress=None only one dialog is created and reused by both
-        phases (fix for the two stacked dialogs)."""
+        """With progress=None only one dialog is created for extraction."""
         pending = DocumentRecord(
             id="DOC_000022", patient_id="P001", filename="pending.pdf",
             original_path="/nonexistent/pending.pdf", file_hash="pending",
@@ -363,9 +365,8 @@ class DocumentsTabTest(unittest.TestCase):
             progress_module.ProgressDialog = original
 
         self.assertEqual(len(_FakeProgressDialog.instances), 1)
-        self.assertEqual(len(observed), 2)
+        self.assertEqual(len(observed), 1)
         self.assertIs(observed[0], _FakeProgressDialog.instances[0])
-        self.assertIs(observed[1], _FakeProgressDialog.instances[0])
         tab.deleteLater()
 
     def test_run_llm_extraction_tolerates_none_progress(self):

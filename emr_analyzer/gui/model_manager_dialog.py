@@ -649,7 +649,9 @@ class ModelManagerDialog(QDialog):
 class _ModelInstallWorker(QThread):
     """Run the network-capable helper outside the offline clinical process."""
 
-    progress_changed = pyqtSignal(int, int, str)
+    # Qt ``int`` is signed 32-bit: GGUF byte counts overflow above 2 GiB.
+    # Transport Python integers unchanged, including queued cross-thread signals.
+    progress_changed = pyqtSignal(object, object, str)
     succeeded = pyqtSignal(str, object)
     catalog_updated = pyqtSignal(object)
     failed = pyqtSignal(str)

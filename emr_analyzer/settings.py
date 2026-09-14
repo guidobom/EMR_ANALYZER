@@ -429,6 +429,12 @@ class ClinicalPipelinePolicy:
     cohesive_threshold: float = 0.72
     bridge_split_threshold: float = 0.58
     lab: LabEvidencePolicy = field(default_factory=LabEvidencePolicy)
+    atomic_strategy: str = "chunked"
+    atomic_sentence_context: int = 1
+    atomic_sentence_workers: int = 4
+    embedding_dedup_enabled: bool = True
+    embedding_threshold: float = 0.86
+    embedding_model: str = "paraphrase-multilingual-MiniLM-L12-v2"
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ClinicalPipelinePolicy":
@@ -442,6 +448,20 @@ class ClinicalPipelinePolicy:
         ).strip().casefold()
         if aggregation_engine not in {"v3", "v4"}:
             aggregation_engine = "v3"
+        atomic_strategy = str(
+            payload.get("atomic_strategy", "chunked")
+        ).strip().casefold()
+        if atomic_strategy not in {"chunked", "sentence"}:
+            atomic_strategy = "chunked"
+        embedding_enabled_value = payload.get(
+            "embedding_dedup_enabled", True
+        )
+        embedding_enabled = (
+            embedding_enabled_value.strip().casefold()
+            in {"1", "true", "yes", "on"}
+            if isinstance(embedding_enabled_value, str)
+            else bool(embedding_enabled_value)
+        )
 
         def integer(name: str, default: int, minimum: int, maximum: int) -> int:
             try:
@@ -460,6 +480,15 @@ class ClinicalPipelinePolicy:
             value.strip().casefold() in {"1", "true", "yes", "on"}
             if isinstance(value, str) else bool(value)
         )
+        try:
+            embedding_threshold = min(
+                0.99, max(0.5, float(payload.get("embedding_threshold", 0.86)))
+            )
+        except (TypeError, ValueError):
+            embedding_threshold = 0.86
+        embedding_model = str(payload.get(
+            "embedding_model", "paraphrase-multilingual-MiniLM-L12-v2"
+        )).strip() or "paraphrase-multilingual-MiniLM-L12-v2"
         return cls(
             aggregation_engine=aggregation_engine,
             adaptive_specialized_retry=adaptive,
@@ -478,6 +507,16 @@ class ClinicalPipelinePolicy:
             cohesive_threshold=floating("cohesive_threshold", 0.72),
             bridge_split_threshold=floating("bridge_split_threshold", 0.58),
             lab=LabEvidencePolicy.from_dict(payload.get("lab", {})),
+            atomic_strategy=atomic_strategy,
+            atomic_sentence_context=integer(
+                "atomic_sentence_context", 1, 0, 3
+            ),
+            atomic_sentence_workers=integer(
+                "atomic_sentence_workers", 4, 1, 8
+            ),
+            embedding_dedup_enabled=embedding_enabled,
+            embedding_threshold=embedding_threshold,
+            embedding_model=embedding_model,
         )
 
 

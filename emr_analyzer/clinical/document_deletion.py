@@ -141,9 +141,18 @@ class DocumentDeletionService:
 
     def _document_artifacts(self, document) -> list[Path]:
         artifacts = []
+        root = self.workspaces_dir.resolve()
+        patient_root = (root / document.patient_id).resolve()
+        if patient_root == root or not patient_root.is_relative_to(root):
+            raise ValueError("Percorso paziente esterno al workspace: eliminazione bloccata")
         original = Path(document.original_path)
         seen = set()
         if original.exists():
+            if not original.resolve().is_relative_to(patient_root):
+                raise ValueError(
+                    "Il documento originale è esterno al workspace del paziente: "
+                    "eliminazione bloccata. Verificare il percorso del documento."
+                )
             artifacts.append(original)
             seen.add(str(original))
         for output_dir_name in ("extraction", "docling"):
@@ -158,6 +167,8 @@ class DocumentDeletionService:
             candidates.extend(output_dir.glob(f"{document.id}_*"))
             for candidate in candidates:
                 if candidate.exists() and str(candidate) not in seen:
+                    if not candidate.resolve().is_relative_to(patient_root):
+                        raise ValueError("Artefatto esterno al workspace paziente: eliminazione bloccata")
                     artifacts.append(candidate)
                     seen.add(str(candidate))
         return artifacts

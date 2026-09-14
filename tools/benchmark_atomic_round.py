@@ -4,6 +4,18 @@
 Clinical source data are never written inside the repository.  Every artifact
 is stored below the explicitly supplied output directory (normally /tmp), and
 the three project databases are opened immutable/read-only.
+
+A/B recipe (baseline chunked vs sentence-level challenger)::
+
+    python tools/benchmark_atomic_round.py sample \\
+        --projects-root /path/to/projects --output /tmp/atomic_bench
+    python tools/benchmark_atomic_round.py qwen \\
+        --output /tmp/atomic_bench --result-dir runs/A_chunked
+    python tools/benchmark_atomic_round.py qwen \\
+        --output /tmp/atomic_bench --result-dir runs/B_sentence \\
+        --strategy sentence
+    python tools/diff_atomic_runs.py --root /tmp/atomic_bench \\
+        --runs runs/A_chunked runs/B_sentence --metrics
 """
 
 from __future__ import annotations
@@ -270,6 +282,8 @@ def run_qwen(
     workers: int | None = None,
     case_ids: set[str] | None = None,
     result_dir: str = "qwen",
+    settings_path: Path | None = None,
+    strategy: str = "chunked",
 ) -> None:
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     if case_ids:
@@ -279,7 +293,7 @@ def run_qwen(
             raise ValueError(f"Case non trovati: {', '.join(sorted(missing))}")
     target = output / result_dir
     target.mkdir(exist_ok=True)
-    configs = load_llm_configs()
+    configs = load_llm_configs(settings_path) if settings_path else load_llm_configs()
     config = configs["atomic_evidence"]
     policy = load_pipeline_policy()
     effective_workers = max(1, min(workers or config.parallel_workers, 8))
@@ -289,7 +303,7 @@ def run_qwen(
         "QWEN CONFIG "
         f"model={config.model} backend={config.backend} "
         f"ctx={config.context_length} output={config.max_output_tokens} "
-        f"workers={effective_workers}",
+        f"workers={effective_workers} strategy={strategy}",
         flush=True,
     )
     warm = client.warmup()
@@ -297,7 +311,9 @@ def run_qwen(
         f"QWEN WARMUP {warm.get('elapsed_seconds', 0):.1f}s "
         f"slots={warm.get('slots', '?')}", flush=True,
     )
-    extractor = AtomicEvidenceExtractor(client, policy=policy)
+    extractor = AtomicEvidenceExtractor(
+        client, policy=policy, strategy=strategy
+    )
     write_lock = threading.Lock()
     started = time.perf_counter()
     completed = 0
@@ -326,6 +342,7 @@ def run_qwen(
             )
             payload = {
                 "case_id": case_id,
+                "strategy": strategy,
                 "status": "ok",
                 "elapsed_seconds": time.perf_counter() - case_started,
                 "metrics": extractor.last_extraction_metrics(),
@@ -406,6 +423,13 @@ def main() -> None:
     qwen.add_argument("--workers", type=int)
     qwen.add_argument("--case-ids", nargs="*")
     qwen.add_argument("--result-dir", default="qwen")
+    qwen.add_argument("--settings-path", type=Path, default=None,
+                      help="File settings.json alternativo (es. per un "
+                           "modello diverso senza toccare la config utente)")
+    qwen.add_argument("--strategy", choices=("chunked", "sentence"),
+                      default="chunked",
+                      help="Variante estrattiva: baseline chunked (default) "
+                           "o frase-per-frase (challenger B)")
     args = parser.parse_args()
     if args.command == "sample":
         build_sample(args.projects_root, args.output)
@@ -415,6 +439,8 @@ def main() -> None:
             workers=args.workers,
             case_ids=set(args.case_ids or ()),
             result_dir=args.result_dir,
+            settings_path=args.settings_path,
+            strategy=args.strategy,
         )
 
 

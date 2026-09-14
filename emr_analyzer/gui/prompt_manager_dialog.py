@@ -337,6 +337,8 @@ class PromptManagerDialog(QDialog):
                 prompt_definitions(), key=lambda item: (item.pipeline, item.label)
             )
             for definition in definitions:
+                if definition.key.startswith("clinical_text_"):
+                    continue  # Clinical Markdown is now filtered without prompts.
                 self.task_combo.addItem(
                     f"{definition.pipeline} — {definition.label}",
                     definition.key,
@@ -465,19 +467,16 @@ class PromptManagerDialog(QDialog):
                 )
 
         if key.startswith(("patient_identity", "clinical_text")):
-            candidates = (
-                extraction_dir / f"{document.id}_cleaned_source.md",
-                extraction_dir / f"{document.id}_raw.md",
-                active_workspace.path / document.patient_id / "docling"
-                / f"{document.id}.md",
-            )
-            layer = "testo sorgente"
+            from ..utils.document_paths import resolve_document_path
+            from ..pipeline.pdf_extractor import PdfPlumberExtractor
+            parser = PdfPlumberExtractor()
+            result = parser.convert(resolve_document_path(document))
+            return parser.export_text(result), "testo estratto dall’originale in memoria"
         else:
             candidates = (
                 extraction_dir / f"{document.id}.md",
                 active_workspace.path / document.patient_id / "docling"
                 / f"{document.id}.md",
-                extraction_dir / f"{document.id}_cleaned_source.md",
             )
             layer = "testo clinico normalizzato"
         path = next((item for item in candidates if item.is_file()), None)

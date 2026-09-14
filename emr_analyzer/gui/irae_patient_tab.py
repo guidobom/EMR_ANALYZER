@@ -10,6 +10,7 @@ corrections are persisted and re-applied; the tab refreshes itself and emits
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QSplitter, QTextBrowser, QVBoxLayout,
     QWidget,
@@ -93,7 +94,8 @@ class IraePatientTab(QWidget):
         consolidation = self._corrected.get("consolidation") or {}
         definitive = list(self._corrected.get("iraes") or [])
         suspects = list(consolidation.get("suspects") or [])
-        if not definitive and not suspects:
+        removed = list(consolidation.get("removed") or [])
+        if not definitive and not suspects and not removed:
             placeholder = QListWidgetItem("Nessun irAE nel report.")
             placeholder.setFlags(Qt.NoItemFlags)
             self._list.addItem(placeholder)
@@ -102,6 +104,8 @@ class IraePatientTab(QWidget):
                 self._add_item(item, definitive=True)
             for item in suspects:
                 self._add_item(item, definitive=False)
+            for item in removed:
+                self._add_removed_item(item)
         self._render_markdown()
 
     def _add_item(self, item: dict, definitive: bool) -> None:
@@ -112,6 +116,24 @@ class IraePatientTab(QWidget):
         list_item = QListWidgetItem(
             f"[{tag}] {item.get('irAE_type')} · {grade} · insorgenza {onset} · {prob}"
         )
+        list_item.setData(Qt.UserRole, item)
+        self._list.addItem(list_item)
+
+    def _add_removed_item(self, item: dict) -> None:
+        """Removed findings stay in the complete registry, struck through."""
+        grade = item.get("ctcae_grade") or "?"
+        onset = item.get("first_onset_date") or "?"
+        prob = item.get("probability_immune") or "?"
+        reason = item.get("removed_reason") or "motivo non specificato"
+        list_item = QListWidgetItem(
+            f"[rimosso] {item.get('irAE_type')} · {grade} · "
+            f"insorgenza {onset} · {prob} — motivo: {reason}"
+        )
+        font = list_item.font()
+        font.setStrikeOut(True)
+        list_item.setFont(font)
+        list_item.setForeground(QColor("#808080"))
+        list_item.setToolTip(f"Rimosso manualmente — motivo: {reason}")
         list_item.setData(Qt.UserRole, item)
         self._list.addItem(list_item)
 

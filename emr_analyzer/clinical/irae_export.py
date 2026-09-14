@@ -26,6 +26,7 @@ EXCEL_COLUMNS: list[tuple[str, str]] = [
     ("immunotherapy_start", "Inizio immunoterapia"),
     ("candidates_total", "N° candidati"),
     ("analyzed_at", "Data analisi"),
+    ("removed", "Rimosso"),
 ]
 
 
@@ -40,6 +41,38 @@ def _immunotherapy_label(report: dict[str, Any]) -> str:
     return first_drug or first_date or ""
 
 
+def _finding_row(
+    item: dict[str, Any],
+    patient_id: str,
+    report: dict[str, Any],
+    removed: str,
+) -> dict[str, Any]:
+    organs = item.get("source_organs") or []
+    organ = ", ".join(organs) if organs else item.get("organ", "")
+    return {
+        "patient_id": patient_id,
+        "organ": organ,
+        "irAE_type": item.get("irAE_type", ""),
+        "ctcae_grade": item.get("ctcae_grade", ""),
+        "first_onset_date": item.get("first_onset_date", ""),
+        "probability_immune": item.get("probability_immune", ""),
+        "new_onset_vs_exacerbation": item.get(
+            "new_onset_vs_exacerbation", ""
+        ),
+        "alternative_causes": item.get("alternative_causes", ""),
+        "confidence": item.get("confidence", ""),
+        "key_evidence_ids": ", ".join(
+            str(eid).strip().lstrip("#")
+            for eid in (item.get("key_evidence_ids") or [])
+        ),
+        "notes": item.get("notes", ""),
+        "immunotherapy_start": _immunotherapy_label(report),
+        "candidates_total": report.get("candidates_total", ""),
+        "analyzed_at": report.get("analyzed_at", ""),
+        "removed": removed,
+    }
+
+
 def irae_rows_for_excel(
     results: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -49,41 +82,28 @@ def irae_rows_for_excel(
     structured}``; ``structured`` is ``None`` for the classic method or for
     patients whose analysis failed.  Returns ``(rows, skipped)`` where each
     row carries the ``EXCEL_COLUMNS`` keys and ``skipped`` lists the patients
-    with no exportable structured finding.
+    with no exportable structured finding (active OR removed).
     """
     rows: list[dict[str, Any]] = []
     skipped: list[str] = []
     for result in results:
         report = result.get("structured")
-        findings = report.get("iraes") if isinstance(report, dict) else None
-        if not isinstance(findings, list) or not findings:
+        if not isinstance(report, dict):
             skipped.append(result["patient_id"])
             continue
-        immunotherapy = _immunotherapy_label(report)
+        findings = report.get("iraes") or []
+        consolidation = report.get("consolidation") or {}
+        removed_findings = consolidation.get("removed") or []
         for item in findings:
-            organs = item.get("source_organs") or []
-            organ = ", ".join(organs) if organs else item.get("organ", "")
-            rows.append({
-                "patient_id": result["patient_id"],
-                "organ": organ,
-                "irAE_type": item.get("irAE_type", ""),
-                "ctcae_grade": item.get("ctcae_grade", ""),
-                "first_onset_date": item.get("first_onset_date", ""),
-                "probability_immune": item.get("probability_immune", ""),
-                "new_onset_vs_exacerbation": item.get(
-                    "new_onset_vs_exacerbation", ""
-                ),
-                "alternative_causes": item.get("alternative_causes", ""),
-                "confidence": item.get("confidence", ""),
-                "key_evidence_ids": ", ".join(
-                    str(eid).strip().lstrip("#")
-                    for eid in (item.get("key_evidence_ids") or [])
-                ),
-                "notes": item.get("notes", ""),
-                "immunotherapy_start": immunotherapy,
-                "candidates_total": report.get("candidates_total", ""),
-                "analyzed_at": report.get("analyzed_at", ""),
-            })
+            rows.append(_finding_row(item, result["patient_id"], report, ""))
+        for item in removed_findings:
+            reason = item.get("removed_reason") or ""
+            rows.append(_finding_row(
+                item, result["patient_id"], report,
+                f"rimosso — {reason}" if reason else "rimosso",
+            ))
+        if not findings and not removed_findings:
+            skipped.append(result["patient_id"])
     return rows, skipped
 
 

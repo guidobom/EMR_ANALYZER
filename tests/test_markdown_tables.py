@@ -56,6 +56,19 @@ class MarkdownTablesTest(unittest.TestCase):
         html = markdown_tables_to_html(text)
         self.assertNotIn(":---:", html)
 
+    def test_strikethrough_spans_become_s_tags(self):
+        html = render_markdown_to_html("~~rimosso~~ testo")
+        self.assertIn("<s>rimosso</s> testo", html)
+        self.assertNotIn("~~", html)
+
+    def test_strikethrough_escapes_inner_content(self):
+        html = render_markdown_to_html("~~<b>x</b>~~")
+        self.assertIn("<s>&lt;b&gt;x&lt;/b&gt;</s>", html)
+
+    def test_lone_tildes_left_as_text(self):
+        html = render_markdown_to_html("~~ aperta")
+        self.assertIn("~~ aperta", html)
+
 
 if __name__ == "__main__":
     unittest.main()

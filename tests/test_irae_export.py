@@ -76,7 +76,7 @@ class IraeRowsForExcelTest(unittest.TestCase):
         self.assertEqual(row["analyzed_at"], "2026-08-27T10:00:00")
         self.assertEqual(rows[1]["key_evidence_ids"], "E-UVE, E-9")
         # every result key has a header column.
-        self.assertEqual(len(EXCEL_COLUMNS), 14)
+        self.assertEqual(len(EXCEL_COLUMNS), 15)
 
     def test_source_organs_and_notes_are_exported(self):
         from emr_analyzer.clinical.irae_export import irae_rows_for_excel
@@ -127,7 +127,7 @@ class IraeRowsForExcelTest(unittest.TestCase):
         self.assertEqual(skipped, [])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["irAE_type"], "Elevazione della troponina")
-        self.assertEqual(len(EXCEL_COLUMNS), 14)
+        self.assertEqual(len(EXCEL_COLUMNS), 15)
 
     def test_hash_prefix_in_cited_ids_is_stripped(self):
         from emr_analyzer.clinical.irae_export import irae_rows_for_excel
@@ -138,6 +138,45 @@ class IraeRowsForExcelTest(unittest.TestCase):
         ])
         rows, _ = irae_rows_for_excel([_result("P001", report)])
         self.assertEqual(rows[0]["key_evidence_ids"], "E-TROP, E-9")
+
+
+    def test_removed_findings_exported_with_reason_column(self):
+        from emr_analyzer.clinical.irae_export import irae_rows_for_excel
+
+        report = _report([_finding()])
+        report["consolidation"] = {
+            "removed": [{
+                "organ": "Dermatite",
+                "irAE_type": "Rash rimosso",
+                "ctcae_grade": "G1",
+                "first_onset_date": "2022-12-13",
+                "probability_immune": "PROBABILE",
+                "removed_reason": "falso positivo",
+            }],
+        }
+        rows, skipped = irae_rows_for_excel([_result("P001", report)])
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(rows), 2)
+        active = next(r for r in rows if r["irAE_type"] != "Rash rimosso")
+        removed_row = next(r for r in rows if r["irAE_type"] == "Rash rimosso")
+        self.assertEqual(active["removed"], "")
+        self.assertEqual(removed_row["removed"], "rimosso — falso positivo")
+
+    def test_patient_with_only_removed_findings_is_not_skipped(self):
+        from emr_analyzer.clinical.irae_export import irae_rows_for_excel
+
+        report = {
+            "iraes": [],
+            "anchor": None,
+            "consolidation": {"removed": [{
+                "irAE_type": "Rash rimosso",
+                "removed_reason": "",
+            }]},
+        }
+        rows, skipped = irae_rows_for_excel([_result("P001", report)])
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["removed"], "rimosso")
 
 
 class WriteIraeXlsxTest(unittest.TestCase):

@@ -224,6 +224,25 @@ Referto Completo
             "laboratorio",
         )
 
+    def test_qualitative_lab_sheet_is_laboratory_not_pronto_soccorso(self):
+        # Regression: antigen/culture sheets with qualitative results
+        # ("Negativo", "Negativa") requested by the emergency unit are lab
+        # sheets; "PRONTO SOCCORSO" is only the requesting unit.
+        text = """LABORATORIO DI ANALISI UNICO PROVINCIALE
+ANALISI BIOCHIMICO-CLINICHE E MICROBIOLOGIA
+Richiesta: 21989065 Emergenza PRONTO SOCCORSO GEN. (47.1)
+
+Esame Esito U.M. Intervalli Riferimento
+Materiale: T. Nasale
+Antigene SARS-CoV-2 (Metodica: CLIA) Negativo
+Referto Completo
+Risultati validati da: Dott.ssa Barbara Sitta
+"""
+        self.assertEqual(
+            DocumentClassifier().classify(text, "documento.pdf"),
+            "laboratorio",
+        )
+
     def test_invalid_numeric_cell_is_not_converted_to_zero(self):
         with self.assertRaises(ValueError):
             LabNormalizer().normalize_value("Siero")
