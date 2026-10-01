@@ -42,9 +42,13 @@ risorsa `Basic` con la copertura dell'elaborazione.
 ## Identificativi e stati
 
 - L'id di un evento dipende dall'occorrenza sorgente (documento, intervallo,
-  etichetta, tipo): resta stabile dopo una revisione o una nuova estrazione. Copie
-  identiche riusate da referti precedenti condividono una risorsa con più
-  `Provenance`.
+  etichetta, tipo): resta stabile dopo una revisione o una nuova estrazione.
+- Le occorrenze di uno stesso enunciato — la frase ripetuta in più referti —
+  condividono una risorsa con una `Provenance` per referto, purché tutti i campi
+  clinici concordino. Un fatto ripetuto la cui data non è nella frase resta una
+  risorsa a sé: parole identiche possono descrivere episodi diversi. Una copia
+  corretta dal revisore esce dal gruppo e diventa un fatto proprio; una conferma
+  senza modifiche vi rientra all'esportazione successiva.
 - L'id di un risultato di laboratorio dipende dal contenuto grezzo della misura
   nel suo documento, non da revisioni, interpretazioni o altri referti.
 - Estensioni applicative (`urn:emr-analyzer:fhir:StructureDefinition:`):

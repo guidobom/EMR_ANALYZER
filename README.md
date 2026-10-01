@@ -26,16 +26,30 @@ frammento del referto da cui proviene e può essere revisionato.
    verificati dal programma, con asserzione, certezza, soggetto, temporalità,
    date e attributi. I referti di laboratorio già letti dal parser non vengono
    inviati al modello.
+   **Testo ripetuto.** Prima di estrarre, il programma indicizza le frasi di
+   ogni paziente: un enunciato è una frase con la sua frase precedente e il
+   titolo di sezione, e la sua prima comparsa nel tempo è l'origine. Solo le
+   origini vanno al modello; le copie ricevono l'annotazione proiettata con i
+   propri offset e la data risolta all'origine (misurato su dodici referti di
+   un paziente: −26% chiamate, −54% tempo, nessuna riga persa). Se la
+   proiezione non è possibile la singola frase viene rianalizzata.
 6. **Codifica SNOMED CT.** Ogni concetto (etichetta normalizzata + tipo di evento)
    viene codificato una sola volta, scegliendo fra candidati del catalogo
    International filtrati per gerarchia; la codifica vale per tutte le sue
    occorrenze, in tutti i pazienti. I risultati tabellari restano su LOINC.
 7. **Revisione.** Nella scheda **🧬 Eventi SNOMED** si ispezionano eventi e
    frammenti e si modifica tutto: codice (per occorrenza o per concetto),
-   frammento, attributi, eventi mancanti o errati, testo del referto. La finestra
-   **🧬 Concetti SNOMED** rivede le codifiche dell'intero progetto per frequenza.
+   frammento, attributi, eventi mancanti o errati, testo del referto. La colonna
+   «Referti» mostra quante volte un enunciato ricorre e se la riga è l'origine o
+   una copia; «Una riga per enunciato» le raggruppa e «Su tutte le copie» estende
+   la decisione a ogni referto che lo ripete (il frammento resta per singolo
+   referto). La finestra **🧬 Concetti SNOMED** rivede le codifiche dell'intero
+   progetto per frequenza.
 8. **FHIR.** Un Bundle per paziente (`<paziente>/clinical_events.fhir.json`) e un
-   export di progetto in NDJSON (**File → Esporta FHIR del progetto**).
+   export di progetto in NDJSON (**File → Esporta FHIR del progetto**). Le
+   occorrenze di uno stesso enunciato diventano una sola risorsa con una
+   `Provenance` per referto; una copia corretta dal revisore diventa un fatto a
+   sé.
 
 **▶ Elabora pazienti** esegue i punti 5–8 per i pazienti selezionati con un'unica
 coda: i documenti di tutti i pazienti condividono gli slot del modello e ogni
