@@ -53,8 +53,16 @@ class ReferencedSourceReader(CompactSourceReader):
         lines = [f'CONTESTO: tipo_dichiarato={document_type}; data_documento={document_date or "non disponibile"}',
                  'Ogni parola è preceduta da [numero]. span=[prima,ultima], estremi inclusi. '
                  'I numeri sono indirizzi, non fanno parte del testo. Estrai solo OBIETTIVO.']
+        if group.copies:
+            lines.append('Le frasi COPIA ripetono un fatto già annotato altrove per questo '
+                         'paziente: non estrarne nulla; servono solo a capire il contesto.')
         for s in group.numbered:
-            role = 'OBIETTIVO' if s.sentence_id in group.target_ids else 'CONTESTO'
+            if s.sentence_id in group.target_ids:
+                role = 'OBIETTIVO'
+            elif s.sentence_id in group.copy_ids:
+                role = 'COPIA'
+            else:
+                role = 'CONTESTO'
             lines.append(f'{role} [S{s.sentence_id}] '+ ' '.join(
                 f'[{i}]'+m.group() for i,m in enumerate(WORDS.finditer(s.text),1)))
         # Reuse the date index and examples, without sending the source twice.
@@ -126,6 +134,14 @@ class ReferencedSourceReader(CompactSourceReader):
             try:
                 raw = {k:v for k,v in original.items() if k!='relations'} if isinstance(original,dict) else original
                 jsonschema.validate(raw,contract['properties']['events']['items'])
+                if raw['s'] in group.copy_ids:
+                    # The statement is already certified elsewhere: this copy
+                    # brings no new fact and needs no repair call.
+                    metrics = getattr(self._local, 'metrics', None)
+                    if isinstance(metrics, dict):
+                        metrics['statement_copy_events_ignored'] = \
+                            metrics.get('statement_copy_events_ignored', 0) + 1
+                    continue
                 if raw['s'] not in group.target_ids:
                     raise ValueError('Frase non OBIETTIVO')
                 source = group.numbered[raw['s']-1]

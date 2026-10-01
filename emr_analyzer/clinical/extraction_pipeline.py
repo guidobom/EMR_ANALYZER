@@ -46,6 +46,8 @@ class _PatientPlan:
     documents: list
     run: ProcessingRun
     tasks: list = field(default_factory=list)       # (doc, text, manifest_id)
+    #: sentence id -> 'origin' | 'copy' for every narrative document
+    statement_roles: dict = field(default_factory=dict)
     skipped: int = 0
     laboratory_documents: int = 0
     processed: int = 0
@@ -315,9 +317,12 @@ class ExtractionPipeline:
             laboratory_documents[doc.id] = (
                 doc.document_type == DocumentType.LABORATORIO.value
                 and lab_counts.get(doc.id, 0) > 0)
-        self.statements.rebuild(patient_id, [
+        indexed = self.statements.rebuild(patient_id, [
             (doc.id, doc.document_date, texts[doc.id]) for doc in documents
             if doc.id in texts and not laboratory_documents[doc.id]], run_id=run.run_id)
+        plan.statement_roles = {
+            document_id: {occurrence.ordinal: occurrence.role for occurrence in occurrences}
+            for document_id, occurrences in indexed.items()}
         for doc in documents:
             if doc.id not in texts:
                 continue
@@ -365,6 +370,7 @@ class ExtractionPipeline:
                 patient_id=plan.patient_id, document_id=doc.id,
                 document_type=doc.document_type, document_date=doc.document_date,
                 text=text, geometry_path=_geometry_source(doc, active_workspace.path),
+                statement_roles=plan.statement_roles.get(doc.id),
                 evidence_ready_callback=lambda rows: self.replace_document_evidence(doc.id, rows),
                 cancel_check=cancel_check,
                 stage_progress_callback=lambda message: report(position(), f"{plan.patient_id} · {doc.id}: {message}"),
@@ -411,6 +417,10 @@ class ExtractionPipeline:
         self.processing_repo.finish_run(
             plan.run.run_id, "completed_with_warnings" if plan.failures else "completed")
         summary = _summarize(plan.doc_stats)
+        counts = self.statements.counts(plan.patient_id)
+        summary.update(statement_occurrences=counts["occurrences"],
+                       statement_origins=counts["origins"], statement_copies=counts["copies"],
+                       statement_reused_characters=counts["copy_chars"])
         if self.audit:
             self.audit.log(plan.patient_id, "clinical_events_extracted", "clinical_evidence",
                            plan.patient_id, {"documents_total": len(plan.documents),
@@ -573,7 +583,8 @@ def _eta_message(completed: int, total: int, elapsed: float, patient_id: str) ->
 def _summarize(doc_stats) -> dict:
     total = lambda key, cast=int: sum(cast(item.get(key, 0) or 0) for item in doc_stats)
     keys = ("llm_calls", "source_chunks", "prompt_tokens", "completion_tokens",
-            "recovery_calls", "snomed_mapped", "snomed_unmapped")
+            "recovery_calls", "snomed_mapped", "snomed_unmapped",
+            "statement_groups_skipped", "statement_copy_events_ignored")
     summary = {key: total(key) for key in keys}
     summary.update(prompt_ms=round(total("prompt_ms", float), 3),
                    predicted_ms=round(total("predicted_ms", float), 3),

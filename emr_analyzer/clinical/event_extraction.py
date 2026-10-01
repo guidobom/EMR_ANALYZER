@@ -2,24 +2,33 @@
 
 SNOMED CT coding is a separate, concept-level step (``snomed_coding``):
 extraction only identifies events, their literal source and their qualifiers.
+Sentences that repeat a statement already certified for this patient are not
+annotated again: the planner targets only origin sentences, and the certified
+payload is projected onto the copies afterwards.
 """
 import json
 
 from .evidence_utils import content_hash
 from .grounded_sources import IncompleteAtomicExtraction
-from .historical_reuse import HistoricalReuseMixin
 from .referenced_annotations import ReferencedSourceReader
+from .sentence_groups import statement_group_plan
 from ..prompt_catalog import load_prompt
 
-VERSION = 'fhir_events_referenced_v8'
+VERSION = 'fhir_events_referenced_v9'
 
 
-class EventExtractor(HistoricalReuseMixin, ReferencedSourceReader):
+class EventExtractor(ReferencedSourceReader):
     def _initial_groups(self, text):
-        # Initialize source spans and the clinical date index before reuse planning.
-        super()._initial_groups(text)
+        # Initialize source spans and the clinical date index before planning.
+        groups = super()._initial_groups(text)
+        roles = getattr(self._local, 'statement_roles', None)
+        if not roles:
+            return groups
         budget = max(200, min(600, int(getattr(self.llm, 'max_output_tokens', 4096))//8))
-        return self._plan_historical_groups(text, budget)
+        planned, skipped = statement_group_plan(
+            text, roles, lambda value: max(1, len(value.encode())//3), budget)
+        self._local.metrics['statement_groups_skipped'] = skipped
+        return planned
 
     def __init__(self, llm_client, **kwargs):
         self.teaching_catalog = list(kwargs.pop('catalog', ()))
@@ -48,7 +57,9 @@ class EventExtractor(HistoricalReuseMixin, ReferencedSourceReader):
 
     def extract_document(self, **kwargs):
         ready = kwargs.pop('evidence_ready_callback', None)
-        self._local.history_document = {k:kwargs.get(k) for k in ('patient_id','document_type','document_date')}
+        # Roles come from the patient-level statement index: 'origin' sentences
+        # are annotated here, 'copy' sentences wait for the projection.
+        self._local.statement_roles = kwargs.pop('statement_roles', None)
         self._local.retrieval_cache = {}
         self._local.cancel_check = kwargs.get('cancel_check')
         try:

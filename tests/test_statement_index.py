@@ -120,3 +120,32 @@ def test_rebuild_replaces_previous_rows(project):
     assert len(index.for_document("DOC_A")) == 3
     index.rebuild("P2", [("DOC_A", "2026-01-01", "Il paziente ha febbre.")])
     assert len(index.for_document("DOC_A")) == 1
+
+
+def test_planner_sends_only_origins_and_marks_copies():
+    from emr_analyzer.clinical.sentence_groups import (plan_statement_groups,
+                                                       statement_group_plan)
+
+    roles = {1: "origin", 2: "origin", 3: "origin", 4: "origin", 5: "copy"}
+    groups = plan_statement_groups(TEXT + "\nTerapia:\n\nProsegue nivolumab.\n", roles,
+                                   lambda value: max(1, len(value.encode()) // 3), 1000)
+    assert groups and all(5 not in group.target_ids for group in groups)
+    assert any(5 in group.copy_ids for group in groups)
+    prompt = groups[0].prompt("visita_oncologica", "2026-10-01")
+    assert "COPIA [S5]" in prompt and "non estrarne nulla" in prompt
+    # A document made only of copies is never sent to the model.
+    planned, skipped = statement_group_plan(TEXT, {n: "copy" for n in range(1, 4)},
+                                            lambda value: 10, 1000)
+    assert planned == [] and skipped == 1
+
+
+def test_split_group_keeps_a_copy_on_one_side_only():
+    from emr_analyzer.clinical.sentence_groups import SentenceGroup, split_group
+    from emr_analyzer.clinical.evidence_utils import SentenceSpan
+
+    spans = [SentenceSpan(n, n * 10, n * 10 + 5, f"S{n}.") for n in range(1, 6)]
+    group = SentenceGroup(targets=(spans[0], spans[1], spans[2], spans[3]),
+                          context=(spans[4],), copies=(spans[0],))
+    left, right = split_group(group)
+    assert left.copies == (spans[0],) and right.copies == ()
+    assert left.targets == (spans[0], spans[1]) and right.targets == (spans[2], spans[3])
