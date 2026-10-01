@@ -5,7 +5,7 @@ import re
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -907,6 +907,66 @@ CREATE_TABLES_SQL += [
         metrics_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL
     )""",
+    # v23: patient-level statement index.  One row per occurrence of a clinical
+    # sentence; the earliest occurrence of a statement is its carrier (origin),
+    # the others are copies that receive the projected annotation.  Derived from
+    # text, rebuilt per patient, never edited by hand.
+    """CREATE TABLE IF NOT EXISTS statement_index (
+        occurrence_id TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        document_date TEXT,
+        sentence_ordinal INTEGER NOT NULL,
+        sentence_start INTEGER NOT NULL,
+        sentence_end INTEGER NOT NULL,
+        sentence_text TEXT NOT NULL,
+        normalized_text TEXT NOT NULL,
+        previous_text TEXT NOT NULL DEFAULT '',
+        heading_text TEXT NOT NULL DEFAULT '',
+        statement_key TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('origin','copy')),
+        carrier_occurrence_id TEXT NOT NULL,
+        carrier_document_id TEXT NOT NULL,
+        carrier_document_date TEXT,
+        key_version TEXT NOT NULL,
+        source_version TEXT NOT NULL,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_statement_index_patient
+       ON statement_index(patient_id, statement_key)""",
+    """CREATE INDEX IF NOT EXISTS idx_statement_index_document
+       ON statement_index(document_id, sentence_ordinal)""",
+    """CREATE INDEX IF NOT EXISTS idx_statement_index_role
+       ON statement_index(patient_id, role)""",
+    # v23: the payload certified for a statement.  One row per statement and
+    # model/prompt version; the carrier document owns the row, so deleting the
+    # origin lets the next occurrence become the carrier and be annotated again.
+    """CREATE TABLE IF NOT EXISTS statement_annotations (
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        statement_key TEXT NOT NULL,
+        annotation_key TEXT NOT NULL,
+        payload_version TEXT NOT NULL,
+        carrier_occurrence_id TEXT NOT NULL,
+        carrier_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        carrier_document_date TEXT,
+        carrier_sentence TEXT NOT NULL,
+        model_name TEXT,
+        model_digest TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL DEFAULT '[]',
+        raw_json TEXT,
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (patient_id, statement_key, annotation_key)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_statement_annotations_carrier
+       ON statement_annotations(carrier_document_id)""",
+    """CREATE INDEX IF NOT EXISTS idx_statement_annotations_statement
+       ON statement_annotations(patient_id, statement_key)""",
 ]
 
 
@@ -1174,6 +1234,7 @@ def drop_all_tables(db: DatabaseEngine) -> None:
         "local_lexicon_examples", "local_example_roles", "local_event_definitions",
         "local_lexicon_annotations", "local_lexicon_terms", "local_lexicon_identity",
         "atomic_group_calls", "atomic_group_results",
+        "statement_annotations", "statement_index", "event_overrides",
         "clinical_events_fts", "clinical_event_relations",
         "clinical_event_claim_sources", "clinical_event_claims",
         "clinical_hypotheses", "evidence_relations",

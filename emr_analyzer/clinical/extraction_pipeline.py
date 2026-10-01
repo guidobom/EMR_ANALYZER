@@ -26,6 +26,7 @@ from .grounded_sources import (
 from .event_extraction import EventExtractor
 from .snomed_coding import CodingCancelled, ConceptCoder
 from .lab_evidence import LEGACY_LAB_METHODS, filter_narrative_lab_duplicates
+from .statement_index import PROJECTION_VERSION
 from ..config import active_workspace
 from ..models.clinical_registry import ProcessingManifestItem, ProcessingRun
 from ..models.document import DocumentType
@@ -84,6 +85,10 @@ class ExtractionPipeline:
         self.pipeline_policy = pipeline_policy or load_pipeline_policy()
         self.shared_lexicon_repo = shared_lexicon_repo
         self.db = db or evidence_repo.db
+        from ..database.statement_repo import (StatementAnnotationRepository,
+                                              StatementIndexRepository)
+        self.statements = StatementIndexRepository(self.db)
+        self.statement_annotations = StatementAnnotationRepository(self.db)
         self.extractor = self.make_extractor()
         self.coder = self.make_coder()
 
@@ -296,18 +301,36 @@ class ExtractionPipeline:
         lab_counts = dict(self.db.execute(
             "SELECT document_id, COUNT(*) FROM lab_values WHERE patient_id=? GROUP BY document_id",
             (patient_id,)).fetchall())
+        # Read every text once: the statement index needs all the narrative
+        # documents of the patient before any document's input hash is fixed.
+        texts, laboratory_documents = {}, {}
         for doc in documents:
             path = self.normalized_text_path(patient_id, doc.id)
             if path is None:
                 plan.failures.append({"document_id": doc.id, "error": "Testo anonimizzato non disponibile."})
                 continue
             base_text = path.read_text(encoding="utf-8")
-            text = self.overlay_repo.effective_text(doc.id, base_text) if self.overlay_repo else base_text
-            laboratory = (doc.document_type == DocumentType.LABORATORIO.value
-                          and lab_counts.get(doc.id, 0) > 0)
+            texts[doc.id] = (self.overlay_repo.effective_text(doc.id, base_text)
+                             if self.overlay_repo else base_text)
+            laboratory_documents[doc.id] = (
+                doc.document_type == DocumentType.LABORATORIO.value
+                and lab_counts.get(doc.id, 0) > 0)
+        self.statements.rebuild(patient_id, [
+            (doc.id, doc.document_date, texts[doc.id]) for doc in documents
+            if doc.id in texts and not laboratory_documents[doc.id]], run_id=run.run_id)
+        for doc in documents:
+            if doc.id not in texts:
+                continue
+            text = texts[doc.id]
+            laboratory = laboratory_documents[doc.id]
             guidance = self.extractor.guidance_digest(text) if self.extractor else ""
+            # The digest makes a document depend on which report carries its
+            # statements: when an older report takes one over, its copies are
+            # planned again even though their own text did not change.
+            index_digest = "" if laboratory else self.statements.digest(doc.id)
             input_hash = content_hash(text, doc.document_date, doc.document_type,
                                       self.prompt_version, self.prompt_digest, guidance,
+                                      PROJECTION_VERSION, index_digest,
                                       "deterministic-laboratory" if laboratory else "")
             if incremental and self.processing_repo.is_current(
                     doc.id, STAGE, input_hash, self.prompt_version,
