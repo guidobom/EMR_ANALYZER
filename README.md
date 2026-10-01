@@ -90,8 +90,11 @@ usano solo dati sintetici.
   Hugging Face locali su Linux/NVIDIA.
 
 Due ruoli LLM si configurano da **Configura LLM**: *documenti* (normalizzazione
-dei referti) ed *estrazione e codifica*. Per l'estrazione si consigliano
-temperatura 0 e più slot paralleli; l'app chiede conferma sopra 0,2.
+dei referti) ed *estrazione e codifica*. Per l'estrazione il preset è
+temperatura 0,7 con top_p 0,8 e top_k 20 — i valori raccomandati per i modelli
+Qwen3, misurati sul campione revisionato: la decodifica greedy produce
+ripetizioni e violazioni dello schema. Più slot paralleli aiutano il
+throughput; l'app chiede conferma sopra 0,8.
 
 ## Installazione
 

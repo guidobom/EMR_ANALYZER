@@ -187,10 +187,12 @@ def default_llm_configs() -> dict[str, LLMRoleConfig]:
             temperature=doc_cfg.temperature,
             parallel_workers=doc_workers,
         ),
-        # Extraction is a source-grounded classification task. Greedy decode
-        # is both more reproducible and less likely to violate the schema,
-        # reducing corrective calls without weakening the event model.
-        "atomic_evidence": replace(clinical_config, temperature=0.0),
+        # Qwen3 models degrade with greedy decoding: repetition loops and
+        # schema violations.  Measured on the P068 reviewed sample (30B-A3B,
+        # three slots): temperature 0 gave located 83.8% / labelled 56.4%
+        # with 39 calls and one usable report; the sampling recommended for
+        # Qwen3 (0.7 / top_p 0.8 / top_k 20) gave 86.9% / 73.4% with 23 calls.
+        "atomic_evidence": replace(clinical_config, temperature=0.7, top_p=0.8, top_k=20),
     }
 
 
@@ -519,12 +521,27 @@ def save_pipeline_policy(
     temporary.replace(settings_path)
 
 
+#: Extraction default before the Qwen3 sampling sweep; a stored config
+#: that still carries it exactly was never touched by the user.
+_LEGACY_ATOMIC_SAMPLING = (0.0, 0.9, 40)
+
+
 def load_pipeline_llm_config(key: str, default: LLMRoleConfig,
                              path: str | Path = SETTINGS_PATH) -> LLMRoleConfig:
     """Read the last confirmed selection for this exact user-facing pipeline."""
     presets = _read_payload(Path(path)).get("pipeline_llm", {})
     payload = presets.get(key, {}) if isinstance(presets, dict) else {}
-    return LLMRoleConfig.from_dict(payload, default)
+    config = LLMRoleConfig.from_dict(payload, default)
+    if key == "atomic" and (
+        config.temperature, config.top_p, config.top_k
+    ) == _LEGACY_ATOMIC_SAMPLING:
+        config = replace(
+            config,
+            temperature=default.temperature,
+            top_p=default.top_p,
+            top_k=default.top_k,
+        )
+    return config
 
 
 def save_pipeline_llm_config(key: str, config: LLMRoleConfig,

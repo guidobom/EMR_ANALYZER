@@ -538,11 +538,12 @@ class MainWindow(QMainWindow):
             if dialog.exec_() != QDialog.Accepted:
                 return False
             selected = dialog.configurations()[role]
-            if key == "atomic" and selected.temperature > 0.2:
+            if key == "atomic" and selected.temperature > 0.8:
                 answer = QMessageBox.question(
                     parent or self, "Temperatura elevata",
-                    f"La temperatura del modello è {selected.temperature:g}. Per un'estrazione "
-                    "riproducibile e conforme allo schema si consiglia 0 (al massimo 0,2).\n\n"
+                    f"La temperatura del modello è {selected.temperature:g}. Per l'estrazione "
+                    "si consigliano 0,7 con top_p 0,8 e top_k 20, i valori raccomandati per i "
+                    "modelli Qwen3: temperature più alte aumentano le violazioni dello schema.\n\n"
                     "Continuare comunque?",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
                 )

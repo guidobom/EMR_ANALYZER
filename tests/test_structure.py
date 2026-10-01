@@ -36,6 +36,34 @@ def test_only_extraction_and_document_llm_roles():
     assert set(default_llm_configs()) == set(MODEL_ROLES)
 
 
+def test_extraction_preset_uses_the_measured_sampling():
+    from emr_analyzer.settings import default_llm_configs
+
+    extraction = default_llm_configs()["atomic_evidence"]
+    assert (extraction.temperature, extraction.top_p, extraction.top_k) == (0.7, 0.8, 20)
+
+
+def test_legacy_extraction_sampling_is_migrated_once(tmp_path):
+    import json
+
+    from emr_analyzer.settings import (LLMRoleConfig, default_llm_configs,
+                                       load_pipeline_llm_config)
+
+    default = default_llm_configs()["atomic_evidence"]
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"pipeline_llm": {"atomic": {
+        **default.to_dict(), "temperature": 0.0, "top_p": 0.9, "top_k": 40}}}),
+        encoding="utf-8")
+    migrated = load_pipeline_llm_config("atomic", default, path)
+    assert (migrated.temperature, migrated.top_p, migrated.top_k) == (0.7, 0.8, 20)
+    # A deliberate choice is never overwritten.
+    path.write_text(json.dumps({"pipeline_llm": {"atomic": {
+        **default.to_dict(), "temperature": 0.0, "top_p": 0.9, "top_k": 20}}}),
+        encoding="utf-8")
+    kept = load_pipeline_llm_config("atomic", default, path)
+    assert kept.temperature == 0.0
+
+
 def test_prompt_manifest_matches_prompt_files():
     import json
 
