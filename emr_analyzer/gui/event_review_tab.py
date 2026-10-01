@@ -484,6 +484,11 @@ class EventReviewTab(QWidget):
         if event.observed_date:
             lines.append(f"Data evento {event.observed_date}" + (f"–{event.observed_date_end}"
                          if event.observed_date_end else "") + f" · referto {event.document_date or 'n.d.'}")
+        provenance = ((event.machine.data if event.machine is not None else {}) or {}).get("date_provenance") or {}
+        origin = provenance.get("projected_from_document")
+        if origin:
+            lines.append(f"<span style='color:#5f6368'>Enunciato ripetuto: data e contenuto ereditati "
+                         f"dal referto {origin} ({provenance.get('projected_from_date') or 'n.d.'})</span>")
         self._detail.setText("<br>".join(lines))
         self._source.show_text(text, None if event.stale else event.start, None if event.stale else event.end)
         self._load_editor(event)
