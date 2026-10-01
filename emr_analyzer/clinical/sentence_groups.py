@@ -146,6 +146,24 @@ def _statement_group(spans, start, end, roles):
     return SentenceGroup(targets, context, copies)
 
 
+def plan_selected_groups(text, ordinals, count_tokens, target_tokens=1000):
+    """Groups for an explicit set of sentences (recovery of a failed projection)."""
+    spans = clinical_sentences(text)
+    wanted = sorted({n for n in ordinals if 1 <= n <= len(spans)})
+    if not spans or not wanted:
+        return []
+    groups, start, size, end = [], wanted[0], 0, wanted[0]
+    for ordinal in wanted:
+        cost = count_tokens(spans[ordinal - 1].text) + 10
+        if size and (ordinal > end + 1 or size + cost > target_tokens):
+            groups.append(_group(spans, start - 1, end))
+            start, size = ordinal, 0
+        size += cost
+        end = ordinal
+    groups.append(_group(spans, start - 1, end))
+    return [group for group in groups if group.targets]
+
+
 def split_group(group):
     if len(group.targets) > 1:
         mid = len(group.targets) // 2

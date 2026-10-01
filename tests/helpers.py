@@ -106,10 +106,16 @@ class KeywordExtractor:
                 continue
             if statement_roles and statement_roles.get(sentence.sentence_id) == "copy":
                 continue
-            first = len([m for m in _re.finditer(r"\S+", sentence.text)
-                         if sentence.start + m.start() < start]) + 1
-            last = first + max(0, len(text[start:start + len(keyword)].split()) - 1)
-            end = start + len(keyword)
+            # Like the real reader: the fragment is the whole-word interval.
+            tokens = list(_re.finditer(r"\S+", sentence.text))
+            keyword_end = start + len(keyword)
+            first_index = next(i for i, match in enumerate(tokens)
+                               if sentence.start + match.end() > start)
+            last_index = max(i for i, match in enumerate(tokens)
+                             if sentence.start + match.start() < keyword_end)
+            first, last = first_index + 1, last_index + 1
+            start = sentence.start + tokens[first_index].start()
+            end = sentence.start + tokens[last_index].end()
             rows.append(ClinicalEvidence(
                 patient_id=patient_id, document_id=document_id,
                 evidence_id="EVD_" + content_hash(patient_id, document_id, start, end, keyword),

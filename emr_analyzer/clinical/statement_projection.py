@@ -284,6 +284,7 @@ class StatementProjectionService:
 def _miss(document_id: str, occurrence: StatementOccurrence, reason: str,
           label: str | None = None) -> dict:
     return {"document_id": document_id, "occurrence_id": occurrence.occurrence_id,
+            "ordinal": occurrence.ordinal,
             "statement_key": occurrence.statement_key, "reason": reason,
             "label": label or occurrence.text[:80],
             "carrier_document_id": occurrence.carrier_document_id}

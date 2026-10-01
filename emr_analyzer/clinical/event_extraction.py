@@ -11,7 +11,7 @@ import json
 from .evidence_utils import content_hash
 from .grounded_sources import IncompleteAtomicExtraction
 from .referenced_annotations import ReferencedSourceReader
-from .sentence_groups import statement_group_plan
+from .sentence_groups import plan_selected_groups, statement_group_plan
 from ..prompt_catalog import load_prompt
 
 VERSION = 'fhir_events_referenced_v9'
@@ -21,10 +21,15 @@ class EventExtractor(ReferencedSourceReader):
     def _initial_groups(self, text):
         # Initialize source spans and the clinical date index before planning.
         groups = super()._initial_groups(text)
+        budget = max(200, min(600, int(getattr(self.llm, 'max_output_tokens', 4096))//8))
+        targets = getattr(self._local, 'sentence_targets', None)
+        if targets:
+            # Recovery: only the sentences whose projection failed.
+            return plan_selected_groups(text, targets,
+                                        lambda value: max(1, len(value.encode())//3), budget)
         roles = getattr(self._local, 'statement_roles', None)
         if not roles:
             return groups
-        budget = max(200, min(600, int(getattr(self.llm, 'max_output_tokens', 4096))//8))
         planned, skipped = statement_group_plan(
             text, roles, lambda value: max(1, len(value.encode())//3), budget)
         self._local.metrics['statement_groups_skipped'] = skipped
@@ -60,6 +65,7 @@ class EventExtractor(ReferencedSourceReader):
         # Roles come from the patient-level statement index: 'origin' sentences
         # are annotated here, 'copy' sentences wait for the projection.
         self._local.statement_roles = kwargs.pop('statement_roles', None)
+        self._local.sentence_targets = kwargs.pop('sentence_targets', None)
         self._local.retrieval_cache = {}
         self._local.cancel_check = kwargs.get('cancel_check')
         try:

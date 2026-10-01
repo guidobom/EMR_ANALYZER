@@ -52,6 +52,7 @@ class _PatientPlan:
     #: effective text per document, read once while planning
     texts: dict = field(default_factory=dict)
     projection_misses: list = field(default_factory=list)
+    fallback_calls: int = 0
     skipped: int = 0
     laboratory_documents: int = 0
     processed: int = 0
@@ -418,48 +419,112 @@ class ExtractionPipeline:
         provisional and are not counted.  ``project_patient`` at the end of the
         patient is the authoritative pass.
         """
-        combined, _ = self.project_document(doc, text, extra=rows, complete=complete)
-        self.replace_document_evidence(doc.id, combined)
+        self.certify_document(doc, rows, complete=complete)
+        projected, _ = self.project_document(doc, text)
+        self.replace_document_evidence(doc.id, list(rows) + projected)
 
-    def project_document(self, doc, text, extra=(), *, complete=True):
-        """Own annotations plus the projected copies, and what stayed missing."""
+    def certify_document(self, doc, rows, *, complete=True) -> int:
+        if self.extractor is None:
+            return 0
+        return self.projection.certify(doc.patient_id, doc.id, list(rows),
+                                       model_digest=self.extractor.model_digest,
+                                       prompt_version=self.prompt_version,
+                                       model_name=getattr(self.extractor, "model_name", None),
+                                       complete=complete)
+
+    def project_document(self, doc, text):
+        """The projected copies of one document, and what could not be projected."""
         if self.extractor is None or not text:
-            return list(extra), []
-        self.projection.certify(getattr(doc, "patient_id", None), doc.id, list(extra),
-                                model_digest=self.extractor.model_digest,
-                                prompt_version=self.prompt_version,
-                                model_name=getattr(self.extractor, "model_name", None),
-                                complete=complete)
-        projected, misses = self.projection.project(
+            return [], []
+        return self.projection.project(
             patient_id=doc.patient_id, document_id=doc.id, text=text,
             document_date=doc.document_date, document_type=doc.document_type,
             geometry=document_geometry(_geometry_source(doc, active_workspace.path)),
             model_digest=self.extractor.model_digest, prompt_version=self.prompt_version)
-        return list(extra) + projected, misses
 
     def project_patient(self, plan) -> list:
         """Recompute every document's projection from the certified payloads.
 
         Deterministic and cheap: it propagates a re-annotated carrier to all of
-        its copies, including the documents this run skipped.
+        its copies, including the documents this run skipped.  A row annotated
+        directly on a copy sentence is kept only while the projection for that
+        sentence still fails, so recovery rows never double a projected fact.
         """
         misses = []
         for doc in plan.documents:
             text = plan.texts.get(doc.id)
             if not text or self.extractor is None:
                 continue
+            projected, missed = self.project_document(doc, text)
+            missed_ids = {item["occurrence_id"] for item in missed}
+            occurrences = {item.occurrence_id: item
+                           for item in self.statements.for_document(doc.id)}
+            kept = []
+            for row in self.evidence_repo.get_by_document(doc.id):
+                if getattr(row, "extraction_method", None) != METHOD:
+                    continue
+                if ((row.data or {}).get("statement_reuse") or {}).get("role") == "copy":
+                    continue
+                span = ((row.data or {}).get("source_spans") or [{}])[0]
+                start = span.get("start")
+                occurrence = next((item for item in occurrences.values()
+                                   if start is not None and item.start <= start < item.end), None)
+                if occurrence is not None and occurrence.role == "copy" \
+                        and occurrence.occurrence_id not in missed_ids:
+                    continue
+                kept.append(row)
+            self.replace_document_evidence(doc.id, kept + projected)
+            # A copy that was annotated directly is covered, not missing.
+            covered = {occurrence_id for occurrence_id in (row_occurrence(row, occurrences)
+                                                           for row in kept) if occurrence_id}
+            misses.extend(item for item in missed if item["occurrence_id"] not in covered)
+        return misses
+
+    def recover_misses(self, plan, cancel_check) -> int:
+        """One extra wave for the sentences whose projection failed.
+
+        The statement is annotated in this document, in its own right: the
+        copy is covered from now on, and the paid price is a single sentence
+        instead of a whole report.
+        """
+        by_document: dict[str, set] = {}
+        for miss in plan.projection_misses:
+            by_document.setdefault(miss["document_id"], set()).add(miss["ordinal"])
+        calls = 0
+        for document_id, ordinals in by_document.items():
+            doc = next((item for item in plan.documents if item.id == document_id), None)
+            text = plan.texts.get(document_id)
+            if doc is None or not text or self.extractor is None:
+                continue
+            if cancel_check is not None and cancel_check():
+                raise ExtractionCancelled("Elaborazione interrotta su richiesta dell'utente")
+            try:
+                rows = self.extractor.extract_document(
+                    patient_id=doc.patient_id, document_id=doc.id,
+                    document_type=doc.document_type, document_date=doc.document_date,
+                    text=text, geometry_path=_geometry_source(doc, active_workspace.path),
+                    sentence_targets=ordinals, cancel_check=cancel_check)
+            except AtomicExtractionCancelled as exc:
+                raise ExtractionCancelled(str(exc)) from exc
+            except IncompleteAtomicExtraction as exc:
+                rows = exc.evidence
+            except Exception:
+                continue
+            calls += 1
             stored = [row for row in self.evidence_repo.get_by_document(doc.id)
                       if getattr(row, "extraction_method", None) == METHOD
                       and ((row.data or {}).get("statement_reuse") or {}).get("role") != "copy"]
-            combined, missed = self.project_document(doc, text, extra=stored)
-            self.replace_document_evidence(doc.id, combined)
-            misses.extend(missed)
-        return misses
+            self.publish_document(plan, doc, text, stored + list(rows), complete=False)
+        return calls
 
     def _finalize(self, plan, check_cancelled) -> dict:
         check_cancelled()
         cancel = lambda: (check_cancelled() or False)
         plan.projection_misses = self.project_patient(plan)
+        if plan.projection_misses:
+            plan.fallback_calls = self.recover_misses(plan, check_cancelled)
+            if plan.fallback_calls:
+                plan.projection_misses = self.project_patient(plan)
         coding = self.code_patient(plan.patient_id, cancel_check=cancel)
         fhir = self.write_fhir(plan.patient_id, plan.documents, {
             "documents_total": len(plan.documents), "processed": plan.processed,
@@ -475,7 +540,8 @@ class ExtractionPipeline:
         summary.update(statement_occurrences=counts["occurrences"],
                        statement_origins=counts["origins"], statement_copies=counts["copies"],
                        statement_reused_characters=counts["copy_chars"],
-                       statement_projection_misses=len(plan.projection_misses))
+                       statement_projection_misses=len(plan.projection_misses),
+                       statement_fallback_calls=plan.fallback_calls)
         if self.audit:
             self.audit.log(plan.patient_id, "clinical_events_extracted", "clinical_evidence",
                            plan.patient_id, {"documents_total": len(plan.documents),
@@ -623,6 +689,16 @@ class ExtractionPipeline:
             grouped.setdefault(item.extraction_method, []).append(item)
         for method, items in grouped.items():
             self.evidence_repo.replace_document_method(document_id, method, items)
+
+
+def row_occurrence(row, occurrences):
+    """The indexed occurrence a stored row is anchored to, if any."""
+    start = ((row.data or {}).get("source_spans") or [{}])[0].get("start")
+    if start is None:
+        return None
+    occurrence = next((item for item in occurrences.values()
+                       if item.start <= start < item.end), None)
+    return occurrence.occurrence_id if occurrence is not None and occurrence.role == "copy" else None
 
 
 def _eta_message(completed: int, total: int, elapsed: float, patient_id: str) -> str:
