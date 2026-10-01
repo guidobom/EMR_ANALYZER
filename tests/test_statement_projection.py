@@ -141,3 +141,44 @@ def test_a_correction_splits_the_resource(project):
     labels = {item["code"]["text"] for item in resources
               if item["resourceType"] == "Observation"}
     assert labels == {"tosse", "Tosse risolta", "febbre"}, "the corrected copy is its own fact"
+
+
+def test_a_decision_can_reach_every_copy(project):
+    from emr_analyzer.clinical.event_review import EventReviewService
+    from emr_analyzer.database.event_override_repo import EventOverrideRepository
+
+    pipeline = project.pipeline(FakeLlm(), KeywordExtractor())
+    pipeline.extract_patient("P001")
+    review = EventReviewService(project.evidence, EventOverrideRepository(project.db), None,
+                                overlay_repo=project.overlays, audit_repo=None, snomed=None)
+    events = [event for event in review.events("P001") if event.label == "tosse"]
+    assert len(events) == 2 and len({event.statement_key for event in events}) == 1
+    assert [event.document_id for event in events] == ["DOC_001", "DOC_002"]
+
+    review.correct(events[0], {"certainty": "suspected"}, fanout=True)
+
+    after = [event for event in review.events("P001") if event.label == "tosse"]
+    assert {event.certainty for event in after} == {"suspected"}
+    assert {event.status for event in after} == {"corrected"}
+    # Each copy keeps its own document and fragment.
+    assert {event.document_id for event in after} == {"DOC_001", "DOC_002"}
+    overrides = EventOverrideRepository(project.db).by_patient("P001")
+    assert len(overrides) == 2
+
+    review.restore(after[0], fanout=True)
+    assert not EventOverrideRepository(project.db).by_patient("P001")
+
+
+def test_a_fragment_change_never_propagates_to_the_copies(project):
+    import pytest as _pytest
+
+    from emr_analyzer.clinical.event_review import EventReviewService
+    from emr_analyzer.database.event_override_repo import EventOverrideRepository
+
+    pipeline = project.pipeline(FakeLlm(), KeywordExtractor())
+    pipeline.extract_patient("P001")
+    review = EventReviewService(project.evidence, EventOverrideRepository(project.db), None,
+                                overlay_repo=project.overlays, audit_repo=None, snomed=None)
+    event = next(item for item in review.events("P001") if item.label == "tosse")
+    with _pytest.raises(ValueError):
+        review.correct(event, {"start": 0, "end": 5}, fanout=True)

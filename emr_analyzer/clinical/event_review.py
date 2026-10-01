@@ -59,6 +59,8 @@ class EffectiveEvent:
     machine: ClinicalEvidence | None = None
     override: dict | None = None
     extraction_method: str = METHOD
+    #: identity of the repeated statement this event belongs to, if any
+    statement_key: str | None = None
 
     # Attribute names shared with ClinicalEvidence (concept collection).
     @property
@@ -103,7 +105,8 @@ def from_machine(item: ClinicalEvidence) -> EffectiveEvent:
         unit=item.unit, value_text=item.value_text, start=span.get("start"), end=span.get("end"),
         quote=item.source_text or "", page=item.source_page,
         status="needs_review" if item.status == "needs_review" else "proposed",
-        note=provenance.get("needs_review") or data.get("value_review"), machine=item)
+        note=provenance.get("needs_review") or data.get("value_review"), machine=item,
+        statement_key=(data.get("statement_reuse") or {}).get("statement_key"))
 
 
 class EventReviewService:
@@ -210,17 +213,52 @@ class EventReviewService:
                 event.coding = dict(concepts.get(event.concept) or {}, source="concept")
 
     # --------------------------------------------------------------- actions
-    def confirm(self, event: EffectiveEvent, *, note=None, reviewer=None) -> None:
-        if event.status == "added":
-            return self._save(event, "add", note=note, reviewer=reviewer)
-        action = "correct" if event.status == "corrected" else "confirm"
-        self._save(event, action, note=note, reviewer=reviewer)
+    def statement_copies(self, event: EffectiveEvent) -> list[EffectiveEvent]:
+        """The other occurrences of the same statement, in this patient."""
+        if not event.statement_key:
+            return [event]
+        siblings = [other for other in self.events(event.patient_id, include_rejected=True)
+                    if other.statement_key == event.statement_key]
+        return siblings or [event]
 
-    def correct(self, event: EffectiveEvent, changes: dict, *, note=None, reviewer=None) -> EffectiveEvent:
-        """Apply field, interval or occurrence-code changes to one event."""
+    def _fanout(self, event: EffectiveEvent) -> list[EffectiveEvent]:
+        """The event itself plus every copy of the same statement."""
+        return self.statement_copies(event)
+
+    def confirm(self, event: EffectiveEvent, *, note=None, reviewer=None, fanout=False) -> None:
+        for target in (self._fanout(event) if fanout else [event]):
+            if target.status == "added":
+                self._save(target, "add", note=note, reviewer=reviewer)
+                continue
+            action = "correct" if target.status == "corrected" else "confirm"
+            self._save(target, action, note=note, reviewer=reviewer)
+
+    def correct(self, event: EffectiveEvent, changes: dict, *, note=None, reviewer=None,
+                fanout=False) -> EffectiveEvent:
+        """Apply field, interval or occurrence-code changes to one event.
+
+        With ``fanout`` the same changes reach every copy of the statement.
+        A fragment belongs to one report only, so an interval change never
+        propagates: it would point at different words elsewhere.
+        """
         unknown = set(changes) - set(EDITABLE) - {"start", "end", "code"}
         if unknown:
             raise ValueError("Campi non modificabili: " + ", ".join(sorted(unknown)))
+        if fanout and ({"start", "end"} & set(changes)):
+            raise ValueError("Il frammento vale per un solo referto: correggilo su ogni copia")
+        updated = self._apply_changes(event, changes)
+        self._save(updated, "add" if updated.status == "added" else "correct",
+                   note=note, reviewer=reviewer)
+        if fanout:
+            for sibling in self.statement_copies(event):
+                if sibling.key == event.key:
+                    continue
+                self._apply_changes(sibling, changes)
+                self._save(sibling, "add" if sibling.status == "added" else "correct",
+                           note=note, reviewer=reviewer)
+        return updated
+
+    def _apply_changes(self, event: EffectiveEvent, changes: dict) -> EffectiveEvent:
         for name in EDITABLE:
             if name in changes:
                 setattr(event, name, changes[name])
@@ -235,18 +273,20 @@ class EventReviewService:
             event.stale = False
         if not (event.label or "").strip():
             raise ValueError("L'evento deve avere un'etichetta")
-        self._save(event, "add" if event.status == "added" else "correct", note=note, reviewer=reviewer)
         return event
 
-    def reject(self, event: EffectiveEvent, *, note=None, reviewer=None) -> None:
-        if event.status == "added":
-            return self.restore(event)
-        self._save(event, "reject", note=note, reviewer=reviewer)
+    def reject(self, event: EffectiveEvent, *, note=None, reviewer=None, fanout=False) -> None:
+        for target in (self._fanout(event) if fanout else [event]):
+            if target.status == "added":
+                self.restore(target)
+                continue
+            self._save(target, "reject", note=note, reviewer=reviewer)
 
-    def restore(self, event: EffectiveEvent) -> None:
+    def restore(self, event: EffectiveEvent, *, fanout=False) -> None:
         """Drop the decision: back to the extracted occurrence (or delete a manual event)."""
-        if self.overrides.delete(event.key):
-            self._audit(event, "restore")
+        for target in (self._fanout(event) if fanout else [event]):
+            if self.overrides.delete(target.key):
+                self._audit(target, "restore")
 
     def add(self, patient_id: str, document_id: str, start: int, end: int, *, label: str,
             fact_type: str, document_date: str | None = None, note=None, reviewer=None,

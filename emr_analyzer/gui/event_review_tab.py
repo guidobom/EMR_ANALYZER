@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel, QPushButton, QProgressBar,
     QTableView, QAbstractItemView, QHeaderView, QLineEdit, QComboBox, QPlainTextEdit,
     QTextEdit, QMessageBox, QDialog, QDialogButtonBox, QFormLayout,
-    QListWidget, QListWidgetItem, QTabWidget, QScrollArea,
+    QListWidget, QListWidgetItem, QTabWidget, QScrollArea, QCheckBox,
 )
 
 from .pipeline_llm import prepare_pipeline
@@ -48,16 +48,35 @@ def _code_text(event) -> str:
 
 
 class EventTableModel(QAbstractTableModel):
-    HEADERS = ("Data", "Evento", "Tipo", "Asserzione", "SNOMED CT", "Revisione", "Documento")
+    HEADERS = ("Data", "Evento", "Tipo", "Asserzione", "SNOMED CT", "Revisione", "Referti",
+               "Documento")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.rows: list = []
+        self.families: dict = {}
 
-    def set_events(self, events) -> None:
+    def set_events(self, events, families=None) -> None:
         self.beginResetModel()
         self.rows = list(events)
+        # statement key -> every occurrence of that statement in the patient
+        self.families = families or {}
         self.endResetModel()
+
+    def _family(self, event):
+        return self.families.get(event.statement_key) or []
+
+    def copies_text(self, event) -> str:
+        family = self._family(event)
+        if len(family) < 2:
+            return "—"
+        carrier = next((item.document_id for item in family
+                        if (item.machine is not None
+                            and (item.machine.data.get("statement_reuse") or {}).get("role") == "origin")),
+                       family[-1].document_id)
+        if event.document_id == carrier:
+            return f"{len(family)} referti · origine"
+        return f"{len(family)} referti · copia di {carrier}"
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.rows)
@@ -74,6 +93,7 @@ class EventTableModel(QAbstractTableModel):
         review = "da ricontrollare" if event.stale else REVIEW_LABELS.get(event.status, event.status)
         return (event.observed_date or "n.d.", event.label, TYPE_LABELS.get(event.fact_type, event.fact_type),
                 ASSERTIONS.get(event.assertion, event.assertion), _code_text(event), review,
+                self.copies_text(event),
                 f"{event.document_id} ({event.document_date or 'n.d.'})")
 
     def data(self, index, role=Qt.DisplayRole):
@@ -83,6 +103,11 @@ class EventTableModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             return self._values(event)[index.column()]
         if role == Qt.ToolTipRole:
+            if index.column() == 6:
+                family = self._family(event)
+                if len(family) > 1:
+                    return "Stesso enunciato in: " + ", ".join(
+                        f"{item.document_id} ({item.document_date or 'n.d.'})" for item in family)
             return event.quote
         if role == Qt.ForegroundRole:
             if event.status == "rejected" or event.assertion == "absent":
@@ -213,6 +238,12 @@ class EventReviewTab(QWidget):
         self._search.setPlaceholderText("Cerca evento, codice o citazione…")
         self._search.textChanged.connect(self._render)
         filters.addWidget(self._search, stretch=1)
+        self._group_toggle = QCheckBox("Una riga per enunciato")
+        self._group_toggle.setToolTip(
+            "Mostra una sola riga per ogni enunciato ripetuto, con il numero di referti "
+            "che lo riportano; le decisioni possono valere per tutte le copie.")
+        self._group_toggle.stateChanged.connect(self._render)
+        filters.addWidget(self._group_toggle)
         layout.addLayout(filters)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -290,6 +321,11 @@ class EventReviewTab(QWidget):
                               ("Attributi", self._attributes), ("Nota", self._note)):
             form.addRow(label, widget)
         buttons = QHBoxLayout()
+        self._fanout = QCheckBox("Su tutte le copie")
+        self._fanout.setToolTip(
+            "Applica la decisione a ogni referto che ripete questo enunciato. "
+            "Il frammento resta per singolo referto: per spostarlo usare la selezione.")
+        buttons.addWidget(self._fanout)
         self._confirm_btn = QPushButton("✓ Conferma")
         self._confirm_btn.clicked.connect(self._on_confirm)
         self._save_btn = QPushButton("Salva correzioni")
@@ -407,7 +443,20 @@ class EventReviewTab(QWidget):
         events = sorted(self._visible(), key=lambda event: (
             event.observed_date or event.document_date or "", event.document_id, event.start or 0),
             reverse=True)
-        self._model.set_events(events)
+        families = {}
+        for event in self._events:
+            if event.statement_key:
+                families.setdefault(event.statement_key, []).append(event)
+        rows = events
+        if getattr(self, "_group_toggle", None) is not None and self._group_toggle.isChecked():
+            seen, rows = set(), []
+            for event in events:
+                key = event.statement_key or event.key
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(event)
+        self._model.set_events(rows, families)
         self._table.resizeColumnsToContents()
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         row = next((index for index, event in enumerate(events) if event.key == keep), None)
@@ -523,7 +572,8 @@ class EventReviewTab(QWidget):
         }
 
     def _on_confirm(self) -> None:
-        self._act(lambda review: review.confirm(self._current, note=self._note.text().strip() or None))
+        self._act(lambda review: review.confirm(self._current, note=self._note.text().strip() or None,
+                                                fanout=self._fanout.isChecked()))
 
     def _on_save(self) -> None:
         try:
@@ -532,13 +582,15 @@ class EventReviewTab(QWidget):
             QMessageBox.warning(self, "Revisione", str(exc))
             return
         self._act(lambda review: review.correct(self._current, changes,
-                                                note=self._note.text().strip() or None))
+                                                note=self._note.text().strip() or None,
+                                                fanout=self._fanout.isChecked()))
 
     def _on_reject(self) -> None:
-        self._act(lambda review: review.reject(self._current, note=self._note.text().strip() or None))
+        self._act(lambda review: review.reject(self._current, note=self._note.text().strip() or None,
+                                               fanout=self._fanout.isChecked()))
 
     def _on_restore(self) -> None:
-        self._act(lambda review: review.restore(self._current))
+        self._act(lambda review: review.restore(self._current, fanout=self._fanout.isChecked()))
 
     def _on_use_selection(self) -> None:
         selection = self._source.selection()
