@@ -903,10 +903,8 @@ class DocumentsTab(QWidget):
                 "clinico (documento non laboratoristico)"
             )
 
-        # Out-of-range values do NOT become atomic evidence here: the
-        # deterministic lab atoms are built only when the user launches
-        # "Estrai evidenze atomiche" (ClinicalRegistryBuilder.
-        # _sync_abnormal_lab_evidence, from lab_values).
+        # Parsed results stay in lab_values; the FHIR export reads them
+        # directly when the patient's events are processed.
         events = []
         if doc.document_type == DocumentType.LABORATORIO.value:
             from ..extraction.document_normalization import normalize_document

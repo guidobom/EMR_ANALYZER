@@ -11,6 +11,9 @@ import uuid
 
 from ..config import CACHE_DIR, SUPPORTED_EXTENSIONS, active_workspace
 from ..utils.file_utils import compute_file_hash
+from .document_deletion import delete_document_dependents
+
+_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 @dataclass
@@ -50,6 +53,9 @@ class PatientWorkspaceDeletionService:
         result = PatientWorkspaceDeletionResult(patient_id=patient_id)
         if not patient_id or self.patient_repo.get_by_id(patient_id) is None:
             result.error = "Paziente non trovato nel registro"
+            return result
+        if not _SAFE_ID.fullmatch(patient_id):
+            result.error = "Identificativo paziente non valido: eliminazione bloccata"
             return result
 
         documents = self.db.execute(
@@ -121,6 +127,9 @@ class PatientWorkspaceDeletionService:
         }
 
         with self.db:
+            document_ids = [row["id"] for row in self.db.execute(
+                "SELECT id FROM documents WHERE patient_id=?", (patient_id,))]
+            delete_document_dependents(self.db, document_ids)
             # The patient delete triggers every declared cascade. The sweep
             # afterwards also covers current or future patient-owned tables
             # that intentionally do not declare a foreign key (e.g. audit_log).
@@ -165,6 +174,14 @@ class PatientWorkspaceDeletionService:
                 tables.append(table)
         return sorted(tables)
 
+    @staticmethod
+    def _contained(path: Path, root: Path) -> Path:
+        """A patient folder must be a real direct child of its root."""
+        resolved, base = path.resolve(), Path(root).resolve()
+        if path.is_symlink() or resolved.parent != base:
+            raise ValueError(f"Percorso esterno al progetto: {path}")
+        return path
+
     def _managed_paths(
         self,
         patient_id: str,
@@ -174,11 +191,11 @@ class PatientWorkspaceDeletionService:
     ) -> list[Path]:
         paths = []
         if workspace.exists():
-            paths.append(workspace)
+            paths.append(self._contained(workspace, self.workspaces_dir))
 
         cache_workspace = self.cache_dir / patient_id
         if cache_workspace.exists():
-            paths.append(cache_workspace)
+            paths.append(self._contained(cache_workspace, self.cache_dir))
 
         trash = self.workspaces_dir / "_trash"
         if trash.exists():

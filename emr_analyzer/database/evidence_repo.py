@@ -109,6 +109,19 @@ class EvidenceRepository:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def delete_methods(self, patient_id: str, methods) -> int:
+        """Delete one patient's rows produced by the given extraction methods."""
+        methods = tuple(methods)
+        if not methods:
+            return 0
+        marks = ",".join("?" for _ in methods)
+        with self.db:
+            return self.db.execute(
+                f"""DELETE FROM clinical_evidence WHERE patient_id=?
+                    AND extraction_method IN ({marks})""",
+                (patient_id, *methods),
+            ).rowcount
+
     def delete_by_document(self, document_id: str) -> None:
         self.db.execute(
             "DELETE FROM clinical_evidence WHERE document_id=?", (document_id,)

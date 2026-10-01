@@ -231,6 +231,11 @@ class LabParser:
                     continue
 
                 # Try numeric first, then textual
+                operator = None
+                censored = re.match(r"^\s*(<=|>=|<|>|≤|≥)\s*(\S.*)$", value_str)
+                if censored and not self.normalizer.is_textual_result(value_str):
+                    operator = {"≤": "<=", "≥": ">="}.get(censored.group(1), censored.group(1))
+                    value_str = censored.group(2).strip()
                 if self.normalizer.is_textual_result(value_str):
                     value = None
                     value_text_result = self.normalizer.normalize_textual_value(value_str)
@@ -248,7 +253,7 @@ class LabParser:
                     value_text_result = None
                     ref_low, ref_high = self.normalizer.parse_reference_range(ref_text)
                     is_abnormal, flag = self._abnormal_status(
-                        value, ref_low, ref_high, ref_text
+                        value, ref_low, ref_high, ref_text, operator=operator
                     )
 
                 base_normalized = self.normalizer.normalize_parameter(
@@ -268,6 +273,7 @@ class LabParser:
                     normalized_name=normalized_name,
                     value=value,
                     value_text=value_text_result,
+                    operator=operator,
                     unit=unit_norm,
                     reference_low=ref_low,
                     reference_high=ref_high,
@@ -275,7 +281,7 @@ class LabParser:
                     is_abnormal=is_abnormal,
                     flag=flag,
                     biological_material=effective_specimen,
-                    source_text=f"{param_name} {value_str} {unit}".strip(),
+                    source_text=f"{param_name} {operator or ''}{value_str} {unit}".strip(),
                     confidence=0.9,  # Tables have higher confidence
                 ))
 
@@ -471,6 +477,7 @@ class LabParser:
                 reference_high,
                 reference_text,
                 explicit_flag,
+                operator,
             )
         elif textual_match:
             # Textual results: flag may still be present
@@ -646,24 +653,17 @@ class LabParser:
         reference_high,
         reference_text: str = "",
         explicit_flag: str = "",
+        operator: str | None = None,
     ) -> tuple[bool, str | None]:
         """Combine calculated ranges with the report's explicit marker."""
-        is_abnormal, flag = self.normalizer.is_abnormal(
-            value, reference_low, reference_high
-        )
         compact_reference = re.sub(r"\s+", "", reference_text or "")
-        if compact_reference.startswith("<=") and reference_high is not None:
-            is_abnormal = value > reference_high
-            flag = "H" if is_abnormal else None
-        elif compact_reference.startswith("<") and reference_high is not None:
-            is_abnormal = value >= reference_high
-            flag = "H" if is_abnormal else None
-        elif compact_reference.startswith(">=") and reference_low is not None:
-            is_abnormal = value < reference_low
-            flag = "L" if is_abnormal else None
-        elif compact_reference.startswith(">") and reference_low is not None:
-            is_abnormal = value <= reference_low
-            flag = "L" if is_abnormal else None
+        is_abnormal, flag = self.normalizer.is_abnormal(
+            value, reference_low, reference_high, operator,
+            high_exclusive=compact_reference.startswith("<")
+            and not compact_reference.startswith("<="),
+            low_exclusive=compact_reference.startswith(">")
+            and not compact_reference.startswith(">="),
+        )
 
         marker = str(explicit_flag or "").strip().upper()
         if marker in {"H", "↑"}:

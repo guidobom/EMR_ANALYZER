@@ -1,306 +1,82 @@
-"""Deterministic conversion of abnormal laboratory rows into atomic evidence."""
+"""Narrative laboratory events versus the deterministic laboratory parser."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-from datetime import date
-from pathlib import Path
 import re
-from typing import Iterable
 import unicodedata
-import uuid
+from typing import Iterable
 
 from ..models.clinical_evidence import ClinicalEvidence
 from ..models.lab_result import LabValue
-from ..settings import LabEvidencePolicy
 
-
-LAB_EVIDENCE_SCHEMA_VERSION = "3.0"
-LAB_EXTRACTION_METHOD = "deterministic_lab"
-NARRATIVE_LAB_EXTRACTION_METHOD = "llm_atomic_v2"
-_ABNORMAL_FLAGS = {
-    "H", "HIGH", "ALTO", "ALTA", "↑",
-    "L", "LOW", "BASSO", "BASSA", "↓",
-    "*", "**", "***", "!", "ABNORMAL", "PATOLOGICO", "PATOLOGICA",
-}
-
-
-def abnormality_reasons(
-    lab: LabValue,
-    policy: LabEvidencePolicy | None = None,
-    *,
-    previous: LabValue | None = None,
-) -> list[str]:
-    """Return configured, independently auditable inclusion reasons."""
-    policy = policy or LabEvidencePolicy()
-    reasons: list[str] = []
-    flag = str(lab.flag or "").strip().upper()
-    if policy.explicit_abnormal_flag and (
-        flag in _ABNORMAL_FLAGS
-        or (bool(lab.is_abnormal) and not _has_assessable_range(lab)
-            and not lab.value_text)
-    ):
-        reasons.append("explicit_abnormal_flag")
-    if policy.outside_reference_range and _measured_direction(lab) in {"high", "low"}:
-        reasons.append("outside_reference_range")
-    if policy.textual_abnormality and lab.value_text and bool(lab.is_abnormal):
-        reasons.append("textual_abnormality")
-    if (
-        policy.significant_delta_within_range
-        and _significant_delta(lab, previous, policy)
-    ):
-        reasons.append("significant_delta_within_range")
-    return reasons
-
-
-def is_out_of_range(
-    lab: LabValue,
-    policy: LabEvidencePolicy | None = None,
-    *,
-    previous: LabValue | None = None,
-) -> bool:
-    """Return whether configured objective abnormality evidence is present."""
-    return bool(abnormality_reasons(lab, policy, previous=previous))
-
-
-def abnormal_lab_evidence(
-    *,
-    patient_id: str,
-    document_id: str,
-    document_date: str | None,
-    lab_values: Iterable[LabValue],
-    geometry=None,
-    policy: LabEvidencePolicy | None = None,
-    prior_values: Iterable[LabValue] = (),
-) -> list[ClinicalEvidence]:
-    """Build one immutable atom for every out-of-range laboratory value.
-
-    Normal and non-assessable values are deliberately omitted.  The structured
-    row, not an LLM, supplies the concept, value, range, date and polarity.
-    """
-    evidence: list[ClinicalEvidence] = []
-    policy = policy or LabEvidencePolicy()
-    previous_by_parameter: dict[tuple[str, str], LabValue] = {}
-    for prior in sorted(
-        prior_values,
-        key=lambda item: (
-            item.sample_date or "", item.document_id, item.page or 0,
-        ),
-    ):
-        if prior.value is None:
-            continue
-        previous_by_parameter[(
-            str(prior.normalized_name or prior.parameter_name).casefold(),
-            str(prior.unit or "").casefold(),
-        )] = prior
-    ordered = sorted(
-        lab_values,
-        key=lambda item: (
-            item.sample_date or "9999-99-99", item.document_id,
-            item.page or 0, item.parameter_name,
-        ),
-    )
-    for lab in ordered:
-        parameter_key = (
-            str(lab.normalized_name or lab.parameter_name).casefold(),
-            str(lab.unit or "").casefold(),
-        )
-        previous = previous_by_parameter.get(parameter_key)
-        reasons = abnormality_reasons(lab, policy, previous=previous)
-        if lab.value is not None:
-            previous_by_parameter[parameter_key] = lab
-        if not reasons:
-            continue
-        source_text = str(lab.source_text or "").strip()
-        if not source_text:
-            # An atomic claim without an exact source passage cannot be cited.
-            continue
-        page = lab.page
-        bbox = None
-        if geometry is not None and hasattr(geometry, "locate_source"):
-            located_page, located_bbox = geometry.locate_source(source_text, page)
-            page = located_page or page
-            bbox = located_bbox
-        observed_date = lab.sample_date or None
-        direction = _abnormal_direction(lab)
-        polarity = "present"
-        evidence_id = _stable_lab_evidence_id(
-            document_id=document_id,
-            lab=lab,
-            observed_date=observed_date,
-            source_text=source_text,
-            page=page,
-        )
-        source_reference = {
-            "document_id": document_id,
-            "page": page,
-            "bbox": list(bbox) if bbox else None,
-            "passage": source_text,
-        }
-        evidence.append(ClinicalEvidence(
-            evidence_id=evidence_id,
-            patient_id=patient_id,
-            document_id=document_id,
-            category="laboratory_finding",
-            normalized_entity=(lab.normalized_name or lab.parameter_name).strip(),
-            fact_type="laboratory_test",
-            concept_original=lab.parameter_name.strip(),
-            canonical_label=(
-                lab.normalized_name or lab.parameter_name
-            ).strip(),
-            mapping_status="normalized_name" if lab.normalized_name else "unmapped",
-            clinical_relevance="accepted_clinical",
-            typed_payload={
-                "parameter_name": lab.parameter_name,
-                "operator": lab.operator,
-                "reference_low": lab.reference_low,
-                "reference_high": lab.reference_high,
-                "reference_text": lab.reference_text,
-                "flag": lab.flag,
-                "abnormal_direction": direction,
-                "inclusion_reasons": reasons,
-                "biological_material": lab.biological_material,
-                "lab_name": lab.lab_name,
-            },
-            assertion="present",
-            temporality="current",
-            clinical_status=direction,
-            observed_date=observed_date,
-            document_date=document_date,
-            date_precision=_date_precision(observed_date),
-            date_source="sample_date" if observed_date else "unknown",
-            significance="clinically_relevant",
-            certainty="confirmed",
-            value_text=(
-                lab.value_text
-                if lab.value_text is not None
-                else _numeric_display(lab)
-            ),
-            numeric_value=lab.value,
-            unit=lab.unit,
-            source_page=page,
-            source_text=source_text,
-            bbox=bbox,
-            confidence=max(0.0, min(float(lab.confidence or 1.0), 1.0)),
-            extraction_method=LAB_EXTRACTION_METHOD,
-            prompt_version=None,
-            schema_version=LAB_EVIDENCE_SCHEMA_VERSION,
-            status="needs_review" if direction == "conflicting" else "auto",
-            data={
-                "fact_type": "laboratory_test",
-                "polarity": polarity,
-                "report_date": document_date,
-                "source_reference": source_reference,
-                "parameter_name": lab.parameter_name,
-                "operator": lab.operator,
-                "reference_low": lab.reference_low,
-                "reference_high": lab.reference_high,
-                "reference_text": lab.reference_text,
-                "flag": lab.flag,
-                "abnormal_direction": direction,
-                "inclusion_reasons": reasons,
-                "biological_material": lab.biological_material,
-                "lab_name": lab.lab_name,
-                "validated_by_user": lab.validated_by_user,
-            },
-        ))
-    return evidence
+# Evidence methods of earlier builds; their rows are cleared on re-extraction.
+LEGACY_LAB_METHODS = ("deterministic_lab", "fhir_laboratory_v1")
 
 
 def filter_narrative_lab_duplicates(
     evidence: Iterable[ClinicalEvidence],
-    authoritative: Iterable[ClinicalEvidence],
+    lab_values: Iterable[LabValue],
 ) -> tuple[list[ClinicalEvidence], int]:
-    """Remove only exact LLM restatements of deterministic laboratory rows.
+    """Remove only exact LLM restatements of parsed laboratory results.
 
     Narrative patterns (for example ``anemia``) remain distinct from their
-    supporting analytes.  A row is suppressed only when analyte, compatible
-    date and, when supplied by both sources, value/unit agree.  This keeps the
-    deterministic row as the auditable source of laboratory measurements
-    without losing clinically meaningful interpretations in prose.
+    supporting analytes.  An event is suppressed only when analyte, compatible
+    date and, when supplied by both sources, value/unit/specimen agree: the
+    parsed result stays the single auditable record of that measurement.
     """
-    authoritative_keys = [
-        _laboratory_comparison_key(item)
-        for item in authoritative
-        if _is_laboratory_atom(item)
-    ]
+    references = [key for lab in lab_values for key in _lab_value_keys(lab)]
     kept: list[ClinicalEvidence] = []
     removed = 0
     for item in evidence:
-        candidate = _laboratory_comparison_key(item)
-        if candidate and any(
-            _same_laboratory_measurement(candidate, reference)
-            for reference in authoritative_keys
-        ):
+        candidate = _event_key(item)
+        if candidate and any(_same_measurement(candidate, reference) for reference in references):
             removed += 1
             continue
         kept.append(item)
     return kept, removed
 
 
-def _is_laboratory_atom(item: ClinicalEvidence) -> bool:
-    return (
-        item.fact_type == "laboratory_test"
-        or item.category == "laboratory_finding"
-        or item.data.get("fact_type") == "laboratory_test"
-    )
+def _lab_value_keys(lab: LabValue) -> list[tuple]:
+    material = _normalize_parameter(lab.biological_material) if lab.biological_material else ""
+    names = {_normalize_parameter(lab.parameter_name),
+             _normalize_parameter((lab.normalized_name or "").replace("_", " "))}
+    return [(name, str(lab.sample_date or ""), lab.value, _normalize_unit(lab.unit), material)
+            for name in names if name]
 
 
-def _laboratory_comparison_key(item: ClinicalEvidence):
-    if not _is_laboratory_atom(item):
+def _event_key(item: ClinicalEvidence):
+    if not (item.fact_type == "laboratory_test" or item.category == "laboratory_finding"):
         return None
     payload = item.typed_payload or {}
-    parameter = (
-        payload.get("parameter_name")
-        or item.data.get("parameter_name")
-        or item.canonical_label
-        or item.normalized_entity
-        or item.concept_original
-    )
-    parameter_key = _normalize_lab_parameter(parameter)
-    if not parameter_key:
+    parameter = _normalize_parameter(
+        payload.get("parameter_name") or item.canonical_label
+        or item.normalized_entity or item.concept_original)
+    if not parameter:
         return None
-    payload = item.typed_payload or {}
-    material = (
-        payload.get("biological_material")
-        or item.data.get("biological_material")
-    )
-    material_key = _normalize_lab_parameter(material) if material else ""
-    return (
-        parameter_key,
-        str(item.observed_date or ""),
-        item.numeric_value,
-        _normalize_lab_unit(item.unit),
-        material_key,
-    )
+    material = payload.get("specimen") or payload.get("biological_material")
+    return (parameter, str(item.observed_date or ""), item.numeric_value,
+            _normalize_unit(item.unit), _normalize_parameter(material) if material else "")
 
 
-def _same_laboratory_measurement(candidate, reference) -> bool:
-    if not candidate or not reference or candidate[0] != reference[0]:
+def _same_measurement(candidate, reference) -> bool:
+    if candidate[0] != reference[0]:
         return False
-    candidate_date, reference_date = candidate[1], reference[1]
-    if candidate_date and reference_date and candidate_date != reference_date:
+    if candidate[1] and reference[1] and candidate[1] != reference[1]:
         return False
-    candidate_value, reference_value = candidate[2], reference[2]
-    if candidate_value is not None and reference_value is not None:
+    if candidate[2] is not None and reference[2] is not None:
         try:
-            tolerance = max(1e-9, abs(float(reference_value)) * 1e-6)
-            if abs(float(candidate_value) - float(reference_value)) > tolerance:
+            tolerance = max(1e-9, abs(float(reference[2])) * 1e-6)
+            if abs(float(candidate[2]) - float(reference[2])) > tolerance:
                 return False
         except (TypeError, ValueError):
             return False
-    candidate_unit, reference_unit = candidate[3], reference[3]
-    candidate_material, reference_material = candidate[4], reference[4]
     # Specimen mismatch means a different measurement (urine Hb vs blood Hb).
-    if (candidate_material or "") != (reference_material or ""):
+    if candidate[4] and reference[4] and candidate[4] != reference[4]:
         return False
-    return not (
-        candidate_unit and reference_unit and candidate_unit != reference_unit
-    )
+    return not (candidate[3] and reference[3] and candidate[3] != reference[3])
 
 
-def _normalize_lab_parameter(value) -> str:
+def _normalize_parameter(value) -> str:
     text = unicodedata.normalize("NFKD", str(value or "").casefold())
     text = "".join(char for char in text if not unicodedata.combining(char))
     text = re.sub(
@@ -313,129 +89,5 @@ def _normalize_lab_parameter(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", text)
 
 
-def _normalize_lab_unit(value) -> str:
+def _normalize_unit(value) -> str:
     return re.sub(r"\s+", "", str(value or "").casefold())
-
-
-def load_document_geometry(path: Path | None):
-    """Load optional PDF text geometry without making it a hard dependency."""
-    if path is None or not path.exists():
-        return None
-    try:
-        from ..pipeline.pdf_extractor import PdfExtractionResult
-
-        return PdfExtractionResult.from_dict(
-            json.loads(path.read_text(encoding="utf-8"))
-        )
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def _measured_direction(lab: LabValue) -> str:
-    """Only conclude abnormality when every value allowed by a comparator is outside."""
-    if lab.value is None:
-        return "unknown"
-    value, op = lab.value, lab.operator or "="
-    lower = float("-inf") if op in {"<", "<="} else value
-    upper = float("inf") if op in {">", ">="} else value
-    if lab.reference_low is not None and (upper < lab.reference_low or
-            (upper == lab.reference_low and op == "<")):
-        return "low"
-    if lab.reference_high is not None and (lower > lab.reference_high or
-            (lower == lab.reference_high and op == ">")):
-        return "high"
-    if ((lab.reference_low is None or lower >= lab.reference_low) and
-            (lab.reference_high is None or upper <= lab.reference_high) and
-            (lab.reference_low is not None or lab.reference_high is not None)):
-        return "normal"
-    return "unknown"
-
-
-def _abnormal_direction(lab: LabValue) -> str:
-    flag = str(lab.flag or "").strip().upper()
-    flagged = ("high" if flag in {"H", "HIGH", "ALTO", "ALTA", "↑"} else
-               "low" if flag in {"L", "LOW", "BASSO", "BASSA", "↓"} else None)
-    measured = _measured_direction(lab)
-    if flagged and measured in {"normal", "high", "low"} and flagged != measured:
-        return "conflicting"
-    return flagged or (measured if measured in {"high", "low"} else "abnormal")
-
-
-def _numeric_display(lab: LabValue) -> str:
-    if lab.value is None:
-        return ""
-    return f"{lab.operator or ''}{lab.value:g}"
-
-
-def _date_precision(value: str | None) -> str:
-    length = len(str(value or ""))
-    return (
-        "day" if length == 10 else "month" if length == 7
-        else "year" if length == 4 else "unknown"
-    )
-
-
-def _has_assessable_range(lab: LabValue) -> bool:
-    return lab.value is not None and (
-        lab.reference_low is not None or lab.reference_high is not None
-    )
-
-
-def _significant_delta(
-    current: LabValue,
-    previous: LabValue | None,
-    policy: LabEvidencePolicy,
-) -> bool:
-    if (
-        previous is None or current.value is None or previous.value is None
-        or not current.sample_date or not previous.sample_date
-    ):
-        return False
-    try:
-        elapsed = abs((
-            date.fromisoformat(current.sample_date[:10])
-            - date.fromisoformat(previous.sample_date[:10])
-        ).days)
-    except (TypeError, ValueError):
-        return False
-    rule = policy.analyzer_rules.get(
-        str(current.normalized_name or current.parameter_name), {}
-    )
-    if not isinstance(rule, dict):
-        rule = {}
-    try:
-        window = int(rule.get("window_days", policy.delta_window_days))
-        threshold = float(rule.get(
-            "relative_delta", policy.default_relative_delta
-        ))
-    except (TypeError, ValueError):
-        return False
-    if elapsed > max(1, window):
-        return False
-    denominator = abs(previous.value)
-    if denominator == 0:
-        return abs(current.value) > 0
-    return abs(current.value - previous.value) / denominator >= max(0.0, threshold)
-
-
-def _stable_lab_evidence_id(
-    *,
-    document_id: str,
-    lab: LabValue,
-    observed_date: str | None,
-    source_text: str,
-    page: int | None,
-) -> str:
-    payload = json.dumps({
-        "document_id": document_id,
-        "parameter": str(lab.normalized_name or lab.parameter_name).casefold(),
-        "value": lab.value,
-        "value_text": lab.value_text,
-        "operator": lab.operator,
-        "unit": str(lab.unit or "").casefold(),
-        "observed_date": observed_date,
-        "page": page,
-        "source_text": " ".join(source_text.casefold().split()),
-    }, ensure_ascii=False, sort_keys=True)
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    return "EVD_" + uuid.uuid5(uuid.NAMESPACE_URL, digest).hex

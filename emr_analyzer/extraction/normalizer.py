@@ -210,26 +210,36 @@ class LabNormalizer:
         return (None, None)
 
     def is_abnormal(self, value: float, ref_low, ref_high,
-                    operator: str = None) -> tuple:
+                    operator: str = None, *, low_exclusive: bool = False,
+                    high_exclusive: bool = False) -> tuple:
+        """Return (is_abnormal, flag) when the range comparison is decidable.
+
+        ``operator`` qualifies the result: "<100" means some value below 100.
+        A censored result is flagged only when every value it allows lies
+        outside the range; otherwise it is not determinable and unflagged.
+        ``*_exclusive`` describe ranges such as "<5" (normal strictly below 5).
         """
-        Determine if a value is abnormal relative to reference range.
-        Returns (is_abnormal: bool, flag: str | None).
-        """
-        if ref_low is None and ref_high is None:
+        if value is None or (ref_low is None and ref_high is None):
             return (False, None)
-
-        # Flag based on operator
-        if operator:
-            op = operator.strip()
-            if op == "<" and ref_high is not None:
-                return (value >= ref_high, "H" if value >= ref_high else None)
-            if op == ">" and ref_low is not None:
-                return (value <= ref_low, "L" if value <= ref_low else None)
-
-        # Standard comparison
-        if ref_high is not None and value > ref_high:
-            return (True, "H")
-        if ref_low is not None and value < ref_low:
-            return (True, "L")
-
+        op = {"≤": "<=", "≥": ">="}.get((operator or "").strip(), (operator or "").strip())
+        inf = float("inf")
+        lo, lo_open, hi, hi_open = value, False, value, False
+        if op in ("<", "<="):
+            lo, hi, hi_open = -inf, value, op == "<"
+        elif op in (">", ">="):
+            lo, lo_open, hi = value, op == ">", inf
+        if ref_high is not None:
+            if high_exclusive:
+                certainly_high = lo >= ref_high
+            else:
+                certainly_high = lo > ref_high or (lo == ref_high and lo_open)
+            if certainly_high:
+                return (True, "H")
+        if ref_low is not None:
+            if low_exclusive:
+                certainly_low = hi <= ref_low
+            else:
+                certainly_low = hi < ref_low or (hi == ref_low and hi_open)
+            if certainly_low:
+                return (True, "L")
         return (False, None)

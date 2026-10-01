@@ -16,7 +16,7 @@ from .grounded_sources import (
     VERSION, METHOD,
 )
 from .event_extraction import EventExtractor
-from .lab_evidence import LAB_EXTRACTION_METHOD, filter_narrative_lab_duplicates
+from .lab_evidence import LEGACY_LAB_METHODS, filter_narrative_lab_duplicates
 from ..config import active_workspace
 from ..models.clinical_registry import ProcessingManifestItem, ProcessingRun
 from ..settings import load_pipeline_policy
@@ -155,7 +155,9 @@ class ExtractionPipeline:
 
         try:
             check_cancelled()
-            self._sync_laboratory_events(patient_id, documents)
+            # Laboratory results are exported from lab_values; projections
+            # written by earlier builds are no longer read.
+            self.evidence_repo.delete_methods(patient_id, LEGACY_LAB_METHODS)
             tasks = []
             for doc in documents:
                 path = self.normalized_text_path(patient_id, doc.id)
@@ -304,7 +306,7 @@ class ExtractionPipeline:
             raise
 
     def write_fhir(self, patient_id, documents, coverage, *, cancel_check=None, progress=None) -> dict:
-        from .fhir_registry import FhirRegistry
+        from .fhir_registry import FhirRegistry, lab_occurrence_keys
         loinc = getattr(self.shared_lexicon_repo, "loinc_catalog", None)
         lab_values = self.lab_repo.get_by_patient(patient_id)
         proposals = {}
@@ -318,8 +320,8 @@ class ExtractionPipeline:
         for item in self.evidence_repo.get_by_patient(patient_id):
             if item.extraction_method == METHOD:
                 exporter.clinical(item)
-        for ordinal, lab in enumerate(lab_values):
-            exporter.laboratory(lab, ordinal)
+        for lab, key in zip(lab_values, lab_occurrence_keys(lab_values)):
+            exporter.laboratory(lab, key)
         path = exporter.write(active_workspace.path / patient_id / FHIR_FILENAME, coverage)
         return {"path": path, "events": exporter.event_count, "uncoded": exporter.unmapped}
 
@@ -355,25 +357,10 @@ class ExtractionPipeline:
         except Exception:
             return 0
 
-    def _sync_laboratory_events(self, patient_id: str, documents) -> int:
-        from .fhir_registry import laboratory_evidence
-        values = self.lab_repo.get_by_patient(patient_id)
-        catalog = getattr(self.shared_lexicon_repo, "loinc_catalog", None)
-        by_document = {}
-        for ordinal, value in enumerate(values):
-            by_document.setdefault(value.document_id, []).append(
-                laboratory_evidence(value, ordinal, catalog))
-        for document in documents:
-            self.evidence_repo.replace_document_method(document.id, LAB_EXTRACTION_METHOD, [])
-            self.evidence_repo.replace_document_method(
-                document.id, "fhir_laboratory_v1", by_document.get(document.id, []))
-        return sum(bool(value.is_abnormal) for value in values)
-
     def replace_document_evidence(self, document_id: str, evidence) -> None:
         """Replace this document's extracted events; legacy atoms are cleared."""
-        stored = self.evidence_repo.get_by_document(document_id)
-        labs = [item for item in stored if item.extraction_method == "fhir_laboratory_v1"]
-        evidence, _ = filter_narrative_lab_duplicates(list(evidence), labs)
+        evidence, _ = filter_narrative_lab_duplicates(
+            list(evidence), self.lab_repo.get_by_document(document_id))
         grouped: dict[str, list] = {
             METHOD: [], "shared_lexicon_atomic": [], "icd11_extraction": [],
             "llm_atomic_v2": [], "deterministic_nonclinical": [],

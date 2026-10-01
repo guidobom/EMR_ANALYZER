@@ -182,13 +182,13 @@ class FhirRegistry:
         self.provenance(event,item.document_id,item.source_text,item.model_name,
             {k:data.get(k) for k in ('source_spans','date_provenance','source_relations','relation_review')})
 
-    def laboratory(self,lab,ordinal):
+    def laboratory(self,lab,key):
         matched=self.loinc.resolve(lab) if self.loinc else None
         if not matched and self.loinc:
             matched=self.lab_proposals.get(self.loinc.signature(lab.normalized_name or lab.parameter_name,lab.biological_material,lab.unit))
         concept=code(lab.parameter_name,LOINC,matched['code'] if matched else None,
             matched['label'] if matched else None,self.loinc.metadata().get('release') if matched else None)
-        event={'resourceType':'Observation','id':ident(self.patient_id,'lab',lab.document_id,ordinal,lab.to_dict()),
+        event={'resourceType':'Observation','id':ident(self.patient_id,'lab',key),
             'status':'unknown','subject':reference(self.patient),'code':concept,
             'category':[code('Laboratorio','http://terminology.hl7.org/CodeSystem/observation-category','laboratory')],
             'extension':[extension('review-status','validated' if matched and lab.validated_by_user and matched.get('mapping_review')!='proposed' else 'needs-review'),
@@ -276,19 +276,19 @@ def validate_bundle(bundle):
     Bundle(bundle,strict=True)
 
 
-def laboratory_evidence(lab,ordinal,loinc=None):
-    """Compatibility projection for existing views; the FHIR file is authoritative."""
-    from ..models.clinical_evidence import ClinicalEvidence
-    matched=loinc.resolve(lab) if loinc else None
-    observed=clinical_date(lab.sample_date)
-    return ClinicalEvidence(patient_id=lab.patient_id,document_id=lab.document_id,
-        category='laboratory_finding',fact_type='laboratory_test',normalized_entity=lab.parameter_name,
-        source_text=lab.source_text,source_page=lab.page,
-        evidence_id='EVD_'+ident(lab.patient_id,'lab',lab.document_id,ordinal,lab.to_dict()),
-        observed_date=observed,date_precision={4:'year',7:'month',10:'day'}.get(len(observed or ''),'unknown'),
-        date_source='sample_date' if observed else 'unknown', numeric_value=lab.value,
-        value_text=lab.value_text,unit=lab.unit,
-        terminology_system='LOINC' if matched else None,terminology_code=matched['code'] if matched else None,
-        mapping_status='mapped' if matched else 'unmapped',extraction_method='fhir_laboratory_v1',
-        status='proposed' if matched else 'needs_review',data={'fhir_pipeline':True,'laboratory':lab.to_dict(),
-            'loinc':{'code':matched['code'] if matched else None,'release':loinc.metadata().get('release') if matched else None}})
+def lab_occurrence_keys(labs):
+    """Stable identity of each parsed result, in input order.
+
+    Only raw report content counts: review flags, derived interpretation and
+    results of other documents never change it. Identical rows of the same
+    document are told apart by a counter.
+    """
+    seen, keys = {}, []
+    for lab in labs:
+        content = (lab.document_id, lab.parameter_name, lab.value, lab.value_text,
+                   lab.operator, lab.unit, lab.reference_text, lab.sample_date,
+                   lab.page, lab.source_text)
+        count = seen.get(content, 0)
+        seen[content] = count + 1
+        keys.append(json.dumps([*content, count], ensure_ascii=False, default=str))
+    return keys

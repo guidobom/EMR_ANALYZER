@@ -126,6 +126,6 @@ class LabRepository:
             lab_name=row["lab_name"],
             page=row["page"],
             source_text=row["source_text"] or "",
-            confidence=row["confidence"] or 1.0,
+            confidence=1.0 if row["confidence"] is None else row["confidence"],
             validated_by_user=bool(row["validated_by_user"]),
         )

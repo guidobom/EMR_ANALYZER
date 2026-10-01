@@ -19,6 +19,30 @@ class DocumentDeletionResult:
     error: str | None = None
 
 
+def delete_document_dependents(db, document_ids) -> int:
+    """Delete rows that reference documents with ON DELETE RESTRICT.
+
+    Source references and the legacy gold-set annotations would otherwise
+    block the cascade from the document.  Must run inside the caller's
+    transaction, before the documents themselves are deleted.
+    """
+    ids = sorted(set(document_ids))
+    if not ids:
+        return 0
+    marks = ",".join("?" for _ in ids)
+    removed = db.execute(
+        f"""DELETE FROM evidence_source_refs WHERE document_id IN ({marks})
+            OR evidence_id IN (SELECT evidence_id FROM clinical_evidence
+                               WHERE document_id IN ({marks}))""",
+        (*ids, *ids),
+    ).rowcount
+    for table in ("gold_annotation_sources", "gold_atomic_annotations"):
+        removed += db.execute(
+            f"DELETE FROM {table} WHERE document_id IN ({marks})", tuple(ids)
+        ).rowcount
+    return removed
+
+
 class DocumentDeletionService:
     """Delete DB rows atomically and move files through a reversible trash."""
 
@@ -38,18 +62,6 @@ class DocumentDeletionService:
         if document is None:
             result.error = "Documento non trovato nel database"
             return result
-        gold_reference = self.db.execute(
-            """SELECT annotation_id FROM gold_annotation_sources
-               WHERE document_id=? LIMIT 1""",
-            (document_id,),
-        ).fetchone()
-        if gold_reference:
-            result.error = (
-                "Documento citato dal gold set clinico "
-                f"({gold_reference['annotation_id']}): eliminazione bloccata"
-            )
-            return result
-
         trash_dir = (
             self.workspaces_dir / "_trash" /
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{document_id}_{uuid.uuid4().hex[:6]}"
@@ -101,6 +113,7 @@ class DocumentDeletionService:
                               AND item_id IN ({placeholders})""",
                         tuple(evidence_ids),
                     )
+                dependents = delete_document_dependents(self.db, [document_id])
                 cursor = self.db.execute(
                     "DELETE FROM documents WHERE id=?", (document_id,)
                 )
@@ -125,6 +138,7 @@ class DocumentDeletionService:
                         "file_hash": document.file_hash,
                         "removed_lab_count": len(lab_ids),
                         "removed_evidence_count": len(evidence_ids),
+                        "removed_source_and_legacy_rows": dependents,
                     },
                 )
             except Exception as exc:

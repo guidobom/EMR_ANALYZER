@@ -12,7 +12,10 @@ def normalize_italian_number(text: str) -> Optional[float]:
     if not text:
         return None
 
-    text = text.strip().replace(" ", "")
+    text = text.strip().replace(" ", "").replace("\u2212", "-")
+    sign = ""
+    if text and text[0] in "+-":
+        sign, text = text[0], text[1:]
 
     # Pattern with both dot and comma: "1.234,56" -> "1234.56"
     if re.match(r'^\d{1,3}(?:\.\d{3})*,\d+$', text):
@@ -23,22 +26,21 @@ def normalize_italian_number(text: str) -> Optional[float]:
     # Pattern with only dot as decimal: "1234.56"
     elif re.match(r'^\d+(?:\.\d+)?$', text):
         pass
-    # Plain integer: "1234"
-    elif text.isdigit():
-        pass
     else:
-        # Try cleaning up and converting
-        cleaned = re.sub(r'[^\d.,]', '', text)
-        if not cleaned:
+        # First number in a longer string, keeping a sign that precedes it.
+        match = re.search(r'([+-]?)(\d+(?:[.,]\d+)*)', sign + text)
+        if not match:
             return None
+        cleaned = match.group(2)
+        if '.' in cleaned and ',' in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif ',' in cleaned:
+            cleaned = cleaned.replace(",", ".")
         try:
-            if '.' in cleaned and ',' in cleaned:
-                cleaned = cleaned.replace(".", "").replace(",", ".")
-            elif ',' in cleaned:
-                cleaned = cleaned.replace(",", ".")
-            return float(cleaned)
+            return float(match.group(1) + cleaned)
         except ValueError:
             return None
+    text = sign + text
 
     try:
         return float(text)
