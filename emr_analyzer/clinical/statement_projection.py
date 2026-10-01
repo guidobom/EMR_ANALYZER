@@ -229,6 +229,13 @@ class StatementProjectionService:
                                if item.start <= start < item.end), None)
             if occurrence is None or occurrence.role != "origin":
                 continue
+            # The carrier is one of the occurrences of the statement: stamping
+            # it lets the FHIR projection fold all of them into one resource.
+            (row.data or {}).setdefault("statement_reuse", {
+                "statement_key": occurrence.statement_key, "role": "origin",
+                "carrier_occurrence_id": occurrence.occurrence_id,
+                "carrier_document_id": document_id,
+                "carrier_document_date": occurrence.document_date})
             carried.setdefault(occurrence.statement_key, []).append(row)
         certified = 0
         for occurrence in occurrences:

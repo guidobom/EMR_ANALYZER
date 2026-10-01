@@ -12,6 +12,7 @@ is content only — no document, no date, no model digest — so the same statem
 keeps its key when the report that carries it changes.
 """
 from dataclasses import dataclass, replace
+import json
 import re
 
 from .evidence_utils import SentenceSpan, content_hash
@@ -139,3 +140,24 @@ def document_digest(occurrences: list[StatementOccurrence]) -> str:
     shape = sorted(f"{item.statement_key}|{item.role}|{item.carrier_occurrence_id}"
                    for item in occurrences)
     return content_hash(PROJECTION_VERSION, *shape)
+
+
+def statement_identity(item) -> str | None:
+    """Stable identity shared by the copies of one statement, for FHIR.
+
+    Two occurrences of the same statement describe the same fact only when
+    every clinical field agrees; any divergence gives each its own identity.
+    A repeated fact whose date is not evidenced by the sentence itself keeps
+    its own resource: identical words can describe two different episodes.
+    """
+    reuse = (item.data or {}).get("statement_reuse") or {}
+    key = reuse.get("statement_key")
+    if not key or item.status == "needs_review":
+        return None
+    data = item.data or {}
+    return content_hash(item.patient_id, key, item.normalized_entity, item.fact_type,
+                        item.observed_date, item.observed_date_end, item.assertion,
+                        item.certainty, item.clinical_status, data.get("experiencer"),
+                        json.dumps(data.get("attributes") or {}, sort_keys=True),
+                        data.get("snomed_concept_id"),
+                        json.dumps(item.typed_payload or {}, sort_keys=True))

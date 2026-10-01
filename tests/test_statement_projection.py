@@ -98,3 +98,46 @@ def test_a_missing_annotation_is_a_miss_not_a_lost_row(workspace):
     finally:
         project.close()
 
+
+
+def test_one_resource_with_one_provenance_per_document(project):
+    import json
+
+    pipeline = project.pipeline(FakeLlm(), KeywordExtractor())
+    pipeline.extract_patient("P001")
+    bundle = json.loads((project.root / "P001" / "clinical_events.fhir.json").read_text(encoding="utf-8"))
+    resources = [entry["resource"] for entry in bundle["entry"]]
+    observations = [item for item in resources
+                    if item["resourceType"] == "Observation" and item["code"]["text"] == "tosse"]
+    assert len(observations) == 1, "the repeated statement is one resource"
+    target = "urn:uuid:" + observations[0]["id"]
+    provenance = [item for item in resources if item["resourceType"] == "Provenance"
+                  and target in provenance_target(item)]
+    assert len(provenance) == 2, "one provenance per report that mentions it"
+    # Both reports are cited as sources of the same resource.
+    documents = {item["entity"][0]["what"]["reference"] for item in provenance}
+    assert len(documents) == 2
+
+
+def provenance_target(item):
+    return [target.get("reference", "") for target in item.get("target", [])]
+
+
+def test_a_correction_splits_the_resource(project):
+    from emr_analyzer.database.event_override_repo import EventOverrideRepository
+    from emr_analyzer.clinical.event_review import EventReviewService
+
+    pipeline = project.pipeline(FakeLlm(), KeywordExtractor())
+    pipeline.extract_patient("P001")
+    review = EventReviewService(project.evidence, EventOverrideRepository(project.db), None,
+                                overlay_repo=project.overlays, audit_repo=None, snomed=None)
+    copy = next(event for event in review.events("P001")
+                if event.document_id == "DOC_002" and event.label == "tosse")
+    review.correct(copy, {"label": "Tosse risolta"})
+    pipeline.write_fhir("P001", project.documents.list_by_patient("P001"), {}, use_llm=False)
+    import json
+    bundle = json.loads((project.root / "P001" / "clinical_events.fhir.json").read_text(encoding="utf-8"))
+    resources = [entry["resource"] for entry in bundle["entry"]]
+    labels = {item["code"]["text"] for item in resources
+              if item["resourceType"] == "Observation"}
+    assert labels == {"tosse", "Tosse risolta", "febbre"}, "the corrected copy is its own fact"

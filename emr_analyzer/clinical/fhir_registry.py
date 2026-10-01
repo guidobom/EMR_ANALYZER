@@ -107,15 +107,15 @@ class FhirRegistry:
         """
         data=item.data or {}
         coding=coding or {}
-        from .historical_reuse import historical_identity
+        from .historical_reuse import statement_or_historical_identity
         # No temporal clustering here: only identical source occurrences share an id.
         rid=ident(self.patient_id,'event',resource_key) if resource_key else ident(
             self.patient_id,item.document_id,item.fact_type,item.normalized_entity,
             data.get('experiencer'),item.certainty,item.source_text,
             data.get('source_spans'),item.observed_date,item.assertion,item.clinical_status,item.typed_payload)
-        shared = historical_identity(item)
+        shared = statement_or_historical_identity(item)
         if shared:
-            rid = ident(self.patient_id, 'historical-event', shared)
+            rid = ident(self.patient_id, 'statement-event', shared)
         if rid in self.resources:
             event = self.resources[rid]
             self.provenance(event,item.document_id,item.source_text,item.model_name,

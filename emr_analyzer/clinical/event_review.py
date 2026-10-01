@@ -306,7 +306,10 @@ def to_evidence(event: EffectiveEvent) -> ClinicalEvidence:
     """ClinicalEvidence view of a reviewed event, for the FHIR exporter."""
     machine_data = dict(event.machine.data) if event.machine is not None else {}
     if event.status in ("corrected", "added"):
+        # A corrected copy is its own fact from now on: it must not fold back
+        # into the shared resource while the other copies stay unchanged.
         machine_data.pop("historical_reuse_id", None)
+        machine_data.pop("statement_reuse", None)
     data = {**machine_data, "fhir_pipeline": True, "experiencer": event.subject,
             "attributes": dict(event.attributes or {}),
             "source_spans": [{"start": event.start, "end": event.end, "text": event.quote}],

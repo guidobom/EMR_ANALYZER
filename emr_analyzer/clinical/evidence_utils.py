@@ -80,8 +80,8 @@ def deduplicate_atomic_evidence(evidence: Iterable[ClinicalEvidence]) -> list[Cl
             canonical.data.pop('duplicate_source_evidence_ids', None)
             canonical.data.pop('source_occurrences', None)
         result.append(canonical)
-    from .historical_reuse import consolidate_historical
-    return result + lexicon + consolidate_historical(exact.values())
+    from .historical_reuse import consolidate_statements
+    return result + lexicon + consolidate_statements(exact.values())
 
 def _atomic_identity_key(item: ClinicalEvidence) -> tuple:
     """Clinical identity independent of the report containing the quote."""

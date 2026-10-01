@@ -10,6 +10,12 @@ import json
 from .evidence_utils import content_hash
 
 
+def statement_or_historical_identity(item):
+    """The statement identity when there is one, else the legacy block identity."""
+    from .statement_index import statement_identity
+    return statement_identity(item) or historical_identity(item)
+
+
 def historical_identity(item):
     """Stable event identity only for certified exact reuse, with conflict guards."""
     key = item.data.get('historical_reuse_id')
@@ -21,11 +27,11 @@ def historical_identity(item):
         item.data.get('snomed_concept_id'),json.dumps(item.typed_payload,sort_keys=True))
 
 
-def consolidate_historical(items):
+def consolidate_statements(items):
     """One displayed event, all source occurrences preserved, including relations."""
     groups = {}
     for item in items:
-        key = historical_identity(item) or item.evidence_id
+        key = statement_or_historical_identity(item) or item.evidence_id
         groups.setdefault(key,[]).append(item)
     result = []
     for members in groups.values():
@@ -43,6 +49,6 @@ def consolidate_historical(items):
         if len(sources)>1:
             row.data.update(source_occurrences=list(sources.values()),
                 duplicate_source_evidence_ids=[i for i in sources if i != row.evidence_id],
-                atomic_duplicate_count=len(sources)-1,deduplication_rule='exact_historical_block_v1')
+                atomic_duplicate_count=len(sources)-1,deduplication_rule='identical_statement_v1')
         result.append(row)
     return result
