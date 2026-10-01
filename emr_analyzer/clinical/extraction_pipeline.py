@@ -1,8 +1,16 @@
-"""Source-grounded event extraction for one patient, persisted per document."""
+"""Source-grounded event extraction for one or many patients.
+
+All documents of the selected patients share one worker pool, so the local
+server slots stay busy across patient boundaries.  Each document is committed
+as soon as it completes and each patient is finalized (FHIR file, run status)
+as soon as its last document is done; an interrupted run resumes from the
+processing manifest and the group checkpoints.
+"""
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
@@ -19,6 +27,7 @@ from .event_extraction import EventExtractor
 from .lab_evidence import LEGACY_LAB_METHODS, filter_narrative_lab_duplicates
 from ..config import active_workspace
 from ..models.clinical_registry import ProcessingManifestItem, ProcessingRun
+from ..models.document import DocumentType
 from ..settings import load_pipeline_policy
 
 STAGE = "atomic_evidence"
@@ -29,12 +38,26 @@ class ExtractionCancelled(RuntimeError):
     pass
 
 
-class ExtractionPipeline:
-    """Extract clinical events from every active text of a patient.
+@dataclass
+class _PatientPlan:
+    patient_id: str
+    documents: list
+    run: ProcessingRun
+    tasks: list = field(default_factory=list)       # (doc, text, manifest_id)
+    skipped: int = 0
+    laboratory_documents: int = 0
+    processed: int = 0
+    extracted: int = 0
+    failures: list = field(default_factory=list)
+    doc_stats: list = field(default_factory=list)
+    started: float = field(default_factory=time.monotonic)
+    remaining: int = 0
+    result: dict | None = None
+    error: Exception | None = None
 
-    Each document is committed as soon as it completes, so an interrupted
-    run resumes from the processing manifest and the group checkpoints.
-    """
+
+class ExtractionPipeline:
+    """Extract, persist and export the clinical events of active texts."""
 
     def __init__(
         self,
@@ -107,213 +130,265 @@ class ExtractionPipeline:
             (patient_id,),
         ).fetchone() is not None
 
-    def extract_patient(
+    # ------------------------------------------------------------- running
+    def extract_patient(self, patient_id: str, **kwargs) -> dict:
+        """Extract one patient; failures of the patient itself are raised."""
+        plans = self.extract_patients([patient_id], **kwargs)
+        plan = plans[patient_id]
+        if plan.error is not None:
+            raise plan.error
+        return plan.result
+
+    def extract_patients(
         self,
-        patient_id: str,
+        patient_ids: list[str],
         *,
         incremental: bool = True,
         num_workers: int = 1,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
-    ) -> dict:
+        patient_finished: Optional[Callable[[str, dict], None]] = None,
+        patient_error: Optional[Callable[[str, str], None]] = None,
+    ) -> dict[str, _PatientPlan]:
         started = time.monotonic()
-        documents = sorted(
-            self.document_repo.list_by_patient(patient_id),
-            key=lambda doc: (doc.document_date or "9999", doc.id),
-        )
-        # The shared Lexicon may have changed since the previous run.
-        self.extractor = self.make_extractor()
-        model_digest = self.extractor.model_digest if self.extractor else ""
-        run = ProcessingRun(
-            patient_id=patient_id, stage="atomic_evidence_v3",
-            model_name=self.extractor.model_name if self.extractor else None,
-            model_digest=model_digest, prompt_version=self.prompt_version,
-            parameters={
-                "incremental": incremental, "requested_workers": num_workers,
-                "document_count": len(documents),
-                "atomic_prompt_digest": self.prompt_digest,
-                "atomic_model": getattr(self.llm, "model", None),
-            },
-        )
-        self.processing_repo.start_run(run)
-        failures: list[dict] = []
-        doc_stats: list[dict] = []
-        skipped = processed = extracted_count = 0
-        progress_lock = threading.Lock()
-        progress_value = 0
+        lock = threading.Lock()
+        progress = {"value": 0}
 
         def report(value, message):
-            nonlocal progress_value
             if progress_callback:
-                with progress_lock:
-                    progress_value = max(progress_value, value)
-                    progress_callback(progress_value, message)
+                with lock:
+                    progress["value"] = max(progress["value"], int(value))
+                    progress_callback(progress["value"], message)
 
         def check_cancelled() -> None:
             if cancel_check is not None and cancel_check():
                 raise ExtractionCancelled("Elaborazione interrotta su richiesta dell'utente")
 
+        # The shared Lexicon may have changed since the previous run.
+        self.extractor = self.make_extractor()
+        model_digest = self.extractor.model_digest if self.extractor else ""
+        plans: dict[str, _PatientPlan] = {}
         try:
-            check_cancelled()
-            # Laboratory results are exported from lab_values; projections
-            # written by earlier builds are no longer read.
-            self.evidence_repo.delete_methods(patient_id, LEGACY_LAB_METHODS)
-            tasks = []
-            for doc in documents:
-                path = self.normalized_text_path(patient_id, doc.id)
-                if path is None:
-                    failures.append({"document_id": doc.id, "error": "Testo anonimizzato non disponibile."})
-                    continue
-                base_text = path.read_text(encoding="utf-8")
-                text = self.overlay_repo.effective_text(doc.id, base_text) if self.overlay_repo else base_text
-                input_hash = content_hash(text, doc.document_date, doc.document_type,
-                                          self.prompt_version, self.prompt_digest)
-                if incremental and self.processing_repo.is_current(
-                        doc.id, STAGE, input_hash, self.prompt_version,
-                        self.prompt_version, model_digest):
-                    skipped += 1
-                    continue
-                tasks.append((doc, text, input_hash))
-
+            for patient_id in patient_ids:
+                check_cancelled()
+                plans[patient_id] = self._plan(patient_id, incremental, model_digest, num_workers)
+            total = sum(len(plan.tasks) for plan in plans.values())
+            skipped = sum(plan.skipped for plan in plans.values())
             available = bool(self.extractor is not None and self.llm
                              and getattr(self.llm, "is_available", False))
-            if tasks and not available:
-                failures.extend({"document_id": doc.id, "error":
-                    "Modello locale non disponibile: il documento sarà riprovato alla prossima esecuzione."}
-                    for doc, _, _ in tasks)
-                tasks = []
-            if tasks:
+            if total and not available:
+                for plan in plans.values():
+                    for doc, _, manifest_id in plan.tasks:
+                        self._fail(plan, doc, manifest_id, RuntimeError(
+                            "Modello locale non disponibile: il documento sarà riprovato "
+                            "alla prossima esecuzione."))
+                    plan.tasks = []
+                total = 0
+            if total:
                 self._retain_only_extraction_runtime()
+            report(0, f"{total} documenti da elaborare, {skipped} invariati")
 
-            workers = max(1, min(int(num_workers or 1), len(tasks) or 1))
-            report(0, f"Eventi: {len(tasks)} documenti da elaborare, {skipped} invariati")
-            manifests = {}
-            for doc, _, input_hash in tasks:
-                item = ProcessingManifestItem(
-                    patient_id=patient_id, document_id=doc.id, stage=STAGE,
-                    input_hash=input_hash, pipeline_version=self.prompt_version,
-                    run_id=run.run_id, prompt_version=self.prompt_version,
-                    model_digest=model_digest, status="running",
-                )
-                self.processing_repo.upsert_manifest(item)
-                manifests[doc.id] = item.manifest_id
-
-            def extract_one(doc, text):
-                task_started = time.monotonic()
-                check_cancelled()
-                kwargs = dict(
-                    patient_id=patient_id, document_id=doc.id,
-                    document_type=doc.document_type, document_date=doc.document_date,
-                    text=text, geometry_path=_geometry_source(doc, active_workspace.path),
-                    stage_progress_callback=lambda message: report(
-                        int(90 * processed / max(len(tasks), 1)), f"{doc.id}: {message}"),
-                    chunk_progress_callback=lambda done, total: report(
-                        int(90 * (processed + done / max(total, 1)) / max(len(tasks), 1)),
-                        f"{doc.id}: gruppi {done}/{total} verificati"),
-                )
+            def finalize(plan):
                 try:
-                    evidence = self.extractor.extract_document(
-                        evidence_ready_callback=lambda rows: self.replace_document_evidence(doc.id, rows),
-                        cancel_check=cancel_check, **kwargs)
-                except AtomicExtractionCancelled as exc:
-                    raise ExtractionCancelled(str(exc)) from exc
-                except IncompleteAtomicExtraction as exc:
-                    self.replace_document_evidence(doc.id, exc.evidence)
+                    plan.result = self._finalize(plan, check_cancelled)
+                    if patient_finished:
+                        patient_finished(plan.patient_id, plan.result)
+                except ExtractionCancelled:
                     raise
-                check_cancelled()
-                return doc, evidence, round(time.monotonic() - task_started, 3), \
-                    self.extractor.last_extraction_metrics()
+                except Exception as exc:
+                    plan.error = exc
+                    self.processing_repo.finish_run(plan.run.run_id, "failed", str(exc))
+                    if patient_error:
+                        patient_error(plan.patient_id, str(exc))
 
-            def persist(result) -> None:
-                nonlocal processed, extracted_count
-                doc, evidence, duration, metrics = result
-                self.replace_document_evidence(doc.id, evidence)
-                self.processing_repo.mark_result(
-                    manifests[doc.id], status="completed",
-                    output_hash=_evidence_hash(evidence), output_count=len(evidence))
-                processed += 1
-                extracted_count += len(evidence)
-                doc_stats.append({"document_id": doc.id, "evidence_count": len(evidence),
-                                  "elapsed_seconds": duration, "status": "completed", **metrics})
-
-            def fail(doc, exc) -> None:
-                failures.append({"document_id": doc.id, "error": str(exc)})
-                incomplete = isinstance(exc, IncompleteAtomicExtraction)
-                doc_stats.append({"document_id": doc.id, "status": "failed", "error": str(exc),
-                                  "evidence_count": len(exc.evidence) if incomplete else 0,
-                                  **(exc.metrics if incomplete else {})})
-                self.processing_repo.mark_result(manifests[doc.id], status="failed",
-                                                 error_message=str(exc))
-
-            # Longest first reduces the final straggler with identical workers.
-            ordered = sorted(tasks, key=lambda task: len(task[1]), reverse=True)
+            for plan in plans.values():
+                plan.remaining = len(plan.tasks)
+                if not plan.tasks:
+                    finalize(plan)
+            # Patients in order, longest documents first within each patient:
+            # early patients finish early while the pool never idles.
+            ordered = [(plan, task) for plan in plans.values()
+                       for task in sorted(plan.tasks, key=lambda task: len(task[1]), reverse=True)]
+            workers = max(1, min(int(num_workers or 1), total or 1))
+            completed = 0
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(extract_one, doc, text): doc for doc, text, _ in ordered}
-                for completed, future in enumerate(as_completed(futures), start=1):
-                    doc = futures[future]
-                    try:
-                        persist(future.result())
-                    except ExtractionCancelled:
-                        for pending in futures:
-                            pending.cancel()
-                        raise
-                    except Exception as exc:
-                        fail(doc, exc)
-                    report(int(completed / max(len(ordered), 1) * 90),
-                           f"Documenti {completed}/{len(ordered)}")
-
-            check_cancelled()
-            fhir = self.write_fhir(patient_id, documents, {
-                "documents_total": len(documents), "processed": processed,
-                "unchanged": skipped, "failures": failures,
-                "complete": not failures, "pipeline": VERSION,
-            }, cancel_check=check_cancelled, progress=report)
-            stored = self.evidence_repo.get_by_patient(patient_id)
-            elapsed = round(time.monotonic() - started, 2)
-            self.processing_repo.finish_run(
-                run.run_id, "completed_with_warnings" if failures else "completed")
-            summary = _summarize(doc_stats)
-            if self.audit:
-                self.audit.log(patient_id, "clinical_events_extracted", "clinical_evidence",
-                               patient_id, {"documents_total": len(documents),
-                                            "documents_processed": processed,
-                                            "documents_skipped": skipped,
-                                            "documents_failed": len(failures),
-                                            "evidence_stored_occurrences": len(stored),
-                                            "elapsed_seconds": elapsed, **summary},
-                               model_used=getattr(self.llm, "model", None),
-                               model_version=self.prompt_version, run_id=run.run_id)
-            report(100, "Estrazione completata")
-            return {
-                "fhir_path": fhir["path"], "fhir_events": fhir["events"],
-                "fhir_uncoded": fhir["uncoded"],
-                "total_entries": len(deduplicate_atomic_evidence(stored)),
-                "stored_evidence_occurrences": len(stored),
-                "documents_processed": processed, "documents_skipped": skipped,
-                "documents_failed": len(failures),
-                "failed_doc_ids": [item["document_id"] for item in failures],
-                "failures": failures,
-                "document_stats": sorted(doc_stats, key=lambda item: item["document_id"]),
-                "atomic_evidence_extracted": extracted_count,
-                "incremental": incremental, "atomic_model": getattr(self.llm, "model", None),
-                "run_id": run.run_id, "elapsed_seconds": elapsed, **summary,
-            }
+                futures = {
+                    pool.submit(self._extract, plan, doc, text, cancel_check, report, total,
+                                lambda: completed): (plan, doc, manifest_id)
+                    for plan, (doc, text, manifest_id) in ordered
+                }
+                try:
+                    for future in as_completed(futures):
+                        plan, doc, manifest_id = futures[future]
+                        try:
+                            self._persist(plan, manifest_id, future.result())
+                        except ExtractionCancelled:
+                            raise
+                        except Exception as exc:
+                            self._fail(plan, doc, manifest_id, exc)
+                        completed += 1
+                        plan.remaining -= 1
+                        if plan.remaining == 0:
+                            finalize(plan)
+                        report(int(completed / max(total, 1) * 100),
+                               _eta_message(completed, total, time.monotonic() - started, plan.patient_id))
+                except ExtractionCancelled:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
         except ExtractionCancelled as exc:
-            self.processing_repo.interrupt_run(run.run_id, str(exc))
+            for plan in plans.values():
+                if plan.result is None and plan.error is None:
+                    self.processing_repo.interrupt_run(plan.run.run_id, str(exc))
             raise
-        except Exception as exc:
-            self.processing_repo.finish_run(run.run_id, "failed", str(exc))
-            raise
+        report(100, "Elaborazione completata")
+        return plans
 
-    def write_fhir(self, patient_id, documents, coverage, *, cancel_check=None, progress=None) -> dict:
+    def _plan(self, patient_id, incremental, model_digest, num_workers) -> _PatientPlan:
+        documents = sorted(
+            self.document_repo.list_by_patient(patient_id),
+            key=lambda doc: (doc.document_date or "9999", doc.id),
+        )
+        run = ProcessingRun(
+            patient_id=patient_id, stage="atomic_evidence_v3",
+            model_name=self.extractor.model_name if self.extractor else None,
+            model_digest=model_digest, prompt_version=self.prompt_version,
+            parameters={"incremental": incremental, "requested_workers": num_workers,
+                        "document_count": len(documents),
+                        "atomic_prompt_digest": self.prompt_digest,
+                        "atomic_model": getattr(self.llm, "model", None)},
+        )
+        self.processing_repo.start_run(run)
+        plan = _PatientPlan(patient_id=patient_id, documents=documents, run=run)
+        # Projections written by earlier builds are no longer read.
+        self.evidence_repo.delete_methods(patient_id, LEGACY_LAB_METHODS)
+        lab_counts = dict(self.db.execute(
+            "SELECT document_id, COUNT(*) FROM lab_values WHERE patient_id=? GROUP BY document_id",
+            (patient_id,)).fetchall())
+        for doc in documents:
+            path = self.normalized_text_path(patient_id, doc.id)
+            if path is None:
+                plan.failures.append({"document_id": doc.id, "error": "Testo anonimizzato non disponibile."})
+                continue
+            base_text = path.read_text(encoding="utf-8")
+            text = self.overlay_repo.effective_text(doc.id, base_text) if self.overlay_repo else base_text
+            laboratory = (doc.document_type == DocumentType.LABORATORIO.value
+                          and lab_counts.get(doc.id, 0) > 0)
+            guidance = self.extractor.guidance_digest(text) if self.extractor else ""
+            input_hash = content_hash(text, doc.document_date, doc.document_type,
+                                      self.prompt_version, self.prompt_digest, guidance,
+                                      "deterministic-laboratory" if laboratory else "")
+            if incremental and self.processing_repo.is_current(
+                    doc.id, STAGE, input_hash, self.prompt_version,
+                    self.prompt_version, model_digest):
+                plan.skipped += 1
+                continue
+            item = ProcessingManifestItem(
+                patient_id=patient_id, document_id=doc.id, stage=STAGE,
+                input_hash=input_hash, pipeline_version=self.prompt_version,
+                run_id=run.run_id, prompt_version=self.prompt_version,
+                model_digest=model_digest, status="running",
+            )
+            self.processing_repo.upsert_manifest(item)
+            if laboratory:
+                # Tabular results are read by the deterministic parser; the
+                # report is complete without a language-model reading.
+                self.replace_document_evidence(doc.id, [])
+                self.processing_repo.mark_result(item.manifest_id, status="completed",
+                                                 output_hash=_evidence_hash([]), output_count=0)
+                plan.laboratory_documents += 1
+                continue
+            plan.tasks.append((doc, text, item.manifest_id))
+        return plan
+
+    def _extract(self, plan, doc, text, cancel_check, report, total, completed):
+        if cancel_check is not None and cancel_check():
+            raise ExtractionCancelled("Elaborazione interrotta su richiesta dell'utente")
+        task_started = time.monotonic()
+        position = lambda: int(completed() / max(total, 1) * 100)
+        try:
+            evidence = self.extractor.extract_document(
+                patient_id=plan.patient_id, document_id=doc.id,
+                document_type=doc.document_type, document_date=doc.document_date,
+                text=text, geometry_path=_geometry_source(doc, active_workspace.path),
+                evidence_ready_callback=lambda rows: self.replace_document_evidence(doc.id, rows),
+                cancel_check=cancel_check,
+                stage_progress_callback=lambda message: report(position(), f"{plan.patient_id} · {doc.id}: {message}"),
+                chunk_progress_callback=lambda done, all_: report(
+                    position(), f"{plan.patient_id} · {doc.id}: gruppi {done}/{all_} verificati"),
+            )
+        except AtomicExtractionCancelled as exc:
+            raise ExtractionCancelled(str(exc)) from exc
+        except IncompleteAtomicExtraction as exc:
+            self.replace_document_evidence(doc.id, exc.evidence)
+            raise
+        return doc, evidence, round(time.monotonic() - task_started, 3), \
+            self.extractor.last_extraction_metrics()
+
+    def _persist(self, plan, manifest_id, result) -> None:
+        doc, evidence, duration, metrics = result
+        self.replace_document_evidence(doc.id, evidence)
+        self.processing_repo.mark_result(manifest_id, status="completed",
+                                         output_hash=_evidence_hash(evidence), output_count=len(evidence))
+        plan.processed += 1
+        plan.extracted += len(evidence)
+        plan.doc_stats.append({"document_id": doc.id, "evidence_count": len(evidence),
+                               "elapsed_seconds": duration, "status": "completed", **metrics})
+
+    def _fail(self, plan, doc, manifest_id, exc) -> None:
+        plan.failures.append({"document_id": doc.id, "error": str(exc)})
+        incomplete = isinstance(exc, IncompleteAtomicExtraction)
+        plan.doc_stats.append({"document_id": doc.id, "status": "failed", "error": str(exc),
+                               "evidence_count": len(exc.evidence) if incomplete else 0,
+                               **(exc.metrics if incomplete else {})})
+        self.processing_repo.mark_result(manifest_id, status="failed", error_message=str(exc))
+
+    def _finalize(self, plan, check_cancelled) -> dict:
+        check_cancelled()
+        fhir = self.write_fhir(plan.patient_id, plan.documents, {
+            "documents_total": len(plan.documents), "processed": plan.processed,
+            "unchanged": plan.skipped, "laboratory_documents": plan.laboratory_documents,
+            "failures": plan.failures, "complete": not plan.failures, "pipeline": VERSION,
+        }, cancel_check=check_cancelled)
+        stored = self.evidence_repo.get_by_patient(plan.patient_id)
+        elapsed = round(time.monotonic() - plan.started, 2)
+        self.processing_repo.finish_run(
+            plan.run.run_id, "completed_with_warnings" if plan.failures else "completed")
+        summary = _summarize(plan.doc_stats)
+        if self.audit:
+            self.audit.log(plan.patient_id, "clinical_events_extracted", "clinical_evidence",
+                           plan.patient_id, {"documents_total": len(plan.documents),
+                                             "documents_processed": plan.processed,
+                                             "documents_skipped": plan.skipped,
+                                             "laboratory_documents": plan.laboratory_documents,
+                                             "documents_failed": len(plan.failures),
+                                             "evidence_stored_occurrences": len(stored),
+                                             "elapsed_seconds": elapsed, **summary},
+                           model_used=getattr(self.llm, "model", None),
+                           model_version=self.prompt_version, run_id=plan.run.run_id)
+        return {
+            "fhir_path": fhir["path"], "fhir_events": fhir["events"], "fhir_uncoded": fhir["uncoded"],
+            "total_entries": len(deduplicate_atomic_evidence(stored)),
+            "stored_evidence_occurrences": len(stored),
+            "documents_processed": plan.processed, "documents_skipped": plan.skipped,
+            "laboratory_documents": plan.laboratory_documents,
+            "documents_failed": len(plan.failures),
+            "failed_doc_ids": [item["document_id"] for item in plan.failures],
+            "failures": plan.failures,
+            "document_stats": sorted(plan.doc_stats, key=lambda item: item["document_id"]),
+            "atomic_evidence_extracted": plan.extracted,
+            "atomic_model": getattr(self.llm, "model", None),
+            "run_id": plan.run.run_id, "elapsed_seconds": elapsed, **summary,
+        }
+
+    def write_fhir(self, patient_id, documents, coverage, *, cancel_check=None) -> dict:
         from .fhir_registry import FhirRegistry, lab_occurrence_keys
         loinc = getattr(self.shared_lexicon_repo, "loinc_catalog", None)
         lab_values = self.lab_repo.get_by_patient(patient_id)
         proposals = {}
         if loinc and self.llm and getattr(self.llm, "is_available", False):
-            if progress:
-                progress(92, "Codifica LOINC dei risultati di laboratorio…")
-            proposals = loinc.propose(lab_values, self.llm, lambda: (cancel_check() if cancel_check else None) or False)
+            proposals = loinc.propose(lab_values, self.llm,
+                                      lambda: (cancel_check() if cancel_check else None) or False)
         exporter = FhirRegistry(patient_id, loinc, proposals)
         for document in documents:
             exporter.document(document.id)
@@ -371,13 +446,24 @@ class ExtractionPipeline:
             self.evidence_repo.replace_document_method(document_id, method, items)
 
 
+def _eta_message(completed: int, total: int, elapsed: float, patient_id: str) -> str:
+    message = f"Documenti {completed}/{total} · ultimo paziente {patient_id}"
+    if completed and total > completed and elapsed > 0:
+        remaining = elapsed / completed * (total - completed)
+        hours, minutes = divmod(int(remaining // 60), 60)
+        message += (f" · {completed / elapsed * 60:.1f} documenti/min · fine stimata tra "
+                    + (f"{hours} h {minutes} min" if hours else f"{minutes} min"))
+    return message
+
+
 def _summarize(doc_stats) -> dict:
     total = lambda key, cast=int: sum(cast(item.get(key, 0) or 0) for item in doc_stats)
     keys = ("llm_calls", "source_chunks", "prompt_tokens", "completion_tokens",
             "recovery_calls", "snomed_mapped", "snomed_unmapped")
     summary = {key: total(key) for key in keys}
     summary.update(prompt_ms=round(total("prompt_ms", float), 3),
-                   predicted_ms=round(total("predicted_ms", float), 3))
+                   predicted_ms=round(total("predicted_ms", float), 3),
+                   llm_seconds=round(total("elapsed_seconds", float), 3))
     return summary
 
 

@@ -32,7 +32,6 @@ class EventExtractor(HistoricalReuseMixin, ReferencedSourceReader):
         self.mapping_system = load_prompt('snomed_mapping_system')
         self.prompt_version = VERSION
         self.prompt_digest = content_hash(self.system, self.mapping_system)
-        self.catalog_digest = content_hash(self.catalog_digest, self.snomed.digest if self.snomed else 'catalog-missing')
 
     @property
     def model_digest(self):

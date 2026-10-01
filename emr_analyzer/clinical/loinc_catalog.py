@@ -18,6 +18,10 @@ class LoincCatalog:
             self.db.execute('CREATE VIRTUAL TABLE IF NOT EXISTS loinc_search USING fts5(code UNINDEXED,label)')
             self.db.execute('CREATE TABLE IF NOT EXISTS loinc_components (name TEXT, code TEXT, PRIMARY KEY(name,code))')
             self.db.execute('CREATE TABLE IF NOT EXISTS loinc_mappings (signature TEXT PRIMARY KEY,code TEXT NOT NULL)')
+            # Model choices are cached per signature, model and candidate set;
+            # they stay proposals and never become reviewed mappings.
+            self.db.execute('CREATE TABLE IF NOT EXISTS loinc_proposals (signature TEXT NOT NULL, '
+                            'context TEXT NOT NULL, code TEXT, PRIMARY KEY(signature, context))')
 
     def metadata(self):
         return dict(self.db.execute('SELECT key,value FROM loinc_meta').fetchall())
@@ -140,23 +144,31 @@ class LoincCatalog:
         proposals={}
         pending=[]
         seen=set()
+        model=json.dumps({k:getattr(llm,k,None) for k in ('model','model_path','temperature','seed','top_p','top_k')},sort_keys=True)
         for lab in labs:
             signature=self.signature(lab.normalized_name or lab.parameter_name,lab.biological_material,lab.unit)
             if signature in seen or self.resolve(lab):continue
             seen.add(signature)
             candidates=self.candidates_for(lab)
-            if candidates:pending.append((signature,lab,candidates))
+            if not candidates:continue
+            context=hashlib.sha256((model+json.dumps(sorted(r['code'] for r in candidates))).encode()).hexdigest()
+            cached=self.db.execute('SELECT code FROM loinc_proposals WHERE signature=? AND context=?',(signature,context)).fetchone()
+            if cached is not None:
+                selected=next((r for r in candidates if r['code']==cached[0]),None)
+                if selected:proposals[signature]={**selected,'mapping_review':'proposed'}
+                continue
+            pending.append((signature,lab,candidates,context))
         for offset in range(0,len(pending),4):
             if cancelled and cancelled():raise InterruptedError('Codifica LOINC interrotta.')
             batch=pending[offset:offset+4]
             payload=[{'id':str(i),'analita':lab.parameter_name,'normalizzato':lab.normalized_name,
                       'campione':lab.biological_material,'unita':lab.unit,
                       'candidati':[{'code':r['code'],'label':r['label'],'axes':r['axes']} for r in candidates]}
-                     for i,(_,lab,candidates) in enumerate(batch)]
+                     for i,(_,lab,candidates,_) in enumerate(batch)]
             contract={'type':'object','additionalProperties':False,'required':['mappings'],'properties':{
                 'mappings':{'type':'array','items':{'type':'object','additionalProperties':False,
                     'required':['id','code'],'properties':{'id':{'type':'string','enum':[p['id'] for p in payload]},
-                    'code':{'type':['string','null'],'enum':list({r['code'] for _,_,cs in batch for r in cs})+[None]}}}}}}
+                    'code':{'type':['string','null'],'enum':list({r['code'] for _,_,cs,_ in batch for r in cs})+[None]}}}}}}
             system=('Associa analiti italiani a codici LOINC candidati. Non aggiungere specificità. '
                     'Confronta componente, proprietà, campione, tempo, scala e metodo. '
                     'Se il nome è ambiguo o nessun candidato coincide usa null. Restituisci ogni id una sola volta. '
@@ -170,10 +182,13 @@ class LoincCatalog:
                 jsonschema.validate(response,contract)
                 choices=response['mappings']
                 if len(choices)!=len(batch) or {c['id'] for c in choices}!={p['id'] for p in payload}:continue
-                for choice in choices:
-                    signature,lab,candidates=batch[int(choice['id'])]
-                    selected=next((r for r in candidates if r['code']==choice['code']),None)
-                    if selected:proposals[signature]={**selected,'mapping_review':'proposed'}
+                with self.db:
+                    for choice in choices:
+                        signature,lab,candidates,context=batch[int(choice['id'])]
+                        selected=next((r for r in candidates if r['code']==choice['code']),None)
+                        if selected:proposals[signature]={**selected,'mapping_review':'proposed'}
+                        self.db.execute('INSERT OR REPLACE INTO loinc_proposals VALUES (?,?,?)',
+                                        (signature,context,selected['code'] if selected else None))
             except Exception:
                 # Mapping failure is not permission to lose the laboratory result.
                 continue

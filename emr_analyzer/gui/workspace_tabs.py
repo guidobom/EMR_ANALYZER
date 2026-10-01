@@ -419,39 +419,28 @@ class WorkspaceTabs(QTabWidget):
         )
         self._registry_queue_workers["atomic"] = worker
         results: list[dict] = []
-        state = {"index": 0, "total": len(patient_ids)}
         progress = ProgressDialog(
-            f"Elaborazione — paziente 1/{len(patient_ids)}", parent=self,
+            f"Elaborazione di {len(patient_ids)} pazienti", parent=self,
         )
         progress.show()
         process_gui_events()
-
-        def on_started(index: int, total: int, patient_id: str) -> None:
-            state.update(index=index, total=total)
-            progress.setWindowTitle(f"Elaborazione — paziente {index}/{total}")
-            progress.add_log(f"\n===== Paziente {index}/{total}: {patient_id} =====")
-            progress.set_progress(int((index - 1) * 100 / total),
-                                  f"Avvio di {patient_id}...")
-
-        def on_progress(patient_id: str, percent: int, message: str) -> None:
-            total = max(state["total"], 1)
-            overall = int(((state["index"] - 1) + percent / 100) * 100 / total)
-            progress.set_progress(overall, f"{patient_id} ({percent}%): {message}")
 
         def on_finished(patient_id: str, result: dict) -> None:
             results.append({"patient_id": patient_id, "result": result, "error": None})
             progress.add_log(
                 f"✓ {patient_id}: {result.get('documents_processed', 0)} documenti elaborati, "
                 f"{result.get('documents_skipped', 0)} invariati, "
+                f"{result.get('laboratory_documents', 0)} di laboratorio, "
                 f"{result.get('documents_failed', 0)} non completati"
             )
+            progress.setWindowTitle(
+                f"Elaborazione: {len(results)}/{len(patient_ids)} pazienti conclusi")
 
         def on_error(patient_id: str, error: str) -> None:
-            results.append({"patient_id": patient_id, "result": {}, "error": error})
-            progress.add_log(f"❌ {patient_id}: {error}")
+            results.append({"patient_id": patient_id or "coda", "result": {}, "error": error})
+            progress.add_log(f"❌ {patient_id or 'coda'}: {error}")
 
-        worker.patient_started.connect(on_started)
-        worker.patient_progress.connect(on_progress)
+        worker.progress.connect(lambda percent, message: progress.set_progress(percent, message))
         worker.patient_finished.connect(on_finished)
         worker.patient_error.connect(on_error)
         progress.cancelled.connect(worker.cancel)

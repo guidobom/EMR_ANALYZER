@@ -85,6 +85,9 @@ class KeywordExtractor:
     def last_extraction_metrics(self):
         return {"llm_calls": 1}
 
+    def guidance_digest(self, text):
+        return ""
+
     def extract_document(self, *, patient_id, document_id, document_type, document_date,
                          text, evidence_ready_callback=None, cancel_check=None, **_):
         self.calls.append(document_id)

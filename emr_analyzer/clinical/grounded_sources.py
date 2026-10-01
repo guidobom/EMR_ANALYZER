@@ -85,10 +85,17 @@ class GroundedSourceReader:
 
     @property
     def model_digest(self):
-        return content_hash(VERSION, self.prompt_digest, self.catalog_digest,
+        # The teaching catalog is not part of the identity: the examples
+        # actually sent are already in each prompt (see guidance_digest), so
+        # editing an unrelated Lexicon term invalidates nothing.
+        return content_hash(VERSION, self.prompt_digest,
             json.dumps({key: getattr(self.llm, key, None) for key in (
                 'model', 'model_path', 'temperature', 'seed', 'top_p', 'top_k',
                 'context_length', 'max_output_tokens', 'thinking_enabled')}, sort_keys=True))
+
+    def guidance_digest(self, text):
+        """Identity of the Lexicon guidance that would be sent for this text."""
+        return content_hash(json.dumps(self._cards(text), sort_keys=True, ensure_ascii=False))
 
     def last_extraction_metrics(self):
         return dict(getattr(self._local, 'metrics', {}))

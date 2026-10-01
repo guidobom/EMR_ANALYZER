@@ -4,7 +4,6 @@ Only complete locally dated blocks are reusable. Similarity is never evidence
 of identity. The cache contains source annotations, not copied document offsets.
 """
 from copy import deepcopy
-from dataclasses import asdict
 from datetime import date, datetime
 import json
 import re
@@ -100,9 +99,8 @@ class HistoricalReuseMixin:
         if RELATIVE.search(' '.join(s.text for s in group.spans)):
             return None
         shape = [(s.sentence_id, s.sentence_id in group.target_ids, normalized(s.text)) for s in group.numbered]
-        return content_hash('historical-block-v1', patient_id, self.model_digest, document_type,
-                            json.dumps(shape,ensure_ascii=False), json.dumps(cards,sort_keys=True,ensure_ascii=False),
-                            json.dumps(asdict(self.policy),sort_keys=True,ensure_ascii=False))
+        return content_hash('historical-block-v2', patient_id, self.model_digest, document_type,
+                            json.dumps(shape,ensure_ascii=False), json.dumps(cards,sort_keys=True,ensure_ascii=False))
 
     def _load_historical_group(self, group, cards, patient_id, document_type, document_date, text, document_id, contract):
         key = self._history_key(group,cards,patient_id,document_type,document_date)

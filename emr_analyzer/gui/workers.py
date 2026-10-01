@@ -48,12 +48,16 @@ class PatientExtractionWorker(QThread):
 
 
 class RegistryQueueWorker(QThread):
-    """Extract several patients in order; cancellation is honoured between calls."""
+    """Extract several patients through one shared pool of model slots.
 
-    patient_started = pyqtSignal(int, int, str)
-    patient_progress = pyqtSignal(str, int, str)
+    Each patient is finalized (and reported) as soon as its last document is
+    done; cancellation is honoured after the active model calls return.
+    """
+
+    progress = pyqtSignal(int, str)
     patient_finished = pyqtSignal(str, dict)
     patient_error = pyqtSignal(str, str)
+    cancelled = pyqtSignal()
 
     def __init__(self, pipeline, patient_ids: list[str], *, num_workers: int = 1,
                  force_rebuild: bool = False, parent=None):
@@ -65,27 +69,20 @@ class RegistryQueueWorker(QThread):
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
-        """Request a safe stop after the patient currently being saved."""
+        """Request a safe stop after the active model calls return."""
         self._cancel_event.set()
 
     def run(self) -> None:
-        total = len(self.patient_ids)
-        for index, patient_id in enumerate(self.patient_ids, start=1):
-            if self._cancel_event.is_set():
-                break
-            self.patient_started.emit(index, total, patient_id)
-
-            def progress(percent: int, message: str, pid=patient_id) -> None:
-                self.patient_progress.emit(pid, int(percent), str(message))
-
-            try:
-                result = self.pipeline.extract_patient(
-                    patient_id, incremental=not self.force_rebuild,
-                    num_workers=self.num_workers, progress_callback=progress,
-                    cancel_check=self._cancel_event.is_set,
-                )
-                self.patient_finished.emit(patient_id, dict(result or {}))
-            except ExtractionCancelled:
-                break
-            except Exception as exc:
-                self.patient_error.emit(patient_id, str(exc))
+        try:
+            self.pipeline.extract_patients(
+                self.patient_ids, incremental=not self.force_rebuild,
+                num_workers=self.num_workers,
+                progress_callback=lambda pct, msg: self.progress.emit(int(pct), str(msg)),
+                cancel_check=self._cancel_event.is_set,
+                patient_finished=lambda pid, result: self.patient_finished.emit(pid, dict(result or {})),
+                patient_error=lambda pid, error: self.patient_error.emit(pid, str(error)),
+            )
+        except ExtractionCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.patient_error.emit("", str(exc))

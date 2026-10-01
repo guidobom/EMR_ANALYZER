@@ -480,6 +480,16 @@ class MainWindow(QMainWindow):
             if dialog.exec_() != QDialog.Accepted:
                 return False
             selected = dialog.configurations()[role]
+            if key == "atomic" and selected.temperature > 0.2:
+                answer = QMessageBox.question(
+                    parent or self, "Temperatura elevata",
+                    f"La temperatura del modello è {selected.temperature:g}. Per un'estrazione "
+                    "riproducibile e conforme allo schema si consiglia 0 (al massimo 0,2).\n\n"
+                    "Continuare comunque?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    return False
             if not selected.model or not LlmClient(config=selected).is_available:
                 QMessageBox.warning(parent or self, "Modello non disponibile",
                                     "Scarica o importa il modello selezionato prima di avviare l’analisi.")
