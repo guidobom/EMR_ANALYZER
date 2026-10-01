@@ -149,3 +149,34 @@ def test_split_group_keeps_a_copy_on_one_side_only():
     left, right = split_group(group)
     assert left.copies == (spans[0],) and right.copies == ()
     assert left.targets == (spans[0], spans[1]) and right.targets == (spans[2], spans[3])
+
+
+def test_invalidation_forgets_what_a_document_contributed(project):
+    from emr_analyzer.clinical.grounded_sources import METHOD
+    from emr_analyzer.database.statement_repo import invalidate_documents
+    from emr_analyzer.models.clinical_evidence import ClinicalEvidence
+
+    project.add_patient("P004")
+    project.add_document("P004", "DOC_A", TEXT, date="2026-01-01")
+    project.add_document("P004", "DOC_B", TEXT, date="2026-02-01")
+    index = StatementIndexRepository(project.db)
+    index.rebuild("P004", [("DOC_A", "2026-01-01", TEXT), ("DOC_B", "2026-02-01", TEXT)])
+    carrier = next(item for item in index.for_document("DOC_A") if item.role == "origin")
+    annotations = StatementAnnotationRepository(project.db)
+    annotations.save(patient_id="P004", statement_key=carrier.statement_key,
+                     carrier_occurrence_id=carrier.occurrence_id, carrier_document_id="DOC_A",
+                     carrier_document_date="2026-01-01", carrier_sentence=carrier.text,
+                     status="completed", payload=[], model_digest="m1", prompt_version="v9")
+    project.evidence.insert_batch([ClinicalEvidence(
+        patient_id="P004", document_id="DOC_A", category="symptom",
+        normalized_entity="tosse", source_text="tosse", evidence_id="EVD_move",
+        extraction_method=METHOD, data={"fhir_pipeline": True})])
+
+    invalidate_documents(project.db, ["DOC_A"])
+
+    assert index.for_document("DOC_A") == []
+    assert annotations.by_carrier_document("DOC_A") == []
+    assert [row for row in project.evidence.get_by_document("DOC_A")
+            if row.extraction_method == METHOD] == []
+    # The other document of the patient is untouched.
+    assert len(index.for_document("DOC_B")) == 3

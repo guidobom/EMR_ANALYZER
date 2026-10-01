@@ -81,5 +81,8 @@ def test_reattribution_moves_review_and_status_with_the_document(setup, workspac
     moved = {event.label: event for event in review.events("P002")}
     assert moved["nivolumab"].status == "confirmed"
     assert "nivolumab" not in {event.label for event in review.events("P001")}
+    # The report is read again in its new patient: the events it contributed
+    # there depend on that patient's statements, not on the old ones.
     manifest = project.db.execute("SELECT patient_id FROM processing_manifest WHERE document_id='DOC_002'")
-    assert {row[0] for row in manifest} == {"P002"}
+    assert {row[0] for row in manifest} == set()
+    assert not [row for row in project.evidence.get_by_document("DOC_002")]

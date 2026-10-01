@@ -176,3 +176,25 @@ def _annotation(row) -> dict:
     data["raw"] = json.loads(data.pop("raw_json") or "null")
     data["metrics"] = json.loads(data.pop("metrics_json") or "{}")
     return data
+
+
+def invalidate_documents(db, document_ids, *, stage: str = "atomic_evidence") -> None:
+    """Forget everything a document contributed to the statements of a patient.
+
+    Used when a report changes hands: its index rows, the payloads it carried,
+    the events derived from it and its extraction state must not follow it into
+    another patient's history.  The statement index is rebuilt from text on the
+    next run, so a statement whose carrier moved promotes a new carrier.
+    """
+    ids = list(document_ids)
+    if not ids:
+        return
+    marks = ",".join("?" * len(ids))
+    with db:
+        db.execute(f"DELETE FROM statement_index WHERE document_id IN ({marks})", tuple(ids))
+        db.execute(f"DELETE FROM statement_annotations WHERE carrier_document_id IN ({marks})",
+                   tuple(ids))
+        db.execute(f"DELETE FROM clinical_evidence WHERE document_id IN ({marks}) "
+                   f"AND extraction_method='fhir_events_v1'", tuple(ids))
+        db.execute(f"DELETE FROM processing_manifest WHERE document_id IN ({marks}) "
+                   f"AND stage=?", (*ids, stage))

@@ -131,8 +131,12 @@ class DocumentReattributionService:
         result.new_original_path = new_original_paths.get(doc_id)
 
         # ---- Database, atomically -------------------------------------
+        from ..database.statement_repo import invalidate_documents
         try:
             with self.db:
+                # The report leaves this patient's statements behind: neither
+                # its index rows nor the payloads it carried may follow it.
+                invalidate_documents(self.db, [doc_id])
                 new_path = result.new_original_path or doc["original_path"]
                 self.db.execute(
                     """UPDATE documents

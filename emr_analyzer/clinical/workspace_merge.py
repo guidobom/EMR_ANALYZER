@@ -313,6 +313,8 @@ class WorkspaceMergeService:
                 self._merge_clinical_state(source_pid, target_pid, result)
 
                 if moved_ids:
+                    from ..database.statement_repo import invalidate_documents
+                    invalidate_documents(self.db, moved_ids)
                     placeholders = ",".join("?" for _ in moved_ids)
                     for table, doc_col in _DOCUMENT_BOUND_TABLES.items():
                         self.db.execute(
