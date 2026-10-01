@@ -89,13 +89,26 @@ class KeywordExtractor:
         return ""
 
     def extract_document(self, *, patient_id, document_id, document_type, document_date,
-                         text, evidence_ready_callback=None, cancel_check=None, **_):
+                         text, evidence_ready_callback=None, cancel_check=None,
+                         statement_roles=None, **_):
+        from emr_analyzer.clinical.sentence_groups import clinical_sentences
+        import re as _re
+
         self.calls.append(document_id)
+        spans = clinical_sentences(text)
         rows = []
         for keyword in self.keywords:
             start = text.find(keyword)
             if start < 0:
                 continue
+            sentence = next((span for span in spans if span.start <= start < span.end), None)
+            if sentence is None:
+                continue
+            if statement_roles and statement_roles.get(sentence.sentence_id) == "copy":
+                continue
+            first = len([m for m in _re.finditer(r"\S+", sentence.text)
+                         if sentence.start + m.start() < start]) + 1
+            last = first + max(0, len(text[start:start + len(keyword)].split()) - 1)
             end = start + len(keyword)
             rows.append(ClinicalEvidence(
                 patient_id=patient_id, document_id=document_id,
@@ -105,7 +118,13 @@ class KeywordExtractor:
                 source_text=text[start:end], assertion="present", certainty="confirmed",
                 document_date=document_date, extraction_method=METHOD, status="proposed",
                 data={"fhir_pipeline": True, "experiencer": "patient", "attributes": {},
-                      "source_spans": [{"start": start, "end": end, "text": text[start:end]}],
+                      "event_kind": "continuous", "lexicon_term_id": "test_" + keyword,
+                      "source_spans": [{"start": start, "end": end, "text": text[start:end],
+                                        "sentence_id": sentence.sentence_id}],
+                      "source_sentence": {"start": sentence.start, "end": sentence.end,
+                                          "text": sentence.text},
+                      "source_selection": {"sentence": sentence.sentence_id,
+                                           "first_word": first, "last_word": last},
                       "source_version": content_hash(text), "date_provenance": {"mode": "unknown"}}))
         if evidence_ready_callback:
             evidence_ready_callback(rows)

@@ -1,0 +1,100 @@
+"""The certified statement reaches its copies with the copy's own offsets."""
+
+import pytest
+
+from emr_analyzer.clinical.grounded_sources import METHOD
+from emr_analyzer.clinical.statement_index import assign_roles, index_document
+from emr_analyzer.clinical.statement_projection import (StatementProjectionService,
+                                                        anchor_offsets, same_text)
+from emr_analyzer.database.statement_repo import (StatementAnnotationRepository,
+                                                 StatementIndexRepository)
+from tests.helpers import FakeLlm, KeywordExtractor, Project
+
+SHARED = "Anamnesi:\n\nRiferisce tosse da tre giorni.\n\n"
+EARLY = SHARED + "Nega febbre."
+LATE = SHARED + "Prosegue nivolumab."
+
+
+@pytest.fixture
+def project(workspace):
+    project = Project(workspace)
+    project.add_patient("P001")
+    project.add_document("P001", "DOC_001", EARLY, date="2026-09-01")
+    project.add_document("P001", "DOC_002", LATE, date="2026-10-01")
+    yield project
+    project.close()
+
+
+def test_anchor_offsets_rejects_an_impossible_interval():
+    assert anchor_offsets("Riferisce tosse da tre giorni.", 2, 2) == (0, 10, 15)
+    assert anchor_offsets("Riferisce tosse.", 4, 4) is None
+    assert anchor_offsets("Riferisce tosse.", "x", 1) is None
+    assert same_text("a  b", "a b") and not same_text("a b", "a c")
+
+
+def test_copies_receive_the_projected_event_with_their_own_offsets(project):
+    extractor = KeywordExtractor()
+    result = project.pipeline(FakeLlm(), extractor).extract_patient("P001")
+
+    # Both the heading and the shared sentence repeat; only the sentence carries a fact.
+    assert result["statement_copies"] == 2 and result["statement_projection_misses"] == 0
+    stored = [row for row in project.evidence.get_by_patient("P001")
+              if row.extraction_method == METHOD]
+    copies = [row for row in stored
+              if (row.data.get("statement_reuse") or {}).get("role") == "copy"]
+    assert len(copies) == 1
+    copy = copies[0]
+    # The fragment belongs to the copy's document, at the copy's own offsets.
+    assert copy.document_id == "DOC_002" and copy.document_date == "2026-10-01"
+    span = copy.data["source_spans"][0]
+    text = (project.root / "P001" / "extraction" / "DOC_002.md").read_text(encoding="utf-8")
+    assert text[span["start"]:span["end"]] == copy.source_text == "tosse"
+    assert copy.data["statement_reuse"]["carrier_document_id"] == "DOC_001"
+    # No model call happened for the copy's sentence.
+    assert sorted(extractor.calls) == ["DOC_001", "DOC_002"]
+    assert {row.normalized_entity for row in stored} == {"tosse", "febbre", "nivolumab"}
+
+
+def test_projection_is_idempotent(project):
+    pipeline = project.pipeline(FakeLlm(), KeywordExtractor())
+    pipeline.extract_patient("P001")
+    first = {row.evidence_id for row in project.evidence.get_by_patient("P001")}
+    pipeline.extract_patient("P001", incremental=False)
+    assert {row.evidence_id for row in project.evidence.get_by_patient("P001")} == first
+
+
+def test_a_changed_copy_sentence_is_not_projected(workspace):
+    project = Project(workspace)
+    project.add_patient("P002")
+    project.add_document("P002", "DOC_001", EARLY, date="2026-09-01")
+    # Same previous sentence and heading, but the words that carry the fact differ.
+    project.add_document("P002", "DOC_002", "Anamnesi:\n\nRiferisce tosse da tre settimane.\n",
+                         date="2026-10-01")
+    try:
+        pipeline = project.pipeline(FakeLlm(), KeywordExtractor())
+        result = pipeline.extract_patient("P002")
+        # The statements are different, so the second document is annotated in its own right.
+        # Only the heading repeats; the two sentences are distinct statements.
+        assert result["statement_copies"] == 1 and result["statement_projection_misses"] == 0
+        assert {row.document_id for row in project.evidence.get_by_patient("P002")} == {"DOC_001", "DOC_002"}
+    finally:
+        project.close()
+
+
+def test_a_missing_annotation_is_a_miss_not_a_lost_row(workspace):
+    project = Project(workspace)
+    project.add_patient("P003")
+    project.add_document("P003", "DOC_001", EARLY, date="2026-09-01")
+    project.add_document("P003", "DOC_002", LATE, date="2026-10-01")
+    try:
+        index = StatementIndexRepository(project.db)
+        index.rebuild("P003", [("DOC_001", "2026-09-01", EARLY), ("DOC_002", "2026-10-01", LATE)])
+        service = StatementProjectionService(index, StatementAnnotationRepository(project.db))
+        rows, misses = service.project(patient_id="P003", document_id="DOC_002", text=LATE,
+                                       document_date="2026-10-01", document_type="visita_oncologica",
+                                       model_digest="m1", prompt_version="v9")
+        assert rows == []
+        assert misses and misses[0]["carrier_document_id"] == "DOC_001"
+    finally:
+        project.close()
+

@@ -27,6 +27,7 @@ from .event_extraction import EventExtractor
 from .snomed_coding import CodingCancelled, ConceptCoder
 from .lab_evidence import LEGACY_LAB_METHODS, filter_narrative_lab_duplicates
 from .statement_index import PROJECTION_VERSION
+from .statement_projection import StatementProjectionService, document_geometry
 from ..config import active_workspace
 from ..models.clinical_registry import ProcessingManifestItem, ProcessingRun
 from ..models.document import DocumentType
@@ -48,6 +49,9 @@ class _PatientPlan:
     tasks: list = field(default_factory=list)       # (doc, text, manifest_id)
     #: sentence id -> 'origin' | 'copy' for every narrative document
     statement_roles: dict = field(default_factory=dict)
+    #: effective text per document, read once while planning
+    texts: dict = field(default_factory=dict)
+    projection_misses: list = field(default_factory=list)
     skipped: int = 0
     laboratory_documents: int = 0
     processed: int = 0
@@ -91,6 +95,7 @@ class ExtractionPipeline:
                                               StatementIndexRepository)
         self.statements = StatementIndexRepository(self.db)
         self.statement_annotations = StatementAnnotationRepository(self.db)
+        self.projection = StatementProjectionService(self.statements, self.statement_annotations)
         self.extractor = self.make_extractor()
         self.coder = self.make_coder()
 
@@ -323,6 +328,7 @@ class ExtractionPipeline:
         plan.statement_roles = {
             document_id: {occurrence.ordinal: occurrence.role for occurrence in occurrences}
             for document_id, occurrences in indexed.items()}
+        plan.texts = dict(texts)
         for doc in documents:
             if doc.id not in texts:
                 continue
@@ -371,7 +377,8 @@ class ExtractionPipeline:
                 document_type=doc.document_type, document_date=doc.document_date,
                 text=text, geometry_path=_geometry_source(doc, active_workspace.path),
                 statement_roles=plan.statement_roles.get(doc.id),
-                evidence_ready_callback=lambda rows: self.replace_document_evidence(doc.id, rows),
+                evidence_ready_callback=lambda rows: self.publish_document(
+                    plan, doc, text, rows, complete=False),
                 cancel_check=cancel_check,
                 stage_progress_callback=lambda message: report(position(), f"{plan.patient_id} · {doc.id}: {message}"),
                 chunk_progress_callback=lambda done, all_: report(
@@ -380,14 +387,14 @@ class ExtractionPipeline:
         except AtomicExtractionCancelled as exc:
             raise ExtractionCancelled(str(exc)) from exc
         except IncompleteAtomicExtraction as exc:
-            self.replace_document_evidence(doc.id, exc.evidence)
+            self.publish_document(plan, doc, text, exc.evidence, complete=False)
             raise
         return doc, evidence, round(time.monotonic() - task_started, 3), \
             self.extractor.last_extraction_metrics()
 
     def _persist(self, plan, manifest_id, result) -> None:
         doc, evidence, duration, metrics = result
-        self.replace_document_evidence(doc.id, evidence)
+        self.publish_document(plan, doc, plan.texts.get(doc.id, ""), evidence)
         self.processing_repo.mark_result(manifest_id, status="completed",
                                          output_hash=_evidence_hash(evidence), output_count=len(evidence))
         plan.processed += 1
@@ -403,9 +410,56 @@ class ExtractionPipeline:
                                **(exc.metrics if incomplete else {})})
         self.processing_repo.mark_result(manifest_id, status="failed", error_message=str(exc))
 
+    def publish_document(self, plan, doc, text, rows, *, complete=True) -> None:
+        """Certify this document's statements, then write it with its copies.
+
+        Documents of one patient are extracted concurrently, so a copy can be
+        published before its carrier is certified: misses seen here are
+        provisional and are not counted.  ``project_patient`` at the end of the
+        patient is the authoritative pass.
+        """
+        combined, _ = self.project_document(doc, text, extra=rows, complete=complete)
+        self.replace_document_evidence(doc.id, combined)
+
+    def project_document(self, doc, text, extra=(), *, complete=True):
+        """Own annotations plus the projected copies, and what stayed missing."""
+        if self.extractor is None or not text:
+            return list(extra), []
+        self.projection.certify(getattr(doc, "patient_id", None), doc.id, list(extra),
+                                model_digest=self.extractor.model_digest,
+                                prompt_version=self.prompt_version,
+                                model_name=getattr(self.extractor, "model_name", None),
+                                complete=complete)
+        projected, misses = self.projection.project(
+            patient_id=doc.patient_id, document_id=doc.id, text=text,
+            document_date=doc.document_date, document_type=doc.document_type,
+            geometry=document_geometry(_geometry_source(doc, active_workspace.path)),
+            model_digest=self.extractor.model_digest, prompt_version=self.prompt_version)
+        return list(extra) + projected, misses
+
+    def project_patient(self, plan) -> list:
+        """Recompute every document's projection from the certified payloads.
+
+        Deterministic and cheap: it propagates a re-annotated carrier to all of
+        its copies, including the documents this run skipped.
+        """
+        misses = []
+        for doc in plan.documents:
+            text = plan.texts.get(doc.id)
+            if not text or self.extractor is None:
+                continue
+            stored = [row for row in self.evidence_repo.get_by_document(doc.id)
+                      if getattr(row, "extraction_method", None) == METHOD
+                      and ((row.data or {}).get("statement_reuse") or {}).get("role") != "copy"]
+            combined, missed = self.project_document(doc, text, extra=stored)
+            self.replace_document_evidence(doc.id, combined)
+            misses.extend(missed)
+        return misses
+
     def _finalize(self, plan, check_cancelled) -> dict:
         check_cancelled()
         cancel = lambda: (check_cancelled() or False)
+        plan.projection_misses = self.project_patient(plan)
         coding = self.code_patient(plan.patient_id, cancel_check=cancel)
         fhir = self.write_fhir(plan.patient_id, plan.documents, {
             "documents_total": len(plan.documents), "processed": plan.processed,
@@ -420,7 +474,8 @@ class ExtractionPipeline:
         counts = self.statements.counts(plan.patient_id)
         summary.update(statement_occurrences=counts["occurrences"],
                        statement_origins=counts["origins"], statement_copies=counts["copies"],
-                       statement_reused_characters=counts["copy_chars"])
+                       statement_reused_characters=counts["copy_chars"],
+                       statement_projection_misses=len(plan.projection_misses))
         if self.audit:
             self.audit.log(plan.patient_id, "clinical_events_extracted", "clinical_evidence",
                            plan.patient_id, {"documents_total": len(plan.documents),
