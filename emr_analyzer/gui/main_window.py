@@ -19,7 +19,6 @@ from .prompt_manager_dialog import PromptManagerDialog
 from .excluded_evidence_dialog import ExcludedEvidenceDialog
 from .hypothesis_dialog import HypothesisDialog
 from .styles import MAIN_STYLESHEET
-from ..clinical.atomic_evidence import AtomicEvidenceExtractor
 from ..config import APP_NAME, APP_VERSION, active_workspace
 from ..extraction.llm_client import LlmClient
 from ..settings import MODEL_ROLES, load_llm_configs, save_llm_configs
@@ -51,6 +50,8 @@ class MainWindow(QMainWindow):
     def set_services(self, services: dict):
         """Inject backend services after construction."""
         self._services = services
+        self._pipeline_llm_defaults = dict(services.get("llm_configs") or load_llm_configs())
+        services["prepare_pipeline_llm"] = self._prepare_pipeline_llm
         self.patient_panel.set_services(services)
         self.workspace_tabs.set_services(services)
         self.context_panel.set_services(services)
@@ -127,6 +128,9 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(registry_queue_action)
 
         pipeline_action = QAction("Configura &pipeline clinica...", self)
+        # macOS otherwise interprets "Configura" as Preferences and moves
+        # this action out of the Tools menu into the application menu.
+        pipeline_action.setMenuRole(QAction.NoRole)
         pipeline_action.setToolTip(
             "Configura evidenze di laboratorio, retry adattivo, grafo e consenso"
         )
@@ -230,14 +234,6 @@ class MainWindow(QMainWindow):
             "Estrazione automatica: pdfplumber → PyMuPDF → OCR locale"
         )
         toolbar.addWidget(self._model_label)
-
-        # All model assignments and generation parameters live in one dialog.
-        self._configure_llm_action = QAction("⚙ Configura LLM", self)
-        self._configure_llm_action.setToolTip(
-            "Configura i modelli per documenti, evidenze, eventi e analisi"
-        )
-        self._configure_llm_action.triggered.connect(self._open_llm_config)
-        toolbar.addAction(self._configure_llm_action)
 
         self._prompt_manager_action = QAction("✎ Prompt", self)
         self._prompt_manager_action.setToolTip(
@@ -568,19 +564,6 @@ class MainWindow(QMainWindow):
             return
         selected = dialog.selected_patient_ids()
         stage = dialog.selected_stage()
-        required_client = {
-            "atomic": (
-                "atomic_evidence_llm_client", "evidenze atomiche"
-            ),
-            "events": ("clinical_events_llm_client", "eventi clinici"),
-        }.get(stage)
-        if required_client and self._services.get(required_client[0]) is None:
-            QMessageBox.warning(
-                self, "LLM non configurato",
-                f"Configura e carica il modello LLM per "
-                f"{required_client[1]}.",
-            )
-            return
         if selected:
             self.workspace_tabs.run_registry_queue(
                 selected,
@@ -634,45 +617,39 @@ class MainWindow(QMainWindow):
             self._ollama_label.setStyleSheet("color: #e74c3c;")
         self._update_llm_summary()
 
-    def _open_llm_config(self) -> None:
-        """Open the single configuration surface for all local LLM roles."""
+    def _prepare_pipeline_llm(self, key, parent=None) -> bool:
+        from .pipeline_llm import pipeline_definition
+        from ..settings import load_pipeline_llm_config, save_pipeline_llm_config
+
         if self.workspace_tabs.llm_operation_running():
-            QMessageBox.information(
-                self,
-                "Elaborazione LLM in corso",
-                "Attendi il completamento dell'elaborazione dei documenti, "
-                "del registro clinico o dell'analisi irAE prima di modificare "
-                "i runtime LLM.",
-            )
-            return
-        configs = self._services.get("llm_configs") or load_llm_configs()
+            QMessageBox.information(parent or self, "Elaborazione in corso",
+                                    "Attendi il termine dell’elaborazione prima di avviare una nuova analisi.")
+            return False
+        role, title = pipeline_definition(key)
+        defaults = self._pipeline_llm_defaults
+        config = load_pipeline_llm_config(key, defaults[role])
         try:
-            available_models = LlmClient.list_available_models()
-            backend_availability = [LlmClient().server_available]
-            for config in configs.values():
-                if config.backend == "vllm" and config.model:
-                    backend_availability.append(
-                        LlmClient(config=config).server_available
-                    )
-            self._ollama_available = any(backend_availability)
-        except Exception:
-            available_models = []
-            self._ollama_available = False
+            available = LlmClient.list_available_models()
+            dialog = LLMConfigDialog({role: config}, available, parent or self,
+                                     role=role, pipeline_title=title,
+                                     enable_slot_benchmark=(key == "atomic"))
+            if dialog.exec_() != QDialog.Accepted:
+                return False
+            selected = dialog.configurations()[role]
+            if not selected.model or not LlmClient(config=selected).is_available:
+                QMessageBox.warning(parent or self, "Modello non disponibile",
+                                    "Scarica o importa il modello selezionato prima di avviare l’analisi.")
+                return False
+            save_pipeline_llm_config(key, selected)
+            configs = dict(self._services.get("llm_configs") or defaults)
+            configs[role] = selected
+            self._apply_llm_configs(configs, persist=False, active_role=role)
+            return self._services.get(f"{role}_llm_client") is not None
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            QMessageBox.warning(parent or self, "Analisi non avviata", str(exc))
+            return False
 
-        dialog = LLMConfigDialog(configs, available_models, self)
-        if dialog.exec_() != LLMConfigDialog.Accepted:
-            self.update_model_status(self._ollama_available)
-            return
-        try:
-            self._apply_llm_configs(dialog.configurations())
-        except (OSError, ValueError, TypeError) as exc:
-            QMessageBox.warning(
-                self,
-                "Configurazione non salvata",
-                f"Impossibile salvare la configurazione LLM.\n\n{exc}",
-            )
-
-    def _apply_llm_configs(self, configs) -> None:
+    def _apply_llm_configs(self, configs, *, persist=True, active_role=None) -> None:
         """Persist settings and replace all live clients atomically."""
         # Compatibility for programmatic callers still passing the former
         # document/Clinical-State pair.
@@ -680,7 +657,8 @@ class MainWindow(QMainWindow):
         for role in ("atomic_evidence", "clinical_events"):
             configs.setdefault(role, configs["clinical_state"])
         old_configs = self._services.get("llm_configs") or {}
-        save_llm_configs(configs)
+        if persist:
+            save_llm_configs(configs)
 
         # A server is keyed by GGUF path, context and slot count. Stop only
         # old shapes no longer referenced by any role. Request-scoped
@@ -719,6 +697,9 @@ class MainWindow(QMainWindow):
         clients = {}
         unavailable = []
         for role in MODEL_ROLES:
+            if active_role is not None and role != active_role:
+                clients[role] = self._services.get(f"{role}_llm_client")
+                continue
             config = configs[role]
             client = LlmClient(config=config) if config.model else None
             if client is not None and not client.is_available:
@@ -737,14 +718,16 @@ class MainWindow(QMainWindow):
             "clinical_events_llm_client": event_client,
             "clinical_state_llm_client": state_client,
         })
-        self._propagate_document_llm(document_client)
+        if active_role in (None, "document"):
+            self._propagate_document_llm(document_client)
         propagate_atomic = getattr(self, "_propagate_atomic_llm", None)
-        if propagate_atomic is not None:
+        if propagate_atomic is not None and active_role in (None, "atomic_evidence"):
             propagate_atomic(atomic_client)
         propagate_events = getattr(self, "_propagate_event_llm", None)
-        if propagate_events is not None:
+        if propagate_events is not None and active_role in (None, "clinical_events"):
             propagate_events(event_client)
-        self._propagate_state_llm(state_client)
+        if active_role in (None, "clinical_state"):
+            self._propagate_state_llm(state_client)
         self._ollama_available = any(
             client is not None and client.server_available
             for client in clients.values()
@@ -829,7 +812,6 @@ class MainWindow(QMainWindow):
         ]
         details = "\n".join([connection, runtime_note, *role_lines])
         self._ollama_label.setToolTip(details)
-        self._configure_llm_action.setToolTip(details)
 
     def _propagate_document_llm(self, client):
         """Update the plain-text document normalizer only."""
@@ -843,7 +825,7 @@ class MainWindow(QMainWindow):
         if registry_builder is not None:
             registry_builder.atomic_llm = client
             registry_builder.atomic_extractor = (
-                AtomicEvidenceExtractor(client) if client is not None else None
+                registry_builder.make_atomic_extractor() if client is not None else None
             )
 
     def _propagate_event_llm(self, client):

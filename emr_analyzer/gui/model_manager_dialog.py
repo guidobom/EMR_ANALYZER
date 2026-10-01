@@ -243,7 +243,7 @@ class ModelManagerDialog(QDialog):
             "Automatico, oppure un nome come qwen3-30b-a3b-q4"
         )
         self._local_name.setToolTip(
-            "Nome mostrato in Configura LLM e usato per il file GGUF locale."
+            "Nome mostrato nella selezione del modello all’avvio delle analisi e usato per il file GGUF locale."
         )
         common.addWidget(QLabel("Nome locale (opzionale):"), 0, 0)
         common.addWidget(self._local_name, 0, 1)

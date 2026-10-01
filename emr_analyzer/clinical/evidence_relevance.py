@@ -118,6 +118,8 @@ _CONTEXT_CATEGORIES = {
 
 def classify_evidence(item: ClinicalEvidence) -> EvidenceDisposition:
     """Classify one atom for downstream registry use without deleting it."""
+    if (item.data or {}).get("experiencer", "patient") != "patient":
+        return EvidenceDisposition(CONTEXTUAL, "non_patient_or_unknown_experiencer")
     entity = _surface(item.normalized_entity)
     quote = _surface(item.source_text)
 

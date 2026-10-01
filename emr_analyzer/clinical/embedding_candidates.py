@@ -19,7 +19,7 @@ import os
 
 import numpy as np
 
-from .atomic_evidence import _atomic_identity_key
+from .evidence_utils import _atomic_identity_key
 from .concept_canonicalization import canonical_concept, canonical_severity
 
 logger = logging.getLogger(__name__)

@@ -4,32 +4,19 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from dataclasses import replace
 from difflib import SequenceMatcher
 import hashlib
 import json
 from pathlib import Path
 import time
+import threading
 from typing import Callable, Optional
 
-from .atomic_evidence import (
-    ATOMIC_PIPELINE_VERSION,
-    ATOMIC_PROMPT_DIGEST,
-    ATOMIC_PROMPT_VERSION,
-    ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS,
-    AtomicExtractionCancelled,
-    AtomicEvidenceExtractor,
-    content_hash,
-    deduplicate_atomic_evidence,
-    locate_quote,
-)
+from .evidence_utils import content_hash, deduplicate_atomic_evidence, locate_quote
+from .grounded_sources import catalog_snapshot, IncompleteAtomicExtraction, AtomicExtractionCancelled, VERSION, METHOD
+from .event_extraction import EventExtractor
 from .embedding_candidates import embedding_duplicate_pairs
-from .block_reuse import (
-    build_targeted_reuse_text,
-    clone_reused_evidence,
-    evidence_matching_reuse_block,
-    plan_exact_block_reuse,
-    plan_reuse_verification_batches,
-)
 from .consolidation import ClinicalConsolidator, stable_id
 from .evidence_graph import EvidenceGraphBuilder, EvidenceGraphCancelled
 from .episode_assembler import (
@@ -46,7 +33,6 @@ from .evidence_relevance import (
 )
 from .lab_evidence import (
     LAB_EXTRACTION_METHOD,
-    abnormal_lab_evidence,
     filter_narrative_lab_duplicates,
     load_document_geometry,
 )
@@ -93,6 +79,7 @@ class ClinicalRegistryBuilder:
         audit_repo=None,
         pipeline_repo=None,
         pipeline_policy=None,
+        shared_lexicon_repo=None,
         db=None,
     ):
         self.registry_repo = registry_repo
@@ -116,17 +103,36 @@ class ClinicalRegistryBuilder:
         self.audit = audit_repo
         self.pipeline_repo = pipeline_repo
         self.pipeline_policy = pipeline_policy or load_pipeline_policy()
+        self.shared_lexicon_repo = shared_lexicon_repo
         self.db = db or timeline_repo.db
-        self.atomic_extractor = (
-            AtomicEvidenceExtractor(self.atomic_llm, policy=self.pipeline_policy)
-            if self.atomic_llm else None
-        )
+        self.atomic_extractor = self.make_atomic_extractor()
+
+    def make_atomic_extractor(self):
+        if self.atomic_llm is None:
+            return None
+        from ..database.atomic_group_repo import AtomicGroupRepository
+        return EventExtractor(self.atomic_llm,
+            snomed_catalog=getattr(self.shared_lexicon_repo, 'snomed_catalog', None),
+            policy=self.pipeline_policy, catalog=catalog_snapshot(self.shared_lexicon_repo),
+            checkpoint_repo=AtomicGroupRepository(self.db))
+
+    @property
+    def atomic_prompt_version(self):
+        return getattr(self.atomic_extractor, 'prompt_version', VERSION)
+
+    @property
+    def atomic_prompt_digest(self):
+        from ..prompt_catalog import load_prompt
+        return getattr(self.atomic_extractor, "prompt_digest", content_hash(load_prompt("compact_events_system")))
+
+    @property
+    def atomic_pipeline_version(self):
+        return self.atomic_prompt_version
 
     def reload_policy(self) -> None:
         """Reload non-clinical settings for subsequent registry builds."""
         self.pipeline_policy = load_pipeline_policy()
-        if self.atomic_extractor is not None:
-            self.atomic_extractor.policy = self.pipeline_policy
+        self.atomic_extractor = self.make_atomic_extractor()
 
     def has_atomic_checkpoint(self, patient_id: str) -> bool:
         """Return whether an interrupted/incremental build can be resumed.
@@ -143,7 +149,13 @@ class ClinicalRegistryBuilder:
                LIMIT 1""",
             (patient_id,),
         ).fetchone()
-        return row is not None
+        if row is not None:
+            return True
+        return self.db.execute(
+            """SELECT 1 FROM atomic_group_results WHERE patient_id=?
+               AND status IN ('completed', 'completed_empty') LIMIT 1""",
+            (patient_id,),
+        ).fetchone() is not None
 
     def build(
         self,
@@ -178,6 +190,8 @@ class ClinicalRegistryBuilder:
             self.document_repo.list_by_patient(patient_id),
             key=lambda doc: (doc.document_date or "9999", doc.id),
         )
+        if run_atomic and isinstance(self.atomic_extractor, EventExtractor):
+            self.atomic_extractor = self.make_atomic_extractor()
         atomic_model_digest = (
             self.atomic_extractor.model_digest if self.atomic_extractor else ""
         )
@@ -200,14 +214,14 @@ class ClinicalRegistryBuilder:
             model_digest=(
                 event_model_digest if mode == "events" else atomic_model_digest
             ),
-            prompt_version=ATOMIC_PROMPT_VERSION,
+            prompt_version=self.atomic_prompt_version,
             parameters={
                 "incremental": incremental,
                 "requested_workers": num_workers,
                 "document_count": len(documents),
                 "mode": mode,
                 "input_evidence_hash": input_evidence_hash,
-                "atomic_prompt_digest": ATOMIC_PROMPT_DIGEST,
+                "atomic_prompt_digest": self.atomic_prompt_digest,
                 "atomic_model": getattr(self.atomic_llm, "model", None),
                 "event_model": getattr(self.event_llm, "model", None),
                 "aggregation_engine": "v3",
@@ -221,6 +235,15 @@ class ClinicalRegistryBuilder:
         extracted_count = 0
         abnormal_lab_evidence_count = 0
         inactive_runtimes_released = 0
+        progress_lock = threading.Lock()
+        extraction_progress = 0
+
+        def report_extraction_progress(value, message):
+            nonlocal extraction_progress
+            if progress_callback:
+                with progress_lock:
+                    extraction_progress = max(extraction_progress, value)
+                    progress_callback(extraction_progress, message)
 
         def check_cancelled() -> None:
             if cancel_check is not None and cancel_check():
@@ -232,29 +255,30 @@ class ClinicalRegistryBuilder:
             check_cancelled()
             try:
                 evidence = self.atomic_extractor.extract_document(
+                    evidence_ready_callback=lambda rows: self._replace_atomic_document_evidence(
+                        kwargs['document_id'], rows),
                     **kwargs, cancel_check=cancel_check,
                 )
             except AtomicExtractionCancelled as exc:
                 raise RegistryBuildCancelled(str(exc)) from exc
+            except IncompleteAtomicExtraction as exc:
+                self._replace_atomic_document_evidence(kwargs["document_id"], exc.evidence)
+                raise
             check_cancelled()
             return evidence
 
         try:
             check_cancelled()
             if run_atomic:
-                abnormal_lab_evidence_count = self._sync_abnormal_lab_evidence(
+                abnormal_lab_evidence_count = self._sync_laboratory_events(
                     patient_id, documents
                 )
             check_cancelled()
             tasks = []
-            reuse_rows = []
             for doc in documents:
-                if doc.document_type == "laboratorio":
-                    # Deterministic laboratory evidence is already populated
-                    # during document extraction and needs no narrative LLM.
-                    continue
                 path = self._normalized_text_path(patient_id, doc.id)
                 if path is None:
+                    failures.append({'document_id':doc.id,'error':'Testo anonimizzato non disponibile.'})
                     continue
                 base_text = path.read_text(encoding="utf-8")
                 effective_text = self.overlay_repo.effective_text(
@@ -262,20 +286,15 @@ class ClinicalRegistryBuilder:
                 ) if self.overlay_repo else base_text
                 input_hash = content_hash(
                     effective_text, doc.document_date, doc.document_type,
-                    ATOMIC_PROMPT_VERSION, ATOMIC_PROMPT_DIGEST,
+                    self.atomic_prompt_version, self.atomic_prompt_digest,
                 )
-                # Current documents remain eligible as canonical sources for
-                # exact-block reuse by new/interrupted targets.  They are not
-                # sent to the LLM again unless focused verification discovers
-                # a previously unmapped clinical block.
-                reuse_rows.append((doc, effective_text, input_hash))
                 current = (incremental or not run_atomic) and (
                     self.processing_repo.is_current(
                         doc.id, "atomic_evidence", input_hash,
-                        ATOMIC_PIPELINE_VERSION, ATOMIC_PROMPT_VERSION,
+                        self.atomic_pipeline_version, self.atomic_prompt_version,
                         atomic_model_digest,
                         compatible_pipeline_versions=(
-                            ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS
+                            ()
                         ),
                     )
                 )
@@ -318,21 +337,6 @@ class ClinicalRegistryBuilder:
                 )
                 tasks = []
 
-            reuse_plans = (
-                plan_exact_block_reuse(reuse_rows) if run_atomic else {}
-            )
-            task_ids = {doc.id for doc, _, _ in tasks}
-            reused_blocks = sum(
-                len(plan.reuse_links)
-                for doc_id, plan in reuse_plans.items()
-                if doc_id in task_ids
-            )
-            reused_chars = sum(
-                plan.original_chars - plan.extraction_chars
-                for doc_id, plan in reuse_plans.items()
-                if doc_id in task_ids
-            )
-
             configured_workers = max(1, int(num_workers or 1))
             event_workers = max(1, int(getattr(
                 self.event_llm, "parallel_workers", configured_workers
@@ -349,8 +353,8 @@ class ClinicalRegistryBuilder:
                 item = ProcessingManifestItem(
                     patient_id=patient_id, document_id=doc.id,
                     stage="atomic_evidence", input_hash=input_hash,
-                    pipeline_version=ATOMIC_PIPELINE_VERSION,
-                    run_id=run.run_id, prompt_version=ATOMIC_PROMPT_VERSION,
+                    pipeline_version=self.atomic_pipeline_version,
+                    run_id=run.run_id, prompt_version=self.atomic_prompt_version,
                     model_digest=atomic_model_digest, status="running",
                 )
                 self.processing_repo.upsert_manifest(item)
@@ -366,6 +370,12 @@ class ClinicalRegistryBuilder:
                     document_type=doc.document_type,
                     document_date=doc.document_date, text=text,
                     geometry_path=geometry_path,
+                    stage_progress_callback=lambda message: report_extraction_progress(
+                        int(50 * processed / max(len(tasks), 1)), f'{doc.id}: {message}'),
+                    **({"chunk_progress_callback": lambda done, total: report_extraction_progress(
+                        int(50 * (processed + done / max(total, 1)) / max(len(tasks), 1)),
+                        f"{doc.id}: gruppi {done}/{total} verificati"
+                    )} if progress_callback else {}),
                 )
                 metrics = self.atomic_extractor.last_extraction_metrics()
                 return (
@@ -373,7 +383,6 @@ class ClinicalRegistryBuilder:
                     round(time.monotonic() - task_started, 3), metrics,
                 )
 
-            partial_results: dict[str, tuple] = {}
 
             def persist_success(result, *, final: bool = False) -> None:
                 """Commit one completed document before scheduling moves on.
@@ -386,13 +395,6 @@ class ClinicalRegistryBuilder:
                 nonlocal processed, extracted_count
                 doc, evidence, _, duration, metrics = result
                 self._replace_atomic_document_evidence(doc.id, evidence)
-                plan = reuse_plans.get(doc.id)
-                if plan and plan.reuse_links and not final:
-                    # The novel portion is durable already, but the manifest
-                    # remains running until every reused source has been
-                    # materialized with this document's provenance.
-                    partial_results[doc.id] = result
-                    return
                 output_hash = _evidence_hash(evidence)
                 self.processing_repo.mark_result(
                     manifests[doc.id], status="completed",
@@ -409,37 +411,11 @@ class ClinicalRegistryBuilder:
                 })
 
             doc_stats: list[dict] = []
-            initial_reuse_errors: dict[str, str] = {}
-
-            extraction_tasks = []
-            for doc, original_text, input_hash in tasks:
-                plan = reuse_plans.get(doc.id)
-                extraction_text = (
-                    plan.extraction_text if plan is not None else original_text
-                )
-                if extraction_text.strip():
-                    extraction_tasks.append(
-                        (doc, extraction_text, input_hash)
-                    )
-                else:
-                    partial_results[doc.id] = (
-                        doc, [], input_hash, 0.0,
-                        {
-                            "llm_calls": 0,
-                            "output_limit_retries": 0,
-                            "source_chunks": 0,
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0,
-                            "prompt_ms": 0.0,
-                            "predicted_ms": 0.0,
-                        },
-                    )
+            extraction_tasks = list(tasks)
 
             # Longest-processing-time first is the standard way to reduce
             # the final straggler with identical workers.  It changes only
-            # scheduling: persistence and reused-block materialization remain
-            # deterministic and chronological.
+            # scheduling; source identity is independent of completion order.
             extraction_tasks.sort(key=lambda task: len(task[1]), reverse=True)
 
             if actual_workers == 1:
@@ -450,25 +426,22 @@ class ClinicalRegistryBuilder:
                     except RegistryBuildCancelled:
                         raise
                     except Exception as exc:
-                        plan = reuse_plans.get(doc.id)
-                        if plan and plan.reuse_links:
-                            initial_reuse_errors[doc.id] = str(exc)
-                        else:
-                            failures.append({
-                                "document_id": doc.id, "error": str(exc)
-                            })
-                            doc_stats.append({
-                                "document_id": doc.id,
-                                "evidence_count": 0,
-                                "status": "failed",
-                                "error": str(exc),
-                            })
-                            self.processing_repo.mark_result(
-                                manifests[doc.id], status="failed",
-                                error_message=str(exc),
-                            )
+                        failures.append({
+                            "document_id": doc.id, "error": str(exc)
+                        })
+                        doc_stats.append({
+                            "document_id": doc.id,
+                            "evidence_count": len(exc.evidence) if isinstance(exc, IncompleteAtomicExtraction) else 0,
+                            "status": "failed",
+                            "error": str(exc),
+                            **(exc.metrics if isinstance(exc, IncompleteAtomicExtraction) else {}),
+                        })
+                        self.processing_repo.mark_result(
+                            manifests[doc.id], status="failed",
+                            error_message=str(exc),
+                        )
                     if progress_callback:
-                        progress_callback(
+                        report_extraction_progress(
                             int(index / max(len(extraction_tasks), 1) * 50),
                             f"Evidenze {index}/{len(extraction_tasks)}",
                         )
@@ -489,456 +462,47 @@ class ClinicalRegistryBuilder:
                                 pending_future.cancel()
                             raise
                         except Exception as exc:
-                            plan = reuse_plans.get(doc.id)
-                            if plan and plan.reuse_links:
-                                initial_reuse_errors[doc.id] = str(exc)
-                            else:
-                                failures.append({
-                                    "document_id": doc.id, "error": str(exc)
-                                })
-                                self.processing_repo.mark_result(
-                                    manifests[doc.id], status="failed",
-                                    error_message=str(exc),
-                                )
-                                doc_stats.append({
-                                    "document_id": doc.id,
-                                    "evidence_count": 0,
-                                    "status": "failed",
-                                    "error": str(exc),
-                                })
+                            failures.append({
+                                "document_id": doc.id, "error": str(exc)
+                            })
+                            self.processing_repo.mark_result(
+                                manifests[doc.id], status="failed",
+                                error_message=str(exc),
+                            )
+                            doc_stats.append({
+                                "document_id": doc.id,
+                                "evidence_count": len(exc.evidence) if isinstance(exc, IncompleteAtomicExtraction) else 0,
+                                "status": "failed",
+                                "error": str(exc),
+                                **(exc.metrics if isinstance(exc, IncompleteAtomicExtraction) else {}),
+                            })
                         if progress_callback:
-                            progress_callback(
+                            report_extraction_progress(
                                 int(completed / max(len(extraction_tasks), 1) * 50),
                                 f"Evidenze {completed}/{len(extraction_tasks)}",
                             )
 
-            # Materialize exact repeated blocks.  Missing mappings are not a
-            # reason to re-read every target document: verify each unique
-            # source fingerprint once, then use a small target-specific pass
-            # only when its citation cannot be transferred.  Full-document
-            # extraction remains the final safety net for actual failures.
-            reused_evidence_count = 0
-            fallback_count = 0
-            targeted_verification_count = 0
-            unique_blocks_verified = 0
-            reuse_verification_batches = 0
-            documents_by_id = {doc.id: doc for doc in documents}
-            source_text_by_doc = {
-                doc.id: text for doc, text, _ in reuse_rows
-            }
-            # A source document can back hundreds of repeated blocks.  Read
-            # its evidence once per build instead of issuing one database
-            # query for every link.
-            source_evidence_cache: dict[str, list] = {}
-
-            def source_llm_evidence(document_id: str) -> list:
-                cached = source_evidence_cache.get(document_id)
-                if cached is None:
-                    cached = [
-                        item for item in self.evidence_repo.get_by_document(
-                            document_id
-                        )
-                        if item.extraction_method == "llm_atomic_v2"
-                    ]
-                    source_evidence_cache[document_id] = cached
-                return cached
-
-            task_by_id = {
-                doc.id: (doc, original_text, input_hash)
-                for doc, original_text, input_hash in tasks
-            }
-            combined_by_doc: dict[str, list] = {}
-            unresolved_by_doc: dict[str, list] = {}
-            forced_full_doc_ids: set[str] = set()
-
-            for doc, original_text, input_hash in tasks:
-                plan = reuse_plans.get(doc.id)
-                if not plan or not plan.reuse_links:
-                    continue
-                partial = partial_results.get(doc.id)
-                if partial is None:
-                    forced_full_doc_ids.add(doc.id)
-                    continue
-                combined = list(partial[1])
-                unresolved_links = []
-                target_geometry = self.atomic_extractor._load_geometry(
-                    _geometry_source(doc, active_workspace.path)
-                )
-                cloned_items = []
-                for link in plan.reuse_links:
-                    clones = clone_reused_evidence(
-                        source_llm_evidence(link.source_document_id),
-                        link,
-                        patient_id=patient_id,
-                        target_document_date=doc.document_date,
-                        target_full_text=original_text,
-                        target_geometry=target_geometry,
-                    )
-                    if not clones:
-                        unresolved_links.append(link)
-                        continue
-                    cloned_items.extend(clones)
-                if cloned_items:
-                    before = len(combined)
-                    combined = deduplicate_atomic_evidence((
-                        *combined, *cloned_items,
-                    ))
-                    reused_evidence_count += max(0, len(combined) - before)
-                combined_by_doc[doc.id] = combined
-                if unresolved_links:
-                    unresolved_by_doc[doc.id] = unresolved_links
-
-            unresolved_links = [
-                link for links in unresolved_by_doc.values() for link in links
-            ]
-            verification_batches = plan_reuse_verification_batches(
-                unresolved_links
-            )
-            reuse_verification_batches = len(verification_batches)
-            verified_by_fingerprint: dict[str, list] = {}
-            source_additions: dict[str, list] = {}
-            verification_errors: dict[str, str] = {}
-
-            def accumulate_metrics(total: dict, current: dict) -> None:
-                for key, value in current.items():
-                    if isinstance(value, (int, float)):
-                        total[key] = total.get(key, 0) + value
-                    else:
-                        total[key] = value
-
-            def verify_source_batch(batch):
-                source_doc = documents_by_id[batch.source_document_id]
-                source_original = source_text_by_doc[source_doc.id]
-                started_batch = time.monotonic()
-                geometry_path = (
-                    _geometry_source(source_doc, active_workspace.path)
-                )
-                metrics: dict = {}
-
-                def extract_focused(text: str):
-                    extracted = extract_atomic_document(
-                        patient_id=patient_id,
-                        document_id=source_doc.id,
-                        document_type=source_doc.document_type,
-                        document_date=source_doc.document_date,
-                        text=text,
-                        geometry_path=geometry_path,
-                    )
-                    accumulate_metrics(
-                        metrics,
-                        self.atomic_extractor.last_extraction_metrics(),
-                    )
-                    grounded = [
-                        item for item in extracted
-                        if locate_quote(item.source_text, source_original)[0]
-                    ]
-                    for item in grounded:
-                        item.data["reuse_block_verification"] = True
-                    return extracted, grounded
-
-                grouped_error = None
-                try:
-                    grouped, grouped_grounded = extract_focused(batch.text)
-                except RegistryBuildCancelled:
-                    raise
-                except Exception as exc:
-                    grouped, grouped_grounded = [], []
-                    grouped_error = str(exc)
-
-                resolved: dict[str, list] = {}
-                errors: dict[str, str] = {}
-                additions = []
-                for link in batch.links:
-                    raw_matches = evidence_matching_reuse_block(grouped, link)
-                    matches = evidence_matching_reuse_block(
-                        grouped_grounded, link
-                    )
-                    needs_individual = bool(
-                        grouped_error or (raw_matches and not matches)
-                    )
-                    if needs_individual:
-                        individual_text = "\n\n".join(
-                            value for value in (
-                                link.source_section.strip(),
-                                link.source_text.strip(),
-                            ) if value
-                        )
-                        try:
-                            individual, individual_grounded = extract_focused(
-                                individual_text
-                            )
-                            raw_matches = evidence_matching_reuse_block(
-                                individual, link
-                            )
-                            matches = evidence_matching_reuse_block(
-                                individual_grounded, link
-                            )
-                        except RegistryBuildCancelled:
-                            raise
-                        except Exception as exc:
-                            errors[link.fingerprint] = str(exc)
-                            continue
-                    if raw_matches and not matches:
-                        errors[link.fingerprint] = (
-                            "Citazione del blocco non localizzabile nel "
-                            "documento sorgente"
-                        )
-                        continue
-                    resolved[link.fingerprint] = matches
-                    additions.extend(matches)
-                return (
-                    batch, resolved, errors, additions,
-                    round(time.monotonic() - started_batch, 3), metrics,
-                )
-
-            def accept_source_verification(result) -> None:
-                nonlocal unique_blocks_verified
-                batch, resolved, errors, additions, duration, metrics = result
-                verified_by_fingerprint.update(resolved)
-                verification_errors.update(errors)
-                unique_blocks_verified += len(resolved)
-                stored_additions = source_additions.setdefault(
-                    batch.source_document_id, []
-                )
-                stored_additions.extend(additions)
-                doc_stats.append({
-                    "document_id": batch.source_document_id,
-                    "evidence_count": len(
-                        deduplicate_atomic_evidence(additions)
-                    ),
-                    "elapsed_seconds": duration,
-                    "status": "reuse_source_verification",
-                    **metrics,
-                })
-
-            if verification_batches:
-                ordered_batches = sorted(
-                    verification_batches,
-                    key=lambda batch: len(batch.text), reverse=True,
-                )
-                with ThreadPoolExecutor(max_workers=actual_workers) as pool:
-                    future_map = {
-                        pool.submit(verify_source_batch, batch): batch
-                        for batch in ordered_batches
-                    }
-                    completed = 0
-                    for future in as_completed(future_map):
-                        completed += 1
-                        batch = future_map[future]
-                        try:
-                            accept_source_verification(future.result())
-                        except RegistryBuildCancelled:
-                            for pending_future in future_map:
-                                pending_future.cancel()
-                            raise
-                        except Exception as exc:
-                            for link in batch.links:
-                                verification_errors[link.fingerprint] = str(exc)
-                        if progress_callback:
-                            progress_callback(
-                                50 + int(
-                                    5 * completed /
-                                    max(len(ordered_batches), 1)
-                                ),
-                                "Verifica blocchi unici "
-                                f"{completed}/{len(ordered_batches)}",
-                            )
-
-            # New evidence discovered by the focused verifier belongs to the
-            # first source document too; otherwise an earlier first-evidence
-            # date would be lost.  Merge it before cloning target occurrences.
-            for source_doc_id, additions in source_additions.items():
-                if not additions:
-                    continue
-                current = source_llm_evidence(source_doc_id)
-                merged_items = deduplicate_atomic_evidence(
-                    (*current, *additions)
-                )
-                self._replace_atomic_document_evidence(
-                    source_doc_id, merged_items, clear_missing=False
-                )
-                source_evidence_cache[source_doc_id] = merged_items
-                partial = partial_results.get(source_doc_id)
-                if partial is not None:
-                    partial_results[source_doc_id] = (
-                        partial[0], merged_items, partial[2],
-                        partial[3], partial[4],
-                    )
-                if source_doc_id in combined_by_doc:
-                    combined_by_doc[source_doc_id] = (
-                        deduplicate_atomic_evidence((
-                            *combined_by_doc[source_doc_id], *additions,
-                        ))
-                    )
-                elif (
-                    source_doc_id in manifests
-                    and source_doc_id not in forced_full_doc_ids
-                ):
-                    self.processing_repo.mark_result(
-                        manifests[source_doc_id], status="completed",
-                        output_hash=_evidence_hash(merged_items),
-                        output_count=len(merged_items),
-                    )
-
-            target_checks: dict[str, list] = {}
-            for doc_id, links in unresolved_by_doc.items():
-                doc, original_text, _ = task_by_id[doc_id]
-                target_geometry = self.atomic_extractor._load_geometry(
-                    _geometry_source(doc, active_workspace.path)
-                )
-                combined = combined_by_doc[doc_id]
-                cloned_items = []
-                for link in links:
-                    templates = verified_by_fingerprint.get(link.fingerprint)
-                    if link.fingerprint in verification_errors:
-                        target_checks.setdefault(doc_id, []).append(link)
-                        continue
-                    if not templates:
-                        # A successful focused pass with no evidence is a
-                        # verified-empty repeated block.
-                        continue
-                    clones = clone_reused_evidence(
-                        templates, link, patient_id=patient_id,
-                        target_document_date=doc.document_date,
-                        target_full_text=original_text,
-                        target_geometry=target_geometry,
-                    )
-                    if not clones:
-                        target_checks.setdefault(doc_id, []).append(link)
-                        continue
-                    cloned_items.extend(clones)
-                if cloned_items:
-                    before = len(combined)
-                    combined = deduplicate_atomic_evidence((
-                        *combined, *cloned_items,
-                    ))
-                    combined_by_doc[doc_id] = combined
-                    reused_evidence_count += max(0, len(combined) - before)
-
-            def merge_metrics(*payloads):
-                merged = {}
-                for payload in payloads:
-                    for key, value in payload.items():
-                        if isinstance(value, (int, float)):
-                            merged[key] = merged.get(key, 0) + value
-                        else:
-                            merged[key] = value
-                return merged
-
-            def verify_target_document(doc_id: str):
-                doc, original_text, input_hash = task_by_id[doc_id]
-                if doc_id in forced_full_doc_ids:
-                    return "full", extract_one(doc, original_text, input_hash)
-                links = target_checks[doc_id]
-                segment = build_targeted_reuse_text(links)
-                started_segment = time.monotonic()
-                geometry_path = (
-                    _geometry_source(doc, active_workspace.path)
-                )
-                try:
-                    evidence = extract_atomic_document(
-                        patient_id=patient_id, document_id=doc.id,
-                        document_type=doc.document_type,
-                        document_date=doc.document_date, text=segment,
-                        geometry_path=geometry_path,
-                    )
-                    metrics = self.atomic_extractor.last_extraction_metrics()
-                    grounded = [
-                        item for item in evidence
-                        if locate_quote(item.source_text, original_text)[0]
-                    ]
-                    ambiguous = any(
-                        evidence_matching_reuse_block(evidence, link)
-                        and not evidence_matching_reuse_block(grounded, link)
-                        for link in links
-                    )
-                    if ambiguous:
-                        raise RuntimeError(
-                            "Citazione del segmento non localizzabile nel documento"
-                        )
-                    for item in grounded:
-                        item.data["reuse_block_target_verification"] = True
-                    partial = partial_results[doc.id]
-                    final_items = deduplicate_atomic_evidence((
-                        *combined_by_doc[doc.id], *grounded,
-                    ))
-                    return "targeted", (
-                        doc, final_items, input_hash,
-                        partial[3] + round(
-                            time.monotonic() - started_segment, 3
-                        ),
-                        merge_metrics(partial[4], metrics),
-                    )
-                except RegistryBuildCancelled:
-                    raise
-                except Exception:
-                    return "full", extract_one(doc, original_text, input_hash)
-
-            pending_target_ids = set(target_checks) | forced_full_doc_ids
-            if pending_target_ids:
-                ordered_target_ids = sorted(
-                    pending_target_ids,
-                    key=lambda doc_id: len(task_by_id[doc_id][1]),
-                    reverse=True,
-                )
-                with ThreadPoolExecutor(max_workers=actual_workers) as pool:
-                    future_map = {
-                        pool.submit(verify_target_document, doc_id): doc_id
-                        for doc_id in ordered_target_ids
-                    }
-                    completed = 0
-                    for future in as_completed(future_map):
-                        completed += 1
-                        doc_id = future_map[future]
-                        try:
-                            mode, result = future.result()
-                            if mode == "full":
-                                fallback_count += 1
-                            else:
-                                targeted_verification_count += 1
-                            persist_success(result, final=True)
-                        except RegistryBuildCancelled:
-                            for pending_future in future_map:
-                                pending_future.cancel()
-                            raise
-                        except Exception as exc:
-                            error = str(exc)
-                            if doc_id in initial_reuse_errors:
-                                error = (
-                                    "Estrazione ridotta: "
-                                    f"{initial_reuse_errors[doc_id]}; "
-                                    f"fallback completo: {error}"
-                                )
-                            failures.append({
-                                "document_id": doc_id, "error": error,
-                            })
-                            self.processing_repo.mark_result(
-                                manifests[doc_id], status="failed",
-                                error_message=error,
-                            )
-                        if progress_callback:
-                            progress_callback(
-                                55 + int(
-                                    5 * completed /
-                                    max(len(ordered_target_ids), 1)
-                                ),
-                                "Verifica mirata documenti "
-                                f"{completed}/{len(ordered_target_ids)}",
-                            )
-
-            # Documents fully resolved by source templates need no second LLM
-            # call.  Persist them only after source additions have been merged.
-            for doc_id, combined in combined_by_doc.items():
-                if doc_id in pending_target_ids:
-                    continue
-                partial = partial_results[doc_id]
-                final_evidence = deduplicate_atomic_evidence(combined)
-                persist_success((
-                    partial[0], final_evidence, partial[2],
-                    partial[3], partial[4],
-                ), final=True)
-
             check_cancelled()
+            if run_atomic:
+                from .fhir_registry import FhirRegistry
+                loinc = getattr(self.shared_lexicon_repo, 'loinc_catalog', None)
+                lab_values = self.lab_repo.get_by_patient(patient_id)
+                lab_proposals = {}
+                if loinc and self.atomic_llm and getattr(self.atomic_llm, 'is_available', False):
+                    if progress_callback:progress_callback(55, 'Codifica LOINC dei risultati di laboratorio…')
+                    lab_proposals = loinc.propose(lab_values, self.atomic_llm, lambda: check_cancelled() or False)
+                check_cancelled()
+                exporter = FhirRegistry(patient_id, loinc, lab_proposals)
+                for document in documents:exporter.document(document.id)
+                for item in self.evidence_repo.get_by_patient(patient_id):
+                    if item.extraction_method == METHOD:
+                        exporter.clinical(item)
+                for ordinal, lab in enumerate(self.lab_repo.get_by_patient(patient_id)):
+                    exporter.laboratory(lab, ordinal)
+                check_cancelled()
+                fhir_path = exporter.write(active_workspace.path / patient_id / 'clinical_events.fhir.json',
+                    {'documents_total':len(documents),'processed':processed,'unchanged':skipped,
+                     'failures':failures,'complete':not bool(failures), 'pipeline':VERSION})
             if not run_events:
                 stored_evidence = self.evidence_repo.get_by_patient(patient_id)
                 source_evidence = deduplicate_atomic_evidence(stored_evidence)
@@ -995,13 +559,16 @@ class ClinicalRegistryBuilder:
                             "elapsed_seconds": elapsed,
                         },
                         model_used=getattr(self.atomic_llm, "model", None),
-                        model_version=ATOMIC_PROMPT_VERSION,
+                        model_version=self.atomic_prompt_version,
                         run_id=run.run_id,
                     )
                 if progress_callback:
                     progress_callback(60, "Evidenze atomiche completate")
                 return {
                     "stage": "atomic",
+                    "fhir_path": fhir_path,
+                    "fhir_events": exporter.event_count,
+                    "fhir_uncoded": exporter.unmapped,
                     "total_entries": len(source_evidence),
                     "stored_evidence_occurrences": len(stored_evidence),
                     "documents_processed": processed,
@@ -1016,15 +583,16 @@ class ClinicalRegistryBuilder:
                     ),
                     "atomic_evidence_extracted": extracted_count,
                     "abnormal_lab_evidence": abnormal_lab_evidence_count,
-                    "exact_blocks_reused": reused_blocks,
-                    "exact_reused_characters": reused_chars,
-                    "reused_evidence": reused_evidence_count,
-                    "unique_reuse_blocks_verified": unique_blocks_verified,
-                    "reuse_verification_batches": reuse_verification_batches,
-                    "targeted_reuse_verifications": (
-                        targeted_verification_count
-                    ),
-                    "full_document_fallbacks": fallback_count,
+                    "lexicon_examples_available": sum(len(c.get("examples", [])) for c in self.atomic_extractor.catalog) if isinstance(self.atomic_extractor, EventExtractor) else 0,
+                    "lexicon_retrieval_mode": ("estrazione aperta + candidati SNOMED CT International" if hasattr(self.atomic_extractor, "snomed") else "catalogo completo; esempi pertinenti per termine"),
+                    "snomed_mapped": sum(int(item.get("snomed_mapped", 0)) for item in doc_stats),
+                    "snomed_joint_mapped": sum(int(item.get("snomed_joint_mapped", 0)) for item in doc_stats),
+                    "snomed_recovery_mapped": sum(int(item.get("snomed_recovery_mapped", 0)) for item in doc_stats),
+                    "snomed_unmapped": sum(int(item.get("snomed_unmapped", 0)) for item in doc_stats),
+                    "relation_links": sum(int(item.get("relation_links", 0)) for item in doc_stats),
+                    "relation_issues": sum(int(item.get("relation_issues", 0)) for item in doc_stats),
+                    "lexicon_terms_available": len(self.atomic_extractor.catalog) if isinstance(self.atomic_extractor, EventExtractor) else 0,
+                    "recovery_calls": sum(int(item.get("recovery_calls", 0)) for item in doc_stats),
                     "inactive_runtimes_released": (
                         inactive_runtimes_released
                     ),
@@ -1361,15 +929,6 @@ class ClinicalRegistryBuilder:
                         ),
                         "atomic_evidence_extracted": extracted_count,
                         "abnormal_lab_evidence": abnormal_lab_evidence_count,
-                        "exact_blocks_reused": reused_blocks,
-                        "exact_reused_characters": reused_chars,
-                        "reused_evidence": reused_evidence_count,
-                        "unique_reuse_blocks_verified": unique_blocks_verified,
-                        "reuse_verification_batches": reuse_verification_batches,
-                        "targeted_reuse_verifications": (
-                            targeted_verification_count
-                        ),
-                        "full_document_fallbacks": fallback_count,
                         "inactive_runtimes_released": (
                             inactive_runtimes_released
                         ),
@@ -1438,7 +997,7 @@ class ClinicalRegistryBuilder:
                         "elapsed_seconds": elapsed,
                     },
                     model_used=run.model_name,
-                    model_version=ATOMIC_PROMPT_VERSION,
+                    model_version=self.atomic_prompt_version,
                     run_id=run.run_id,
                 )
             if progress_callback:
@@ -1488,13 +1047,6 @@ class ClinicalRegistryBuilder:
                 ),
                 "atomic_evidence_extracted": extracted_count,
                 "abnormal_lab_evidence": abnormal_lab_evidence_count,
-                "exact_blocks_reused": reused_blocks,
-                "exact_reused_characters": reused_chars,
-                "reused_evidence": reused_evidence_count,
-                "unique_reuse_blocks_verified": unique_blocks_verified,
-                "reuse_verification_batches": reuse_verification_batches,
-                "targeted_reuse_verifications": targeted_verification_count,
-                "full_document_fallbacks": fallback_count,
                 "inactive_runtimes_released": inactive_runtimes_released,
                 "llm_calls": sum(
                     int(item.get("llm_calls", 0)) for item in doc_stats
@@ -1683,8 +1235,6 @@ class ClinicalRegistryBuilder:
         )
         eligible = current = 0
         for document in documents:
-            if document.document_type == "laboratorio":
-                continue
             path = self._normalized_text_path(patient_id, document.id)
             if path is None:
                 continue
@@ -1695,15 +1245,15 @@ class ClinicalRegistryBuilder:
             ) if self.overlay_repo else base_text
             input_hash = content_hash(
                 effective_text, document.document_date,
-                document.document_type, ATOMIC_PROMPT_VERSION,
-                ATOMIC_PROMPT_DIGEST,
+                document.document_type, self.atomic_prompt_version,
+                self.atomic_prompt_digest,
             )
             if self.processing_repo.is_current(
                 document.id, "atomic_evidence", input_hash,
-                ATOMIC_PIPELINE_VERSION, ATOMIC_PROMPT_VERSION,
+                self.atomic_pipeline_version, self.atomic_prompt_version,
                 atomic_digest,
                 compatible_pipeline_versions=(
-                    ATOMIC_RESUME_COMPATIBLE_PIPELINE_VERSIONS
+                    ()
                 ),
             ):
                 current += 1
@@ -1837,46 +1387,19 @@ class ClinicalRegistryBuilder:
         )
         return next((path for path in candidates if path.exists()), None)
 
-    def _sync_abnormal_lab_evidence(self, patient_id: str, documents) -> int:
-        """Rebuild deterministic lab atoms from structured out-of-range rows.
-
-        This makes the post-extraction registry independent from the GUI path
-        that originally parsed the report and also removes normal laboratory
-        atoms left by older pipeline versions.
-        """
-        lab_values = self.lab_repo.get_by_patient(patient_id)
-        by_document: dict[str, list] = {}
-        for value in lab_values:
-            by_document.setdefault(value.document_id, []).append(value)
-        total = 0
-        prior_values = []
+    def _sync_laboratory_events(self, patient_id: str, documents) -> int:
+        """Adapt every parsed laboratory result; leave the parser unchanged."""
+        from .fhir_registry import laboratory_evidence
+        values = self.lab_repo.get_by_patient(patient_id)
+        catalog = getattr(self.shared_lexicon_repo, 'loinc_catalog', None)
+        by_document = {}
+        for ordinal, value in enumerate(values):
+            row = laboratory_evidence(value, ordinal, catalog)
+            by_document.setdefault(value.document_id, []).append(row)
         for document in documents:
-            values = by_document.get(document.id, [])
-            if document.document_type != "laboratorio" and not values:
-                continue
-            geometry = None
-            if values:
-                geometry = load_document_geometry(
-                    active_workspace.path / patient_id / "extraction" /
-                    f"{document.id}.json"
-                )
-            evidence = abnormal_lab_evidence(
-                patient_id=patient_id,
-                document_id=document.id,
-                document_date=document.document_date,
-                lab_values=values,
-                geometry=geometry,
-                policy=getattr(
-                    getattr(self, "pipeline_policy", None), "lab", None
-                ),
-                prior_values=prior_values,
-            )
-            self.evidence_repo.replace_document_method(
-                document.id, LAB_EXTRACTION_METHOD, evidence
-            )
-            total += len(evidence)
-            prior_values.extend(values)
-        return total
+            self.evidence_repo.replace_document_method(document.id, LAB_EXTRACTION_METHOD, [])
+            self.evidence_repo.replace_document_method(document.id, 'fhir_laboratory_v1', by_document.get(document.id, []))
+        return sum(bool(value.is_abnormal) for value in values)
 
     def _replace_atomic_document_evidence(
         self, document_id: str, evidence, *, clear_missing: bool = True
@@ -1887,12 +1410,15 @@ class ClinicalRegistryBuilder:
         stored = getter(document_id) if callable(getter) else []
         authoritative_labs = [
             item for item in stored
-            if item.extraction_method == LAB_EXTRACTION_METHOD
+            if item.extraction_method == "fhir_laboratory_v1"
         ]
         evidence, _ = filter_narrative_lab_duplicates(
             evidence, authoritative_labs
         )
         grouped: dict[str, list] = {
+            METHOD: [],
+            "shared_lexicon_atomic": [],
+            "icd11_extraction": [],
             "llm_atomic_v2": [],
             "deterministic_nonclinical": [],
         }
@@ -2506,7 +2032,9 @@ def _graph_voting_llm(atomic_llm, event_llm):
 def _llm_model_digest(llm) -> str:
     if llm is None:
         return ""
-    return AtomicEvidenceExtractor(llm).model_digest
+    return content_hash(json.dumps({key: getattr(llm, key, None) for key in
+        ('model', 'model_path', 'temperature', 'seed', 'top_p', 'top_k',
+         'context_length', 'max_output_tokens', 'thinking_enabled')}, sort_keys=True))
 
 
 def _event_hash(events) -> str:

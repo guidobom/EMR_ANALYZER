@@ -40,6 +40,8 @@ class _ActiveWorkspace:
 
 active_workspace = _ActiveWorkspace()
 
+SHARED_LEXICON_PATH = BASE_DIR / "shared_lexicon.db"
+
 CACHE_DIR = BASE_DIR / "cache"
 LOG_DIR = BASE_DIR / "logs"
 IDENTITY_KEY_PATH = BASE_DIR / "identity.key"

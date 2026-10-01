@@ -3,9 +3,16 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QLabel, QComboBox, QPushButton, QAbstractItemView,
-    QSplitter,
+    QSplitter, QListView,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
+from collections import Counter
+from datetime import datetime, timezone
+import math
+
+from ..config import LAB_SYNONYMS
+from ..extraction.normalizer import LabNormalizer
+from ..utils.date_utils import parse_italian_date
 
 # Try to import pyqtgraph for charts
 try:
@@ -37,8 +44,11 @@ class LaboratoryTab(QWidget):
 
         self._parameter_combo = QComboBox()
         self._parameter_combo.setMinimumWidth(250)
-        self._parameter_combo.setEditable(True)
-        self._parameter_combo.currentTextChanged.connect(self._on_parameter_changed)
+        # Use an explicit list popup on macOS too; selection always refers to
+        # a model item, never to uncommitted editable text.
+        self._parameter_combo.setView(QListView())
+        self._parameter_combo.setMaxVisibleItems(20)
+        self._parameter_combo.currentIndexChanged.connect(self._on_parameter_changed)
         selector_layout.addWidget(self._parameter_combo)
 
         self._abnormal_only_btn = QPushButton("Solo anomali")
@@ -54,10 +64,19 @@ class LaboratoryTab(QWidget):
 
         selector_layout.addStretch()
 
+        self._series_combo = QComboBox()
+        self._series_combo.setToolTip("Unità di misura e materiale della serie temporale")
+        self._series_combo.currentIndexChanged.connect(self._update_chart)
+        selector_layout.addWidget(self._series_combo)
+
         self._stats_label = QLabel("")
         selector_layout.addWidget(self._stats_label)
 
         layout.addLayout(selector_layout)
+
+        self._chart_status = QLabel()
+        self._chart_status.setWordWrap(True)
+        layout.addWidget(self._chart_status)
 
         # Splitter: chart on top, table below
         self._splitter = QSplitter(Qt.Vertical)
@@ -65,7 +84,9 @@ class LaboratoryTab(QWidget):
         # Chart widget
         self._chart_widget = None
         if HAS_PYQTGRAPH:
-            self._chart_widget = pg.PlotWidget()
+            self._chart_widget = pg.PlotWidget(
+                axisItems={"bottom": pg.DateAxisItem(orientation="bottom", utcOffset=0)}
+            )
             self._chart_widget.setLabel("left", "Valore")
             self._chart_widget.setLabel("bottom", "Data")
             self._chart_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -93,9 +114,12 @@ class LaboratoryTab(QWidget):
         self._services = services
 
     def load_patient(self, patient_id: str):
+        if patient_id != self._current_patient_id:
+            self._current_parameter = None
         self._current_patient_id = patient_id
         self._load_data()
         self._populate_parameter_combo()
+        self._populate_series_combo()
         self._refresh_table()
         self._update_chart()
 
@@ -106,40 +130,81 @@ class LaboratoryTab(QWidget):
         else:
             self._all_lab_values = []
 
+    @staticmethod
+    def _parameter_key(value):
+        return (value.normalized_name or "").strip() or LabNormalizer().normalize_parameter(
+            value.parameter_name, value.unit, value.biological_material
+        ) or "analita_non_specificato"
+
+    @staticmethod
+    def _series_key(value):
+        return ((value.unit or "").strip(),
+                (value.biological_material or "").strip().casefold())
+
+    @staticmethod
+    def _parameter_label(key):
+        """Keep familiar abbreviations visible alongside the stored name."""
+        name = key.replace("_", " ")
+        abbreviations = sorted({alias.upper() for alias, canonical in LAB_SYNONYMS.items()
+                                if canonical == key and alias != key
+                                and alias.isalnum() and len(alias) <= 5})
+        return f"{' / '.join(abbreviations)} — {name}" if abbreviations else name
+
     def _populate_parameter_combo(self):
+        counts = Counter(self._parameter_key(v) for v in self._all_lab_values)
         self._parameter_combo.blockSignals(True)
-        self._parameter_combo.clear()
-        self._parameter_combo.addItem("— Tutti i parametri —", "")
+        try:
+            self._parameter_combo.clear()
+            self._parameter_combo.addItem("— Tutti i parametri —", "")
+            for key in sorted(counts, key=lambda k: self._parameter_label(k).casefold()):
+                self._parameter_combo.addItem(
+                    f"{self._parameter_label(key)} ({counts[key]} valori)", key
+                )
+            index = self._parameter_combo.findData(self._current_parameter)
+            self._parameter_combo.setCurrentIndex(max(0, index))
+            self._current_parameter = self._parameter_combo.currentData()
+        finally:
+            self._parameter_combo.blockSignals(False)
 
-        params = sorted(set(
-            lv.normalized_name for lv in self._all_lab_values
-        ))
-        for p in params:
-            display = f"{p} ({sum(1 for lv in self._all_lab_values if lv.normalized_name == p)} valori)"
-            self._parameter_combo.addItem(display, p)
+    def _populate_series_combo(self):
+        previous = self._series_combo.currentData()
+        keys = sorted({self._series_key(v) for v in self._all_lab_values
+                       if self._parameter_key(v) == self._current_parameter})
+        self._series_combo.blockSignals(True)
+        try:
+            self._series_combo.clear()
+            for unit, material in keys:
+                self._series_combo.addItem(
+                    f"{unit or 'Unità non indicata'} · {material or 'Materiale non indicato'}",
+                    (unit, material),
+                )
+            index = next((i for i, key in enumerate(keys) if key == previous), -1)
+            self._series_combo.setCurrentIndex(max(0, index) if keys else -1)
+            self._series_combo.setVisible(bool(keys))
+        finally:
+            self._series_combo.blockSignals(False)
 
-        self._parameter_combo.blockSignals(False)
-
-    def _on_parameter_changed(self, text: str):
+    def _on_parameter_changed(self, index):
         self._current_parameter = self._parameter_combo.currentData()
+        self._populate_series_combo()
         self._refresh_table()
         self._update_chart()
 
     def _refresh_table(self):
         """Filter and display lab values."""
-        values = self._all_lab_values
+        values = list(self._all_lab_values)
 
         # Filter by parameter
         if self._current_parameter:
             values = [v for v in values
-                      if v.normalized_name == self._current_parameter]
+                      if self._parameter_key(v) == self._current_parameter]
 
         # Filter abnormal only
         if self._abnormal_only_btn.isChecked():
             values = [v for v in values if v.is_abnormal]
 
         # Sort by date
-        values.sort(key=lambda v: v.sample_date or "0000-00-00")
+        values.sort(key=lambda v: self._timestamp(v.sample_date) or float("-inf"))
 
         self._table.setRowCount(len(values))
         for i, lv in enumerate(values):
@@ -189,75 +254,83 @@ class LaboratoryTab(QWidget):
             f"{len(values)} valori | {abnormal_count} anomali"
         )
 
-    def _update_chart(self):
-        """Update the temporal chart for the selected parameter."""
-        if not HAS_PYQTGRAPH or not self._chart_widget:
+    @staticmethod
+    def _timestamp(value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            parsed = parse_italian_date(text)
+            if not parsed:
+                return None
+            dt = datetime.fromisoformat(parsed)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+
+    def _update_chart(self, *_):
+        """Connect only numeric, dated observations in a comparable series."""
+        if self._chart_widget is None:
+            self._chart_status.setText("Grafici non disponibili: installare pyqtgraph.")
+            return
+        self._chart_widget.clear()
+        self._chart_widget.setTitle("")
+        self._chart_widget.setLabel("left", "Valore")
+        if not self._all_lab_values:
+            self._chart_status.setText("Nessun valore di laboratorio disponibile per questo paziente.")
             return
         if not self._current_parameter:
-            self._chart_widget.clear()
+            self._chart_status.setText("Seleziona un analita nel menu per visualizzare l’andamento temporale.")
             return
-
-        self._chart_widget.clear()
-
-        # Filter values for chart
         values = [v for v in self._all_lab_values
-                  if v.normalized_name == self._current_parameter
-                  and v.sample_date]
-        values.sort(key=lambda v: v.sample_date)
-
-        if not values:
-            return
-
-        # Build x (timestamps) and y (values)
-        import time
-        from datetime import datetime
-
-        x_vals = []
-        y_vals = []
-        for lv in values:
-            if lv.value is None:
-                continue  # Skip textual results (cannot chart)
+                  if self._parameter_key(v) == self._current_parameter
+                  and self._series_key(v) == self._series_combo.currentData()]
+        points = []
+        for value in values:
+            timestamp = self._timestamp(value.sample_date)
+            if timestamp is None or value.value is None or value.operator:
+                continue
             try:
-                dt = datetime.fromisoformat(lv.sample_date)
-                x_vals.append(dt.timestamp())
-                y_vals.append(lv.value)
-            except (ValueError, TypeError):
-                x_vals.append(len(x_vals))
-                y_vals.append(lv.value)
-
-        # Plot values
-        scatter = pg.ScatterPlotItem(
-            x=x_vals, y=y_vals, size=10, brush=pg.mkBrush(52, 152, 219, 200)
+                numeric = float(value.value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                points.append((timestamp, numeric, value))
+        points.sort(key=lambda p: p[0])
+        omitted = len(values) - len(points)
+        self._chart_status.setText(
+            f"{len(points)} misure nel grafico; {omitted} escluse "
+            "(data assente/non valida, risultato non numerico o con soglia < / >). "
+            "I trattini rossi indicano i limiti di riferimento del singolo referto. "
+            "Il filtro «Solo anomali» riguarda la tabella."
         )
-        self._chart_widget.addItem(scatter)
-
-        if len(x_vals) >= 2:
-            line = pg.PlotDataItem(x_vals, y_vals, pen=pg.mkPen(52, 152, 219, 150))
-            self._chart_widget.addItem(line)
-
-        # Reference range lines
-        ref_low = values[0].reference_low
-        ref_high = values[0].reference_high
-        if ref_low is not None and ref_high is not None and x_vals:
-            min_x = min(x_vals)
-            max_x = max(x_vals)
-            if min_x < max_x:
-                low_line = pg.PlotDataItem(
-                    [min_x, max_x], [ref_low, ref_low],
-                    pen=pg.mkPen(231, 76, 60, 100, style=Qt.DashLine)
+        if not points:
+            return
+        unit, _ = self._series_combo.currentData()
+        self._chart_widget.setTitle(self._parameter_combo.currentText())
+        self._chart_widget.setLabel("left", "Valore", units=unit or None)
+        self._chart_widget.plot(
+            [p[0] for p in points], [p[1] for p in points],
+            pen=pg.mkPen(52, 152, 219, width=2), symbol="o", symbolSize=9,
+            symbolBrush=pg.mkBrush(52, 152, 219),
+        )
+        # Reference limits may differ across reports: do not apply the first
+        # report's interval to every later observation.
+        for attribute in ("reference_low", "reference_high"):
+            refs = [(x, getattr(v, attribute)) for x, _, v in points
+                    if getattr(v, attribute) is not None
+                    and math.isfinite(getattr(v, attribute))]
+            if refs:
+                self._chart_widget.plot(
+                    [p[0] for p in refs], [p[1] for p in refs],
+                    pen=None, symbol="_", symbolSize=14,
+                    symbolPen=pg.mkPen(231, 76, 60),
                 )
-                high_line = pg.PlotDataItem(
-                    [min_x, max_x], [ref_high, ref_high],
-                    pen=pg.mkPen(231, 76, 60, 100, style=Qt.DashLine)
-                )
-                self._chart_widget.addItem(low_line)
-                self._chart_widget.addItem(high_line)
-
-        # Format x-axis as dates
-        if x_vals and isinstance(x_vals[0], float) and x_vals[0] > 1000000000:
-            from pyqtgraph import DateAxisItem
-            date_axis = DateAxisItem(orientation='bottom')
-            self._chart_widget.setAxisItems({'bottom': date_axis})
+        self._chart_widget.enableAutoRange()
+        if len({p[0] for p in points}) == 1:
+            self._chart_widget.setXRange(points[0][0] - 43200, points[0][0] + 43200)
 
     def _on_double_click(self, index):
         """Emit lab value to context panel."""

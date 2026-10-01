@@ -152,13 +152,13 @@ class EvidenceGraphBuilder:
         relations = _apply_reviewed_relations(
             patient_id, relations, reviewed_relations, set(by_id)
         )
+        from .laboratory_support import as_support_relations
+        anchors = set(by_id) if anchor_evidence_ids is None else set(anchor_evidence_ids) & set(by_id)
+        relations, laboratory_links = as_support_relations(
+            items, relations, threshold=self.policy.cohesive_threshold,
+            max_days=self.policy.longitudinal_window_days, eligible_target_ids=anchors)
         clusters, split_count = self._clusters(
-            items,
-            relations,
-            anchor_evidence_ids=(
-                set(by_id) if anchor_evidence_ids is None
-                else set(anchor_evidence_ids) & set(by_id)
-            ),
+            items, relations, anchor_evidence_ids=anchors - set(laboratory_links),
         )
         return EvidenceGraphResult(
             relations=relations,
@@ -248,6 +248,9 @@ class EvidenceGraphBuilder:
         pairs, left, right, scale: str, distance: int | None,
         shared_terms: set[str] | None = None,
     ) -> None:
+        if any(item.data.get("experiencer", "patient") != "patient"
+               for item in (left, right)):
+            return
         source_id, target_id = sorted((left.evidence_id, right.evidence_id))
         key = (source_id, target_id)
         pair = pairs.get(key)
@@ -945,7 +948,9 @@ def _role_for(item, *, core: bool) -> str:
         return "diagnostic_support"
     if item.category == "medication" or item.category in {"procedure", "surgery"}:
         return "treatment"
-    if item.category in {"laboratory_finding", "vital_sign"}:
+    if item.category == "laboratory_finding" or getattr(item, "fact_type", None) == "laboratory_test":
+        return "diagnostic_support"
+    if item.category == "vital_sign":
         return "monitoring"
     if item.category in {"response", "progression", "discharge"}:
         return "outcome"

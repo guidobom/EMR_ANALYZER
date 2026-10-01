@@ -145,6 +145,24 @@ class LlamaBackend:
             progress_cb=progress_cb,
         )
 
+    def count_tokens(self, text, config):
+        response = self._http.post(
+            self.ensure(config) + "/tokenize",
+            json={"content": text, "add_special": False, "parse_special": True},
+        )
+        response.raise_for_status()
+        return len(response.json()["tokens"])
+
+    def count_prompt_tokens(self, prompt, system, config):
+        base = self.ensure(config)
+        response = self._http.post(base + "/apply-template", json={
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": prompt}],
+            **self._thinking_parameters(config),
+        })
+        response.raise_for_status()
+        return self.count_tokens(response.json()["prompt"], config)
+
     def status(self, config) -> str | None:
         try:
             key = self.key_for(config)
@@ -235,6 +253,14 @@ class LlamaBackend:
     # -- HTTP API ------------------------------------------------------------
 
     @staticmethod
+    def _thinking_parameters(config) -> dict:
+        enabled = bool(getattr(config, "thinking_enabled", False))
+        return {
+            "reasoning_effort": "medium" if enabled else "none",
+            "chat_template_kwargs": {"enable_thinking": enabled},
+        }
+
+    @staticmethod
     def structured_response_format(schema: dict) -> dict:
         return {"type": "json_object", "schema": schema}
 
@@ -261,9 +287,8 @@ class LlamaBackend:
             "top_k": top_k,
             "seed": seed,
             "max_tokens": max_tokens,
-            # The app never wants the thinking channel (think=False with
-            # Ollama); belt and suspenders together with the -rea off flag.
-            "reasoning_effort": "none",
+            **self._thinking_parameters(config),
+            "reasoning_format": "deepseek",
         }
         if response_format is not None:
             payload["response_format"] = response_format

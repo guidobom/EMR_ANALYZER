@@ -42,10 +42,7 @@ def abnormality_reasons(
             and not lab.value_text)
     ):
         reasons.append("explicit_abnormal_flag")
-    if policy.outside_reference_range and lab.value is not None and (
-        (lab.reference_low is not None and lab.value < lab.reference_low)
-        or (lab.reference_high is not None and lab.value > lab.reference_high)
-    ):
+    if policy.outside_reference_range and _measured_direction(lab) in {"high", "low"}:
         reasons.append("outside_reference_range")
     if policy.textual_abnormality and lab.value_text and bool(lab.is_abnormal):
         reasons.append("textual_abnormality")
@@ -189,7 +186,7 @@ def abnormal_lab_evidence(
             extraction_method=LAB_EXTRACTION_METHOD,
             prompt_version=None,
             schema_version=LAB_EVIDENCE_SCHEMA_VERSION,
-            status="auto",
+            status="needs_review" if direction == "conflicting" else "auto",
             data={
                 "fact_type": "laboratory_test",
                 "polarity": polarity,
@@ -334,18 +331,34 @@ def load_document_geometry(path: Path | None):
         return None
 
 
+def _measured_direction(lab: LabValue) -> str:
+    """Only conclude abnormality when every value allowed by a comparator is outside."""
+    if lab.value is None:
+        return "unknown"
+    value, op = lab.value, lab.operator or "="
+    lower = float("-inf") if op in {"<", "<="} else value
+    upper = float("inf") if op in {">", ">="} else value
+    if lab.reference_low is not None and (upper < lab.reference_low or
+            (upper == lab.reference_low and op == "<")):
+        return "low"
+    if lab.reference_high is not None and (lower > lab.reference_high or
+            (lower == lab.reference_high and op == ">")):
+        return "high"
+    if ((lab.reference_low is None or lower >= lab.reference_low) and
+            (lab.reference_high is None or upper <= lab.reference_high) and
+            (lab.reference_low is not None or lab.reference_high is not None)):
+        return "normal"
+    return "unknown"
+
+
 def _abnormal_direction(lab: LabValue) -> str:
     flag = str(lab.flag or "").strip().upper()
-    if flag in {"H", "HIGH", "ALTO", "ALTA", "↑"}:
-        return "high"
-    if flag in {"L", "LOW", "BASSO", "BASSA", "↓"}:
-        return "low"
-    if lab.value is not None:
-        if lab.reference_low is not None and lab.value < lab.reference_low:
-            return "low"
-        if lab.reference_high is not None and lab.value > lab.reference_high:
-            return "high"
-    return "abnormal"
+    flagged = ("high" if flag in {"H", "HIGH", "ALTO", "ALTA", "↑"} else
+               "low" if flag in {"L", "LOW", "BASSO", "BASSA", "↓"} else None)
+    measured = _measured_direction(lab)
+    if flagged and measured in {"normal", "high", "low"} and flagged != measured:
+        return "conflicting"
+    return flagged or (measured if measured in {"high", "low"} else "abnormal")
 
 
 def _numeric_display(lab: LabValue) -> str:

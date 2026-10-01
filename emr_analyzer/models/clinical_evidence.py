@@ -66,7 +66,8 @@ class ClinicalEvidence:
             "recommendation": "clinical_decision",
         }.get(self.category, self.category)
         polarity = self.data.get("polarity") or (
-            "suspected" if self.certainty == "suspected"
+            "unknown" if self.assertion == "unknown"
+            else "suspected" if self.certainty == "suspected"
             else "negated" if (
                 self.assertion == "absent" or self.certainty == "excluded"
             ) else "present"
@@ -88,6 +89,19 @@ class ClinicalEvidence:
             "terminology_system": self.terminology_system,
             "terminology_code": self.terminology_code,
             "mapping_status": self.mapping_status,
+            "lexicon": {"term_id": self.data.get("lexicon_term_id"),
+                        "label": self.data.get("lexicon_label"),
+                        "catalog_digest": self.data.get("lexicon_catalog_digest")},
+            "date_provenance": dict(self.data.get("date_provenance") or {}),
+            "source_occurrences": list(self.data.get("source_occurrences") or []),
+            "duplicate_source_evidence_ids": list(self.data.get("duplicate_source_evidence_ids") or []),
+            "snomed": {"code": self.data.get("snomed_concept_id"),
+                       "release": self.data.get("snomed_release"),
+                       "fsn": self.data.get("snomed_fsn"),
+                       "status": self.data.get("snomed_mapping_status"),
+                       "reason": self.data.get("snomed_mapping_reason")},
+            "icd11": dict(self.data.get("icd11", {})),
+            "loinc": dict(self.data.get("loinc", {})),
             "mapping_confidence": self.mapping_confidence,
             "clinical_relevance": self.clinical_relevance,
             "value_text": self.value_text,
@@ -110,6 +124,9 @@ class ClinicalEvidence:
             "confidence": self.confidence,
             "review_status": self.status,
             "source_reference": source_reference,
+            "experiencer": self.data.get("experiencer", "patient"),
+            "source_spans": self.data.get("source_spans", []),
+            "source_version": self.data.get("source_version"),
             "typed_payload": dict(self.typed_payload),
             "extraction_method": self.extraction_method,
             "schema_version": self.schema_version,

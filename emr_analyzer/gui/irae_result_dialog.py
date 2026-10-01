@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMessageBox, QLabel,
 )
 
+from .pipeline_llm import prepare_pipeline
 from ..clinical.irae_layers import render_irae_markdown
 from ..config import active_workspace
 from ..utils.markdown_tables import render_markdown_to_html
@@ -98,7 +99,8 @@ class IraeResultDialog(QDialog):
         if not isinstance(report, dict) or not report.get("organ_results"):
             return False
         llm = (self._services or {}).get("clinical_state_llm_client")
-        return bool(llm is not None and getattr(llm, "is_available", False))
+        return bool((self._services or {}).get("prepare_pipeline_llm") or
+                    (llm is not None and getattr(llm, "is_available", False)))
 
     def _on_reconsolidate(self) -> None:
         if not self._can_reconsolidate():
@@ -126,6 +128,8 @@ class IraeResultDialog(QDialog):
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
+            return
+        if not prepare_pipeline(self._services, 'irae_consolidation', self):
             return
         llm = (self._services or {}).get("clinical_state_llm_client")
         from ..clinical.irae_evidence import load_registry_rows

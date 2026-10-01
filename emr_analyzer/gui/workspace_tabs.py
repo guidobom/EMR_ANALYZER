@@ -9,11 +9,13 @@ from PyQt5.QtCore import Qt, pyqtSignal
 
 from datetime import datetime
 
+from .pipeline_llm import prepare_pipeline
 from .documents_tab import DocumentsTab
 from .laboratory_tab import LaboratoryTab
 from .clinical_history_tab import ClinicalHistoryTab
 from .validation_tab import ValidationTab
 from .gold_set_tab import GoldSetTab
+from .local_lexicon_tab import LocalLexiconTab
 from .import_dialog import ImportDialog
 from .batch_import_dialog import BatchImportDialog
 from .progress_dialog import ProgressDialog
@@ -75,6 +77,7 @@ class WorkspaceTabs(QTabWidget):
         self._clinical_history_tab = ClinicalHistoryTab()
         self._validation_tab = ValidationTab()
         self._gold_set_tab = GoldSetTab()
+        self._local_lexicon_tab = LocalLexiconTab()
 
         # Add tabs
         self.addTab(self._documents_tab, "📄 Documenti")
@@ -82,8 +85,10 @@ class WorkspaceTabs(QTabWidget):
         self.addTab(self._clinical_history_tab, "📋 Storia Clinica")
         self.addTab(self._validation_tab, "✓ Validazione")
         self.addTab(self._gold_set_tab, "🧪 Gold Set")
+        self.addTab(self._local_lexicon_tab, "Lessico condiviso")
 
         # Connect signals
+        self.currentChanged.connect(self._on_workspace_tab_changed)
         self._documents_tab.document_selected.connect(self._on_document_selected)
         self._documents_tab.import_requested.connect(self._on_import_requested)
         self._documents_tab.processing_complete.connect(self._on_processing_complete)
@@ -104,15 +109,22 @@ class WorkspaceTabs(QTabWidget):
         self._clinical_history_tab.set_services(services)
         self._validation_tab.set_services(services)
         self._gold_set_tab.set_services(services)
+        self._local_lexicon_tab.set_services(services)
 
     def load_patient(self, patient_id: str):
         """Load all tabs with data for the given patient."""
         self._current_patient_id = patient_id
+        self._current_document_id = None
         self._documents_tab.load_patient(patient_id)
         self._laboratory_tab.load_patient(patient_id)
         self._clinical_history_tab.load_patient(patient_id)
         self._validation_tab.load_patient(patient_id)
         self._gold_set_tab.load_patient(patient_id)
+        self._local_lexicon_tab.load_patient(patient_id)
+
+    def _on_workspace_tab_changed(self, index: int) -> None:
+        if self.widget(index) is self._local_lexicon_tab and self._current_document_id:
+            self._local_lexicon_tab.select_document(self._current_document_id)
 
     def _show_validation_tab(self) -> None:
         """Open and refresh phase 3 after its queue has been prepared."""
@@ -123,6 +135,7 @@ class WorkspaceTabs(QTabWidget):
     def request_shutdown(self) -> None:
         """Request cancellation without waiting for long LLM timeouts."""
 
+        self._local_lexicon_tab.cancel_search()
         try:
             self._documents_tab.request_shutdown()
         except Exception:
@@ -133,6 +146,7 @@ class WorkspaceTabs(QTabWidget):
             pass
         for worker in (
             self._irae_queue_worker, *self._registry_queue_workers.values(),
+                *self._local_lexicon_tab.search_workers,
         ):
             if worker is not None and worker.isRunning():
                 cancel = getattr(worker, "cancel", None)
@@ -156,6 +170,7 @@ class WorkspaceTabs(QTabWidget):
         workers = [
             worker for worker in (
                 self._irae_queue_worker, *self._registry_queue_workers.values(),
+                *self._local_lexicon_tab.search_workers,
             )
             if worker is not None and worker.isRunning()
         ]
@@ -166,6 +181,7 @@ class WorkspaceTabs(QTabWidget):
         return sum(
             1 for worker in (
                 self._irae_queue_worker, *self._registry_queue_workers.values(),
+                *self._local_lexicon_tab.search_workers,
             )
             if worker is not None and worker.isRunning()
         ) + sum(
@@ -184,6 +200,7 @@ class WorkspaceTabs(QTabWidget):
             worker is not None and worker.isRunning()
             for worker in (
                 self._irae_queue_worker, *self._registry_queue_workers.values(),
+                *self._local_lexicon_tab.search_workers,
             )
         )
 
@@ -407,6 +424,8 @@ class WorkspaceTabs(QTabWidget):
         if not patient_ids:
             return
 
+        if not prepare_pipeline(self._services, 'documents', self):
+            return
         total = len(patient_ids)
         progress = ProgressDialog(
             f"Coda di estrazione — paziente 1/{total}", parent=self,
@@ -427,6 +446,7 @@ class WorkspaceTabs(QTabWidget):
                 self._documents_tab.extract_clinical_text(
                     progress=progress,
                     patient_label=f"Paziente {idx}/{total}: {pid}",
+                    llm_prepared=True,
                 )
             except Exception as exc:
                 progress.add_log(f"❌ Errore per {pid}: {exc}")
@@ -469,6 +489,8 @@ class WorkspaceTabs(QTabWidget):
             )
             return
 
+        if stage in {"atomic", "events"} and not prepare_pipeline(self._services, stage, self):
+            return
         builder = self._services.get("clinical_history_builder")
         client_key = {
             "atomic": "atomic_evidence_llm_client",
@@ -719,6 +741,8 @@ class WorkspaceTabs(QTabWidget):
         if not patient_ids:
             return
 
+        if not prepare_pipeline(self._services, 'irae', self):
+            return
         llm = self._services.get("clinical_state_llm_client")
         if not llm or not llm.is_available:
             QMessageBox.warning(
@@ -901,6 +925,8 @@ class WorkspaceTabs(QTabWidget):
         if not patients:
             return
 
+        if not prepare_pipeline(self._services, 'documents', self):
+            return
         total = len(patients)
         progress = ProgressDialog(
             f"Estrazione documenti selezionati — paziente 1/{total}",
@@ -923,6 +949,7 @@ class WorkspaceTabs(QTabWidget):
                     doc_ids=grouped[pid],
                     progress=progress,
                     patient_label=f"Paziente {idx}/{total}: {pid}",
+                    llm_prepared=True,
                 )
             except Exception as exc:
                 progress.add_log(f"❌ Errore per {pid}: {exc}")
@@ -943,6 +970,7 @@ class WorkspaceTabs(QTabWidget):
 
     def _on_processing_complete(self, patient_id: str):
         """Refresh all tabs after document processing completes."""
+        self._local_lexicon_tab.load_patient(patient_id)
         self._laboratory_tab.load_patient(patient_id)
         self._clinical_history_tab.load_patient(patient_id)
         self._validation_tab.load_patient(patient_id)

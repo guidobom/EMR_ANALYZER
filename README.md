@@ -7,6 +7,14 @@ della pratica clinica.
 > **Stato del progetto:** sviluppo sperimentale. Non è un dispositivo medico e
 > non deve essere utilizzato per decisioni cliniche senza verifica umana.
 
+La pipeline di estrazione delle evidenze atomiche usa il catalogo del Lessico
+condiviso: riconoscimento delle entità, date documentate e deduplicazione entro
+15 giorni dalla prima osservazione, conservando tutte le fonti.
+Vedi [Estrazione dal Lessico](docs/LEXICON_EXTRACTION.md).
+
+La scheda **Lessico condiviso** permette di selezionare frammenti del testo estratto
+e associarli a termini sintetici condivisi fra tutti i progetti sul computer: [guida all’annotazione](docs/LOCAL_LEXICON.md).
+
 ## Obiettivi
 
 - una workspace indipendente per ciascun paziente;
@@ -183,21 +191,6 @@ completezza rispetto al PDF né la sua anonimizzazione.
 La [revisione del codice e della pipeline](docs/CODE_AUDIT_2026-09-09.md)
 descrive correzioni, limiti, duplicazioni e priorità successive.
 
-## Test
-
-```bash
-conda activate emr-analyzer
-python -m pip install -r requirements-dev.txt
-QT_QPA_PLATFORM=offscreen python -m pytest -q
-```
-
-`tests/conftest.py` è un file di configurazione caricato automaticamente da
-pytest: non deve essere eseguito direttamente con Python.
-
-La suite include inoltre datazione retrospettiva, deduplicazione, recidive,
-correlazioni tiroidee e respiratorie, provenienza, revisioni persistenti,
-formati di input, export, audit, flusso gold set e metriche di valutazione.
-
 ## Struttura
 
 ```text
@@ -331,3 +324,9 @@ testo clinico non sono più esposti nella finestra dei prompt attivi.
 I test automatici verificano file prodotti, anonimizzazione su esempi sintetici,
 provenienza, errori e integrazione. Non dimostrano la sensibilità clinica del modello
 locale sul corpus reale e non costituiscono un benchmark di velocità.
+
+## Nuovo registro eventi FHIR
+
+Il pulsante **Storia clinica → Genera registro FHIR** scrive un Bundle R4 per paziente.
+Importazione SNOMED CT e LOINC: **Lessico condiviso → Catalogo SNOMED CT / Catalogo LOINC**.
+Dettagli, limiti e stato della validazione: [Registro eventi FHIR](docs/FHIR_EVENT_REGISTRY.md).

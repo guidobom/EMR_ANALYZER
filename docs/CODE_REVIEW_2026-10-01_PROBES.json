@@ -1,0 +1,163 @@
+{
+  "migration_idempotence": {
+    "foreign_key_errors": [],
+    "integrity": "ok"
+  },
+  "zero_lab_confidence": {
+    "input": 0.0,
+    "persisted_reload": 1.0
+  },
+  "lab_synonyms": {
+    "GOT": "ast",
+    "AST": "aspartato_aminotransferasi",
+    "GPT": "alt",
+    "ALT": "alanina_aminotransferasi",
+    "creat.": "creat"
+  },
+  "signed_numeric_values": {
+    "-3.2": 3.2,
+    "-3,2": 3.2,
+    "+3,2": 3.2,
+    "1.234,56": 1234.56
+  },
+  "censored_lab_flags": {
+    "less_than_100_range_0_50": [
+      true,
+      "H"
+    ],
+    "greater_than_10_range_20_100": [
+      true,
+      "L"
+    ]
+  },
+  "censored_lab_active_parser": [
+    {
+      "patient_id": "P001",
+      "document_id": "DOC_001",
+      "parameter_name": "Glucosio",
+      "normalized_name": "glucosio",
+      "value": 100.0,
+      "value_text": null,
+      "operator": "<",
+      "unit": "mg/dL",
+      "reference_low": 0.0,
+      "reference_high": 50.0,
+      "reference_text": "0-50",
+      "is_abnormal": true,
+      "flag": "H",
+      "sample_date": null,
+      "biological_material": null,
+      "lab_name": null,
+      "page": null,
+      "source_text": "Glucosio <100 mg/dL (0-50)",
+      "confidence": 0.98,
+      "validated_by_user": false
+    }
+  ],
+  "opposite_assertion_evaluation": {
+    "gold_count": 1,
+    "predicted_count": 1,
+    "true_positive": 1,
+    "false_positive": 0,
+    "false_negative": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "temporal_exact_accuracy": 1.0,
+    "temporal_compatible_accuracy": 1.0,
+    "certainty_accuracy": 1.0,
+    "status_accuracy": 1.0,
+    "citation_completeness": 1.0,
+    "matches": [
+      {
+        "gold_index": 0,
+        "predicted_index": 0,
+        "similarity": 1.0
+      }
+    ],
+    "false_negative_indices": [],
+    "false_positive_indices": []
+  },
+  "fhir_lab_identity_on_review": {
+    "before": "4db00eb4-e6d4-5fbd-8d8f-86dd44ced701",
+    "after": "5246fbb6-e0de-5b87-90c9-fc1a95174bab",
+    "changed": true
+  },
+  "fhir_lab_identity_on_order": {
+    "changed": true
+  },
+  "audit_tail_removal": {
+    "before": [
+      true,
+      []
+    ],
+    "after_tail_removal": [
+      true,
+      []
+    ],
+    "head_still_present": true
+  },
+  "export_sources_disabled": {
+    "top_level_source_text_present": false,
+    "source_ref_passages": [
+      "tosse"
+    ]
+  },
+  "patient_import_textual_lab": [
+    {
+      "value": 100.0,
+      "value_text": null
+    },
+    {
+      "value": null,
+      "value_text": null
+    }
+  ],
+  "patient_import_evidence": {
+    "source": 1,
+    "target": 0
+  },
+  "patient_import_timeline_collision": {
+    "error": "IntegrityError: UNIQUE constraint failed: clinical_timeline.entry_id",
+    "patients_left_after_rollback": 1,
+    "copied_files_left": 1
+  },
+  "shared_migration_semantics": {
+    "local_definition": {
+      "definition": "Sintomo respiratorio",
+      "fields": [
+        "durata"
+      ]
+    },
+    "shared_definition": {
+      "definition": "",
+      "fields": []
+    },
+    "local_role": "counterexample",
+    "shared_role": "example"
+  },
+  "document_delete_with_evidence": {
+    "deleted": false,
+    "error": "FOREIGN KEY constraint failed",
+    "original_restored": true
+  },
+  "document_delete_residues": {
+    "deleted": true,
+    "error": null,
+    "fhir_exists": true,
+    "shared_annotations": 1,
+    "shared_full_texts": 0
+  },
+  "patient_delete_shared_residues": {
+    "deleted": true,
+    "error": null,
+    "shared_annotations": 2,
+    "shared_full_texts": 1
+  },
+  "patient_deletion_path_guard": {
+    "external_directory_planned": true
+  },
+  "application_module_imports": {
+    "failures": []
+  }
+}

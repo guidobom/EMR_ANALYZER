@@ -23,6 +23,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from .pipeline_llm import prepare_pipeline
 from ..config import active_workspace
 from ..prompt_catalog import (
     PromptConfigurationError,
@@ -36,14 +37,12 @@ from ..prompt_catalog import (
 
 
 _PROMPT_ROLE = {
+    "compact_events_system": "atomic_evidence",
+    "snomed_mapping_system": "atomic_evidence",
     "patient_identity_system": "document",
     "patient_identity_task": "document",
     "clinical_text_system": "document",
     "clinical_text_instructions": "document",
-    "atomic_evidence_system": "atomic_evidence",
-    "atomic_evidence_it": "atomic_evidence",
-    "atomic_evidence_repair_system": "atomic_evidence",
-    "atomic_evidence_coverage_system": "atomic_evidence",
     "clinical_fusion_system": "clinical_events",
     "clinical_fusion_task": "clinical_events",
     "evidence_relations_system": "clinical_events",
@@ -59,8 +58,8 @@ _PROMPT_ROLE = {
 }
 
 _ROLE_SERVICE = {
-    "document": "document_llm_client",
     "atomic_evidence": "atomic_evidence_llm_client",
+    "document": "document_llm_client",
     "clinical_events": "clinical_events_llm_client",
     "clinical_state": "clinical_state_llm_client",
 }
@@ -118,44 +117,28 @@ class PromptPreviewWorker(QThread):
                     "warnings": result.warnings,
                     "redaction_counts": result.redaction_counts,
                 }
-            elif mode == "atomic_evidence":
-                from ..clinical.atomic_evidence import AtomicEvidenceExtractor
-
-                extractor = AtomicEvidenceExtractor(
-                    self.llm,
-                    task_prompt=self.request.get("task_prompt"),
-                    system_prompt=self.request.get("system_prompt"),
-                    repair_system_prompt=self.request.get(
-                        "repair_system_prompt"
-                    ),
-                    coverage_system_prompt=self.request.get(
-                        "coverage_system_prompt"
-                    ),
-                )
-                evidence = extractor.extract_document(
-                    patient_id=self.request["patient_id"],
-                    document_id=self.request["document_id"],
+            elif mode == "snomed_extraction":
+                from ..clinical.grounded_sources import catalog_snapshot
+                repo = self.request.get("shared_lexicon_repo")
+                if mode == "snomed_extraction":
+                    from ..clinical.event_extraction import EventExtractor
+                    from ..clinical.evidence_utils import content_hash
+                    gps = getattr(repo, 'snomed_catalog', None)
+                    if self.request['prompt_key'] != 'compact_events_system' and (gps is None or not gps.available):
+                        raise ValueError('Importa il catalogo SNOMED CT prima della prova.')
+                    extractor = EventExtractor(self.llm, snomed_catalog=gps, catalog=catalog_snapshot(repo))
+                    if self.request['prompt_key'] == 'compact_events_system':
+                        extractor.system = self.request['system_prompt']
+                    else:
+                        extractor.mapping_system = self.request['system_prompt']
+                    extractor.prompt_digest = content_hash(extractor.system, extractor.mapping_system)
+                atoms = extractor.extract_document(
+                    patient_id=self.request["patient_id"], document_id=self.request["document_id"],
                     document_type=self.request.get("document_type") or "",
-                    document_date=self.request.get("document_date"),
-                    text=self.request["text"],
-                )
-                output = json.dumps(
-                    [item.to_atomic_dict() for item in evidence],
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                extra = {
-                    "evidence_count": len(evidence),
-                    "pipeline_metrics": extractor.last_extraction_metrics(),
-                }
-            elif mode == "structured":
-                result = self.llm.generate_structured(
-                    self.request["user_prompt"],
-                    self.request["system_prompt"],
-                    self.request["schema"],
-                )
-                output = json.dumps(result, ensure_ascii=False, indent=2)
-                extra = {}
+                    document_date=self.request.get("document_date"), text=self.request["text"])
+                output = json.dumps([atom.to_atomic_dict() for atom in atoms], ensure_ascii=False, indent=2)
+                extra = {"evidence_count": len(atoms), "pipeline_metrics": extractor.last_extraction_metrics()}
+
             else:
                 output = self.llm.generate_text(
                     self.request["user_prompt"],
@@ -402,8 +385,8 @@ class PromptManagerDialog(QDialog):
             and self._preview_worker.isRunning()
         )
         available = bool(
-            client is not None
-            and getattr(client, "is_available", False)
+            (callable(self._services.get("prepare_pipeline_llm")) or
+             (client is not None and getattr(client, "is_available", False)))
             and document is not None
             and not running
         )
@@ -417,10 +400,13 @@ class PromptManagerDialog(QDialog):
                 "Seleziona un paziente con almeno un documento importato."
             )
             return
+        if callable(self._services.get("prepare_pipeline_llm")):
+            self.preview_info_label.setText("Premi Esegui prova per scegliere modello e parametri. La prova non salva dati clinici.")
+            return
         if client is None or not getattr(client, "is_available", False):
             self.preview_info_label.setText(
                 f"Nessun modello disponibile per il ruolo «{role}». "
-                "Configurarlo in Configura LLM."
+                "Scegli il modello premendo Esegui prova."
             )
             return
         layer = self._preview_layer_name(key)
@@ -569,27 +555,8 @@ class PromptManagerDialog(QDialog):
                 **base, "mode": "clinical_text",
                 "system_prompt": system, "task_prompt": task,
             }
-        if key.startswith("atomic_evidence"):
-            prompts = {
-                "task_prompt": load_prompt("atomic_evidence_it"),
-                "system_prompt": load_prompt("atomic_evidence_system"),
-                "repair_system_prompt": load_prompt(
-                    "atomic_evidence_repair_system"
-                ),
-                "coverage_system_prompt": load_prompt(
-                    "atomic_evidence_coverage_system"
-                ),
-            }
-            field_by_key = {
-                "atomic_evidence_it": "task_prompt",
-                "atomic_evidence_system": "system_prompt",
-                "atomic_evidence_repair_system": "repair_system_prompt",
-                "atomic_evidence_coverage_system": (
-                    "coverage_system_prompt"
-                ),
-            }
-            prompts[field_by_key[key]] = edited_text
-            return {**base, "mode": "atomic_evidence", **prompts}
+        if key in {'compact_events_system', 'snomed_mapping_system'}:
+            return {**base, 'mode':'snomed_extraction', 'prompt_key':key, 'system_prompt':edited_text}
 
         system, task = self._paired_prompts(key, edited_text)
         user_prompt = (
@@ -613,6 +580,8 @@ class PromptManagerDialog(QDialog):
         key = self._selected_key()
         document = self.preview_document_combo.currentData()
         role = _PROMPT_ROLE.get(key, "clinical_state")
+        if not prepare_pipeline(self._services, "prompt:" + key, self):
+            return
         client = self._services.get(_ROLE_SERVICE[role])
         if document is None or client is None:
             self._update_preview_availability()
@@ -627,6 +596,7 @@ class PromptManagerDialog(QDialog):
             f"Prova in corso con {getattr(client, 'model', 'modello locale')} "
             f"su {document.id} · {request['source_description']}…"
         )
+        request["shared_lexicon_repo"] = self._services.get("shared_lexicon_repo")
         worker = PromptPreviewWorker(client, request, self)
         self._preview_worker = worker
         worker.completed.connect(self._on_preview_completed)

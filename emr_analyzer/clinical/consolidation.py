@@ -1041,6 +1041,7 @@ def evidence_for_prompt(item: ClinicalEvidence) -> dict[str, Any]:
         "numeric_value": item.numeric_value,
         "unit": item.unit,
         "source_text": item.source_text,
+        "experiencer": item.data.get("experiencer", "patient"),
     }
     if not item.observed_date and item.document_date:
         payload["documented_date"] = item.document_date

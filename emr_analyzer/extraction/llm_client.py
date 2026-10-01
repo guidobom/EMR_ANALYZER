@@ -24,8 +24,9 @@ from .golden_fewshot import (
 class OutputLimitError(RuntimeError):
     """The server stopped because the request-specific output cap was hit."""
 
-    def __init__(self, max_tokens: int):
+    def __init__(self, max_tokens: int, partial_content: str = ""):
         self.max_tokens = int(max_tokens)
+        self.partial_content = partial_content
         super().__init__(
             "Il modello ha raggiunto il limite di token in output "
             f"(max_output_tokens={self.max_tokens})"
@@ -62,6 +63,7 @@ class LlmClient:
         self.top_p = config.top_p if config is not None else 0.9
         self.top_k = config.top_k if config is not None else 40
         self.seed = config.seed if config is not None else 42
+        self.thinking_enabled = config.thinking_enabled if config is not None else False
         self.keep_alive_minutes = (
             config.keep_alive_minutes if config is not None else 10
         )
@@ -413,10 +415,8 @@ class LlmClient:
                   max_tokens: int | None = None) -> str:
         """Internal: chat completion against the app-managed llama-server.
 
-        The server is spawned with ``-rea off`` and every request also sends
-        ``reasoning_effort: none``: reasoning text is not part of the
-        clinical document and wastes context on models with a thinking
-        channel (qwen3).
+        Thinking follows the pipeline configuration. Only the final answer
+        is consumed; the backend keeps reasoning separate from clinical JSON.
 
         ``seed``/``temperature`` override the configured generation
         parameters for this single call when given (used by corrective
@@ -433,6 +433,8 @@ class LlmClient:
                 self.max_output_tokens if max_tokens is None else max_tokens
             )
         )
+        self._generation_local.metadata = {}
+        self._generation_local.response_text = ''
         try:
             result = self.backend.chat(
                 self,
@@ -457,9 +459,24 @@ class LlmClient:
             **dict(result.get("usage") or {}),
             **dict(result.get("timings") or {}),
         }
+        self._generation_local.response_text = str(result.get('content') or '')
         if result.get("finish_reason") == "length":
-            raise OutputLimitError(request_max_tokens)
+            raise OutputLimitError(request_max_tokens, str(result.get("content") or ""))
         return str(result.get("content") or "")
+
+    def count_tokens(self, text: str) -> int:
+        counter = getattr(self.backend, "count_tokens", None)
+        if callable(counter):
+            return counter(text, self)
+        # A byte upper bound is deliberately conservative when a backend
+        # does not expose its tokenizer; do not guess Italian tokens/word.
+        return len(text.encode("utf-8"))
+
+    def count_prompt_tokens(self, prompt: str, system: str) -> int:
+        counter = getattr(self.backend, "count_prompt_tokens", None)
+        if callable(counter):
+            return counter(prompt, system, self)
+        return len((system + prompt).encode("utf-8")) + 256
 
     def generate_structured(self, prompt: str, system: str,
                             schema: dict,
@@ -489,6 +506,9 @@ class LlmClient:
             if match:
                 return json.loads(match.group(0))
             raise
+
+    def last_response_text(self) -> str:
+        return str(getattr(self._generation_local, 'response_text', ''))
 
     def last_generation_metadata(self) -> dict:
         """Return metrics for the last request made by the current thread."""
@@ -562,61 +582,6 @@ class LlmClient:
     # Clinical Timeline — strictly temporal extraction & deduplication
     # ------------------------------------------------------------------
 
-    _TIMELINE_EXTRACTION_SCHEMA = {
-        "type": "object",
-        "properties": {
-            "entries": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "date_observed": {
-                            "type": "string",
-                            "description": "Data di prima osservazione YYYY-MM-DD o YYYY-MM",
-                        },
-                        "date_resolved": {
-                            "type": ["string", "null"],
-                            "description": "Data di risoluzione se nota, altrimenti null",
-                        },
-                        "category": {
-                            "type": "string",
-                            "enum": [
-                                "diagnosis", "treatment", "procedure",
-                                "surgery", "toxicity", "adverse_event",
-                                "imaging_finding", "laboratory", "symptom",
-                                "hospitalization", "discharge", "follow_up",
-                                "other",
-                            ],
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Descrizione clinica concisa e accurata in italiano",
-                        },
-                        "status": {
-                            "type": "string",
-                            "enum": ["active", "resolved", "ongoing"],
-                            "description": "Stato dell'osservazione",
-                        },
-                        "source_text": {
-                            "type": "string",
-                            "description": "Testo originale dal documento che supporta questa osservazione",
-                        },
-                        "confidence": {
-                            "type": "number",
-                            "minimum": 0.0,
-                            "maximum": 1.0,
-                            "description": "Confidenza dell'estrazione (0.0-1.0)",
-                        },
-                    },
-                    "required": [
-                        "date_observed", "category", "description",
-                        "status", "source_text", "confidence",
-                    ],
-                },
-            }
-        },
-        "required": ["entries"],
-    }
 
     _TIMELINE_DEDUP_SCHEMA = {
         "type": "object",
@@ -662,333 +627,9 @@ class LlmClient:
         "required": ["deduplicated_entries", "removed_entry_ids", "merge_map"],
     }
 
-    def extract_timeline_entries(
-        self,
-        normalized_text: str,
-        registry_summary: str,
-        document_date: str | None = None,
-        max_text_chars: int | None = None,
-        *,
-        golden_examples: list[dict] | None = None,
-    ) -> dict:
-        """Extract clinical timeline entries from one normalized document.
 
-        Uses plain-text generation (no JSON schema enforcement) for broader
-        model compatibility, then parses the JSON block from the response.
-        Falls back gracefully on any parsing error.
 
-        The *max_text_chars* parameter controls how much text is sent to the
-        LLM.  When ``None`` (default), a budget is computed from the model's
-        ``context_length`` so the full prompt fits in the context window.
 
-        *golden_examples* are user-confirmed entries from OTHER patients,
-        injected as few-shot style references in the prompt.
-        """
-        system_prompt = (
-            "Sei un assistente clinico specializzato nell'estrazione di "
-            "informazioni cliniche rilevanti da documentazione medica in "
-            "lingua italiana. Lavori in modo conservativo: estrai solo "
-            "informazioni esplicitamente presenti nel testo, senza inferire, "
-            "interpretare o dedurre. Rispondi SOLO con un array JSON "
-            "circondato da ```json ... ```, senza altro testo."
-        )
-
-        doc_date_info = (
-            f"Il documento ha data {document_date}. "
-            if document_date else ""
-        )
-
-        # Compute a context-aware text budget when the caller doesn't
-        # specify an explicit limit.
-        if max_text_chars is None:
-            max_text_chars = self._compute_text_budget()
-
-        golden_section = format_examples_section(golden_examples)
-
-        user_prompt = f"""Analizza il seguente testo clinico ed estrai le osservazioni clinicamente rilevanti.
-
-{doc_date_info}
-
-REGISTRO CLINICO ATTUALE (per contesto — NON ri-estrarre osservazioni già presenti):
-{registry_summary if registry_summary else "(Nessuna informazione pregressa registrata)"}
-
-{golden_section}
-
-REGOLE GENERALI:
-1. Estrai SOLO informazioni esplicitamente presenti nel testo. Non dedurre, non interpretare.
-2. Ogni osservazione DEVE includere: date_observed, category, description, status, source_text, confidence.
-3. date_resolved e' opzionale (solo se il testo dice esplicitamente che la condizione si e' risolta).
-4. status: "active" (in corso), "resolved" (risolto), "ongoing" (cronico).
-5. NON aggiungere osservazioni gia' presenti nel registro.
-6. Descrizione concisa ma clinicamente precisa (1-3 frasi), includendo dettagli quantitativi quando disponibili.
-
-CATEGORIE SPECIFICHE:
-- diagnosis: diagnosi oncologiche e non, con stadio/grading se noto (es. "Melanoma dorsale, Breslow 2.7mm, Clark IV, BRAF mutato")
-- histopathology: referti istopatologici (esame istologico, biopsia, immunoistochimica, marcatori molecolari)
-- treatment: terapie farmacologiche con farmaco, dose, via, frequenza, data inizio (es. "Pembrolizumab 180 mg ev ogni 3 settimane dal 24/10/2017")
-- treatment_interruption: sospensione/interruzione di una terapia con motivazione
-- procedure: procedure diagnostiche o terapeutiche (es. EGDS, endoscopia)
-- surgery: interventi chirurgici con data e tipo (es. "Asportazione melanoma dorsale + dissezione ascellare, 2013")
-- toxicity: tossicità da trattamento con grado CTCAE se noto
-- adverse_event: eventi avversi non necessariamente correlati al trattamento
-- imaging_finding: referti radiologici (TC, PET, RM, eco) con sede, esito, RECIST se riportato (es. "TC total-body: progressione, settembre 2017")
-- laboratory: SOLO valori di laboratorio ALTERATI (fuori range), includere parametro, valore, unità e range se disponibili
-- biomarker: biomarcatori molecolari e loro valore/presenza (es. "BRAF V600E mutato", "PD-L1 60%")
-- symptom: sintomi clinicamente rilevanti
-- hospitalization: ricoveri ospedalieri con motivo e reparto
-- discharge: lettere di dimissione
-- follow_up: appuntamenti di controllo programmati
-- progression: progressione di malattia documentata
-- response: risposta a trattamento (risposta completa, parziale, stabilità, progressione)
-- other: altre informazioni clinicamente rilevanti
-
-FORMATO RISPOSTA (ESATTAMENTE così):
-```json
-[
-  {{
-    "date_observed": "2024-03-15",
-    "date_resolved": null,
-    "category": "treatment",
-    "description": "Pembrolizumab 180 mg ev ogni 3 settimane",
-    "status": "active",
-    "source_text": "Dal 24.10.2017 inizia PEMBROLIZUMAB 180 mg ogni 3 settimane",
-    "confidence": 0.9
-  }}
-]
-```
-
-TESTO DA ANALIZZARE:
-{normalized_text[:max_text_chars]}
-"""
-        try:
-            raw = self.generate_text(user_prompt, system_prompt)
-            entries = self._parse_json_entries(raw)
-            if not entries and raw.strip():
-                # Log the raw response when parsing produced nothing
-                import sys as _sys
-                preview = raw[:500].replace("\n", "\\n")
-                print(
-                    f"[extract_timeline_entries] LLM returned "
-                    f"{len(raw)} chars but parsed 0 entries. "
-                    f"Raw preview: {preview}",
-                    file=_sys.stderr,
-                )
-            return {"entries": entries}
-        except Exception as exc:
-            import sys as _sys
-            print(
-                f"[extract_timeline_entries] Error: {exc}",
-                file=_sys.stderr,
-            )
-            return {"entries": []}
-
-    def extract_from_discharge_letter(
-        self,
-        normalized_text: str,
-        document_date: str | None = None,
-        registry_summary: str = "",
-        max_text_chars: int = 50000,
-        *,
-        golden_examples: list[dict] | None = None,
-    ) -> dict:
-        """Extract clinical events from a pre-acute discharge letter.
-
-        Uses a specialised prompt that understands the typical structure of
-        an Italian discharge letter from a post-acute / rehabilitation ward:
-        admission diagnosis, clinical course, therapies, consultations,
-        adverse events, discharge outcome, and follow-up plan.
-
-        *golden_examples* are user-confirmed entries from OTHER patients,
-        injected as few-shot style references (filtered to the discharge
-        category set).
-
-        Returns a dict with key ``"entries"`` containing timeline-ready dicts.
-        """
-        import re as _re
-
-        text_budget = max(
-            4000, min(max_text_chars, len(normalized_text))
-        )
-        doc_date_info = (
-            f"Il documento ha data {document_date}. "
-            if document_date else ""
-        )
-        system_prompt = (
-            "Sei un medico che estrae eventi clinici strutturati da una "
-            "LETTERA DI DIMISSIONE da un reparto di degenza pre-acuti o "
-            "post-acuti (lungodegenza, riabilitazione). Lavori in modo "
-            "conservativo: estrai solo informazioni esplicitamente presenti "
-            "nel testo. Rispondi SOLO con un array JSON circondato da "
-            "```json ... ```, senza altro testo."
-        )
-
-        golden_section = format_examples_section(
-            golden_examples,
-            allowed_categories=DISCHARGE_ALLOWED_CATEGORIES,
-        )
-
-        user_prompt = f"""Analizza la seguente LETTERA DI DIMISSIONE ed estrai gli eventi clinicamente rilevanti.
-
-{doc_date_info}
-
-REGISTRO CLINICO ATTUALE (per contesto — NON ri-estrarre osservazioni già presenti):
-{registry_summary if registry_summary else "(Nessuna informazione pregressa registrata)"}
-
-{golden_section}
-
-STRUTTURA TIPICA DI UNA LETTERA DI DIMISSIONE PRE-ACUTI:
-1. Diagnosi di ingresso e diagnosi alla dimissione
-2. Motivo del ricovero
-3. Decorso clinico (sintesi)
-4. Terapie somministrate durante il ricovero
-5. Eventi avversi o complicanze insorte
-6. Consulenze specialistiche richieste
-7. Outcome alla dimissione (migliorato, stabile, trasferito)
-8. Terapia prescritta alla dimissione
-9. Piano di follow-up
-
-REGOLE OBBLIGATORIE:
-- Estrai SOLO informazioni esplicitamente presenti nel testo. Non dedurre, non interpretare.
-- Per il DECORSO CLINICO: NON estrarre ogni giorno come evento separato.
-  Sintetizza in 1-3 eventi clinicamente significativi (es. "Miglioramento
-  progressivo delle condizioni generali", "Complicanza respiratoria in
-  giornata X con avvio ossigenoterapia", "Trasferimento in riabilitazione").
-- Per le TERAPIE: includi farmaco, dose, via di somministrazione, data inizio
-  e data fine/modifica se disponibili. Distingui tra terapia somministrata
-  durante il ricovero e terapia prescritta alla dimissione.
-- Per gli EVENTI AVVERSI: includi tipo, data, gestione intrapresa.
-- Per le CONSULENZE: includi specialità, data, quesito e risposta se presenti.
-- Per le DIAGNOSI: distinguere diagnosi di ingresso, diagnosi alla dimissione
-  e diagnosi secondarie. Includere stadio/grading se noto.
-- Ogni evento DEVE includere source_text (citazione letterale dal documento).
-- NON aggiungere osservazioni già presenti nel registro clinico.
-- Descrizione concisa ma clinicamente precisa (1-3 frasi).
-
-CATEGORIE (usa una di queste per ogni evento):
-- diagnosis: diagnosi (ingresso, dimissione, secondaria)
-- treatment: terapia farmacologica iniziata o somministrata
-- treatment_completed: terapia completata o sospesa
-- procedure: procedura diagnostica o terapeutica
-- surgery: intervento chirurgico
-- toxicity: tossicità da trattamento
-- adverse_event: evento avverso o complicanza
-- consultation: consulenza specialistica
-- imaging_finding: reperto radiologico significativo
-- laboratory: alterazione significativa di esami di laboratorio
-- hospitalization: ricovero (data ingresso, reparto, motivo)
-- discharge: dimissione (data, outcome, destinazione)
-- follow_up: appuntamento di controllo o follow-up programmato
-- other: altro evento clinicamente rilevante
-
-FORMATO RISPOSTA (ESATTAMENTE così):
-```json
-[
-  {{
-    "date_observed": "2024-03-15",
-    "date_resolved": null,
-    "category": "discharge",
-    "description": "Dimissione con outcome migliorato. Destinazione: domicilio con attivazione ADI.",
-    "status": "resolved",
-    "source_text": "Il paziente viene dimesso in data 15/03/2024 con outcome migliorato",
-    "confidence": 0.95
-  }}
-]
-```
-
-TESTO DA ANALIZZARE:
-{normalized_text[:text_budget]}
-"""
-        try:
-            raw = self.generate_text(user_prompt, system_prompt)
-            entries = self._parse_json_entries(raw)
-            if not entries and raw.strip():
-                import sys as _sys
-                preview = raw[:500].replace("\n", "\\n")
-                print(
-                    f"[extract_from_discharge_letter] LLM returned "
-                    f"{len(raw)} chars but parsed 0 entries. "
-                    f"Raw preview: {preview}",
-                    file=_sys.stderr,
-                )
-            return {"entries": entries}
-        except Exception as exc:
-            import sys as _sys
-            print(
-                f"[extract_from_discharge_letter] Error: {exc}",
-                file=_sys.stderr,
-            )
-            return {"entries": []}
-
-    def _compute_text_budget(self) -> int:
-        """Estimate how many characters of source text fit in the context.
-
-        Reserve tokens for the system prompt, the user-prompt template,
-        the registry summary, and the output (max_output_tokens).  The
-        remainder is converted to characters using a conservative 2.5
-        chars-per-token estimate.
-        """
-        ctx = self.context_length or 32768
-        output_reserve = min(
-            self.max_output_tokens or 4096, max(512, ctx // 2)
-        )
-        # Prompt template overhead (system + instructions + registry):
-        # empirically ~2 500 tokens for the full timeline-extraction template.
-        prompt_overhead_tokens = 2500
-        available_tokens = max(
-            480, ctx - output_reserve - prompt_overhead_tokens
-        )
-        chars_per_token = 2.5
-        return max(4000, int(available_tokens * chars_per_token))
-
-    @staticmethod
-    def _parse_json_entries(raw: str) -> list[dict]:
-        """Extract a JSON array from an LLM response.
-
-        Handles ```json fences, stray whitespace, and missing outer brackets.
-        Returns an empty list on any parse failure.
-        """
-        import json as _json
-        import re as _re
-
-        if not raw or not raw.strip():
-            return []
-
-        text = raw.strip()
-
-        # Try to extract from ```json ... ``` fence
-        m = _re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-        if m:
-            text = m.group(1).strip()
-
-        # Remove any leading/trailing non-JSON text
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            text = text[start:end + 1]
-
-        try:
-            parsed = _json.loads(text)
-            if isinstance(parsed, list):
-                # Validate each entry has required fields
-                valid = []
-                for item in parsed:
-                    if isinstance(item, dict) and "description" in item:
-                        valid.append(item)
-                return valid
-            elif isinstance(parsed, dict) and isinstance(
-                parsed.get("entries"), list
-            ):
-                # Validate like the list branch: a non-list (e.g. None) here
-                # would crash the caller's iteration.
-                valid = []
-                for item in parsed["entries"]:
-                    if isinstance(item, dict) and "description" in item:
-                        valid.append(item)
-                return valid
-        except (_json.JSONDecodeError, ValueError):
-            pass
-
-        return []
 
     _DEDUP_BATCH_SIZE_MIN = 20
     _DEDUP_BATCH_SIZE_MAX = 120

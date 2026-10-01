@@ -13,7 +13,8 @@ import statistics
 import time
 from typing import Callable, Iterable
 
-from ..clinical.atomic_evidence import AtomicEvidenceExtractor
+from ..clinical.event_extraction import EventExtractor
+from ..clinical.grounded_sources import IncompleteAtomicExtraction
 from ..extraction.llm_client import LlmClient
 from ..settings import LLMRoleConfig
 from .hardware import get_safe_max_workers
@@ -146,6 +147,18 @@ def choose_slot_benchmark_result(
     )
 
 
+def _benchmark_error(exc: Exception) -> str:
+    if isinstance(exc, IncompleteAtomicExtraction):
+        errors = list(dict.fromkeys(
+            str(error) for issue in exc.issues for error in issue.get("errors", [])
+        ))
+        details = "; ".join(errors)[:800]
+        return ("Validazione dell’estrazione sintetica fallita"
+                + (f": {details}" if details else f" ({len(exc.issues)} problemi)")
+                + ". Questo risultato non dimostra un problema degli slot.")
+    return str(exc)
+
+
 def benchmark_atomic_slots(
     config: LLMRoleConfig,
     *,
@@ -153,7 +166,7 @@ def benchmark_atomic_slots(
     progress_callback: Callable[[str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     client_factory=LlmClient,
-    extractor_factory=AtomicEvidenceExtractor,
+    extractor_factory=None,
 ) -> SlotBenchmarkResult:
     """Measure atomic extraction throughput for several llama-server shapes.
 
@@ -172,6 +185,13 @@ def benchmark_atomic_slots(
     if not selected_candidates:
         raise ValueError("Nessun numero di slot compatibile da misurare")
 
+    if extractor_factory is None:
+        # Fixed synthetic lexicon: no patient documents or shared examples are
+        # read for hardware tuning. Exercise the actual closed-catalog engine.
+        labels = ('Melanoma', 'Dispnea', 'Desaturazione', 'Opacità polmonari', 'Terapia farmacologica')
+        catalog = [dict(term_id=f'benchmark-{i}', label=label,
+                        definition='', fields=[], examples=[]) for i, label in enumerate(labels)]
+        extractor_factory = lambda client: EventExtractor(client, catalog=catalog)
     samples: list[SlotBenchmarkSample] = []
     for candidate_index, slots in enumerate(selected_candidates, start=1):
         if cancel_check is not None and cancel_check():
@@ -256,7 +276,7 @@ def benchmark_atomic_slots(
                             metrics.get("unresolved_invalid_items") or 0
                         )
                     except Exception as exc:  # report every failed request
-                        errors.append(str(exc))
+                        errors.append(_benchmark_error(exc))
             elapsed = max(0.001, time.perf_counter() - started)
             completed = len(evidence_counts)
             samples.append(SlotBenchmarkSample(
@@ -291,7 +311,7 @@ def benchmark_atomic_slots(
                 completion_tokens_per_second=0.0,
                 quality_score=0.0,
                 median_evidence_count=0.0,
-                error=str(exc),
+                error=_benchmark_error(exc),
             ))
         finally:
             # Do not leave multiple benchmark shapes (and therefore duplicate

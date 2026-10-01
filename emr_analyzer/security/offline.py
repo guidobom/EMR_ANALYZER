@@ -134,16 +134,3 @@ class OfflinePolicy:
             raise OfflineViolation("Unsupported network address in offline mode")
         if not is_loopback_host(address[0]):
             raise OfflineViolation("Outbound network access is blocked in clinical mode")
-
-    @classmethod
-    def _reset_for_tests(cls) -> None:
-        """Restore socket functions. Intended only for isolated tests."""
-
-        with cls._lock:
-            if not cls._installed:
-                return
-            socket.socket.connect = cls._original_connect
-            socket.socket.connect_ex = cls._original_connect_ex
-            socket.create_connection = cls._original_create_connection
-            socket.getaddrinfo = cls._original_getaddrinfo
-            cls._installed = False

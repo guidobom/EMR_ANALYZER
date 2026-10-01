@@ -47,6 +47,8 @@ def _context_score(
     evidence_by_id: dict[str, ClinicalEvidence],
 ) -> int:
     """Conservative compatibility score for a normal/negative observation."""
+    if item.data.get("experiencer", "patient") != "patient":
+        return 0
     item_entity = canonicalize_entity(item.normalized_entity)
     event_entity = canonicalize_entity(bundle.event.canonical_entity)
     exact_entity = bool(item_entity and item_entity == event_entity)

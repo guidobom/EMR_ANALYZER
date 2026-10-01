@@ -6,7 +6,7 @@ from PyQt5.QtCore import Qt
 
 from .config import (
     APP_NAME, APP_VERSION, active_workspace, CACHE_DIR, LOG_DIR,
-    OFFLINE_MODE,
+    OFFLINE_MODE, SHARED_LEXICON_PATH,
 )
 from .security.offline import OfflinePolicy
 from .database.engine import DatabaseEngine
@@ -148,6 +148,10 @@ class EMRAnalyzerApp:
             "pipeline_repo": pipeline_repo,
             "gold_set_repo": gold_set_repo,
         })
+        from .database.shared_lexicon_repo import SharedLexiconRepository
+        shared_lexicon = SharedLexiconRepository(db, active_workspace.path, SHARED_LEXICON_PATH)
+        self._services["shared_lexicon_repo"] = shared_lexicon
+        self._qapp.aboutToQuit.connect(shared_lexicon.close)
         print(f"  ✓ Repositories initialized")
 
         # ---- Deterministic PDF parsing ----
@@ -261,6 +265,7 @@ class EMRAnalyzerApp:
 
         # ---- Clinical components ----
         registry_builder = ClinicalRegistryBuilder(
+            shared_lexicon_repo=shared_lexicon,
             registry_repo=registry_repo,
             evidence_repo=evidence_repo,
             processing_repo=processing_repo,

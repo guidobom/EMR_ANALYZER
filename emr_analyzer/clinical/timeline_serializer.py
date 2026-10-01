@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 
-from .atomic_evidence import deduplicate_atomic_evidence
+from .evidence_utils import deduplicate_atomic_evidence
 from .temporal import date_sort_key
 
 _FACT_TYPE_LABELS = {

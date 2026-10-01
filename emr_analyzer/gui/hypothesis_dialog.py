@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
+from .pipeline_llm import prepare_pipeline
 from ..clinical.hypothesis_discovery import HypothesisDiscovery
 
 
@@ -117,6 +118,8 @@ class HypothesisDialog(QDialog):
 
     def _run_discovery(self) -> None:
         if self._worker and self._worker.isRunning():
+            return
+        if not prepare_pipeline(self.services, 'hypotheses', self):
             return
         llm = self.services.get("clinical_events_llm_client")
         discovery = HypothesisDiscovery(

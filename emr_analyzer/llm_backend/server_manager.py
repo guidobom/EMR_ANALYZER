@@ -267,8 +267,8 @@ class ServerManager:
         parallel slots (verified against llama-server build 10470): to give
         every request the full configured context the total must be
         ``ctx_size * np``.  KV cache is quantized to q8_0 (≈ half the RAM of
-        f16 with negligible quality loss).  ``-rea off`` disables the
-        thinking channel for models that support it (qwen3).
+        f16 with negligible quality loss). Thinking is selected per request,
+        allowing pipelines with different choices to share one server.
         """
         port = self._allocate_port()
         argv = [
@@ -281,7 +281,8 @@ class ServerManager:
             "-ngl", "all",
             "-ctk", "q8_0",
             "-ctv", "q8_0",
-            "-rea", "off",
+            "-rea", "auto",
+            "--jinja",
         ]
         if key.speculative_mode == "ngram-cache":
             # Draft tokens are always checked by the target model.  This can

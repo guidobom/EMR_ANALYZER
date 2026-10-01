@@ -51,6 +51,7 @@ class LLMRoleConfig:
     # Target-verified n-gram speculative decoding in llama.cpp. Disabled by
     # default until benchmarked on the local machine.
     speculative_decoding: bool = False
+    thinking_enabled: bool = False
     # vLLM-only engine parameters.  They are harmless when llama.cpp is
     # selected and therefore make role settings fully round-trippable when
     # switching between the two backends.
@@ -118,6 +119,7 @@ class LLMRoleConfig:
             keep_alive_minutes=integer("keep_alive_minutes", 0, 1440),
             parallel_workers=integer("parallel_workers", 1, 8),
             speculative_decoding=boolean("speculative_decoding"),
+            thinking_enabled=boolean("thinking_enabled"),
             vllm_dtype=dtype,
             vllm_gpu_memory_utilization=floating(
                 "vllm_gpu_memory_utilization", 0.05, 0.99
@@ -429,9 +431,6 @@ class ClinicalPipelinePolicy:
     cohesive_threshold: float = 0.72
     bridge_split_threshold: float = 0.58
     lab: LabEvidencePolicy = field(default_factory=LabEvidencePolicy)
-    atomic_strategy: str = "chunked"
-    atomic_sentence_context: int = 1
-    atomic_sentence_workers: int = 4
     embedding_dedup_enabled: bool = True
     embedding_threshold: float = 0.86
     embedding_model: str = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -448,11 +447,6 @@ class ClinicalPipelinePolicy:
         ).strip().casefold()
         if aggregation_engine not in {"v3", "v4"}:
             aggregation_engine = "v3"
-        atomic_strategy = str(
-            payload.get("atomic_strategy", "chunked")
-        ).strip().casefold()
-        if atomic_strategy not in {"chunked", "sentence"}:
-            atomic_strategy = "chunked"
         embedding_enabled_value = payload.get(
             "embedding_dedup_enabled", True
         )
@@ -507,13 +501,6 @@ class ClinicalPipelinePolicy:
             cohesive_threshold=floating("cohesive_threshold", 0.72),
             bridge_split_threshold=floating("bridge_split_threshold", 0.58),
             lab=LabEvidencePolicy.from_dict(payload.get("lab", {})),
-            atomic_strategy=atomic_strategy,
-            atomic_sentence_context=integer(
-                "atomic_sentence_context", 1, 0, 3
-            ),
-            atomic_sentence_workers=integer(
-                "atomic_sentence_workers", 4, 1, 8
-            ),
             embedding_dedup_enabled=embedding_enabled,
             embedding_threshold=embedding_threshold,
             embedding_model=embedding_model,
@@ -539,4 +526,29 @@ def save_pipeline_policy(
     temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    temporary.replace(settings_path)
+
+
+def load_pipeline_llm_config(key: str, default: LLMRoleConfig,
+                             path: str | Path = SETTINGS_PATH) -> LLMRoleConfig:
+    """Read the last confirmed selection for this exact user-facing pipeline."""
+    presets = _read_payload(Path(path)).get("pipeline_llm", {})
+    payload = presets.get(key, {}) if isinstance(presets, dict) else {}
+    return LLMRoleConfig.from_dict(payload, default)
+
+
+def save_pipeline_llm_config(key: str, config: LLMRoleConfig,
+                             path: str | Path = SETTINGS_PATH) -> None:
+    """Persist one preset without changing legacy roles or other settings."""
+    if not isinstance(config, LLMRoleConfig):
+        raise TypeError("Configurazione LLM non valida")
+    settings_path = Path(path)
+    payload = _read_payload(settings_path)
+    presets = payload.get("pipeline_llm", {})
+    presets = dict(presets) if isinstance(presets, dict) else {}
+    presets[key] = config.to_dict()
+    payload["pipeline_llm"] = presets
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(settings_path)

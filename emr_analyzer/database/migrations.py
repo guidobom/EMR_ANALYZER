@@ -5,7 +5,7 @@ import re
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 21
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -865,12 +865,43 @@ INDEXES_SQL = [
 ]
 
 
+CREATE_TABLES_SQL += [
+    """CREATE TABLE IF NOT EXISTS atomic_group_results (
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        request_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        result_json TEXT NOT NULL DEFAULT '[]',
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        error_message TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(document_id, request_key)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_atomic_group_cache
+       ON atomic_group_results(patient_id, request_key, status)""",
+    """CREATE TABLE IF NOT EXISTS atomic_group_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        request_key TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        status TEXT NOT NULL,
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+    )""",
+]
+
+
 def init_database(db: DatabaseEngine) -> None:
     """Create all tables and indexes if they don't exist."""
     from datetime import datetime
 
     with db:
         for sql in CREATE_TABLES_SQL:
+            db.execute(sql)
+
+        from .local_lexicon_repo import SCHEMA as LOCAL_LEXICON_SCHEMA
+        for sql in LOCAL_LEXICON_SCHEMA:
             db.execute(sql)
 
         # ---- Schema migrations (safe ALTER TABLE) -------------------------
@@ -1122,6 +1153,9 @@ def reset_stale_processing(db: DatabaseEngine) -> None:
 def drop_all_tables(db: DatabaseEngine) -> None:
     """Drop all tables (for testing/reset). Use with caution."""
     tables = [
+        "local_lexicon_examples", "local_example_roles", "local_event_definitions",
+        "local_lexicon_annotations", "local_lexicon_terms", "local_lexicon_identity",
+        "atomic_group_calls", "atomic_group_results",
         "clinical_events_fts", "clinical_event_relations",
         "clinical_event_claim_sources", "clinical_event_claims",
         "clinical_hypotheses", "evidence_relations",

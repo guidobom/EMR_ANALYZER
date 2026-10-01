@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit, QPushButton, QTextBrowser,
 )
 
+from .pipeline_llm import prepare_pipeline
 from ..clinical.dossier_query import (
     DossierQueryService, QueryCancelled, render_report, summarize_cohort,
 )
@@ -162,6 +163,10 @@ class DossierQueryDialog(QDialog):
         ids = [self.patients.item(i).data(Qt.UserRole) for i in range(self.patients.count())
                if self.patients.item(i).checkState() == Qt.Checked]
         question = self.question.toPlainText().strip()
+        if not ids or not question:
+            self.status.setText('Seleziona almeno un paziente e scrivi una domanda.'); return
+        if not prepare_pipeline(self.services, 'dossier_query', self):
+            return
         llm = self.services.get("clinical_state_llm_client")
         if not ids or not question or llm is None:
             self.status.setText("Seleziona almeno un paziente, scrivi una domanda e configura il modello di analisi.")

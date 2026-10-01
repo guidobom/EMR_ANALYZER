@@ -36,58 +36,6 @@
       "minimum_length": 200
     },
     {
-      "key": "atomic_evidence_system",
-      "label": "Evidenze atomiche — ruolo",
-      "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v12",
-      "minimum_length": 80
-    },
-    {
-      "key": "atomic_evidence_it",
-      "label": "Evidenze atomiche — istruzioni complete",
-      "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v12",
-      "required_markers": [
-        "Vincoli obbligatori",
-        "source_refs",
-        "laboratory_test"
-      ],
-      "minimum_length": 400
-    },
-    {
-      "key": "atomic_evidence_repair_system",
-      "label": "Evidenze atomiche — riparazione",
-      "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v12",
-      "minimum_length": 80
-    },
-    {
-      "key": "atomic_evidence_coverage_system",
-      "label": "Evidenze atomiche — recupero copertura",
-      "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v12",
-      "minimum_length": 80
-    },
-    {
-      "key": "atomic_evidence_sentence_system",
-      "label": "Evidenze atomiche frase — ruolo",
-      "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v13",
-      "minimum_length": 80
-    },
-    {
-      "key": "atomic_evidence_sentence_it",
-      "label": "Evidenze atomiche frase — istruzioni complete",
-      "pipeline": "2 · Estrazione evidenze atomiche",
-      "institutional_version": "institutional-v13",
-      "required_markers": [
-        "Vincoli obbligatori",
-        "source_refs",
-        "laboratory_test"
-      ],
-      "minimum_length": 400
-    },
-    {
       "key": "clinical_fusion_system",
       "label": "Fusione eventi clinici — ruolo",
       "pipeline": "3 · Creazione eventi clinici",
@@ -186,6 +134,42 @@
         "tabella Markdown"
       ],
       "minimum_length": 80
+    },
+    {
+      "key": "snomed_mentions_system",
+      "label": "SNOMED — estrazione delle menzioni",
+      "pipeline": "2 · Evidenze atomiche SNOMED",
+      "institutional_version": "institutional-v1",
+      "required_markers": [
+        "OBIETTIVO",
+        "assertion"
+      ],
+      "minimum_length": 300
+    },
+    {
+      "key": "snomed_mapping_system",
+      "label": "SNOMED — selezione dei candidati",
+      "pipeline": "2 · Evidenze atomiche SNOMED",
+      "institutional_version": "institutional-v2",
+      "required_markers": [
+        "SNOMED",
+        "candidati"
+      ],
+      "minimum_length": 300
+    },
+    {
+      "key": "compact_events_system",
+      "label": "Eventi clinici — annotazione compatta",
+      "pipeline": "2 · Registro FHIR",
+      "institutional_version": "institutional-v4",
+      "minimum_length": 100
+    },
+    {
+      "key": "event_relations_system",
+      "label": "Eventi clinici — relazioni mirate",
+      "pipeline": "2 · Registro FHIR",
+      "institutional_version": "institutional-v1",
+      "minimum_length": 100
     }
   ]
 }

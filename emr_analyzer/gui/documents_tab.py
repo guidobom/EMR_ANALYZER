@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer, QUrl
 from PyQt5.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 
+from .pipeline_llm import prepare_pipeline
 from ..models.document import DocumentType, ParsingStatus, ExtractionStatus
 from ..extraction.clinical_text_result import ClinicalTextIsolationError
 from ..config import ATTRIBUTION_VERIFICATION_ENABLED
@@ -150,8 +151,10 @@ class DocumentsTab(QWidget):
 
         mark_shutdown_requested()
 
-    def _process_documents_with_busy_state(self, *args, **kwargs):
+    def _process_documents_with_busy_state(self, *args, llm_prepared=False, **kwargs):
         """Run a document batch while runtime changes are blocked."""
+        if not llm_prepared and not prepare_pipeline(self._services, 'documents', self):
+            return
         self._llm_processing_depth += 1
         try:
             return self._process_documents(*args, **kwargs)
@@ -363,12 +366,14 @@ class DocumentsTab(QWidget):
             self.import_requested.emit(files)
 
     def extract_clinical_text(self, doc_ids=None, progress=None,
-                              patient_label=None):
+                              patient_label=None, llm_prepared=False):
         """Track the complete extraction operation for application shutdown."""
 
         from .application_shutdown import shutdown_requested
 
         if shutdown_requested():
+            return
+        if not llm_prepared and not prepare_pipeline(self._services, 'documents', self):
             return
         self._processing_depth += 1
         try:
@@ -442,7 +447,7 @@ class DocumentsTab(QWidget):
         ids = parsed + to_parse
         if ids:
             self._process_documents_with_busy_state(
-                ids, progress=progress
+                ids, progress=progress, llm_prepared=True
             )
 
     def _get_selected_doc_ids(self) -> list[str]:

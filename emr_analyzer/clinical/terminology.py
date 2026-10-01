@@ -36,7 +36,7 @@ _LOINC_LAB = {
     ),
     "creatinina": (
         "Creatinine [Mass/volume] in Serum or Plasma", "2160-0",
-        {"mg/dL", "mg/L", "μmol/L"},
+        {"mg/dL", "mg/L"},
     ),
     "proteina_c_reattiva": (
         "C reactive protein [Mass/volume] in Serum or Plasma", "1988-5",
@@ -72,6 +72,24 @@ class DeterministicTerminologyResolver:
         return [self.resolve(item) for item in evidence]
 
     def resolve(self, item):
+        if item.data.get("lexicon_term_id") or item.data.get("fhir_pipeline"):
+            return item
+        if "icd11" in item.data:
+            # LOINC describes the observation; it cannot overwrite the ICD finding.
+            if item.fact_type == "laboratory_test":
+                payload = item.typed_payload or {}
+                specimen = str(payload.get("biological_material") or "").casefold()
+                if specimen:
+                    mapping = self._builtin_lab_mapping(item.normalized_entity, item.unit)
+                    if mapping is not None:
+                        urinary = "urine" in item.normalized_entity
+                        blood = item.normalized_entity in {"emoglobina", "globuli_bianchi"}
+                        compatible = ("urin" in specimen if urinary else
+                                      any(s in specimen for s in (("sangue", "blood") if blood else
+                                                                 ("siero", "plasma", "serum"))))
+                        if compatible:
+                            item.data["loinc"] = asdict(mapping)
+            return item
         original_unit = str(item.unit or "")
         if item.fact_type == "laboratory_test" or item.category == (
             "laboratory_finding"

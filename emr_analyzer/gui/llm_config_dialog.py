@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from ..extraction.llm_client import LlmClient
@@ -61,14 +62,22 @@ class LLMConfigDialog(QDialog):
         configs: dict[str, LLMRoleConfig],
         available_models: list[str],
         parent=None,
+        *, role: str | None = None, pipeline_title: str | None = None,
+        enable_slot_benchmark: bool = True,
     ):
         super().__init__(parent)
         self.setWindowTitle("Configura LLM locali")
         self.setMinimumWidth(900)
         self.resize(980, 850)
         configs = dict(configs)
-        for role in ("atomic_evidence", "clinical_events"):
-            configs.setdefault(role, configs["clinical_state"])
+        self._slot_benchmark_enabled = enable_slot_benchmark
+        self._launch_role = role
+        if role is None:
+            for fallback_role in ("atomic_evidence", "clinical_events"):
+                configs.setdefault(fallback_role, configs["clinical_state"])
+        else:
+            configs = {role: configs[role]}
+            self.setWindowTitle(pipeline_title or ROLE_DEFINITIONS[role][0])
         self._initial_configs = dict(configs)
         self._installed_models = set(available_models)  # GGUF / llama.cpp
         try:
@@ -118,6 +127,10 @@ class LLMConfigDialog(QDialog):
                 "~/.emr_analyzer/models.\n"
                 "Usa “Scarica o importa modelli” per aggiungere un GGUF."
             )
+        if self._launch_role is not None:
+            intro.setText("Scegli il modello e i parametri per questa analisi. "
+                          "La selezione verrà ricordata solo per questa pipeline, "
+                          "anche alla prossima sessione. Annulla non avvia l’analisi.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -189,11 +202,14 @@ class LLMConfigDialog(QDialog):
         self._update_model_count_label()
 
         self._role_tabs = QTabWidget()
-        for role in MODEL_ROLES:
+        for role in (MODEL_ROLES if self._launch_role is None else configs):
             self._role_tabs.addTab(
                 self._build_role_group(role, configs[role]),
                 ROLE_TAB_LABELS[role],
             )
+        if self._launch_role is not None:
+            self._role_tabs.tabBar().hide()
+            self._role_tabs.widget(0).setTitle(pipeline_title or "Modello e parametri")
         layout.addWidget(self._role_tabs, stretch=1)
 
         runtime_box = QGroupBox("Server LLM locali fisici")
@@ -226,12 +242,23 @@ class LLMConfigDialog(QDialog):
         self._slots_label = QLabel("Slot reali: —")
         self._slots_label.setStyleSheet("color: #5d6d7e;")
         gpu_actions.addWidget(self._slots_label)
-        layout.addLayout(gpu_actions)
+        gpu_box = QWidget()
+        gpu_box.setLayout(gpu_actions)
+        layout.addWidget(gpu_box)
+        if self._launch_role is not None:
+            advanced = QCheckBox("Mostra gestione del motore e diagnostica")
+            for box in (server_box, acceleration_box, runtime_box, gpu_box):
+                box.hide()
+                advanced.toggled.connect(box.setVisible)
+            layout.addWidget(advanced)
+            self.resize(980, 690)
 
         self._buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel
         )
-        self._buttons.button(QDialogButtonBox.Save).setText("Salva e applica")
+        self._buttons.button(QDialogButtonBox.Save).setText(
+            "Avvia analisi" if self._launch_role is not None else "Salva e applica"
+        )
         self._buttons.button(QDialogButtonBox.Cancel).setText("Annulla")
         self._buttons.accepted.connect(self.accept)
         self._buttons.rejected.connect(self.reject)
@@ -514,7 +541,7 @@ class LLMConfigDialog(QDialog):
         test_button = QPushButton("▶ Carica e testa")
         optimize_button = QPushButton("⚡ Ottimizza")
         benchmark_button = QPushButton("⏱ Misura slot")
-        benchmark_button.setVisible(role == "atomic_evidence")
+        benchmark_button.setVisible(role == "atomic_evidence" and self._slot_benchmark_enabled)
         benchmark_button.setToolTip(
             "Misura 4/6/8 slot, entro la capacità RAM stimata, usando il "
             "vero estrattore su un testo clinico sintetico. Ferma i runtime "
@@ -601,7 +628,7 @@ class LLMConfigDialog(QDialog):
         grid.addWidget(temperature, 4, 1)
         grid.addWidget(QLabel("Contesto:"), 4, 3)
         grid.addWidget(context, 4, 4, 1, 2)
-        grid.addWidget(QLabel("Token risposta (massimo):"), 5, 0)
+        grid.addWidget(QLabel("Token massimi risposta:"), 5, 0)
         grid.addWidget(output, 5, 1)
         grid.addWidget(QLabel("Top-p:"), 5, 3)
         grid.addWidget(top_p, 5, 4, 1, 2)
@@ -642,7 +669,7 @@ class LLMConfigDialog(QDialog):
             workers_info = QLabel("")
             workers_info.setWordWrap(True)
             workers_info.setStyleSheet("color: #5d6d7e; font-size: 11px;")
-            grid.addWidget(QLabel("Richieste parallele (slot):"), 9, 0)
+            grid.addWidget(QLabel("Slot simultanei:"), 9, 0)
             grid.addWidget(workers_combo, 9, 1)
             grid.addWidget(workers_info, 9, 3, 1, 3)
             grid.addWidget(benchmark_button, 9, 6)
@@ -656,7 +683,25 @@ class LLMConfigDialog(QDialog):
             "verifica ogni token prima di accettarlo. Può accelerare il JSON "
             "clinico, ma va misurato sul computer locale."
         )
-        grid.addWidget(speculative, 10, 0, 1, 6)
+        thinking = QComboBox()
+        thinking.addItem("No thinking", False)
+        thinking.addItem("Thinking", True)
+        thinking.setCurrentIndex(1 if config.thinking_enabled else 0)
+        thinking.setToolTip(
+            "Attiva il ragionamento nei modelli che lo supportano. "
+            "Può aumentare i tempi e usa parte dei token massimi di risposta. "
+            "La scelta viene ricordata per questa pipeline. "
+            "Disponibile con il motore locale llama.cpp/GGUF; vLLM usa No thinking."
+        )
+        grid.addWidget(QLabel("Modalità di ragionamento:"), 10, 0)
+        grid.addWidget(thinking, 10, 1, 1, 2)
+        thinking_note = QLabel(
+            "Thinking usa parte dei token di risposta e può aumentare i tempi. "
+            "Richiede un modello e un motore compatibili."
+        )
+        thinking_note.setWordWrap(True)
+        grid.addWidget(thinking_note, 10, 3, 1, 4)
+        grid.addWidget(speculative, 11, 0, 1, 6)
 
         vllm_group = QGroupBox("Parametri motore vLLM")
         vllm_grid = QGridLayout(vllm_group)
@@ -706,7 +751,7 @@ class LLMConfigDialog(QDialog):
         vllm_grid.addWidget(vllm_quantization, 1, 3)
         vllm_grid.addWidget(vllm_trust_remote_code, 2, 0, 1, 2)
         vllm_grid.addWidget(vllm_enforce_eager, 2, 2, 1, 2)
-        grid.addWidget(vllm_group, 11, 0, 1, 7)
+        grid.addWidget(vllm_group, 12, 0, 1, 7)
 
         # Recommendation label (shown below the parameter grid)
         rec_label = QLabel("")
@@ -717,7 +762,7 @@ class LLMConfigDialog(QDialog):
             "padding: 6px; margin-top: 4px;"
         )
         rec_label.setVisible(False)
-        grid.addWidget(rec_label, 12, 0, 1, 7)
+        grid.addWidget(rec_label, 13, 0, 1, 7)
 
         self._widgets[role] = {
             "backend": backend,
@@ -739,6 +784,7 @@ class LLMConfigDialog(QDialog):
             "workers_combo": workers_combo,
             "workers_info": workers_info,
             "speculative_decoding": speculative,
+            "thinking_enabled": thinking,
             "vllm_group": vllm_group,
             "vllm_dtype": vllm_dtype,
             "vllm_gpu_memory_utilization": vllm_gpu_memory,
@@ -822,6 +868,9 @@ class LLMConfigDialog(QDialog):
                         self._refresh_runtime_statuses(),
                     )
                 )
+        if self._launch_role is not None:
+            for label in group.findChildren(QLabel):
+                label.setWordWrap(True)
         return group
 
     def configurations(self) -> dict[str, LLMRoleConfig]:
@@ -857,6 +906,10 @@ class LLMConfigDialog(QDialog):
             # Deprecated with the llama.cpp backend; kept for compatibility.
             keep_alive_minutes=10,
             parallel_workers=workers,
+            thinking_enabled=(
+                bool(widgets["thinking_enabled"].currentData())
+                if backend == "llama_cpp" else False
+            ),
             speculative_decoding=(
                 widgets["speculative_decoding"].isChecked()
                 if backend == "llama_cpp" else False
@@ -903,16 +956,21 @@ class LLMConfigDialog(QDialog):
         widgets["speculative_decoding"].setVisible(backend == "llama_cpp")
         widgets["benchmark"].setVisible(
             role == "atomic_evidence" and backend == "llama_cpp"
+            and self._slot_benchmark_enabled
         )
         self._on_model_changed(role)
 
     def _on_model_changed(self, role: str, initial: bool = False) -> None:
         widgets = self._widgets[role]
         backend = str(widgets["backend"].currentData() or "llama_cpp")
+        widgets["thinking_enabled"].setEnabled(backend == "llama_cpp")
+        if backend != "llama_cpp":
+            widgets["thinking_enabled"].setCurrentIndex(0)
         widgets["vllm_group"].setVisible(backend == "vllm")
         widgets["speculative_decoding"].setVisible(backend == "llama_cpp")
         widgets["benchmark"].setVisible(
             role == "atomic_evidence" and backend == "llama_cpp"
+            and self._slot_benchmark_enabled
         )
         model = self._selected_model(widgets)
         if not model:
@@ -1538,7 +1596,7 @@ class LLMConfigDialog(QDialog):
 
     def _start_slot_benchmark(self, role: str) -> None:
         """Measure real atomic-extraction throughput off the GUI thread."""
-        if role != "atomic_evidence":
+        if role != "atomic_evidence" or not self._slot_benchmark_enabled:
             return
         if (
             self._workers
@@ -1997,7 +2055,10 @@ class LLMConfigDialog(QDialog):
             }:
                 continue
             if widget is not None:
-                widget.setEnabled(enabled)
+                widget.setEnabled(enabled and (
+                    key != "thinking_enabled"
+                    or self._widgets[role]["backend"].currentData() == "llama_cpp"
+                ))
 
     def _set_status(self, role: str, state: str, tooltip: str = "") -> None:
         states = {
@@ -2103,6 +2164,9 @@ class LLMConfigDialog(QDialog):
             )
             return
         configs = self.configurations()
+        if self._launch_role is not None and not configs[self._launch_role].model:
+            QMessageBox.warning(self, "Seleziona un modello", "Scegli un modello per avviare questa analisi.")
+            return
         if not all(
             self._validate_role(role, config)
             for role, config in configs.items()

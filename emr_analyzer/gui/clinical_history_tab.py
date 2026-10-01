@@ -11,7 +11,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
 
-from ..clinical.atomic_evidence import deduplicate_atomic_evidence
+from .pipeline_llm import prepare_pipeline
+from ..clinical.evidence_utils import deduplicate_atomic_evidence
 from ..models.chat_message import ChatMessage
 from ..models.clinical_timeline import CATEGORY_LABELS
 from ..settings import (
@@ -92,20 +93,34 @@ class ClinicalHistoryTab(QWidget):
     # UI setup
     # ------------------------------------------------------------------
 
+    def _show_fhir_registry(self):
+        from ..config import active_workspace
+        from PyQt5.QtWidgets import QPlainTextEdit
+        path = active_workspace.path / (self._current_patient_id or '') / 'clinical_events.fhir.json'
+        if not self._current_patient_id or not path.is_file():
+            QMessageBox.information(self, 'Registro FHIR', 'Genera prima il registro FHIR del paziente.')
+            return
+        dialog=QDialog(self);dialog.setWindowTitle(str(path));dialog.resize(900,700)
+        layout=QVBoxLayout(dialog)
+        text=QPlainTextEdit();text.setReadOnly(True);text.setPlainText(path.read_text(encoding='utf-8'))
+        layout.addWidget(text);dialog.exec_()
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
         # ---- Top: Generation bar ---------------------------------------
         gen_layout = QHBoxLayout()
 
-        self._gen_btn = QPushButton("1 · Estrai evidenze")
+        self._gen_btn = QPushButton("1 · Genera registro FHIR")
         self._gen_btn.setToolTip(
-            "Estrae e salva esclusivamente le evidenze cliniche atomiche "
-            "dai testi normalizzati. Non crea né modifica gli eventi del "
-            "registro cronologico. Usa il modello Evidenze atomiche."
+            "Genera clinical_events.fhir.json con eventi dai testi anonimizzati e tutti i risultati "
+            "di laboratorio. SNOMED CT per i concetti clinici, LOINC per gli esami."
         )
         self._gen_btn.clicked.connect(self._on_generate)
         gen_layout.addWidget(self._gen_btn)
+        fhir_button = QPushButton("Visualizza FHIR")
+        fhir_button.clicked.connect(self._show_fhir_registry)
+        gen_layout.addWidget(fhir_button)
 
         self._events_btn = QPushButton("2 · Crea eventi clinici")
         self._events_btn.setToolTip(
@@ -684,6 +699,7 @@ class ClinicalHistoryTab(QWidget):
                 reverse=True,
             ):
                 self._add_atomic_evidence_item(evidence)
+            laboratory_support_count = self._attach_laboratory_support(unique, patient_id)
         finally:
             self._atomic_evidence_tree.setUpdatesEnabled(True)
 
@@ -695,19 +711,51 @@ class ClinicalHistoryTab(QWidget):
         )
         live_mark = " · aggiornamento automatico attivo" if running else ""
         self._atomic_evidence_status.setText(
-            f"{len(unique)} fatti clinici unici da {len(stored)} evidenze "
-            f"salvate · {fused} occorrenze duplicate fuse{live_mark}. "
+            f"{len(unique) - laboratory_support_count} voci autonome da {len(stored)} evidenze "
+            f"salvate · {fused} occorrenze duplicate fuse · "
+            f"{laboratory_support_count} reperti di laboratorio collegati a supporto{live_mark}. "
             "Espandi una riga per ispezionare tutte le fonti."
         )
         self._clinical_data_tabs.setTabText(
             self._evidence_page_index,
-            f"Evidenze atomiche ({len(unique)})",
+            f"Evidenze atomiche ({len(unique) - laboratory_support_count})",
         )
         self._atomic_view_dirty = False
 
+    def _attach_laboratory_support(self, evidence, patient_id):
+        """Show validated support as children; unassociated labs stay visible."""
+        from ..clinical.laboratory_support import support_targets
+        from ..settings import load_pipeline_policy
+        repo = self._services.get("pipeline_repo")
+        if repo is None:
+            return 0
+        policy = load_pipeline_policy()
+        links = support_targets(evidence, repo.list_evidence_relations(patient_id),
+            threshold=policy.cohesive_threshold, max_days=policy.longitudinal_window_days)
+        tree = self._atomic_evidence_tree
+        roots = {tree.topLevelItem(i).data(0, Qt.UserRole): tree.topLevelItem(i)
+                 for i in range(tree.topLevelItemCount())}
+        attached = 0
+        for lab_id, target_ids in links.items():
+            source = roots.get(lab_id)
+            targets = [roots[target] for target in target_ids if target in roots]
+            if source is None or not targets:
+                continue
+            for target in targets:
+                child = source.clone()
+                child.setText(1, 'Laboratorio · supporto')
+                child.setToolTip(1, 'Reperto fuori range collegato all’evento. Non modifica la certezza della diagnosi.')
+                target.addChild(child)
+            tree.takeTopLevelItem(tree.indexOfTopLevelItem(source))
+            attached += 1
+        return attached
+
     def _add_atomic_evidence_item(self, evidence) -> None:
-        date_text = evidence.observed_date or evidence.document_date or "data n.d."
-        category = CATEGORY_LABELS.get(
+        date_text = evidence.observed_date or (
+            "data n.d." if evidence.data.get("lexicon_term_id")
+            else evidence.document_date or "data n.d."
+        )
+        category = evidence.data.get("lexicon_category") or CATEGORY_LABELS.get(
             evidence.category, evidence.category or "altro"
         )
         entity = (
@@ -764,7 +812,34 @@ class ClinicalHistoryTab(QWidget):
         ])
         item.setData(0, Qt.UserRole, evidence.evidence_id)
         item.setData(0, Qt.UserRole + 1, occurrences[0])
-        item.setToolTip(2, evidence.source_text or description)
+        coding = evidence.data.get("icd11", {})
+        coding_label = coding.get("code") or {
+            "catalog_missing": "catalogo non caricato",
+            "unmapped": "nessuna corrispondenza",
+            "foundation_only": "solo concetto Foundation; codice completo non disponibile",
+        }.get(coding.get("status"), "non codificato")
+        if evidence.data.get("lexicon_term_id"):
+            date_info = evidence.data.get("date_provenance", {})
+            item.setToolTip(2, (evidence.source_text or description) +
+                f"\n\nLessico condiviso: {evidence.normalized_entity}" +
+                f"\nData: {evidence.observed_date or 'non determinata'} ({evidence.date_precision})" +
+                f"\nFonte della data: {date_info.get('quote') or evidence.date_source or 'non disponibile'}" +
+                (f"\nDa rivedere: {date_info['needs_review']}" if date_info.get('needs_review') else '') +
+                ("\nRegistro FHIR: occorrenze distinte; nessuna fusione a 15 giorni." if evidence.data.get("fhir_pipeline") else "\nDeduplicazione: entro 15 giorni dalla prima osservazione, con fonti conservate."))
+        elif evidence.data.get('fhir_pipeline'):
+            item.setToolTip(2, (evidence.source_text or description) +
+                f"\nLOINC: {evidence.terminology_code or 'codifica da completare'}")
+        else:
+            item.setToolTip(2, (evidence.source_text or description) +
+                            f"\n\nICD-11: {coding_label}" +
+                            (f"\nRelease: {coding['release']}" if coding.get("release") else ""))
+        if evidence.data.get('snomed_mapping_status'):
+            code = evidence.data.get('snomed_concept_id')
+            item.setText(2, description + (f' [SNOMED {code}]' if code else ' [SNOMED: da rivedere]'))
+            item.setToolTip(2, item.toolTip(2) +
+                f"\nSNOMED CT International {evidence.data.get('snomed_release', '')}: {code or 'non codificato'}" +
+                f"\n{evidence.data.get('snomed_fsn', '')}" +
+                f"\nCodifica proposta: {evidence.data.get('snomed_mapping_reason', '')}")
         item.setToolTip(
             3,
             "\n".join(self._atomic_source_label(row) for row in occurrences),
@@ -1416,6 +1491,8 @@ class ClinicalHistoryTab(QWidget):
         if not builder:
             return
 
+        if not prepare_pipeline(self._services, 'dedup', self):
+            return
         llm = self._services.get("clinical_events_llm_client")
         if not llm or not llm.is_available:
             QMessageBox.warning(
@@ -1512,15 +1589,6 @@ class ClinicalHistoryTab(QWidget):
             "atomic": "atomic_evidence_llm_client",
             "events": "clinical_events_llm_client",
         }.get(stage)
-        llm = self._services.get(client_key) if client_key else None
-        if role and (not llm or not llm.is_available):
-            QMessageBox.warning(
-                self, "LLM non disponibile",
-                f"Il modello per la fase “{role.replace('_', ' ')}” non è "
-                "disponibile. Configuralo in Strumenti → Configura LLM."
-            )
-            return
-
         if stage == "events" and not self._pipeline_status.get(
             "atomic_current"
         ):
@@ -1550,6 +1618,17 @@ class ClinicalHistoryTab(QWidget):
             QMessageBox.warning(
                 self, "Servizio non disponibile",
                 "Il ClinicalHistoryBuilder non e' inizializzato."
+            )
+            return
+
+        if role and not prepare_pipeline(self._services, stage, self):
+            return
+        llm = self._services.get(client_key) if client_key else None
+        if role and (not llm or not llm.is_available):
+            QMessageBox.warning(
+                self, "LLM non disponibile",
+                f"Il modello per la fase “{role.replace('_', ' ')}” non è "
+                "disponibile. Seleziona un modello installato all’avvio dell’analisi."
             )
             return
 
@@ -1692,13 +1771,9 @@ class ClinicalHistoryTab(QWidget):
         elapsed = result.get('elapsed_seconds')
         incremental = result.get('incremental', False)
         newly_extracted = result.get('atomic_evidence_extracted', 0)
-        reused_blocks = result.get('exact_blocks_reused', 0)
-        reused_evidence = result.get('reused_evidence', 0)
         verified_reuse_blocks = result.get(
             'unique_reuse_blocks_verified', 0
         )
-        targeted_reuse = result.get('targeted_reuse_verifications', 0)
-        full_fallbacks = result.get('full_document_fallbacks', 0)
         llm_calls = result.get('llm_calls', 0)
         source_chunks = result.get('source_chunks', 0)
         output_retries = result.get('output_limit_retries', 0)
@@ -1749,26 +1824,31 @@ class ClinicalHistoryTab(QWidget):
                 f"• {final} voci finali nel registro"
             )
         if (
-            llm_calls or reused_blocks or relation_calls
+            llm_calls or relation_calls
             or relation_cache_hits or relation_auto
         ):
             msg += (
                 f"\n\nOttimizzazione:\n"
                 f"• {llm_calls} chiamate LLM\n"
                 f"• {source_chunks} segmenti clinici elaborati\n"
-                f"• {output_retries} risposte scartate per limite output\n"
-                f"• {validation_retries} retry mirati di validazione\n"
-                f"• {wire_normalized} difformità corrette localmente\n"
-                f"• {unresolved_invalid} item non validi esclusi\n"
-                f"• {reused_blocks} blocchi identici riutilizzati"
-                f" ({reused_evidence} evidenze replicate con nuova fonte)\n"
-                f"• {verified_reuse_blocks} blocchi unici verificati una volta\n"
-                f"• {targeted_reuse} verifiche mirate sul documento\n"
-                f"• {full_fallbacks} fallback completi di sicurezza"
+                f"• {result.get('recovery_calls', 0)} recuperi mirati\n"
                 f"\n• {relation_calls} batch LLM per le relazioni"
                 f"\n• {relation_cache_hits} decisioni relazionali riutilizzate"
                 f"\n• {relation_auto} incompatibilità risolte da regole"
             )
+        if 'lexicon_examples_available' in result:
+            msg += (f"\n\nLessico condiviso: {result['lexicon_examples_available']} esempi disponibili; "
+                    f"ricerca {result.get('lexicon_retrieval_mode', 'lessicale')}.")
+        if result.get('fhir_path'):
+            msg += (f"\n\nRegistro FHIR: {result['fhir_path']}"
+                    f"\nEventi: {result.get('fhir_events',0)}; senza codice: {result.get('fhir_uncoded',0)}.")
+        if result.get('snomed_mapped') or result.get('snomed_unmapped'):
+            msg += (f"\nSNOMED CT: {result.get('snomed_mapped', 0)} codifiche proposte; "
+                    f"{result.get('snomed_unmapped', 0)} eventi senza codice, da rivedere."
+                    f"\nCodifica SNOMED dopo annotazione: {result.get('snomed_recovery_mapped',0)}.")
+        if 'relation_issues' in result:
+            msg += (f"\nRelazioni proposte: {result.get('relation_links',0)}; "
+                    f"problemi nelle relazioni da rivedere: {result['relation_issues']}.")
         if failed > 0:
             failed_ids = result.get('failed_doc_ids', [])
             msg += (
@@ -1827,6 +1907,8 @@ class ClinicalHistoryTab(QWidget):
             )
             return
 
+        if not prepare_pipeline(self._services, 'narrative', self):
+            return
         llm = self._services.get("clinical_state_llm_client")
         if not llm or not llm.is_available:
             # Fallback: build simple markdown from entries
@@ -1916,6 +1998,8 @@ class ClinicalHistoryTab(QWidget):
             self._render_chat()
             return
 
+        if not prepare_pipeline(self._services, 'history_query', self):
+            return
         # The conversation slice must NOT include the question being asked
         # now: build it BEFORE appending the user message.
         use_context = (
@@ -2047,6 +2131,8 @@ class ClinicalHistoryTab(QWidget):
             )
             return
 
+        if not prepare_pipeline(self._services, 'irae', self):
+            return
         llm = self._services.get("clinical_state_llm_client")
         if not llm or not llm.is_available:
             QMessageBox.warning(

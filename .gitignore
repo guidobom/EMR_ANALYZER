@@ -2,7 +2,6 @@
 __pycache__/
 *.py[cod]
 *$py.class
-.pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -82,3 +81,11 @@ identity.key
 *.gguf
 *.safetensors
 *.bin
+
+# Local terminology distributions (not application source)
+/Loinc_*/
+
+# Private clinical evaluation inputs and outputs (never commit patient text)
+/.clinical-evaluation/
+/SnomedCT_*/
+/.terminology/

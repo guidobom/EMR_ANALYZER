@@ -116,14 +116,3 @@ def _threads_in_value(value) -> Iterable[QThread]:
         for item in value:
             if isinstance(item, QThread):
                 yield item
-
-
-def _reset_for_tests() -> None:
-    """Reset global state; intended only for isolated unit tests."""
-
-    global _emergency_timer
-    _shutdown_requested.clear()
-    with _timer_lock:
-        if _emergency_timer is not None:
-            _emergency_timer.cancel()
-        _emergency_timer = None

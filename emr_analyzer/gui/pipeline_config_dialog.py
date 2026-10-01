@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from PyQt5.QtWidgets import (
     QCheckBox,
@@ -11,6 +12,7 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFileDialog,
     QGroupBox,
     QLabel,
     QLineEdit,
@@ -68,17 +70,11 @@ class PipelineConfigDialog(QDialog):
     def _extraction_page(self) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
-        self._adaptive_retry = QCheckBox(
-            "Ripeti solo le porzioni che non superano la validazione"
-        )
-        self._adaptive_retry.setChecked(
-            self._policy.adaptive_specialized_retry
-        )
-        self._max_retries = QSpinBox()
-        self._max_retries.setRange(0, 10)
-        self._max_retries.setValue(self._policy.max_specialized_retries)
-        form.addRow("Retry adattivo", self._adaptive_retry)
-        form.addRow("Tentativi specializzati massimi", self._max_retries)
+        notice = QLabel("Registro eventi FHIR R4: estrazione aperta dal testo italiano, codifica SNOMED CT "
+                        "e tutti i risultati di laboratorio con LOINC. Nessuna fusione automatica a 15 giorni. "
+                        "Importa le terminologie da Lessico condiviso → Catalogo SNOMED CT / Catalogo LOINC.")
+        notice.setWordWrap(True)
+        form.addRow(notice)
         return page
 
     def _laboratory_page(self) -> QWidget:
@@ -97,6 +93,9 @@ class PipelineConfigDialog(QDialog):
             "Variazione significativa anche se ancora nel range"
         )
         self._lab_delta.setChecked(lab.significant_delta_within_range)
+        self._lab_delta.setChecked(False)
+        self._lab_delta.setEnabled(False)
+        self._lab_delta.setToolTip("Il registro FHIR conserva anche i risultati normali; queste regole riguardano le proiezioni cliniche precedenti.")
         self._delta_window = QSpinBox()
         self._delta_window.setRange(1, 3650)
         self._delta_window.setSuffix(" giorni")
@@ -271,12 +270,10 @@ class PipelineConfigDialog(QDialog):
             rules = json.loads(self._analyzer_rules.toPlainText() or "{}")
             if not isinstance(rules, dict):
                 raise ValueError("Le regole di laboratorio devono essere un oggetto JSON")
-            policy = ClinicalPipelinePolicy(
+            policy = replace(self._policy,
                 aggregation_engine=str(
                     self._aggregation_engine.currentData()
                 ),
-                adaptive_specialized_retry=self._adaptive_retry.isChecked(),
-                max_specialized_retries=self._max_retries.value(),
                 consensus_profile=str(self._consensus.currentData()),
                 local_window_days=self._local_window.value(),
                 longitudinal_window_days=self._long_window.value(),
