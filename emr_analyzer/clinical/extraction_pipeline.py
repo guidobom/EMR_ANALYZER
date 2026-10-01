@@ -24,7 +24,7 @@ from .grounded_sources import (
     VERSION, METHOD,
 )
 from .event_extraction import EventExtractor
-from .snomed_coding import CodingCancelled, ConceptCoder, concept_key
+from .snomed_coding import CodingCancelled, ConceptCoder
 from .lab_evidence import LEGACY_LAB_METHODS, filter_narrative_lab_duplicates
 from ..config import active_workspace
 from ..models.clinical_registry import ProcessingManifestItem, ProcessingRun
@@ -115,9 +115,17 @@ class ExtractionPipeline:
         self.extractor = self.make_extractor()
         self.coder = self.make_coder()
 
-    def events(self, patient_id: str) -> list:
-        return [item for item in self.evidence_repo.get_by_patient(patient_id)
-                if item.extraction_method == METHOD]
+    def review_service(self):
+        """Reviewed events of a patient: occurrences, concept codes, decisions."""
+        from .event_review import EventReviewService
+        from ..database.event_override_repo import EventOverrideRepository
+        return EventReviewService(
+            self.evidence_repo, EventOverrideRepository(self.db), self.coder,
+            overlay_repo=self.overlay_repo, audit_repo=self.audit,
+            snomed=getattr(self.shared_lexicon_repo, "snomed_catalog", None))
+
+    def events(self, patient_id: str, *, include_rejected: bool = False) -> list:
+        return self.review_service().events(patient_id, include_rejected=include_rejected)
 
     def code_patient(self, patient_id: str, cancel_check=None, progress=None) -> dict:
         """Code the patient's concepts that have no SNOMED mapping yet."""
@@ -417,10 +425,9 @@ class ExtractionPipeline:
         exporter = FhirRegistry(patient_id, loinc, proposals)
         for document in documents:
             exporter.document(document.id)
-        events = self.events(patient_id)
-        mappings = self.coder.resolve(events)
-        for item in events:
-            exporter.clinical(item, mappings.get(concept_key(item.normalized_entity, item.fact_type)))
+        from .event_review import to_evidence
+        for event in self.events(patient_id):
+            exporter.clinical(to_evidence(event), event.coding, resource_key=event.key)
         for lab, key in zip(lab_values, lab_occurrence_keys(lab_values)):
             exporter.laboratory(lab, key)
         path = exporter.write(active_workspace.path / patient_id / FHIR_FILENAME, coverage)
@@ -445,11 +452,8 @@ class ExtractionPipeline:
 
     @staticmethod
     def normalized_text_path(patient_id: str, document_id: str) -> Path | None:
-        candidates = (
-            active_workspace.path / patient_id / "extraction" / f"{document_id}.md",
-            active_workspace.path / patient_id / "docling" / f"{document_id}.md",
-        )
-        return next((path for path in candidates if path.exists()), None)
+        from .document_text import normalized_text_path
+        return normalized_text_path(patient_id, document_id)
 
     def _retain_only_extraction_runtime(self) -> int:
         reserve = getattr(self.llm, "retain_only_this_runtime", None)

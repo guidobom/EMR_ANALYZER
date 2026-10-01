@@ -294,7 +294,7 @@ class ContextPanel(QWidget):
         if reply != QMessageBox.Yes:
             return
 
-        from ..models.clinical_registry import DocumentTextOverlay
+        from ..clinical.document_text import save_text_overlay
 
         overlay_repo = self._services.get("overlay_repo")
         if overlay_repo is None:
@@ -305,26 +305,9 @@ class ContextPanel(QWidget):
             )
             return
         new_text = self._text_edit.toPlainText()
-        overlay_repo.save(DocumentTextOverlay(
-            patient_id=self._current_patient_id,
-            document_id=self._current_doc_id,
-            corrected_text=new_text,
-            base_text_hash=hashlib.sha256(
-                self._base_text.encode("utf-8")
-            ).hexdigest(),
-        ))
+        save_text_overlay(overlay_repo, self._current_patient_id, self._current_doc_id,
+                          new_text, audit_repo=self._services.get("audit_repo"))
         self._original_text = new_text
-
-        audit_repo = self._services.get("audit_repo")
-        if audit_repo:
-            audit_repo.log(
-                self._current_patient_id, "document_text_overlay_created",
-                "document", self._current_doc_id,
-                {"base_text_hash": hashlib.sha256(
-                    self._base_text.encode("utf-8")
-                ).hexdigest()},
-                actor_id="local_user", actor_role="clinician",
-            )
 
         self._save_btn.setText("✓ Salvato")
         self._save_btn.setStyleSheet("background-color: #2ecc71; color: white;")

@@ -99,13 +99,18 @@ class FhirRegistry:
         if not record['extension']:record.pop('extension')
         self.add(record)
 
-    def clinical(self,item,coding=None):
-        """One clinical event; ``coding`` is its concept → SNOMED CT mapping."""
+    def clinical(self,item,coding=None,resource_key=None):
+        """One clinical event; ``coding`` is its SNOMED CT mapping.
+
+        ``resource_key`` (the source occurrence) keeps the resource id stable
+        across reviews and re-extractions.
+        """
         data=item.data or {}
         coding=coding or {}
         from .historical_reuse import historical_identity
         # No temporal clustering here: only identical source occurrences share an id.
-        rid=ident(self.patient_id,item.document_id,item.fact_type,item.normalized_entity,
+        rid=ident(self.patient_id,'event',resource_key) if resource_key else ident(
+            self.patient_id,item.document_id,item.fact_type,item.normalized_entity,
             data.get('experiencer'),item.certainty,item.source_text,
             data.get('source_spans'),item.observed_date,item.assertion,item.clinical_status,item.typed_payload)
         shared = historical_identity(item)
@@ -128,9 +133,12 @@ class FhirRegistry:
             'mapping_reason':coding.get('note') or '','fact_type':item.fact_type,
             'source_relations':data.get('source_relations',[]),
             'relation_review':data.get('relation_review',{})}
+        reviewed={'confirmed':'confirmed','corrected':'corrected','added':'manual'}.get(data.get('review_status'))
+        review=reviewed or ('needs-review' if item.status=='needs_review' or not concept.get('coding') else 'proposed')
+        if item.status=='needs_review':review='needs-review'
+        coding_status=coding.get('status') if coding.get('code') or coding.get('status')=='confirmed' else 'needs_review'
         base={'id':rid,'extension':[extension('extraction-context',json.dumps(details,ensure_ascii=False)),
-            extension('review-status','needs-review' if item.status=='needs_review' or not concept.get('coding')
-                      else 'confirmed' if coding.get('status')=='confirmed' else 'proposed')]}
+            extension('review-status',review),extension('coding-status',coding_status)]}
         subject=data.get('experiencer')
         if subject=='family' and item.assertion=='present':
             event={**base,'resourceType':'FamilyMemberHistory','status':'partial','patient':reference(self.patient),

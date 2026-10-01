@@ -5,7 +5,7 @@ import re
 from .engine import DatabaseEngine
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 CREATE_TABLES_SQL = [
     # Patients
@@ -879,6 +879,24 @@ CREATE_TABLES_SQL += [
     )""",
     """CREATE INDEX IF NOT EXISTS idx_atomic_group_cache
        ON atomic_group_results(patient_id, request_key, status)""",
+    # v22: reviewer decisions on extracted events.  Keyed by the source
+    # occurrence (document, interval, label, type) so they survive a new
+    # extraction; each row also stores the full reviewed event.
+    """CREATE TABLE IF NOT EXISTS event_overrides (
+        occurrence_key TEXT PRIMARY KEY,
+        patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        action TEXT NOT NULL,
+        base_evidence_id TEXT,
+        fields_json TEXT NOT NULL DEFAULT '{}',
+        text_hash TEXT,
+        note TEXT,
+        reviewer TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_event_overrides_patient
+       ON event_overrides(patient_id)""",
     """CREATE TABLE IF NOT EXISTS atomic_group_calls (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
