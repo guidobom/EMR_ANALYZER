@@ -181,6 +181,13 @@ class MainWindow(QMainWindow):
         registry_queue_btn.triggered.connect(self._on_show_registry_queue)
         toolbar.addAction(registry_queue_btn)
 
+        concepts_btn = QAction("🧬 Concetti SNOMED", self)
+        concepts_btn.setToolTip(
+            "Rivedi le codifiche SNOMED CT per concetto in tutto il progetto"
+        )
+        concepts_btn.triggered.connect(self._on_show_concepts)
+        toolbar.addAction(concepts_btn)
+
         # Spacer
         spacer = QWidget()
         spacer.setMinimumWidth(20)
@@ -418,6 +425,14 @@ class MainWindow(QMainWindow):
         self._project_export_worker = worker
         progress.show()
         worker.start()
+
+
+    def _on_show_concepts(self):
+        """Project-wide review of concept → SNOMED CT codes."""
+        from .concept_review_dialog import ConceptReviewDialog
+        ConceptReviewDialog(self._services, self).exec_()
+        if self._current_patient_id:
+            self.workspace_tabs.load_patient(self._current_patient_id)
 
     def _on_show_registry_queue(self):
         """Select patients and extract, code and export their events."""

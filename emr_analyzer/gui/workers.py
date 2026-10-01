@@ -115,3 +115,42 @@ class ProjectExportWorker(QThread):
             self.cancelled.emit()
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+class ConceptCodingWorker(QThread):
+    """Code the SNOMED CT concepts still without a mapping, patient by patient."""
+
+    progress = pyqtSignal(int, str)
+    result_ready = pyqtSignal(dict)
+    cancelled = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, pipeline, patient_ids: list[str], parent=None):
+        super().__init__(parent)
+        self.pipeline = pipeline
+        self.patient_ids = list(patient_ids)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self):
+        totals: dict = {}
+        try:
+            for index, patient_id in enumerate(self.patient_ids, start=1):
+                if self._cancel_event.is_set():
+                    raise ExtractionCancelled("Codifica interrotta")
+                base = int((index - 1) * 100 / max(len(self.patient_ids), 1))
+                self.progress.emit(base, f"Codifica dei concetti di {patient_id}")
+                stats = self.pipeline.code_patient(
+                    patient_id, cancel_check=self._cancel_event.is_set,
+                    progress=lambda done, total, pid=patient_id: self.progress.emit(
+                        base, f"{pid}: {done}/{total} concetti verificati"))
+                for key, value in stats.items():
+                    if isinstance(value, (int, float)):
+                        totals[key] = totals.get(key, 0) + value
+            self.result_ready.emit(totals)
+        except ExtractionCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.error.emit(str(exc))

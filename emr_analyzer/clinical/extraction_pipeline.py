@@ -414,8 +414,11 @@ class ExtractionPipeline:
             "run_id": plan.run.run_id, "elapsed_seconds": elapsed, "coding": coding, **summary,
         }
 
-    def build_fhir(self, patient_id, documents=None, *, cancel_check=None):
-        """FHIR registry of the patient's reviewed events and parsed results."""
+    def build_fhir(self, patient_id, documents=None, *, cancel_check=None, use_llm=True):
+        """FHIR registry of the patient's reviewed events and parsed results.
+
+        ``use_llm=False`` never calls the model (cached LOINC proposals only).
+        """
         from .event_review import to_evidence
         from .fhir_registry import FhirRegistry, lab_occurrence_keys
         if documents is None:
@@ -424,7 +427,7 @@ class ExtractionPipeline:
         lab_values = self.lab_repo.get_by_patient(patient_id)
         proposals = {}
         if loinc:
-            llm = self.llm if (self.llm and getattr(self.llm, "is_available", False)) else None
+            llm = self.llm if (use_llm and self.llm and getattr(self.llm, "is_available", False)) else None
             proposals = loinc.propose(lab_values, llm,
                                       lambda: (cancel_check() if cancel_check else None) or False)
         exporter = FhirRegistry(patient_id, loinc, proposals)
@@ -436,8 +439,8 @@ class ExtractionPipeline:
             exporter.laboratory(lab, key)
         return exporter
 
-    def write_fhir(self, patient_id, documents, coverage, *, cancel_check=None) -> dict:
-        exporter = self.build_fhir(patient_id, documents, cancel_check=cancel_check)
+    def write_fhir(self, patient_id, documents, coverage, *, cancel_check=None, use_llm=True) -> dict:
+        exporter = self.build_fhir(patient_id, documents, cancel_check=cancel_check, use_llm=use_llm)
         path = exporter.write(active_workspace.path / patient_id / FHIR_FILENAME, coverage)
         return {"path": path, "events": exporter.event_count, "uncoded": exporter.unmapped}
 
@@ -448,9 +451,9 @@ class ExtractionPipeline:
                 "complete": status["failed"] == 0 and status["completed"] == status["with_text"],
                 "pipeline": VERSION}
 
-    def export_patient(self, patient_id: str) -> dict:
+    def export_patient(self, patient_id: str, *, use_llm: bool = True) -> dict:
         """Rewrite the patient's FHIR file from the current reviewed state."""
-        return self.write_fhir(patient_id, None, self.coverage(patient_id))
+        return self.write_fhir(patient_id, None, self.coverage(patient_id), use_llm=use_llm)
 
     def export_project(self, patient_ids=None, *, target=None, progress=None,
                        cancel_check=None) -> dict:
