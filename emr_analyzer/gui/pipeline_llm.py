@@ -2,16 +2,8 @@
 
 PIPELINES = {
     "lexicon": ("atomic_evidence", "Lessico condiviso — analisi del documento"),
-    "atomic": ("atomic_evidence", "Estrazione delle evidenze atomiche"),
-    "events": ("clinical_events", "Creazione degli eventi clinici"),
+    "atomic": ("atomic_evidence", "Estrazione e codifica SNOMED CT degli eventi clinici"),
     "documents": ("document", "Estrazione e normalizzazione dei documenti"),
-    "dedup": ("clinical_events", "Deduplicazione del registro"),
-    "hypotheses": ("clinical_events", "Scoperta delle ipotesi cliniche"),
-    "narrative": ("clinical_state", "Profilo narrativo"),
-    "history_query": ("clinical_state", "Interrogazione della storia clinica"),
-    "dossier_query": ("clinical_state", "Interrogazione dei referti"),
-    "irae": ("clinical_state", "Analisi irAE"),
-    "irae_consolidation": ("clinical_state", "Consolidamento irAE"),
 }
 
 
@@ -19,7 +11,7 @@ def pipeline_definition(key):
     if key.startswith("prompt:"):
         from .prompt_manager_dialog import _PROMPT_ROLE
         prompt = key.split(":", 1)[1]
-        return _PROMPT_ROLE.get(prompt, "clinical_state"), f"Prova del prompt — {prompt}"
+        return _PROMPT_ROLE.get(prompt, "atomic_evidence"), f"Prova del prompt — {prompt}"
     return PIPELINES[key]
 
 

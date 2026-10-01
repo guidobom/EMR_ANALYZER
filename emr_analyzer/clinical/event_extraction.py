@@ -30,9 +30,8 @@ class EventExtractor(HistoricalReuseMixin, ReferencedSourceReader):
                          system_prompt=load_prompt('compact_events_system'), **kwargs)
         self.snomed_fingerprint = self.snomed.metadata().get('sha256') if self.snomed else None
         self.mapping_system = load_prompt('snomed_mapping_system')
-        self.relation_system = load_prompt('event_relations_system')
         self.prompt_version = VERSION
-        self.prompt_digest = content_hash(self.system, self.mapping_system, self.relation_system)
+        self.prompt_digest = content_hash(self.system, self.mapping_system)
         self.catalog_digest = content_hash(self.catalog_digest, self.snomed.digest if self.snomed else 'catalog-missing')
 
     @property
@@ -69,8 +68,6 @@ class EventExtractor(HistoricalReuseMixin, ReferencedSourceReader):
         if ready:
             ready(rows)
         self._map(rows, kwargs)
-        from .event_relations import enrich_relations
-        enrich_relations(self, rows, kwargs)
         return rows
 
     def _map(self, rows, kwargs):

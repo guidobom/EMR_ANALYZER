@@ -982,15 +982,6 @@ class DocumentsTab(QWidget):
         if legacy_projection.exists():
             legacy_projection.unlink()
 
-        # A normalized document changes the source on which the longitudinal
-        # reconstruction must operate. Invalidate the current state instead of
-        # rebuilding it once per document (quadratic work on large dossiers).
-        # The dedicated Clinical State phase will rebuild it from all active
-        # normalized texts in one pass.
-        cs_repo = self._services.get("cs_repo")
-        if cs_repo:
-            cs_repo.delete(doc.patient_id)
-
         audit_repo = self._services.get("audit_repo")
         if audit_repo:
             try:

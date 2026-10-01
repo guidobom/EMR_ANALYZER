@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 
 from .engine import DatabaseEngine
-from .pipeline_repo import ClinicalPipelineRepository
-from ..clinical.terminology import DeterministicTerminologyResolver
 from ..models.clinical_evidence import ClinicalEvidence
 
 
@@ -44,41 +42,19 @@ _UPSERT_EVIDENCE_SQL = (
 class EvidenceRepository:
     def __init__(self, db: DatabaseEngine):
         self.db = db
-        self.pipeline = ClinicalPipelineRepository(db)
-        self.terminology = DeterministicTerminologyResolver(self.pipeline)
 
     def insert_batch(self, evidence: list[ClinicalEvidence]) -> None:
-        evidence = self.terminology.resolve_all(evidence)
         if not evidence:
             return
         self.db.executemany(
             _INSERT_EVIDENCE_SQL,
             [self._params(item) for item in evidence],
         )
-        for item in evidence:
-            self.pipeline.ensure_primary_source(item)
         self.db.commit()
-
-    def replace_document(self, document_id: str,
-                         evidence: list[ClinicalEvidence]) -> None:
-        evidence = self.terminology.resolve_all(evidence)
-        self._assert_document_scope(document_id, evidence)
-        self._assert_identity_scope(document_id, evidence)
-        with self.db:
-            if evidence:
-                self.db.executemany(
-                    _UPSERT_EVIDENCE_SQL,
-                    [self._params(item) for item in evidence],
-                )
-                for item in evidence:
-                    self.pipeline.ensure_primary_source(item)
-            self._delete_stale_document_ids(
-                document_id, {item.evidence_id for item in evidence}
-            )
 
     def replace_document_method(self, document_id: str, method: str,
                                 evidence: list[ClinicalEvidence]) -> None:
-        evidence = self.terminology.resolve_all(evidence)
+        """Replace one method's rows for a document; other methods are kept."""
         self._assert_document_scope(document_id, evidence)
         self._assert_identity_scope(document_id, evidence)
         if any(item.extraction_method != method for item in evidence):
@@ -89,8 +65,6 @@ class EvidenceRepository:
                     _UPSERT_EVIDENCE_SQL,
                     [self._params(item) for item in evidence],
                 )
-                for item in evidence:
-                    self.pipeline.ensure_primary_source(item)
             current_ids = {
                 row["evidence_id"] for row in self.db.execute(
                     """SELECT evidence_id FROM clinical_evidence
@@ -140,17 +114,6 @@ class EvidenceRepository:
             "DELETE FROM clinical_evidence WHERE document_id=?", (document_id,)
         )
         self.db.commit()
-
-    def _delete_stale_document_ids(
-        self, document_id: str, retained_ids: set[str]
-    ) -> None:
-        current = {
-            row["evidence_id"] for row in self.db.execute(
-                "SELECT evidence_id FROM clinical_evidence WHERE document_id=?",
-                (document_id,),
-            ).fetchall()
-        }
-        self._delete_ids(current - retained_ids)
 
     def _delete_ids(self, evidence_ids: set[str]) -> None:
         if not evidence_ids:

@@ -11,7 +11,6 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 
-from ..models.validation import ValidationStatus, Severity
 from ..utils.document_paths import resolve_document_path
 from .pdf_viewer import PDFViewerDialog
 from .quick_look import QuickLook
@@ -118,10 +117,12 @@ class ValidationTab(QWidget):
         if not db:
             return
 
-        # Query validation_queue table directly
+        # Only document attribution and laboratory values are reviewed here;
+        # clinical events are reviewed in the "Eventi SNOMED" tab.
         cursor = db.execute(
             """SELECT * FROM validation_queue
                WHERE patient_id=? AND status='pending'
+                 AND item_type IN ('attribution', 'lab_value')
                ORDER BY
                  CASE severity
                    WHEN 'high' THEN 1
@@ -219,40 +220,6 @@ class ValidationTab(QWidget):
                 (new_status, datetime.now().isoformat(), item_id),
             )
             db.commit()
-
-            if row_data.get("item_type") in {
-                "clinical_event_v2", "clinical_event_v3"
-            }:
-                review_repo = self._services.get("review_repo")
-                if review_repo:
-                    review_repo.decide_event(
-                        self._current_patient_id,
-                        str(row_data.get("item_id") or ""),
-                        new_status,
-                        reason=str(row_data.get("issue") or "Revisione clinica"),
-                    )
-                timeline_repo = self._services.get("timeline_repo")
-                if timeline_repo:
-                    if new_status == "rejected":
-                        timeline_repo.delete_entry(str(row_data.get("item_id") or ""))
-                    else:
-                        timeline_repo.set_golden(
-                            str(row_data.get("item_id") or ""),
-                            new_status == "accepted",
-                        )
-            elif row_data.get("item_type") in {
-                "atomic_duplicate_v3", "evidence_relation_v3"
-            } and new_status in {"accepted", "rejected"}:
-                repository = self._services.get("pipeline_repo")
-                if repository:
-                    if row_data.get("item_type") == "atomic_duplicate_v3":
-                        repository.review_duplicate_group(
-                            str(row_data.get("item_id") or ""), new_status
-                        )
-                    else:
-                        repository.review_evidence_relation(
-                            str(row_data.get("item_id") or ""), new_status
-                        )
 
             # If accepted, also update the underlying item
             if new_status == "accepted":
@@ -365,15 +332,6 @@ class ValidationTab(QWidget):
                 return
             self._perform_reattribution(row_data, target, "corrected")
             return
-        if row_data.get("item_type") in {
-            "atomic_duplicate_v3", "evidence_relation_v3"
-        }:
-            QMessageBox.information(
-                self, "Decisione strutturata",
-                "Per questo elemento usa Accetta o Rifiuta; la correzione "
-                "testuale non modificherebbe la relazione sottostante."
-            )
-            return
 
         new_value, ok = QInputDialog.getText(
             self, "Correggi Valore",
@@ -391,23 +349,6 @@ class ValidationTab(QWidget):
                     (new_value, datetime.now().isoformat(), row_data.get("id")),
                 )
                 db.commit()
-            if row_data.get("item_type") in {
-                "clinical_event_v2", "clinical_event_v3"
-            }:
-                review_repo = self._services.get("review_repo")
-                if review_repo:
-                    review_repo.decide_event(
-                        self._current_patient_id,
-                        str(row_data.get("item_id") or ""),
-                        "corrected",
-                        corrected_value={"summary_short": new_value.strip()},
-                        reason=str(row_data.get("issue") or "Correzione clinica"),
-                    )
-                timeline_repo = self._services.get("timeline_repo")
-                if timeline_repo:
-                    timeline_repo.update_description(
-                        str(row_data.get("item_id") or ""), new_value.strip()
-                    )
             audit_repo = self._services.get("audit_repo")
             if audit_repo:
                 audit_repo.log(

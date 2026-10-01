@@ -43,25 +43,11 @@ _PROMPT_ROLE = {
     "patient_identity_task": "document",
     "clinical_text_system": "document",
     "clinical_text_instructions": "document",
-    "clinical_fusion_system": "clinical_events",
-    "clinical_fusion_task": "clinical_events",
-    "evidence_relations_system": "clinical_events",
-    "evidence_relations_task": "clinical_events",
-    "episode_assembly_system": "clinical_events",
-    "episode_assembly_task": "clinical_events",
-    "hypothesis_system": "clinical_events",
-    "hypothesis_task": "clinical_events",
-    "clinical_query_system": "clinical_state",
-    "narrative_profile_system": "clinical_state",
-    "narrative_profile_task": "clinical_state",
-    "irae_system": "clinical_state",
 }
 
 _ROLE_SERVICE = {
     "atomic_evidence": "atomic_evidence_llm_client",
     "document": "document_llm_client",
-    "clinical_events": "clinical_events_llm_client",
-    "clinical_state": "clinical_state_llm_client",
 }
 
 _PROMPT_PAIRS = {
@@ -69,16 +55,6 @@ _PROMPT_PAIRS = {
     "patient_identity_task": "patient_identity_system",
     "clinical_text_system": "clinical_text_instructions",
     "clinical_text_instructions": "clinical_text_system",
-    "clinical_fusion_system": "clinical_fusion_task",
-    "clinical_fusion_task": "clinical_fusion_system",
-    "evidence_relations_system": "evidence_relations_task",
-    "evidence_relations_task": "evidence_relations_system",
-    "episode_assembly_system": "episode_assembly_task",
-    "episode_assembly_task": "episode_assembly_system",
-    "hypothesis_system": "hypothesis_task",
-    "hypothesis_task": "hypothesis_system",
-    "narrative_profile_system": "narrative_profile_task",
-    "narrative_profile_task": "narrative_profile_system",
 }
 
 
@@ -376,7 +352,7 @@ class PromptManagerDialog(QDialog):
 
     def _update_preview_availability(self, *_args) -> None:
         key = self._selected_key()
-        role = _PROMPT_ROLE.get(key, "clinical_state")
+        role = _PROMPT_ROLE.get(key, "atomic_evidence")
         service_name = _ROLE_SERVICE[role]
         client = self._services.get(service_name)
         document = self.preview_document_combo.currentData()
@@ -421,37 +397,12 @@ class PromptManagerDialog(QDialog):
             return "testo sorgente pre-normalizzazione"
         if key.startswith("clinical_text"):
             return "testo sorgente pulito"
-        if key.startswith((
-            "clinical_fusion", "evidence_relations", "episode_assembly",
-            "hypothesis",
-        )):
-            return "evidenze atomiche già estratte dal documento"
         return "testo clinico normalizzato"
 
     def _source_for_preview(self, key: str, document) -> tuple[str, str]:
         extraction_dir = (
             active_workspace.path / document.patient_id / "extraction"
         )
-        event_prompt = key.startswith((
-            "clinical_fusion", "evidence_relations", "episode_assembly",
-            "hypothesis",
-        ))
-        if event_prompt:
-            evidence_repo = self._services.get("evidence_repo")
-            evidence = (
-                evidence_repo.get_by_document(document.id)
-                if evidence_repo is not None else []
-            )
-            if evidence:
-                return (
-                    json.dumps(
-                        [item.to_atomic_dict() for item in evidence],
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    f"{len(evidence)} evidenze atomiche",
-                )
-
         if key.startswith(("patient_identity", "clinical_text")):
             from ..utils.document_paths import resolve_document_path
             from ..pipeline.pdf_extractor import PdfPlumberExtractor
@@ -500,40 +451,17 @@ class PromptManagerDialog(QDialog):
                     "name", "birth_date", "fiscal_code", "confidence",
                 ],
             }
-        if key.startswith("clinical_fusion"):
-            from ..clinical.consolidation import FUSION_SCHEMA
-            return FUSION_SCHEMA
-        if key.startswith("evidence_relations"):
-            from ..clinical.evidence_graph import _RELATION_SCHEMA
-            return _RELATION_SCHEMA
-        if key.startswith("episode_assembly"):
-            from ..clinical.episode_synthesis import _SCHEMA
-            return _SCHEMA
-        if key.startswith("hypothesis"):
-            from ..clinical.hypothesis_discovery import _SCHEMA
-            return _SCHEMA
         return None
 
     def _paired_prompts(self, key: str, edited_text: str) -> tuple[str, str]:
         pair = _PROMPT_PAIRS.get(key)
-        task_keys = {
-            "patient_identity_task", "clinical_text_instructions",
-            "clinical_fusion_task", "evidence_relations_task",
-            "episode_assembly_task", "hypothesis_task",
-            "narrative_profile_task",
-        }
+        task_keys = {"patient_identity_task", "clinical_text_instructions"}
         if key in task_keys:
             return load_prompt(pair), edited_text
         task = load_prompt(pair) if pair else (
             "Analizza esclusivamente i dati del documento fornito e "
             "restituisci il risultato richiesto dal prompt."
         )
-        if key == "irae_system":
-            try:
-                from ..clinical.irae_analysis import load_prompt as load_irae
-                task = load_irae()
-            except Exception:
-                pass
         return edited_text, task
 
     def _build_preview_request(self, key: str, document) -> dict:
@@ -579,7 +507,7 @@ class PromptManagerDialog(QDialog):
             return
         key = self._selected_key()
         document = self.preview_document_combo.currentData()
-        role = _PROMPT_ROLE.get(key, "clinical_state")
+        role = _PROMPT_ROLE.get(key, "atomic_evidence")
         if not prepare_pipeline(self._services, "prompt:" + key, self):
             return
         client = self._services.get(_ROLE_SERVICE[role])

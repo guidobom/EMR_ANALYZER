@@ -12,49 +12,14 @@ from datetime import datetime
 from .pipeline_llm import prepare_pipeline
 from .documents_tab import DocumentsTab
 from .laboratory_tab import LaboratoryTab
-from .clinical_history_tab import ClinicalHistoryTab
+from .event_review_tab import EventReviewTab
 from .validation_tab import ValidationTab
-from .gold_set_tab import GoldSetTab
 from .local_lexicon_tab import LocalLexiconTab
 from .import_dialog import ImportDialog
 from .batch_import_dialog import BatchImportDialog
 from .progress_dialog import ProgressDialog
 from .qt_utils import process_gui_events
 from ..models import Patient
-
-
-def choose_irae_method(parent) -> str | None:
-    """Confirm the irAE analysis method.
-
-    The classic chunked protocol is temporarily disabled (it lacks the final
-    duplicate-elimination pass and the structured granularity of the 3-layer
-    model), so the dialog only offers the structured analysis.  Returns
-    ``"structured"`` or ``None`` when dismissed without confirmation (ESC /
-    close button).  Uses a ``QMessageBox`` with ``addButton`` because the
-    PyQt5 two-string overload ``QMessageBox.question(parent, title, text,
-    "a", "b")`` does not exist: it raises ``TypeError: argument 4 has
-    unexpected type 'str'`` (only the ``StandardButtons`` form is accepted).
-    """
-    box = QMessageBox(parent)
-    box.setWindowTitle("Analisi irAE")
-    box.setText(
-        "Avvia l'analisi irAE strutturata NCTCAE sui pazienti "
-        "selezionati?\n\n"
-        "• Lessico deterministico sulle evidenze atomiche (Layer 1-2)\n"
-        "• Una chiamata strutturata per organo (Layer 3)\n"
-        "• Passata finale di consolidamento ed eliminazione dei duplicati "
-        "(Layer 4)\n\n"
-        "Il protocollo classico a chunk è temporaneamente disattivato."
-    )
-    structured_btn = box.addButton(
-        "Avvia analisi strutturata", QMessageBox.AcceptRole
-    )
-    cancel_btn = box.addButton("Annulla", QMessageBox.RejectRole)
-    box.setDefaultButton(structured_btn)
-    box.exec_()
-    if box.clickedButton() in (None, cancel_btn):
-        return None
-    return "structured"
 
 
 class WorkspaceTabs(QTabWidget):
@@ -68,26 +33,20 @@ class WorkspaceTabs(QTabWidget):
         self._services = {}
         self._current_patient_id = None
         self._current_document_id = None
-        self._irae_queue_worker = None
         self._registry_queue_workers: dict = {}
 
-        # Create tabs
         self._documents_tab = DocumentsTab()
         self._laboratory_tab = LaboratoryTab()
-        self._clinical_history_tab = ClinicalHistoryTab()
+        self._events_tab = EventReviewTab()
         self._validation_tab = ValidationTab()
-        self._gold_set_tab = GoldSetTab()
         self._local_lexicon_tab = LocalLexiconTab()
 
-        # Add tabs
         self.addTab(self._documents_tab, "📄 Documenti")
         self.addTab(self._laboratory_tab, "🔬 Laboratorio")
-        self.addTab(self._clinical_history_tab, "📋 Storia Clinica")
-        self.addTab(self._validation_tab, "✓ Validazione")
-        self.addTab(self._gold_set_tab, "🧪 Gold Set")
+        self.addTab(self._events_tab, "🧬 Eventi SNOMED")
+        self.addTab(self._validation_tab, "✓ Attribuzioni")
         self.addTab(self._local_lexicon_tab, "Lessico condiviso")
 
-        # Connect signals
         self.currentChanged.connect(self._on_workspace_tab_changed)
         self._documents_tab.document_selected.connect(self._on_document_selected)
         self._documents_tab.import_requested.connect(self._on_import_requested)
@@ -95,20 +54,14 @@ class WorkspaceTabs(QTabWidget):
         self._validation_tab.document_reattributed.connect(
             self._on_document_reattributed
         )
-        self._clinical_history_tab.validation_requested.connect(
-            self._show_validation_tab
-        )
-
-        # Forward tab selections to context panel
         self._laboratory_tab.lab_selected.connect(self._on_lab_selected)
 
     def set_services(self, services: dict):
         self._services = services
         self._documents_tab.set_services(services)
         self._laboratory_tab.set_services(services)
-        self._clinical_history_tab.set_services(services)
+        self._events_tab.set_services(services)
         self._validation_tab.set_services(services)
-        self._gold_set_tab.set_services(services)
         self._local_lexicon_tab.set_services(services)
 
     def load_patient(self, patient_id: str):
@@ -117,38 +70,26 @@ class WorkspaceTabs(QTabWidget):
         self._current_document_id = None
         self._documents_tab.load_patient(patient_id)
         self._laboratory_tab.load_patient(patient_id)
-        self._clinical_history_tab.load_patient(patient_id)
+        self._events_tab.load_patient(patient_id)
         self._validation_tab.load_patient(patient_id)
-        self._gold_set_tab.load_patient(patient_id)
         self._local_lexicon_tab.load_patient(patient_id)
 
     def _on_workspace_tab_changed(self, index: int) -> None:
         if self.widget(index) is self._local_lexicon_tab and self._current_document_id:
             self._local_lexicon_tab.select_document(self._current_document_id)
 
-    def _show_validation_tab(self) -> None:
-        """Open and refresh phase 3 after its queue has been prepared."""
-
-        self._validation_tab.load_patient(self._current_patient_id)
-        self.setCurrentWidget(self._validation_tab)
 
     def request_shutdown(self) -> None:
         """Request cancellation without waiting for long LLM timeouts."""
 
         self._local_lexicon_tab.cancel_search()
-        try:
-            self._documents_tab.request_shutdown()
-        except Exception:
-            pass
-        try:
-            self._clinical_history_tab.request_shutdown()
-        except Exception:
-            pass
-        for worker in (
-            self._irae_queue_worker, *self._registry_queue_workers.values(),
-                *self._local_lexicon_tab.search_workers,
-        ):
-            if worker is not None and worker.isRunning():
+        for tab in (self._documents_tab, self._events_tab):
+            try:
+                tab.request_shutdown()
+            except Exception:
+                pass
+        for worker in self._background_workers():
+            if worker.isRunning():
                 cancel = getattr(worker, "cancel", None)
                 if callable(cancel):
                     cancel()
@@ -161,48 +102,30 @@ class WorkspaceTabs(QTabWidget):
 
         self.request_shutdown()
         deadline = time.monotonic() + max(0, int(wait_ms)) / 1000
+        remaining = lambda: max(0, int((deadline - time.monotonic()) * 1000))
         try:
-            self._clinical_history_tab.shutdown(
-                max(0, int((deadline - time.monotonic()) * 1000))
-            )
+            self._events_tab.shutdown(remaining())
         except Exception:
             pass
-        workers = [
-            worker for worker in (
-                self._irae_queue_worker, *self._registry_queue_workers.values(),
-                *self._local_lexicon_tab.search_workers,
-            )
-            if worker is not None and worker.isRunning()
-        ]
-        for worker in workers:
-            remaining = max(0, int((deadline - time.monotonic()) * 1000))
-            if remaining:
-                worker.wait(remaining)
-        return sum(
-            1 for worker in (
-                self._irae_queue_worker, *self._registry_queue_workers.values(),
-                *self._local_lexicon_tab.search_workers,
-            )
-            if worker is not None and worker.isRunning()
-        ) + sum(
-            1 for attr in self._clinical_history_tab._WORKER_ATTRS
-            if getattr(self._clinical_history_tab, attr, None) is not None
-            and getattr(self._clinical_history_tab, attr).isRunning()
-        )
+        for worker in self._background_workers():
+            if worker.isRunning() and remaining():
+                worker.wait(remaining())
+        return sum(worker.isRunning() for worker in self._background_workers()) \
+            + int(self._events_tab._worker_running())
+
+    def _background_workers(self) -> list:
+        return [worker for worker in (
+            *self._registry_queue_workers.values(),
+            *self._local_lexicon_tab.search_workers,
+        ) if worker is not None]
 
     def llm_operation_running(self) -> bool:
         """True while any workspace operation is using an LLM runtime."""
         if self._documents_tab.llm_operation_running():
             return True
-        if self._clinical_history_tab._worker_running():
+        if self._events_tab._worker_running():
             return True
-        return any(
-            worker is not None and worker.isRunning()
-            for worker in (
-                self._irae_queue_worker, *self._registry_queue_workers.values(),
-                *self._local_lexicon_tab.search_workers,
-            )
-        )
+        return any(worker.isRunning() for worker in self._background_workers())
 
     def _on_document_reattributed(self, source_pid: str,
                                   target_pid: str) -> None:
@@ -217,9 +140,8 @@ class WorkspaceTabs(QTabWidget):
             return
         self._documents_tab.load_patient(pid)
         self._laboratory_tab.load_patient(pid)
-        self._clinical_history_tab.load_patient(pid)
+        self._events_tab.load_patient(pid)
         self._validation_tab.load_patient(pid)
-        self._gold_set_tab.load_patient(pid)
 
     def show_import_dialog(self, files: list[str]):
         """Import documents — routes to existing/new patient workspaces."""
@@ -460,145 +382,72 @@ class WorkspaceTabs(QTabWidget):
 
     def run_registry_queue(
         self, patient_ids: list[str], *, force_rebuild: bool = False,
-        stage: str = "atomic",
     ) -> None:
-        """Run one explicit registry phase for several patients in order.
-
-        One queue per phase may run concurrently (atomic evidence and
-        clinical events use independent local models); a second queue of
-        the same phase, and any per-document LLM operation, still blocks.
-        """
+        """Extract, code and export the clinical events of several patients."""
         if not patient_ids:
             return
-        running = self._registry_queue_workers.get(stage)
+        running = self._registry_queue_workers.get("atomic")
         if running is not None and running.isRunning():
             QMessageBox.information(
                 self, "Coda già in esecuzione",
-                "Una coda della stessa fase è già in esecuzione. "
-                "Attendi il suo completamento prima di avviarne un'altra.",
+                "Attendi il completamento della coda in corso.",
             )
             return
-        if (
-            self._documents_tab.llm_operation_running()
-            or self._clinical_history_tab._worker_running()
-        ):
+        if self._documents_tab.llm_operation_running() or self._events_tab._worker_running():
             QMessageBox.information(
                 self, "Operazione LLM in corso",
-                "Attendi il completamento dell'operazione corrente prima "
-                "di avviare la coda dei registri.",
+                "Attendi il completamento dell'operazione corrente.",
             )
             return
-
-        if stage in {"atomic", "events"} and not prepare_pipeline(self._services, stage, self):
+        if not prepare_pipeline(self._services, "atomic", self):
             return
-        builder = self._services.get("clinical_history_builder")
-        client_key = {
-            "atomic": "atomic_evidence_llm_client",
-            "events": "clinical_events_llm_client",
-        }.get(stage)
-        required_llm = self._services.get(client_key) if client_key else None
-        if builder is None or (
-            client_key and (
-                required_llm is None or not required_llm.is_available
-            )
-        ):
+        pipeline = self._services.get("extraction_pipeline")
+        llm = self._services.get("atomic_evidence_llm_client")
+        if pipeline is None or llm is None or not llm.is_available:
             QMessageBox.warning(
                 self, "LLM non disponibile",
-                "Il modello richiesto dalla fase selezionata, oppure il "
-                "generatore dei registri, non è disponibile.",
+                "Il modello di estrazione non è disponibile.",
             )
             return
-
-        configs = self._services.get("llm_configs") or {}
-        state_config = configs.get(
-            "clinical_events" if stage == "events" else "atomic_evidence"
-        )
-        num_workers = max(
-            1, int(getattr(state_config, "parallel_workers", 1) or 1)
-        )
-
-        other_stage = "events" if stage == "atomic" else "atomic"
-        other_queue = self._registry_queue_workers.get(other_stage)
-        concurrent = (
-            other_queue is not None and other_queue.isRunning()
-        )
 
         from .workers import RegistryQueueWorker
 
         worker = RegistryQueueWorker(
-            builder, patient_ids, num_workers=num_workers,
+            pipeline, patient_ids,
+            num_workers=max(1, int(getattr(llm, "parallel_workers", 1) or 1)),
             force_rebuild=force_rebuild,
-            stage=stage,
         )
-        self._registry_queue_workers[stage] = worker
+        self._registry_queue_workers["atomic"] = worker
         results: list[dict] = []
-        state = {"index": 0, "total": len(patient_ids), "patient": ""}
+        state = {"index": 0, "total": len(patient_ids)}
         progress = ProgressDialog(
-            f"Coda {stage} — paziente 1/{len(patient_ids)}", parent=self,
+            f"Elaborazione — paziente 1/{len(patient_ids)}", parent=self,
         )
         progress.show()
-        if concurrent:
-            progress.add_log(
-                "⚠️ In parallelo alla coda dell'altra fase: i due modelli "
-                "locali saranno residenti insieme in RAM e le prestazioni "
-                "potranno ridursi."
-            )
         process_gui_events()
 
         def on_started(index: int, total: int, patient_id: str) -> None:
-            state.update(index=index, total=total, patient=patient_id)
-            progress.setWindowTitle(
-                f"Coda {stage} — paziente {index}/{total}"
-            )
-            progress.add_log(
-                f"\n===== Paziente {index}/{total}: {patient_id} ====="
-            )
-            progress.set_progress(
-                int((index - 1) * 100 / total),
-                f"Avvio registro di {patient_id}...",
-            )
+            state.update(index=index, total=total)
+            progress.setWindowTitle(f"Elaborazione — paziente {index}/{total}")
+            progress.add_log(f"\n===== Paziente {index}/{total}: {patient_id} =====")
+            progress.set_progress(int((index - 1) * 100 / total),
+                                  f"Avvio di {patient_id}...")
 
         def on_progress(patient_id: str, percent: int, message: str) -> None:
-            index = state["index"]
             total = max(state["total"], 1)
-            overall = int(((index - 1) + percent / 100) * 100 / total)
-            progress.set_progress(
-                overall,
-                f"{patient_id} ({percent}%): {message}",
-            )
+            overall = int(((state["index"] - 1) + percent / 100) * 100 / total)
+            progress.set_progress(overall, f"{patient_id} ({percent}%): {message}")
 
         def on_finished(patient_id: str, result: dict) -> None:
-            results.append({
-                "patient_id": patient_id, "result": result, "error": None,
-            })
-            processed = int(result.get("documents_processed", 0) or 0)
-            skipped = int(result.get("documents_skipped", 0) or 0)
-            result_stage = result.get("stage") or stage
-            if result_stage == "events":
-                label = (
-                    f"eventi completati ({result.get('final_entries', 0)} voci)"
-                )
-            elif result_stage == "validation":
-                label = (
-                    "validazione preparata "
-                    f"({result.get('validation_pending', 0)} elementi)"
-                )
-            else:
-                label = (
-                    "evidenze già aggiornate"
-                    if processed == 0 and skipped else
-                    f"evidenze completate ({processed} documenti elaborati)"
-                )
-            progress.add_log(f"✓ {patient_id}: {label}")
-            progress.set_progress(
-                int(state["index"] * 100 / max(state["total"], 1)),
-                f"{patient_id}: {label}",
+            results.append({"patient_id": patient_id, "result": result, "error": None})
+            progress.add_log(
+                f"✓ {patient_id}: {result.get('documents_processed', 0)} documenti elaborati, "
+                f"{result.get('documents_skipped', 0)} invariati, "
+                f"{result.get('documents_failed', 0)} non completati"
             )
 
         def on_error(patient_id: str, error: str) -> None:
-            results.append({
-                "patient_id": patient_id, "result": {}, "error": error,
-            })
+            results.append({"patient_id": patient_id, "result": {}, "error": error})
             progress.add_log(f"❌ {patient_id}: {error}")
 
         worker.patient_started.connect(on_started)
@@ -610,19 +459,19 @@ class WorkspaceTabs(QTabWidget):
         def on_queue_finished() -> None:
             cancelled = progress.is_cancelled()
             worker.deleteLater()
-            self._registry_queue_workers.pop(stage, None)
+            self._registry_queue_workers.pop("atomic", None)
             progress.mark_done()
             progress.accept()
             if self._current_patient_id:
-                self._clinical_history_tab.load_patient(
-                    self._current_patient_id
-                )
-            from .registry_queue_result_dialog import (
-                RegistryQueueResultDialog,
+                self._events_tab.load_patient(self._current_patient_id)
+            failed = [row for row in results if row["error"]]
+            QMessageBox.information(
+                self, "Elaborazione terminata",
+                f"{'Interrotta. ' if cancelled else ''}"
+                f"{len(results) - len(failed)} pazienti completati, {len(failed)} con errori."
+                + ("\n\n" + "\n".join(f"{row['patient_id']}: {row['error']}" for row in failed[:10])
+                   if failed else ""),
             )
-            RegistryQueueResultDialog(
-                results, cancelled=cancelled, parent=self,
-            ).exec_()
 
         worker.finished.connect(on_queue_finished)
         worker.start()
@@ -631,287 +480,6 @@ class WorkspaceTabs(QTabWidget):
     # Multi-patient irAE analysis queue
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_irae_plans(
-        services: dict, patient_ids: list[str], protocol: str
-    ) -> list[tuple[str, list[str]]]:
-        """Pre-build the analysis prompts of every patient (main thread:
-        SQLite must not be touched from the worker)."""
-        from ..clinical.irae_analysis import build_analysis_plan
-
-        timeline_repo = services.get("timeline_repo")
-        cs_repo = services.get("cs_repo")
-        plans = []
-        for pid in patient_ids:
-            entries = timeline_repo.get_by_patient(pid) if timeline_repo else []
-            profile = ""
-            if cs_repo:
-                state = cs_repo.load(pid)
-                profile = state.clinical_profile if state else ""
-            prompts = build_analysis_plan(
-                [e.to_dict() for e in entries], profile, protocol
-            )
-            plans.append((pid, prompts))
-        return plans
-
-    @staticmethod
-    def _build_irae_layer3_plans(
-        services: dict,
-        patient_ids: list[str],
-        *,
-        max_candidates: int = 60,
-    ) -> list[tuple[str, list[tuple[str, str]], dict]]:
-        """Pre-build per-organ Layer 3 prompts from the atomic evidence.
-
-        Main thread only (SQLite must not be touched from the worker): each
-        patient's ``clinical_evidence`` rows are loaded through
-        ``evidence_repo``, Layers 1-2 run deterministically, and one bounded
-        prompt per organ is produced.  Returns ``[(pid, [(organ, prompt)],
-        meta)]`` where ``meta`` carries the anchor/candidate counts so the
-        worker can render a complete report.  A patient without atomic
-        evidence yields an empty prompt list (the worker reports an explicit
-        error).
-        """
-        from dataclasses import asdict
-
-        from ..clinical import irae_layers
-        from ..clinical.irae_prototype import (
-            find_ici_anchor,
-            scan_for_irae,
-            summarize_candidates,
-        )
-
-        evidence_repo = services.get("evidence_repo")
-        if evidence_repo is None:
-            raise RuntimeError("evidence_repo non disponibile nei servizi")
-        plans: list[tuple[str, list[tuple[str, str]], dict]] = []
-        for pid in patient_ids:
-            rows = irae_layers.evidence_rows_from_models(
-                evidence_repo.get_by_patient(pid)
-            )
-            anchor = find_ici_anchor(rows)
-            candidates = scan_for_irae(rows, anchor)
-            by_organ: dict[str, list] = {}
-            for candidate in candidates:
-                by_organ.setdefault(candidate.organ, []).append(candidate)
-            organ_order = [s["organ"] for s in summarize_candidates(candidates)]
-            prompts = [
-                (
-                    organ,
-                    irae_layers.build_organ_prompt(
-                        organ, by_organ[organ], anchor, max_candidates
-                    )[0],
-                )
-                for organ in organ_order
-            ]
-            meta: dict = {
-                "candidates_total": len(candidates),
-                "anchor": (
-                    {
-                        "first_drug": anchor.first_drug,
-                        "first_date": anchor.first_date.isoformat(),
-                        "first_raw": anchor.first_raw,
-                        "last_drug": anchor.last_drug,
-                        "last_date": anchor.last_date.isoformat(),
-                        "last_raw": anchor.last_raw,
-                        "occurrences": anchor.occurrences,
-                    }
-                    if anchor is not None
-                    else None
-                ),
-                # Inspection payload (bounded, in clinical order): the Layer 2
-                # candidates plus the compact provenance of every cited
-                # evidence, so the result dialog can show and open them.
-                "candidates": [asdict(c) for c in candidates[:max_candidates]],
-                "evidence": irae_layers._compact_evidence(rows),
-            }
-            plans.append((pid, prompts, meta))
-        return plans
-
-    def run_irae_queue(self, patient_ids: list[str], instances: int = 0):
-        """Run the structured NCTCAE irAE analysis over several patients.
-
-        The classic chunked protocol is temporarily disabled, so only the
-        structured 3-layer method (+ Layer 4 consolidation) runs.  Plans are
-        built on the main thread; the LLM calls run in a background worker
-        so the UI stays responsive.  A summary dialog with one tab per
-        patient opens at the end.  *instances* (0 = auto) bounds how many
-        parallel llama-server runtimes the queue may use.
-        """
-        if not patient_ids:
-            return
-
-        if not prepare_pipeline(self._services, 'irae', self):
-            return
-        llm = self._services.get("clinical_state_llm_client")
-        if not llm or not llm.is_available:
-            QMessageBox.warning(
-                self, "LLM non disponibile",
-                "Il modello Clinical State non è disponibile.",
-            )
-            return
-
-        if choose_irae_method(self) is None:
-            return
-        self._run_irae_layer3_queue(patient_ids, llm, instances=instances)
-
-    def _run_irae_classic_queue(self, patient_ids: list[str], llm):
-        """Legacy chunked irAE protocol over the chronological registry."""
-        from ..clinical import irae_analysis
-
-        try:
-            prompt_path = irae_analysis.ensure_prompt()
-            protocol = irae_analysis.load_prompt(prompt_path)
-        except OSError as exc:
-            QMessageBox.warning(
-                self, "Protocollo non disponibile", str(exc)
-            )
-            return
-        if not protocol:
-            QMessageBox.warning(
-                self, "Protocollo non disponibile",
-                f"Il file del protocollo irAE è vuoto: {prompt_path}",
-            )
-            return
-
-        plans = self._build_irae_plans(self._services, patient_ids, protocol)
-        self._run_irae_queue_with_worker(
-            patient_ids, llm, plans, "IraeQueueWorker"
-        )
-
-    def _run_irae_layer3_queue(
-        self, patient_ids: list[str], llm, instances: int = 0
-    ):
-        """Structured NCTCAE 3-layer irAE analysis over atomic evidence."""
-        from ..clinical import irae_layers
-
-        try:
-            plans = self._build_irae_layer3_plans(
-                self._services, patient_ids,
-                max_candidates=irae_layers.DEFAULT_MAX_CANDIDATES,
-            )
-        except RuntimeError as exc:
-            QMessageBox.warning(
-                self, "Analisi irAE non disponibile", str(exc)
-            )
-            return
-        self._run_irae_queue_with_worker(
-            patient_ids, llm, plans, "IraeLayer3QueueWorker",
-            instances=instances,
-        )
-
-    def _run_irae_queue_with_worker(
-        self,
-        patient_ids: list[str],
-        llm,
-        plans: list,
-        worker_name: str,
-        instances: int = 0,
-    ):
-        """Shared queue wiring for both irAE analysis methods.
-
-        ``plans`` is either ``[(pid, list[str])]`` (classic prompts) or
-        ``[(pid, list[(organ, prompt)])]`` (structured Layer 3).  Both
-        worker classes expose the same signal contract, so the progress
-        dialog, log and result dialog are identical.  *instances* (0 =
-        auto) is forwarded to the Layer 3 worker to run several llama-server
-        runtimes in parallel; the classic worker ignores it.
-        """
-        from ..clinical import irae_layers
-        from .workers import IraeLayer3QueueWorker, IraeQueueWorker
-
-        worker_cls = {
-            "IraeQueueWorker": IraeQueueWorker,
-            "IraeLayer3QueueWorker": IraeLayer3QueueWorker,
-        }[worker_name]
-        if worker_name == "IraeLayer3QueueWorker":
-            self._irae_queue_worker = worker_cls(
-                llm, plans, instances=instances
-            )
-        else:
-            self._irae_queue_worker = worker_cls(llm, plans)
-        worker = self._irae_queue_worker
-        results: list[dict] = []
-
-        total = len(plans)
-        resolved = irae_layers.parallel_instance_count(
-            llm, override=instances
-        )
-        if resolved > 1:
-            title = (
-                f"Coda analisi irAE — {total} pazienti, "
-                f"{resolved} istanze in parallelo"
-            )
-        else:
-            title = f"Coda analisi irAE — paziente 1/{total}"
-        progress = ProgressDialog(title, parent=self)
-        progress.show()
-        process_gui_events()
-
-        worker.patient_started.connect(
-            lambda idx, n, pid, progress=progress: (
-                progress.setWindowTitle(
-                    f"Coda analisi irAE — paziente {idx}/{n}"
-                ),
-                progress.add_log(f"\n===== Paziente {idx}/{n}: {pid} ====="),
-            )
-        )
-        worker.chunk_progress.connect(
-            lambda chunk, n, progress=progress: progress.set_progress(
-                int(chunk * 100 / n),
-                f"Analisi parte {chunk}/{n}...",
-            )
-        )
-        # The structured method also emits the raw report so the result
-        # dialog can export it (Excel): attach it to the same result entry.
-        structured_by_patient: dict[str, dict] = {}
-        if hasattr(worker, "patient_structured"):
-            worker.patient_structured.connect(
-                lambda pid, report, store=structured_by_patient: (
-                    store.__setitem__(pid, report)
-                )
-            )
-        worker.patient_finished.connect(
-            lambda pid, markdown, results=results,
-            structured_by_patient=structured_by_patient: (
-                results.append({
-                    "patient_id": pid, "label": pid, "markdown": markdown,
-                    "structured": structured_by_patient.pop(pid, None),
-                    "error": None,
-                }),
-                progress.add_log(f"✓ {pid}: analisi completata"),
-            )
-        )
-        worker.patient_error.connect(
-            lambda pid, error, results=results: (
-                results.append({
-                    "patient_id": pid, "label": pid, "markdown": "",
-                    "error": error,
-                }),
-                progress.add_log(f"❌ {pid}: {error}"),
-            )
-        )
-        progress.cancelled.connect(worker.cancel)
-
-        def _on_queue_finished():
-            worker.deleteLater()
-            self._irae_queue_worker = None
-            progress.mark_done()
-            progress.accept()
-            if results:
-                from .irae_queue_result_dialog import IraeQueueResultDialog
-                dialog = IraeQueueResultDialog(
-                    results, parent=self, services=self._services
-                )
-                dialog.exec_()
-            else:
-                QMessageBox.information(
-                    self, "Nessun risultato",
-                    "Nessuna analisi completata.",
-                )
-
-        worker.finished.connect(_on_queue_finished)
-        worker.start()
 
     def run_extraction_for_docs(self, grouped: dict[str, list[str]]):
         """Run clinical-text extraction for explicit doc_ids, grouped by patient.
@@ -972,7 +540,7 @@ class WorkspaceTabs(QTabWidget):
         """Refresh all tabs after document processing completes."""
         self._local_lexicon_tab.load_patient(patient_id)
         self._laboratory_tab.load_patient(patient_id)
-        self._clinical_history_tab.load_patient(patient_id)
+        self._events_tab.load_patient(patient_id)
         self._validation_tab.load_patient(patient_id)
 
     def reprocess_document(self, doc_id: str):

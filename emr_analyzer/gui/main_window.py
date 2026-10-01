@@ -14,10 +14,7 @@ from .patient_panel import PatientPanel
 from .workspace_tabs import WorkspaceTabs
 from .context_panel import ContextPanel
 from .llm_config_dialog import LLMConfigDialog
-from .pipeline_config_dialog import PipelineConfigDialog
 from .prompt_manager_dialog import PromptManagerDialog
-from .excluded_evidence_dialog import ExcludedEvidenceDialog
-from .hypothesis_dialog import HypothesisDialog
 from .styles import MAIN_STYLESHEET
 from ..config import APP_NAME, APP_VERSION, active_workspace
 from ..extraction.llm_client import LlmClient
@@ -88,20 +85,9 @@ class MainWindow(QMainWindow):
         import_action.triggered.connect(self._on_import_documents)
         file_menu.addAction(import_action)
 
-        import_patient_action = QAction("Importa &paziente da altro progetto...", self)
-        import_patient_action.triggered.connect(self._on_import_patient)
-        file_menu.addAction(import_patient_action)
-
         merge_action = QAction("Unisci &workspace pazienti...", self)
         merge_action.triggered.connect(self._on_merge_workspaces)
         file_menu.addAction(merge_action)
-
-        file_menu.addSeparator()
-
-        export_action = QAction("&Esporta...", self)
-        export_action.setShortcut("Ctrl+E")
-        export_action.triggered.connect(self._on_export)
-        file_menu.addAction(export_action)
 
         file_menu.addSeparator()
 
@@ -113,29 +99,15 @@ class MainWindow(QMainWindow):
         # Tools menu
         tools_menu = menubar.addMenu("&Strumenti")
 
-        dossier_query_action = QAction("Interroga referti: paziente o coorte...", self)
-        dossier_query_action.triggered.connect(self._on_dossier_query)
-        tools_menu.addAction(dossier_query_action)
-
         reprocess_action = QAction("&Rielabora Documento", self)
         reprocess_action.triggered.connect(self._on_reprocess)
         tools_menu.addAction(reprocess_action)
 
         registry_queue_action = QAction(
-            "Genera registri &multi-paziente...", self
+            "Elabora &pazienti (eventi e codici SNOMED)...", self
         )
         registry_queue_action.triggered.connect(self._on_show_registry_queue)
         tools_menu.addAction(registry_queue_action)
-
-        pipeline_action = QAction("Configura &pipeline clinica...", self)
-        # macOS otherwise interprets "Configura" as Preferences and moves
-        # this action out of the Tools menu into the application menu.
-        pipeline_action.setMenuRole(QAction.NoRole)
-        pipeline_action.setToolTip(
-            "Configura evidenze di laboratorio, retry adattivo, grafo e consenso"
-        )
-        pipeline_action.triggered.connect(self._open_pipeline_config)
-        tools_menu.addAction(pipeline_action)
 
         prompts_action = QAction("Gestisci &prompt LLM...", self)
         prompts_action.setToolTip(
@@ -144,20 +116,9 @@ class MainWindow(QMainWindow):
         prompts_action.triggered.connect(self._open_prompt_manager)
         tools_menu.addAction(prompts_action)
 
-        exclusions_action = QAction("Rivedi evidenze &escluse...", self)
-        exclusions_action.triggered.connect(self._open_excluded_evidence)
-        tools_menu.addAction(exclusions_action)
-
-        hypotheses_action = QAction("Scopri e rivedi &ipotesi cliniche...", self)
-        hypotheses_action.setToolTip(
-            "Comando esplorativo separato: le ipotesi non entrano nel RAG"
-        )
-        hypotheses_action.triggered.connect(self._open_hypotheses)
-        tools_menu.addAction(hypotheses_action)
-
         tools_menu.addSeparator()
 
-        validate_action = QAction("&Validazione", self)
+        validate_action = QAction("&Attribuzioni dei documenti", self)
         validate_action.setShortcut("Ctrl+V")
         validate_action.triggered.connect(
             lambda: self.workspace_tabs.setCurrentWidget(
@@ -192,10 +153,6 @@ class MainWindow(QMainWindow):
         import_btn.triggered.connect(self._on_import_documents)
         toolbar.addAction(import_btn)
 
-        export_btn = QAction("📤 Esporta", self)
-        export_btn.triggered.connect(self._on_export)
-        toolbar.addAction(export_btn)
-
         # Workspace-wide view of documents still needing normalization or
         # carrying an error, with the option to launch the extraction on them.
         pending_btn = QAction("🧹 Non normalizzati", self)
@@ -206,21 +163,13 @@ class MainWindow(QMainWindow):
         pending_btn.triggered.connect(self._on_show_pending)
         toolbar.addAction(pending_btn)
 
-        registry_queue_btn = QAction("📚 Coda registri", self)
+        registry_queue_btn = QAction("▶ Elabora pazienti", self)
         registry_queue_btn.setToolTip(
-            "Genera o aggiorna in sequenza i registri cronologici di più "
-            "pazienti"
+            "Estrae gli eventi clinici dei pazienti selezionati, li codifica "
+            "in SNOMED CT e scrive i file FHIR"
         )
         registry_queue_btn.triggered.connect(self._on_show_registry_queue)
         toolbar.addAction(registry_queue_btn)
-
-        irae_btn = QAction("⚡ Analisi irAE", self)
-        irae_btn.setToolTip(
-            "Lancia una coda di analisi con il protocollo irAE sui registri "
-            "cronologici dei pazienti selezionati"
-        )
-        irae_btn.triggered.connect(self._on_show_irae_queue)
-        toolbar.addAction(irae_btn)
 
         # Spacer
         spacer = QWidget()
@@ -301,17 +250,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Event Handlers
     # ------------------------------------------------------------------
-    def _open_pipeline_config(self):
-        dialog = PipelineConfigDialog(
-            self, pipeline_repo=self._services.get("pipeline_repo")
-        )
-        if dialog.exec_() == QDialog.Accepted:
-            builder = self._services.get("registry_builder")
-            if builder is not None and hasattr(builder, "reload_policy"):
-                builder.reload_policy()
-            self.statusbar.showMessage(
-                "Configurazione della pipeline clinica aggiornata", 5000
-            )
 
     def _open_prompt_manager(self):
         dialog = PromptManagerDialog(
@@ -326,27 +264,6 @@ class MainWindow(QMainWindow):
             7000,
         )
 
-    def _open_excluded_evidence(self):
-        if not self._current_patient_id:
-            QMessageBox.information(
-                self, "Nessun paziente", "Seleziona prima un paziente."
-            )
-            return
-        dialog = ExcludedEvidenceDialog(
-            self._current_patient_id, self._services, self
-        )
-        dialog.exec_()
-
-    def _open_hypotheses(self):
-        if not self._current_patient_id:
-            QMessageBox.information(
-                self, "Nessun paziente", "Seleziona prima un paziente."
-            )
-            return
-        dialog = HypothesisDialog(
-            self._current_patient_id, self._services, self
-        )
-        dialog.exec_()
 
     def _on_new_patient(self):
         from .patient_panel import NewPatientDialog
@@ -411,12 +328,6 @@ class MainWindow(QMainWindow):
         if files:
             self.workspace_tabs.show_import_dialog(files)
 
-    def _on_import_patient(self):
-        """Import patients from another project."""
-        from .import_patient_dialog import ImportPatientDialog
-        dialog = ImportPatientDialog(self)
-        if dialog.exec_() == ImportPatientDialog.Accepted:
-            self.patient_panel.refresh()
 
     def _on_merge_workspaces(self):
         """Merge one or more patient workspaces into others (same project)."""
@@ -432,12 +343,6 @@ class MainWindow(QMainWindow):
             # Reload so moved documents appear in the target workspace.
             self.workspace_tabs.load_patient(self._current_patient_id)
 
-    def _on_export(self):
-        from .export_dialog import ExportDialog
-        if not self._current_patient_id:
-            return
-        dialog = ExportDialog(self._services, self._current_patient_id, self)
-        dialog.exec_()
 
     def _on_show_pending(self):
         """List every document needing normalization or with an error.
@@ -470,67 +375,9 @@ class MainWindow(QMainWindow):
             if grouped:
                 self.workspace_tabs.run_extraction_for_docs(grouped)
 
-    def _on_show_irae_queue(self):
-        """Launch the multi-patient irAE analysis queue.
-
-        Lists the patients that HAVE a chronological registry, plus those
-        with atomic evidence (the input of the structured NCTCAE 3-layer
-        method) that have no registry yet, so the batch can run as soon as
-        the 'Estrai evidenze' stage is complete.  The queue runs after the
-        selection dialog closes.
-        """
-        timeline_repo = self._services.get("timeline_repo")
-        evidence_repo = self._services.get("evidence_repo")
-        if not timeline_repo and not evidence_repo:
-            QMessageBox.warning(
-                self, "Errore", "Servizio del registro non disponibile."
-            )
-            return
-
-        from ..clinical import irae_layers
-        from .irae_queue_dialog import IraeQueueDialog, merge_irae_queue_summaries
-
-        summaries = merge_irae_queue_summaries(
-            timeline_repo.patients_with_entries() if timeline_repo else [],
-            evidence_repo.patients_with_evidence() if evidence_repo else [],
-        )
-        if not summaries:
-            QMessageBox.information(
-                self, "Nessun registro",
-                "Nessun paziente ha ancora un registro cronologico o "
-                "evidenze atomiche generate.",
-            )
-            return
-
-        llm = self._services.get("clinical_state_llm_client")
-        auto_max = irae_layers.parallel_instance_count(llm, override=0)
-        dialog = IraeQueueDialog(
-            summaries, max_instances=auto_max, parent=self
-        )
-        if dialog.exec_() != QDialog.Accepted:
-            return
-        selected = dialog.selected_patient_ids()
-        instances = dialog.selected_instances()
-        if selected:
-            self.workspace_tabs.run_irae_queue(
-                selected, instances=instances
-            )
-
-    def _on_dossier_query(self):
-        from .dossier_query_dialog import DossierQueryDialog
-
-        if self.workspace_tabs.llm_operation_running():
-            QMessageBox.information(self, "Elaborazione in corso",
-                                    "Attendi il termine dell'elaborazione prima di avviare una nuova analisi.")
-            return
-        dialog = DossierQueryDialog(
-            self._services, active_workspace.path,
-            patient_id=self._current_patient_id, parent=self,
-        )
-        dialog.exec_()
 
     def _on_show_registry_queue(self):
-        """Select patients and launch sequential registry generation."""
+        """Select patients and extract, code and export their events."""
         if self.workspace_tabs.llm_operation_running():
             QMessageBox.information(
                 self, "LLM occupato",
@@ -554,7 +401,7 @@ class MainWindow(QMainWindow):
         if not any(summary.get("eligible") for summary in summaries):
             QMessageBox.information(
                 self, "Nessun documento normalizzato",
-                "Prima di creare i registri occorre normalizzare almeno un "
+                "Prima di elaborare gli eventi occorre normalizzare almeno un "
                 "documento clinico.",
             )
             return
@@ -563,12 +410,9 @@ class MainWindow(QMainWindow):
         if dialog.exec_() != QDialog.Accepted:
             return
         selected = dialog.selected_patient_ids()
-        stage = dialog.selected_stage()
         if selected:
             self.workspace_tabs.run_registry_queue(
-                selected,
-                force_rebuild=dialog.force_rebuild(),
-                stage=stage,
+                selected, force_rebuild=dialog.force_rebuild(),
             )
 
     def _on_about(self):
@@ -651,11 +495,6 @@ class MainWindow(QMainWindow):
 
     def _apply_llm_configs(self, configs, *, persist=True, active_role=None) -> None:
         """Persist settings and replace all live clients atomically."""
-        # Compatibility for programmatic callers still passing the former
-        # document/Clinical-State pair.
-        configs = dict(configs)
-        for role in ("atomic_evidence", "clinical_events"):
-            configs.setdefault(role, configs["clinical_state"])
         old_configs = self._services.get("llm_configs") or {}
         if persist:
             save_llm_configs(configs)
@@ -707,27 +546,18 @@ class MainWindow(QMainWindow):
                 client = None
             clients[role] = client
 
+        configs = {role: configs[role] for role in MODEL_ROLES}
         document_client = clients["document"]
         atomic_client = clients["atomic_evidence"]
-        event_client = clients["clinical_events"]
-        state_client = clients["clinical_state"]
         self._services.update({
             "llm_configs": configs,
             "document_llm_client": document_client,
             "atomic_evidence_llm_client": atomic_client,
-            "clinical_events_llm_client": event_client,
-            "clinical_state_llm_client": state_client,
         })
         if active_role in (None, "document"):
             self._propagate_document_llm(document_client)
-        propagate_atomic = getattr(self, "_propagate_atomic_llm", None)
-        if propagate_atomic is not None and active_role in (None, "atomic_evidence"):
-            propagate_atomic(atomic_client)
-        propagate_events = getattr(self, "_propagate_event_llm", None)
-        if propagate_events is not None and active_role in (None, "clinical_events"):
-            propagate_events(event_client)
-        if active_role in (None, "clinical_state"):
-            self._propagate_state_llm(state_client)
+        if active_role in (None, "atomic_evidence"):
+            self._propagate_atomic_llm(atomic_client)
         self._ollama_available = any(
             client is not None and client.server_available
             for client in clients.values()
@@ -767,9 +597,7 @@ class MainWindow(QMainWindow):
                      "lo strumento di setup llama.cpp/vLLM"
             )
             return
-        configs = dict(configs)
-        for role in ("atomic_evidence", "clinical_events"):
-            configs.setdefault(role, configs["clinical_state"])
+        configs = {role: configs[role] for role in MODEL_ROLES if role in configs}
         connection = (
             "Motore LLM locale pronto" if self._ollama_available
             else "Motore locale non disponibile — esegui "
@@ -798,9 +626,7 @@ class MainWindow(QMainWindow):
             runtime_note = "Nessun server configurato"
         labels = {
             "document": "Documenti",
-            "atomic_evidence": "Evidenze atomiche",
-            "clinical_events": "Eventi clinici",
-            "clinical_state": "Analisi e interrogazione",
+            "atomic_evidence": "Estrazione e codifica",
         }
         role_lines = [
             f"{labels[role]}: {configs[role].model or 'off'} "
@@ -808,7 +634,7 @@ class MainWindow(QMainWindow):
             f"ctx {configs[role].context_length}, "
             f"{configs[role].parallel_workers} slot, "
             f"T {configs[role].temperature:g}"
-            for role in MODEL_ROLES
+            for role in MODEL_ROLES if role in configs
         ]
         details = "\n".join([connection, runtime_note, *role_lines])
         self._ollama_label.setToolTip(details)
@@ -820,26 +646,11 @@ class MainWindow(QMainWindow):
             isolator.llm = client
 
     def _propagate_atomic_llm(self, client):
-        """Update the immutable evidence-extraction stage only."""
-        registry_builder = self._services.get("registry_builder")
-        if registry_builder is not None:
-            registry_builder.atomic_llm = client
-            registry_builder.atomic_extractor = (
-                registry_builder.make_atomic_extractor() if client is not None else None
-            )
+        """Update the event extraction and coding stage."""
+        pipeline = self._services.get("extraction_pipeline")
+        if pipeline is not None:
+            pipeline.set_llm(client)
 
-    def _propagate_event_llm(self, client):
-        """Update event fusion and clinical-episode synthesis only."""
-        registry_builder = self._services.get("registry_builder")
-        if registry_builder is not None:
-            registry_builder.event_llm = client
-            registry_builder.llm = client
-
-    def _propagate_state_llm(self, client):
-        """Update analysis, narrative and longitudinal-query services."""
-        history_builder = self._services.get("clinical_history_builder")
-        if history_builder is not None:
-            history_builder._llm = client
 
     def closeEvent(self, event):
         """Always permit an explicit exit, even while background work runs."""

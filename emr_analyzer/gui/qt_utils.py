@@ -20,3 +20,13 @@ def process_gui_events() -> None:
     application = QApplication.instance()
     if application is not None:
         application.processEvents()
+
+
+def qt_offset(text: str, offset: int) -> int:
+    """Python string offset → Qt (UTF-16) document position."""
+    return len(text[:offset].encode('utf-16-le')) // 2
+
+
+def python_offset(text: str, offset: int) -> int:
+    """Qt (UTF-16) document position → Python string offset."""
+    return len(text.encode('utf-16-le')[:offset*2].decode('utf-16-le', errors='ignore'))

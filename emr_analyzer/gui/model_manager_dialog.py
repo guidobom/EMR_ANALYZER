@@ -105,7 +105,7 @@ class _CatalogCard(QFrame):
         if "document" in model.roles:
             roles.append("Documenti/evidenze")
         if "clinical_state" in model.roles:
-            roles.append("Evidenze/eventi/analisi")
+            roles.append("Estrazione e codifica")
         metrics = QLabel(
             f"<b>Ruoli:</b> {' + '.join(roles)} &nbsp; · &nbsp; "
             f"<b>Pesi:</b> {html.escape(model.parameter_label)}, "
@@ -264,13 +264,7 @@ class ModelManagerDialog(QDialog):
         self._catalog_role.addItem("Tutti i ruoli", "")
         self._catalog_role.addItem("LLM per i documenti", "document")
         self._catalog_role.addItem(
-            "LLM per le evidenze atomiche", "atomic_evidence"
-        )
-        self._catalog_role.addItem(
-            "LLM per gli eventi clinici", "clinical_events"
-        )
-        self._catalog_role.addItem(
-            "LLM per analisi e interrogazione", "clinical_state"
+            "LLM per estrazione e codifica", "atomic_evidence"
         )
         filters.addWidget(self._catalog_role)
         self._catalog_search = QLineEdit()

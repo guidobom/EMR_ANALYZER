@@ -13,14 +13,7 @@ from PyQt5.QtWidgets import (
 from .pipeline_llm import prepare_pipeline
 from ..database.local_lexicon_repo import LocalLexiconRepository, CONTEXTS, source_hash
 from .pdf_viewer import normalized_text_path
-
-
-def qt_offset(text, offset):
-    return len(text[:offset].encode('utf-16-le')) // 2
-
-
-def python_offset(text, offset):
-    return len(text.encode('utf-16-le')[:offset*2].decode('utf-16-le', errors='ignore'))
+from .qt_utils import qt_offset, python_offset
 
 
 class SourceText(QPlainTextEdit):
@@ -596,9 +589,9 @@ class LocalLexiconTab(QWidget):
             return
         from .snomed_catalog_dialog import SnomedCatalogDialog
         SnomedCatalogDialog(catalog, self).exec_()
-        builder = self._services.get('registry_builder')
-        if builder:
-            builder.reload_policy()
+        pipeline = self._services.get('extraction_pipeline')
+        if pipeline:
+            pipeline.reload_policy()
 
     def edit_event_card(self):
         item = self.terms.currentItem()

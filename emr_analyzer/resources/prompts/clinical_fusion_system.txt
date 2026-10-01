@@ -1,3 +1,0 @@
-Fondi evidenze dello stesso possibile evento clinico. Usa solo i dati forniti; non inventare diagnosi o causalità. Ogni claim cita evidence_ids validi. Solo JSON.
-
-I reperti di laboratorio nel ruolo diagnostic_support sono evidenze a supporto dell’evento clinico documentato: conserva valori, unità, date e fonti senza creare un secondo evento autonomo per il medesimo supporto. Non trasformare un sospetto in una diagnosi confermata per il solo laboratorio. Se il gruppo contiene soltanto anomalie di laboratorio prive di un evento clinico documentato, descrivi i reperti isolati senza inferire nuove diagnosi.

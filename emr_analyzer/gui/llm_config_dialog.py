@@ -33,24 +33,14 @@ ROLE_DEFINITIONS = {
         "Isola e normalizza il contenuto clinico estratto dai singoli PDF.",
     ),
     "atomic_evidence": (
-        "LLM per le evidenze atomiche",
-        "Estrae fatti clinici aderenti al testo, citati e strutturati in JSON.",
-    ),
-    "clinical_events": (
-        "LLM per gli eventi clinici",
-        "Fonde, deduplica e assembla le evidenze in problemi ed episodi.",
-    ),
-    "clinical_state": (
-        "LLM per analisi e interrogazione",
-        "Interroga il registro e genera analisi longitudinali, incluso irAE.",
+        "LLM per estrazione e codifica",
+        "Estrae gli eventi clinici ancorati al testo e li codifica in SNOMED CT.",
     ),
 }
 
 ROLE_TAB_LABELS = {
     "document": "Documenti",
-    "atomic_evidence": "Evidenze atomiche",
-    "clinical_events": "Eventi clinici",
-    "clinical_state": "Analisi",
+    "atomic_evidence": "Estrazione e codifica",
 }
 
 
@@ -73,8 +63,7 @@ class LLMConfigDialog(QDialog):
         self._slot_benchmark_enabled = enable_slot_benchmark
         self._launch_role = role
         if role is None:
-            for fallback_role in ("atomic_evidence", "clinical_events"):
-                configs.setdefault(fallback_role, configs["clinical_state"])
+            configs = {name: configs[name] for name in ROLE_DEFINITIONS if name in configs}
         else:
             configs = {role: configs[role]}
             self.setWindowTitle(pipeline_title or ROLE_DEFINITIONS[role][0])
@@ -1210,9 +1199,7 @@ class LLMConfigDialog(QDialog):
             return
         workload = {
             "document": "normalizzazioni documentali lunghe",
-            "atomic_evidence": "estrazioni JSON con molte evidenze",
-            "clinical_events": "fusioni e assemblaggi di episodi complessi",
-            "clinical_state": "registri estesi e analisi irAE complete",
+            "atomic_evidence": "estrazioni JSON con molti eventi",
         }[role]
         warning.setText(
             f"⚠ Limite inferiore al valore consigliato "

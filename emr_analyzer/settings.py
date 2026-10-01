@@ -17,16 +17,14 @@ from .config import (
 SETTINGS_PATH = BASE_DIR / "settings.json"
 
 # Keep a stable order: it is also the order shown in the configuration UI.
-# ``clinical_state`` remains the analysis/query role for backward
-# compatibility.  Older settings containing only that role are migrated by
-# cloning it into the two new registry-specific roles.
+# ``document`` normalizes imported reports; ``atomic_evidence`` extracts and
+# codes clinical events.  Settings written by older builds may still contain
+# ``clinical_state``: it seeds ``atomic_evidence`` when that role is absent.
 MODEL_ROLES = (
     "document",
     "atomic_evidence",
-    "clinical_events",
-    "clinical_state",
 )
-REGISTRY_MODEL_ROLES = ("atomic_evidence", "clinical_events")
+REGISTRY_MODEL_ROLES = ("atomic_evidence",)
 
 
 @dataclass(frozen=True)
@@ -193,8 +191,6 @@ def default_llm_configs() -> dict[str, LLMRoleConfig]:
         # is both more reproducible and less likely to violate the schema,
         # reducing corrective calls without weakening the event model.
         "atomic_evidence": replace(clinical_config, temperature=0.0),
-        "clinical_events": clinical_config,
-        "clinical_state": clinical_config,
     }
 
 
@@ -276,19 +272,13 @@ def save_llm_configs(
     configs: dict[str, LLMRoleConfig],
     path: str | Path = SETTINGS_PATH,
 ) -> None:
-    """Atomically persist role configurations and legacy model names.
-
-    Two-role callers are accepted as a compatibility bridge and are upgraded
-    by assigning their Clinical State configuration to both registry stages.
-    """
-    unknown = set(configs) - set(MODEL_ROLES)
-    if unknown or "document" not in configs or "clinical_state" not in configs:
+    """Atomically persist the document and extraction role configurations."""
+    missing = set(MODEL_ROLES) - set(configs)
+    if missing:
         raise ValueError(
-            "Sono richieste almeno le configurazioni document e clinical_state"
+            "Sono richieste le configurazioni: " + ", ".join(sorted(missing))
         )
-    normalized = dict(configs)
-    for role in REGISTRY_MODEL_ROLES:
-        normalized.setdefault(role, normalized["clinical_state"])
+    normalized = {role: configs[role] for role in MODEL_ROLES}
     if not all(
         isinstance(normalized[role], LLMRoleConfig) for role in MODEL_ROLES
     ):

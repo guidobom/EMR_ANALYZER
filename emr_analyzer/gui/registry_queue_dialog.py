@@ -1,4 +1,4 @@
-"""Selection dialog for sequential multi-patient registry generation."""
+"""Patient selection for event extraction, SNOMED coding and FHIR export."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
+from ..clinical.grounded_sources import METHOD
 from ..models.document import ExtractionStatus
 
 
@@ -32,8 +33,11 @@ def build_registry_queue_summaries(services: dict) -> list[dict]:
     for document in document_repo.list_all():
         documents_by_patient[document.patient_id].append(document)
 
-    registry_repo = services.get("registry_repo")
-    timeline_repo = services.get("timeline_repo")
+    db = services.get("db")
+    event_counts = dict(db.execute(
+        """SELECT patient_id, COUNT(*) FROM clinical_evidence
+           WHERE extraction_method=? GROUP BY patient_id""", (METHOD,)
+    ).fetchall()) if db is not None else {}
     summaries = []
     for patient in patient_repo.list_all():
         documents = documents_by_patient.get(patient.id, [])
@@ -43,36 +47,27 @@ def build_registry_queue_summaries(services: dict) -> list[dict]:
             document.extraction_status == ExtractionStatus.DONE.value
             for document in documents
         )
-        if registry_repo is not None:
-            registry_count = registry_repo.count_by_patient(patient.id)
-        elif timeline_repo is not None:
-            registry_count = timeline_repo.count_by_patient(patient.id)
-        else:
-            registry_count = 0
         summaries.append({
             "id": patient.id,
             "pseudonym": patient.pseudonym or "",
             "document_count": len(documents),
             "normalized_count": ready,
             "pending_count": len(documents) - ready,
-            "registry_count": registry_count,
+            "event_count": int(event_counts.get(patient.id, 0)),
             "eligible": ready > 0,
         })
     return summaries
 
 
 class RegistryQueueDialog(QDialog):
-    """Choose patients and incremental versus full registry generation."""
+    """Choose patients and incremental versus full extraction."""
 
     INCREMENTAL = "incremental"
     REBUILD = "rebuild"
-    ATOMIC = "atomic"
-    EVENTS = "events"
-    VALIDATION = "validation"
 
     def __init__(self, summaries: list[dict], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Generazione registri multi-paziente")
+        self.setWindowTitle("Elabora pazienti: eventi clinici, SNOMED CT e FHIR")
         self.resize(860, 540)
         self._summaries = list(summaries)
         self._selected = {
@@ -82,29 +77,13 @@ class RegistryQueueDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Seleziona i pazienti da inserire nella coda. I pazienti vengono "
-            "elaborati uno alla volta; per ciascuno, i documenti utilizzano "
-            "tutti i worker LLM configurati. L'annullamento diventa effettivo "
-            "dopo il paziente in corso."
+            "Seleziona i pazienti da elaborare. Per ogni paziente vengono letti "
+            "i referti anonimizzati non ancora elaborati, estratti e codificati "
+            "gli eventi clinici e scritto il file FHIR. I documenti già "
+            "elaborati vengono saltati."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
-
-        phase_row = QHBoxLayout()
-        phase_row.addWidget(QLabel("Fase indipendente:"))
-        self._phase = QComboBox()
-        self._phase.addItem(
-            "1 · Estrai/aggiorna evidenze atomiche", self.ATOMIC
-        )
-        self._phase.addItem(
-            "2 · Crea eventi clinici dalle evidenze", self.EVENTS
-        )
-        self._phase.addItem(
-            "3 · Prepara le code di validazione", self.VALIDATION
-        )
-        self._phase.currentIndexChanged.connect(self._on_phase_changed)
-        phase_row.addWidget(self._phase, stretch=1)
-        layout.addLayout(phase_row)
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Modalità:"))
@@ -114,7 +93,7 @@ class RegistryQueueDialog(QDialog):
             self.INCREMENTAL,
         )
         self._mode.addItem(
-            "Rigenera integralmente tutti i registri selezionati",
+            "Rielabora da capo tutti i documenti dei pazienti selezionati",
             self.REBUILD,
         )
         self._mode.currentIndexChanged.connect(self._update_run_button)
@@ -130,7 +109,7 @@ class RegistryQueueDialog(QDialog):
         self._table.setColumnCount(7)
         self._table.setHorizontalHeaderLabels([
             "☑", "Paziente", "Pseudonimo", "Documenti",
-            "Normalizzati", "Da normalizzare", "Voci registro",
+            "Normalizzati", "Da normalizzare", "Eventi estratti",
         ])
         self._table.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.Stretch
@@ -162,7 +141,7 @@ class RegistryQueueDialog(QDialog):
                 summary.get("document_count", 0),
                 summary.get("normalized_count", 0),
                 summary.get("pending_count", 0),
-                summary.get("registry_count", 0),
+                summary.get("event_count", 0),
             )
             for column, value in enumerate(values, start=1):
                 self._table.setItem(row, column, QTableWidgetItem(str(value)))
@@ -217,42 +196,14 @@ class RegistryQueueDialog(QDialog):
 
     def _update_run_button(self) -> None:
         rebuild = self.force_rebuild()
-        stage = self.selected_stage()
-        verb = {
-            self.ATOMIC: "Rigenera evidenze" if rebuild else "Estrai evidenze",
-            self.EVENTS: "Crea eventi",
-            self.VALIDATION: "Prepara validazione",
-        }[stage]
-        self._run_btn.setText(f"📋 {verb} ({len(self._selected)})")
+        verb = "Rielabora" if rebuild else "Elabora"
+        self._run_btn.setText(f"▶ {verb} ({len(self._selected)})")
         self._run_btn.setEnabled(bool(self._selected))
         self._warning.setText(
-            "La rigenerazione integrale ignora i manifest correnti e può "
-            "richiedere molte ore."
-            if rebuild else
-            {
-                self.ATOMIC: (
-                    "I documenti con evidenze correnti vengono saltati; non "
-                    "saranno creati eventi clinici."
-                ),
-                self.EVENTS: (
-                    "Usa soltanto evidenze atomiche già aggiornate e non "
-                    "rilegge i documenti."
-                ),
-                self.VALIDATION: (
-                    "Aggiorna deterministicamente la coda per la revisione "
-                    "umana; non esegue alcun LLM."
-                ),
-            }[stage]
+            "La rielaborazione completa ignora i documenti già elaborati e può "
+            "richiedere molte ore." if rebuild else
+            "I documenti già elaborati con lo stesso modello e prompt vengono saltati."
         )
-
-    def _on_phase_changed(self) -> None:
-        atomic = self.selected_stage() == self.ATOMIC
-        self._mode.setEnabled(atomic)
-        if not atomic:
-            self._mode.setCurrentIndex(
-                self._mode.findData(self.INCREMENTAL)
-            )
-        self._update_run_button()
 
     def selected_patient_ids(self) -> list[str]:
         """Selected eligible IDs in their displayed order."""
@@ -262,10 +213,4 @@ class RegistryQueueDialog(QDialog):
         ]
 
     def force_rebuild(self) -> bool:
-        return (
-            self.selected_stage() == self.ATOMIC
-            and self._mode.currentData() == self.REBUILD
-        )
-
-    def selected_stage(self) -> str:
-        return str(self._phase.currentData() or self.ATOMIC)
+        return self._mode.currentData() == self.REBUILD

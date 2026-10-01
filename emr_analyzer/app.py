@@ -16,7 +16,6 @@ from .database.patient_identity_repo import PatientIdentityRepository
 from .database.evidence_repo import EvidenceRepository
 from .database.document_repo import DocumentRepository
 from .database.lab_repo import LabRepository
-from .database.clinical_state_repo import ClinicalStateRepository
 from .database.audit_repo import AuditRepository
 from .pipeline.converter import DoclingConverter
 from .pipeline.pdf_extractor import PdfPlumberExtractor
@@ -30,21 +29,13 @@ from .extraction.lab_parser import LabParser
 from .extraction.normalizer import LabNormalizer
 from .extraction.llm_client import LlmClient
 from .extraction.clinical_text_filter import ClinicalTextFilter
-from .clinical.clinical_history_builder import ClinicalHistoryBuilder
-from .clinical.registry_builder import ClinicalRegistryBuilder
+from .clinical.extraction_pipeline import ExtractionPipeline
 from .clinical.document_deletion import DocumentDeletionService
-from .clinical.evidence_deletion import EvidenceDeletionService
 from .clinical.patient_deletion import PatientWorkspaceDeletionService
 from .clinical.document_reattribution import DocumentReattributionService
 from .gui.main_window import MainWindow
-from .database.timeline_repo import TimelineRepository
-from .database.chat_repo import ChatRepository
-from .database.registry_repo import ClinicalRegistryRepository
 from .database.processing_repo import ProcessingRepository
 from .database.overlay_repo import DocumentTextOverlayRepository
-from .database.review_repo import ReviewDecisionRepository
-from .database.gold_set_repo import GoldSetRepository
-from .database.pipeline_repo import ClinicalPipelineRepository
 from .settings import load_llm_configs
 
 
@@ -118,35 +109,19 @@ class EMRAnalyzerApp:
         identity_repo = PatientIdentityRepository(db)
         doc_repo = DocumentRepository(db)
         lab_repo = LabRepository(db)
-        cs_repo = ClinicalStateRepository(db)
         audit_repo = AuditRepository(db)
         evidence_repo = EvidenceRepository(db)
-        timeline_repo = TimelineRepository(db)
-        chat_repo = ChatRepository(db)
-        registry_repo = ClinicalRegistryRepository(db)
         processing_repo = ProcessingRepository(db)
         overlay_repo = DocumentTextOverlayRepository(db)
-        review_repo = ReviewDecisionRepository(db)
-        pipeline_repo = ClinicalPipelineRepository(db)
-        gold_set_repo = GoldSetRepository(
-            db, registry_repo=registry_repo, audit_repo=audit_repo
-        )
         self._services.update({
             "patient_repo": patient_repo,
             "identity_repo": identity_repo,
             "document_repo": doc_repo,
             "lab_repo": lab_repo,
-            "cs_repo": cs_repo,
             "audit_repo": audit_repo,
             "evidence_repo": evidence_repo,
-            "timeline_repo": timeline_repo,
-            "chat_repo": chat_repo,
-            "registry_repo": registry_repo,
             "processing_repo": processing_repo,
             "overlay_repo": overlay_repo,
-            "review_repo": review_repo,
-            "pipeline_repo": pipeline_repo,
-            "gold_set_repo": gold_set_repo,
         })
         from .database.shared_lexicon_repo import SharedLexiconRepository
         shared_lexicon = SharedLexiconRepository(db, active_workspace.path, SHARED_LEXICON_PATH)
@@ -197,8 +172,6 @@ class EMRAnalyzerApp:
             self._services.update({
                 "document_llm_client": clients["document"],
                 "atomic_evidence_llm_client": clients["atomic_evidence"],
-                "clinical_events_llm_client": clients["clinical_events"],
-                "clinical_state_llm_client": clients["clinical_state"],
                 "ollama_available": ollama_ok,
                 "llm_configs": self._llm_configs,
             })
@@ -229,8 +202,6 @@ class EMRAnalyzerApp:
             self._services.update({
                 "document_llm_client": None,
                 "atomic_evidence_llm_client": None,
-                "clinical_events_llm_client": None,
-                "clinical_state_llm_client": None,
                 "ollama_available": False,
                 "llm_configs": self._llm_configs,
             })
@@ -264,42 +235,19 @@ class EMRAnalyzerApp:
         })
 
         # ---- Clinical components ----
-        registry_builder = ClinicalRegistryBuilder(
-            shared_lexicon_repo=shared_lexicon,
-            registry_repo=registry_repo,
+        self._services["extraction_pipeline"] = ExtractionPipeline(
             evidence_repo=evidence_repo,
             processing_repo=processing_repo,
-            timeline_repo=timeline_repo,
             document_repo=doc_repo,
             lab_repo=lab_repo,
             overlay_repo=overlay_repo,
-            atomic_llm_client=self._services.get(
-                "atomic_evidence_llm_client"
-            ),
-            event_llm_client=self._services.get(
-                "clinical_events_llm_client"
-            ),
+            llm_client=self._services.get("atomic_evidence_llm_client"),
             audit_repo=audit_repo,
-            pipeline_repo=pipeline_repo,
+            shared_lexicon_repo=shared_lexicon,
             db=db,
         )
-        clinical_history_builder = ClinicalHistoryBuilder(
-            timeline_repo=timeline_repo,
-            document_repo=doc_repo,
-            cs_repo=cs_repo,
-            clinical_state_llm_client=self._services.get("clinical_state_llm_client"),
-            audit_repo=audit_repo,
-            registry_builder=registry_builder,
-        )
-        self._services.update({
-            "clinical_history_builder": clinical_history_builder,
-            "registry_builder": registry_builder,
-        })
         self._services["document_deletion"] = DocumentDeletionService(
             db, doc_repo, audit_repo=audit_repo
-        )
-        self._services["evidence_deletion"] = EvidenceDeletionService(
-            db, review_repo, registry_repo, cs_repo, audit_repo=audit_repo
         )
         self._services["patient_workspace_deletion"] = (
             PatientWorkspaceDeletionService(db, patient_repo)
