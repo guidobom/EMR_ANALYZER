@@ -99,6 +99,9 @@ _DOCUMENT_BOUND_TABLES = {
     "clinical_evidence": "document_id",
     "lab_values": "document_id",
     "document_identity_evidence": "document_id",
+    "event_overrides": "document_id",
+    "document_text_overlays": "document_id",
+    "processing_manifest": "document_id",
 }
 
 # Tables that can be repointed wholesale; document references are nullable or
@@ -363,6 +366,8 @@ class WorkspaceMergeService:
             )
             result.source_removed = False
 
+        from .fhir_registry import invalidate_patient_fhir
+        invalidate_patient_fhir(self.workspaces_dir, target_pid)
         self._emit(progress_callback, 100, "Completato")
         return result
 

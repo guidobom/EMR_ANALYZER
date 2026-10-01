@@ -240,16 +240,21 @@ class FhirRegistry:
     def write(self,path,coverage):
         bundle=self.bundle(coverage)
         validate_bundle(bundle)
-        target=Path(path);target.parent.mkdir(parents=True,exist_ok=True)
-        fd,temp=tempfile.mkstemp(prefix='.clinical-events-',suffix='.json',dir=target.parent)
-        try:
-            with os.fdopen(fd,'w',encoding='utf-8') as handle:
-                json.dump(bundle,handle,ensure_ascii=False,indent=2,allow_nan=False)
-                handle.flush();os.fsync(handle.fileno())
-            os.replace(temp,target)
-        finally:
-            if os.path.exists(temp):os.unlink(temp)
-        return str(target)
+        return write_atomic(path,json.dumps(bundle,ensure_ascii=False,indent=2,allow_nan=False))
+
+
+def write_atomic(path,content):
+    """Write a text file through a temporary sibling, then replace it."""
+    target=Path(path);target.parent.mkdir(parents=True,exist_ok=True)
+    fd,temp=tempfile.mkstemp(prefix='.'+target.stem+'-',suffix=target.suffix,dir=target.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as handle:
+            handle.write(content)
+            handle.flush();os.fsync(handle.fileno())
+        os.replace(temp,target)
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+    return str(target)
 
 
 def validate_bundle(bundle):
@@ -285,6 +290,22 @@ def validate_bundle(bundle):
     except ImportError:
         return
     Bundle(bundle,strict=True)
+
+
+PATIENT_FILENAME = 'clinical_events.fhir.json'
+
+
+def invalidate_patient_fhir(workspaces_dir, *patient_ids):
+    """Remove FHIR files that no longer match the patient's documents.
+
+    The file is a projection of the database: it is rebuilt by the next
+    processing or export of the patient, never patched in place.
+    """
+    for patient_id in patient_ids:
+        if patient_id:
+            path = Path(workspaces_dir) / patient_id / PATIENT_FILENAME
+            if path.is_file():
+                path.unlink()
 
 
 def lab_occurrence_keys(labs):

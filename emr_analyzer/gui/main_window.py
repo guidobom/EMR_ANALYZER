@@ -91,6 +91,16 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        fhir_export_action = QAction("Esporta &FHIR del progetto (NDJSON)...", self)
+        fhir_export_action.setToolTip(
+            "Rigenera il file FHIR di ogni paziente e scrive un unico file NDJSON "
+            "del progetto (una risorsa FHIR per riga)"
+        )
+        fhir_export_action.triggered.connect(self._on_export_project_fhir)
+        file_menu.addAction(fhir_export_action)
+
+        file_menu.addSeparator()
+
         quit_action = QAction("&Esci", self)
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
@@ -375,6 +385,39 @@ class MainWindow(QMainWindow):
             if grouped:
                 self.workspace_tabs.run_extraction_for_docs(grouped)
 
+
+    def _on_export_project_fhir(self):
+        """Export the reviewed events of every patient as FHIR NDJSON."""
+        pipeline = self._services.get("extraction_pipeline")
+        if pipeline is None:
+            return
+        if self.workspace_tabs.llm_operation_running():
+            QMessageBox.information(self, "Elaborazione in corso",
+                                    "Attendi il termine dell'elaborazione prima di esportare.")
+            return
+        from .progress_dialog import ProgressDialog
+        from .workers import ProjectExportWorker
+
+        progress = ProgressDialog("Esportazione FHIR del progetto", parent=self)
+        worker = ProjectExportWorker(pipeline, self)
+        worker.progress.connect(lambda percent, message: progress.set_progress(percent, message))
+        progress.cancelled.connect(worker.cancel)
+
+        def finish(message, *, error=False):
+            progress.mark_done()
+            progress.accept()
+            (QMessageBox.warning if error else QMessageBox.information)(
+                self, "Esportazione FHIR", message)
+
+        worker.result_ready.connect(lambda result: finish(
+            f"{result['patients']} pazienti, {result['events']} risorse cliniche "
+            f"({result['uncoded']} senza codice), {result['resources']} righe.\n\n{result['path']}"))
+        worker.cancelled.connect(lambda: finish("Esportazione interrotta."))
+        worker.error.connect(lambda message: finish(f"Esportazione non riuscita: {message}", error=True))
+        worker.finished.connect(worker.deleteLater)
+        self._project_export_worker = worker
+        progress.show()
+        worker.start()
 
     def _on_show_registry_queue(self):
         """Select patients and extract, code and export their events."""

@@ -139,7 +139,22 @@ class LoincCatalog:
         return result
 
     def propose(self,labs,llm,cancelled=None,progress=None):
-        """Proposals are run-local: LLM choices never become reviewed aliases."""
+        """Proposals never become reviewed mappings.
+
+        Without a model (``llm`` None) only previously cached proposals are
+        returned, so an export does not need a running model.
+        """
+        if llm is None:
+            proposals={}
+            for lab in labs:
+                signature=self.signature(lab.normalized_name or lab.parameter_name,lab.biological_material,lab.unit)
+                if signature in proposals or self.resolve(lab):continue
+                row=self.db.execute('SELECT code FROM loinc_proposals WHERE signature=? AND code IS NOT NULL '
+                                    'ORDER BY rowid DESC LIMIT 1',(signature,)).fetchone()
+                concept=self.lookup(row[0]) if row else None
+                if concept and concept['status']=='ACTIVE':
+                    proposals[signature]={**concept,'mapping_review':'proposed'}
+            return proposals
         import jsonschema
         proposals={}
         pending=[]

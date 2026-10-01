@@ -1,7 +1,6 @@
 """Right panel showing context/details of the selected item."""
 
 import json
-import hashlib
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QGroupBox,

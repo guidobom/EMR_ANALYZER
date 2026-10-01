@@ -86,3 +86,32 @@ class RegistryQueueWorker(QThread):
             self.cancelled.emit()
         except Exception as exc:
             self.patient_error.emit("", str(exc))
+
+
+class ProjectExportWorker(QThread):
+    """Write every patient's FHIR file and the project NDJSON export."""
+
+    progress = pyqtSignal(int, str)
+    result_ready = pyqtSignal(dict)
+    cancelled = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, pipeline, parent=None):
+        super().__init__(parent)
+        self.pipeline = pipeline
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def run(self):
+        try:
+            result = self.pipeline.export_project(
+                progress=lambda pct, msg: self.progress.emit(int(pct), str(msg)),
+                cancel_check=self._cancel_event.is_set,
+            )
+            self.result_ready.emit(result)
+        except ExtractionCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.error.emit(str(exc))

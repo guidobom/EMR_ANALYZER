@@ -92,6 +92,10 @@ class EventReviewTab(QWidget):
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._cancel_btn.setVisible(False)
         actions.addWidget(self._cancel_btn)
+        self._export_btn = QPushButton("Esporta FHIR")
+        self._export_btn.setToolTip("Riscrive il file FHIR del paziente con lo stato attuale della revisione.")
+        self._export_btn.clicked.connect(self._export_fhir)
+        actions.addWidget(self._export_btn)
         self._fhir_btn = QPushButton("Apri FHIR")
         self._fhir_btn.clicked.connect(self._show_fhir)
         actions.addWidget(self._fhir_btn)
@@ -276,6 +280,18 @@ class EventReviewTab(QWidget):
             "evidence_id": item.evidence_id, "page_number": item.source_page,
             "bbox": item.bbox, "source_text": item.source_text,
             "normalized_entity": item.normalized_entity}).exec_()
+
+    def _export_fhir(self) -> None:
+        pipeline = self._services.get("extraction_pipeline")
+        if pipeline is None or not self._patient_id or self._worker_running():
+            return
+        try:
+            result = pipeline.export_patient(self._patient_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "Esportazione FHIR", f"Esportazione non riuscita: {exc}")
+            return
+        self._status.setText(f"FHIR aggiornato: {result['events']} risorse cliniche, "
+                             f"{result['uncoded']} senza codice · {result['path']}")
 
     def _show_fhir(self) -> None:
         pipeline = self._services.get("extraction_pipeline")

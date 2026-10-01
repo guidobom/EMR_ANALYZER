@@ -46,6 +46,11 @@ class DocumentReattributionService:
         "clinical_evidence",
         "lab_values",
         "document_identity_evidence",
+        # Reviewer decisions, text corrections and extraction status follow
+        # the report, so nothing is redone or misattributed after the move.
+        "event_overrides",
+        "document_text_overlays",
+        "processing_manifest",
     )
 
     def __init__(self, db, document_repo, patient_repo, audit_repo,
@@ -205,6 +210,8 @@ class DocumentReattributionService:
                 result.warnings.append(
                     "File originale duplicato non rimosso dalla sorgente"
                 )
+        from .fhir_registry import invalidate_patient_fhir
+        invalidate_patient_fhir(self.workspaces_dir, source, target_patient_id)
         try:
             self.audit_repo.log(
                 target_patient_id, "document_reattributed", "document",
@@ -284,6 +291,8 @@ class DocumentReattributionService:
             )
             return result
 
+        from .fhir_registry import invalidate_patient_fhir
+        invalidate_patient_fhir(self.workspaces_dir, source)
         try:
             self.audit_repo.log(
                 source, "attribution_confirmed", "document", doc_id,

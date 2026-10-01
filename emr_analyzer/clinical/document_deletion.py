@@ -144,6 +144,8 @@ class DocumentDeletionService:
             except Exception as exc:
                 result.warnings.append(f"Audit log non aggiornato: {exc}")
 
+        from .fhir_registry import invalidate_patient_fhir
+        invalidate_patient_fhir(self.workspaces_dir, document.patient_id)
         if trash_dir.exists():
             try:
                 shutil.rmtree(trash_dir)

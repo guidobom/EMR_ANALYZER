@@ -414,24 +414,82 @@ class ExtractionPipeline:
             "run_id": plan.run.run_id, "elapsed_seconds": elapsed, "coding": coding, **summary,
         }
 
-    def write_fhir(self, patient_id, documents, coverage, *, cancel_check=None) -> dict:
+    def build_fhir(self, patient_id, documents=None, *, cancel_check=None):
+        """FHIR registry of the patient's reviewed events and parsed results."""
+        from .event_review import to_evidence
         from .fhir_registry import FhirRegistry, lab_occurrence_keys
+        if documents is None:
+            documents = self.document_repo.list_by_patient(patient_id)
         loinc = getattr(self.shared_lexicon_repo, "loinc_catalog", None)
         lab_values = self.lab_repo.get_by_patient(patient_id)
         proposals = {}
-        if loinc and self.llm and getattr(self.llm, "is_available", False):
-            proposals = loinc.propose(lab_values, self.llm,
+        if loinc:
+            llm = self.llm if (self.llm and getattr(self.llm, "is_available", False)) else None
+            proposals = loinc.propose(lab_values, llm,
                                       lambda: (cancel_check() if cancel_check else None) or False)
         exporter = FhirRegistry(patient_id, loinc, proposals)
         for document in documents:
             exporter.document(document.id)
-        from .event_review import to_evidence
         for event in self.events(patient_id):
             exporter.clinical(to_evidence(event), event.coding, resource_key=event.key)
         for lab, key in zip(lab_values, lab_occurrence_keys(lab_values)):
             exporter.laboratory(lab, key)
+        return exporter
+
+    def write_fhir(self, patient_id, documents, coverage, *, cancel_check=None) -> dict:
+        exporter = self.build_fhir(patient_id, documents, cancel_check=cancel_check)
         path = exporter.write(active_workspace.path / patient_id / FHIR_FILENAME, coverage)
         return {"path": path, "events": exporter.event_count, "uncoded": exporter.unmapped}
+
+    def coverage(self, patient_id: str) -> dict:
+        status = self.patient_status(patient_id)
+        return {"documents_total": status["documents"], "documents_with_text": status["with_text"],
+                "processed": status["completed"], "failed": status["failed"],
+                "complete": status["failed"] == 0 and status["completed"] == status["with_text"],
+                "pipeline": VERSION}
+
+    def export_patient(self, patient_id: str) -> dict:
+        """Rewrite the patient's FHIR file from the current reviewed state."""
+        return self.write_fhir(patient_id, None, self.coverage(patient_id))
+
+    def export_project(self, patient_ids=None, *, target=None, progress=None,
+                       cancel_check=None) -> dict:
+        """One NDJSON file (one FHIR resource per line) for the whole project.
+
+        Each patient's Bundle is validated and its own file refreshed too.
+        """
+        from datetime import datetime
+        from .fhir_registry import validate_bundle, write_atomic
+        if patient_ids is None:
+            patient_ids = [row[0] for row in self.db.execute("SELECT id FROM patients ORDER BY id")]
+        lines, seen = [], set()
+        totals = {"patients": 0, "events": 0, "uncoded": 0}
+        for index, patient_id in enumerate(patient_ids, start=1):
+            if cancel_check and cancel_check():
+                raise ExtractionCancelled("Esportazione interrotta")
+            if progress:
+                progress(int((index - 1) * 100 / max(len(patient_ids), 1)), f"Esportazione {patient_id}")
+            exporter = self.build_fhir(patient_id)
+            bundle = exporter.bundle(self.coverage(patient_id))
+            validate_bundle(bundle)
+            write_atomic(active_workspace.path / patient_id / FHIR_FILENAME,
+                         json.dumps(bundle, ensure_ascii=False, indent=2, allow_nan=False))
+            for entry in bundle["entry"]:
+                resource = entry["resource"]
+                identity = (resource["resourceType"], resource["id"])
+                if identity not in seen:
+                    seen.add(identity)
+                    lines.append(json.dumps(resource, ensure_ascii=False, allow_nan=False))
+            totals["patients"] += 1
+            totals["events"] += exporter.event_count
+            totals["uncoded"] += exporter.unmapped
+        if target is None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = active_workspace.path / "exports" / "fhir" / f"progetto-{stamp}.ndjson"
+        path = write_atomic(target, "\n".join(lines) + ("\n" if lines else ""))
+        if progress:
+            progress(100, "Esportazione completata")
+        return {"path": path, "resources": len(lines), **totals}
 
     def patient_status(self, patient_id: str) -> dict:
         """Documents with text, current extractions and failures."""
