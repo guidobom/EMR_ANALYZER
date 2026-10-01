@@ -15,6 +15,7 @@ from .pipeline_llm import prepare_pipeline
 from .qt_utils import qt_offset
 from ..clinical.evidence_utils import content_hash
 from ..clinical.grounded_sources import METHOD
+from ..clinical.snomed_coding import concept_key
 
 TYPE_LABELS = {
     "diagnosis": "Diagnosi", "symptom": "Sintomo", "clinical_sign": "Segno",
@@ -26,6 +27,8 @@ TYPE_LABELS = {
 }
 ASSERTION_LABELS = {"present": "presente", "absent": "negato", "unknown": "incerto"}
 STATUS_LABELS = {"proposed": "proposto", "needs_review": "da rivedere"}
+CODING_LABELS = {"proposed": "codice proposto", "confirmed": "codice confermato",
+                 "needs_review": "codice da rivedere"}
 FILTERS = ("Tutti", "Da rivedere", "Senza codice SNOMED", "Con codice SNOMED")
 
 
@@ -68,6 +71,7 @@ class EventReviewTab(QWidget):
         self._services: dict = {}
         self._patient_id: str | None = None
         self._events: list = []
+        self._mappings: dict = {}
         self._texts: dict[str, str] = {}
         self._worker = None
         self._setup_ui()
@@ -153,13 +157,14 @@ class EventReviewTab(QWidget):
 
     def _refresh(self) -> None:
         repo = self._services.get("evidence_repo")
+        pipeline = self._services.get("extraction_pipeline")
         self._events = []
         if self._patient_id and repo is not None:
             self._events = [item for item in repo.get_by_patient(self._patient_id)
                             if item.extraction_method == METHOD]
-        coded = sum(bool(item.data.get("snomed_concept_id")) for item in self._events)
+        self._mappings = pipeline.coder.resolve(self._events) if pipeline is not None else {}
+        coded = sum(bool(self._coding(item).get("code")) for item in self._events)
         review = sum(item.status == "needs_review" for item in self._events)
-        pipeline = self._services.get("extraction_pipeline")
         status = pipeline.patient_status(self._patient_id) if (pipeline and self._patient_id) else {}
         self._status.setText(
             f"{len(self._events)} eventi · {coded} con codice SNOMED · {review} da rivedere"
@@ -167,11 +172,15 @@ class EventReviewTab(QWidget):
                f" (falliti {status['failed']})" if status else ""))
         self._render()
 
+    def _coding(self, item) -> dict:
+        return self._mappings.get(concept_key(item.normalized_entity, item.fact_type)) or {}
+
     def _visible_events(self):
         mode = self._filter.currentText()
         needle = self._search.text().strip().casefold()
         for item in self._events:
-            code = item.data.get("snomed_concept_id")
+            coding = self._coding(item)
+            code = coding.get("code")
             if mode == "Da rivedere" and item.status != "needs_review":
                 continue
             if mode == "Senza codice SNOMED" and code:
@@ -179,7 +188,7 @@ class EventReviewTab(QWidget):
             if mode == "Con codice SNOMED" and not code:
                 continue
             if needle and needle not in " ".join(str(value or "") for value in (
-                    item.normalized_entity, code, item.data.get("snomed_term"),
+                    item.normalized_entity, code, coding.get("term"), coding.get("fsn"),
                     item.source_text, item.document_id)).casefold():
                 continue
             yield item
@@ -191,8 +200,9 @@ class EventReviewTab(QWidget):
         self._table.setSortingEnabled(False)
         self._table.setRowCount(len(events))
         for row, item in enumerate(events):
-            code = item.data.get("snomed_concept_id")
-            snomed = f"{code} — {item.data.get('snomed_term', '')}" if code else "—"
+            coding = self._coding(item)
+            code = coding.get("code")
+            snomed = f"{code} — {coding.get('term') or coding.get('fsn') or ''}" if code else "—"
             values = (item.observed_date or "data n.d.", item.normalized_entity,
                       TYPE_LABELS.get(item.fact_type, item.fact_type),
                       ASSERTION_LABELS.get(item.assertion, item.assertion), snomed,
@@ -230,20 +240,21 @@ class EventReviewTab(QWidget):
         if item is None:
             return
         text = self._document_text(item.document_id)
+        coding = self._coding(item)
         span = (item.data.get("source_spans") or [{}])[0]
         stale = bool(text) and item.data.get("source_version") not in (None, content_hash(text))
         provenance = item.data.get("date_provenance") or {}
         lines = [
             f"<b>{item.normalized_entity}</b> · {TYPE_LABELS.get(item.fact_type, item.fact_type)}"
             f" · {ASSERTION_LABELS.get(item.assertion, item.assertion)}, certezza {item.certainty}",
-            f"SNOMED CT: {item.data.get('snomed_concept_id') or 'non codificato'}"
-            f" {item.data.get('snomed_fsn', '')}",
+            f"SNOMED CT: {coding.get('code') or 'non codificato'} {coding.get('fsn') or ''}"
+            f" ({CODING_LABELS.get(coding.get('status'), 'concetto non ancora codificato')})",
             f"Data evento: {item.observed_date or 'non determinata'}"
             + (f" — da «{provenance.get('quote')}»" if provenance.get("quote") else "")
             + (f" — {provenance['needs_review']}" if provenance.get("needs_review") else ""),
         ]
-        if item.data.get("snomed_mapping_reason") and not item.data.get("snomed_concept_id"):
-            lines.append(f"Codifica: {item.data['snomed_mapping_reason']}")
+        if coding.get("note") and not coding.get("code"):
+            lines.append(f"Codifica: {coding['note']}")
         if stale:
             lines.append("<span style='color:#c0392b'>Il testo del referto è cambiato dopo "
                          "l'estrazione: rielabora il paziente.</span>")

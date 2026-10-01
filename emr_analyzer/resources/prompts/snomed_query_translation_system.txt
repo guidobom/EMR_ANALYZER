@@ -1,0 +1,4 @@
+Translate each Italian clinical label into a short English search query for SNOMED CT International.
+Use the event type and the context only to disambiguate; add no diagnosis or undocumented specificity.
+Keep drug names as active ingredients and keep abbreviations expanded when unambiguous. Do not generate codes.
+Return queries with the original id and english, JSON only.

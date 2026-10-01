@@ -24,6 +24,7 @@ from .grounded_sources import (
     VERSION, METHOD,
 )
 from .event_extraction import EventExtractor
+from .snomed_coding import CodingCancelled, ConceptCoder, concept_key
 from .lab_evidence import LEGACY_LAB_METHODS, filter_narrative_lab_duplicates
 from ..config import active_workspace
 from ..models.clinical_registry import ProcessingManifestItem, ProcessingRun
@@ -84,6 +85,7 @@ class ExtractionPipeline:
         self.shared_lexicon_repo = shared_lexicon_repo
         self.db = db or evidence_repo.db
         self.extractor = self.make_extractor()
+        self.coder = self.make_coder()
 
     def make_extractor(self):
         if self.llm is None:
@@ -91,19 +93,39 @@ class ExtractionPipeline:
         from ..database.atomic_group_repo import AtomicGroupRepository
         return EventExtractor(
             self.llm,
-            snomed_catalog=getattr(self.shared_lexicon_repo, "snomed_catalog", None),
             policy=self.pipeline_policy,
             catalog=catalog_snapshot(self.shared_lexicon_repo),
             checkpoint_repo=AtomicGroupRepository(self.db),
         )
 
+    def make_coder(self) -> ConceptCoder:
+        return ConceptCoder(
+            self.llm,
+            getattr(self.shared_lexicon_repo, "snomed_catalog", None),
+            getattr(self.shared_lexicon_repo, "concept_mappings", None),
+        )
+
     def set_llm(self, llm_client) -> None:
         self.llm = llm_client
         self.extractor = self.make_extractor()
+        self.coder = self.make_coder()
 
     def reload_policy(self) -> None:
         self.pipeline_policy = load_pipeline_policy()
         self.extractor = self.make_extractor()
+        self.coder = self.make_coder()
+
+    def events(self, patient_id: str) -> list:
+        return [item for item in self.evidence_repo.get_by_patient(patient_id)
+                if item.extraction_method == METHOD]
+
+    def code_patient(self, patient_id: str, cancel_check=None, progress=None) -> dict:
+        """Code the patient's concepts that have no SNOMED mapping yet."""
+        try:
+            return self.coder.code_events(self.events(patient_id), cancel_check=cancel_check,
+                                          progress=progress)
+        except CodingCancelled as exc:
+            raise ExtractionCancelled(str(exc)) from exc
 
     @property
     def prompt_version(self):
@@ -166,6 +188,7 @@ class ExtractionPipeline:
 
         # The shared Lexicon may have changed since the previous run.
         self.extractor = self.make_extractor()
+        self.coder = self.make_coder()
         model_digest = self.extractor.model_digest if self.extractor else ""
         plans: dict[str, _PatientPlan] = {}
         try:
@@ -345,6 +368,8 @@ class ExtractionPipeline:
 
     def _finalize(self, plan, check_cancelled) -> dict:
         check_cancelled()
+        cancel = lambda: (check_cancelled() or False)
+        coding = self.code_patient(plan.patient_id, cancel_check=cancel)
         fhir = self.write_fhir(plan.patient_id, plan.documents, {
             "documents_total": len(plan.documents), "processed": plan.processed,
             "unchanged": plan.skipped, "laboratory_documents": plan.laboratory_documents,
@@ -378,7 +403,7 @@ class ExtractionPipeline:
             "document_stats": sorted(plan.doc_stats, key=lambda item: item["document_id"]),
             "atomic_evidence_extracted": plan.extracted,
             "atomic_model": getattr(self.llm, "model", None),
-            "run_id": plan.run.run_id, "elapsed_seconds": elapsed, **summary,
+            "run_id": plan.run.run_id, "elapsed_seconds": elapsed, "coding": coding, **summary,
         }
 
     def write_fhir(self, patient_id, documents, coverage, *, cancel_check=None) -> dict:
@@ -392,9 +417,10 @@ class ExtractionPipeline:
         exporter = FhirRegistry(patient_id, loinc, proposals)
         for document in documents:
             exporter.document(document.id)
-        for item in self.evidence_repo.get_by_patient(patient_id):
-            if item.extraction_method == METHOD:
-                exporter.clinical(item)
+        events = self.events(patient_id)
+        mappings = self.coder.resolve(events)
+        for item in events:
+            exporter.clinical(item, mappings.get(concept_key(item.normalized_entity, item.fact_type)))
         for lab, key in zip(lab_values, lab_occurrence_keys(lab_values)):
             exporter.laboratory(lab, key)
         path = exporter.write(active_workspace.path / patient_id / FHIR_FILENAME, coverage)

@@ -36,32 +36,28 @@
       "minimum_length": 200
     },
     {
-      "key": "snomed_mentions_system",
-      "label": "SNOMED — estrazione delle menzioni",
-      "pipeline": "2 · Evidenze atomiche SNOMED",
-      "institutional_version": "institutional-v1",
-      "required_markers": [
-        "OBIETTIVO",
-        "assertion"
-      ],
-      "minimum_length": 300
-    },
-    {
-      "key": "snomed_mapping_system",
-      "label": "SNOMED — selezione dei candidati",
-      "pipeline": "2 · Evidenze atomiche SNOMED",
-      "institutional_version": "institutional-v2",
-      "required_markers": [
-        "SNOMED",
-        "candidati"
-      ],
-      "minimum_length": 300
-    },
-    {
       "key": "compact_events_system",
       "label": "Eventi clinici — annotazione compatta",
       "pipeline": "2 · Registro FHIR",
       "institutional_version": "institutional-v4",
+      "minimum_length": 100
+    },
+    {
+      "key": "snomed_concept_coding_system",
+      "label": "SNOMED — codifica per concetto",
+      "pipeline": "Estrazione e codifica SNOMED CT",
+      "institutional_version": "institutional-v1",
+      "required_markers": [
+        "SNOMED",
+        "candidat"
+      ],
+      "minimum_length": 300
+    },
+    {
+      "key": "snomed_query_translation_system",
+      "label": "SNOMED — query di ricerca in inglese",
+      "pipeline": "Estrazione e codifica SNOMED CT",
+      "institutional_version": "institutional-v1",
       "minimum_length": 100
     }
   ]

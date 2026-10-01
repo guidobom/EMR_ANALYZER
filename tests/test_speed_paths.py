@@ -47,7 +47,7 @@ def test_unrelated_lexicon_example_and_snomed_alias_keep_the_fingerprint(tmp_pat
         snomed.db.execute("INSERT INTO sct_concepts VALUES ('18165001',1,'Jaundice (finding)','Jaundice','finding')")
     # Twelve terms occur in the text and fill all guidance cards; "ittero" does not.
     text = "Riferisce " + ", ".join(SYMPTOMS) + "."
-    extractor = lambda: EventExtractor(ExtractorLlm(), snomed_catalog=snomed, catalog=catalog_snapshot(shared))
+    extractor = lambda: EventExtractor(ExtractorLlm(), catalog=catalog_snapshot(shared))
 
     before = extractor()
     shared.save_example(ids["ittero"], "Cute itterica.")

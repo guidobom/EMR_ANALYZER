@@ -141,15 +141,25 @@ class SnomedCatalog:
             self._loaded_revision = (fingerprint, self.metadata()['embedding_revision'])
         return self.metadata()
 
-    def search(self, text, english='', limit=12):
-        """RRF merge of lexical and optional multilingual vector candidates."""
+    def search(self, text, english='', limit=12, tags=None):
+        """RRF merge of lexical and optional multilingual vector candidates.
+
+        ``tags`` restricts candidates to SNOMED hierarchies (semantic tags such
+        as ``disorder`` or ``substance``) inside every query, so concepts of
+        other hierarchies cannot crowd out the relevant ones.
+        """
         if not self.available or limit <= 0:
             return []
+        tags = tuple(sorted(tags)) if tags else ()
+        tag_sql = f" AND c.tag IN ({','.join('?' for _ in tags)})" if tags else ""
+        allowed = lambda concept: bool(concept and concept['active'] and (not tags or concept['tag'] in tags))
         rankings = []
         exact_codes = set()
         alias = self.db.execute('SELECT code FROM sct_aliases WHERE text=?', (' '.join(words(text)),)).fetchone()
-        if alias and (c := self.lookup(alias[0])) and c['active']:
+        if alias and allowed(self.lookup(alias[0])):
             rankings.append([alias[0]])
+        else:
+            alias = None
         for query in (text, english):
             if query.strip():
                 exact = [r[0] for r in self.db.execute(
@@ -157,8 +167,8 @@ class SnomedCatalog:
                     "WHERE d.term=? COLLATE NOCASE AND d.active='1' AND c.active=1 AND d.languageCode='en' "
                     "AND EXISTS (SELECT 1 FROM sct_rf2_language l WHERE l.referencedComponentId=d.id "
                     "AND l.active='1' AND l.refsetId IN ('900000000000509007','900000000000508004') "
-                    "AND l.acceptabilityId IN ('900000000000548007','900000000000549004')) LIMIT 40",
-                    (query.strip(),))]
+                    "AND l.acceptabilityId IN ('900000000000548007','900000000000549004'))" + tag_sql + " LIMIT 40",
+                    (query.strip(), *tags))]
                 exact_codes.update(exact)
                 rankings.append(exact)
             tokens = list(dict.fromkeys(words(query)))[:24]
@@ -167,7 +177,9 @@ class SnomedCatalog:
                                ' OR '.join('"'+t+'"' for t in tokens)]
                 for expression in dict.fromkeys(expressions):
                     found = [r[0] for r in self.db.execute(
-                        'SELECT code FROM sct_search WHERE sct_search MATCH ? ORDER BY bm25(sct_search) LIMIT 200', (expression,))]
+                        'SELECT sct_search.code FROM sct_search JOIN sct_concepts c ON c.code=sct_search.code '
+                        'WHERE sct_search MATCH ? AND c.active=1' + tag_sql
+                        + ' ORDER BY bm25(sct_search) LIMIT 200', (expression, *tags))]
                     rankings.append(list(dict.fromkeys(found))[:40])
         meta = self.metadata()
         if meta.get('embedding_model'):
@@ -188,9 +200,12 @@ class SnomedCatalog:
                 codes, vectors = self._vectors
                 vector = self._encoder.encode([text], normalize_embeddings=True, show_progress_bar=False)[0]
                 scores = vectors @ vector
-                count = min(40, len(scores))
+                count = min(200 if tags else 40, len(scores))
                 best = np.argpartition(-scores, count-1)[:count]
-                rankings.append([str(codes[i]) for i in sorted(best, key=lambda i: -scores[i])])
+                ranked = [str(codes[i]) for i in sorted(best, key=lambda i: -scores[i])]
+                if tags:
+                    ranked = [code for code in ranked if allowed(self.lookup(code))]
+                rankings.append(ranked[:40])
         scores = {}
         for ranking in rankings:
             for rank, code in enumerate(ranking):

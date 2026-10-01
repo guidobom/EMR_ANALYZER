@@ -99,8 +99,10 @@ class FhirRegistry:
         if not record['extension']:record.pop('extension')
         self.add(record)
 
-    def clinical(self,item):
+    def clinical(self,item,coding=None):
+        """One clinical event; ``coding`` is its concept → SNOMED CT mapping."""
         data=item.data or {}
+        coding=coding or {}
         from .historical_reuse import historical_identity
         # No temporal clustering here: only identical source occurrences share an id.
         rid=ident(self.patient_id,item.document_id,item.fact_type,item.normalized_entity,
@@ -114,7 +116,7 @@ class FhirRegistry:
             self.provenance(event,item.document_id,item.source_text,item.model_name,
                 {k:data.get(k) for k in ('source_spans','date_provenance','source_relations','relation_review')})
             return
-        concept=code(item.normalized_entity,SNOMED,data.get('snomed_concept_id'),data.get('snomed_term'),data.get('snomed_release'))
+        concept=code(item.normalized_entity,SNOMED,coding.get('code'),coding.get('term') or coding.get('fsn'),coding.get('release'))
         date=clinical_date(item.observed_date)
         end=clinical_date(item.observed_date_end)
         details={'assertion':item.assertion,'certainty':item.certainty,'subject':data.get('experiencer','unknown'),
@@ -122,12 +124,13 @@ class FhirRegistry:
             'date_provenance':data.get('date_provenance',{}),'date_precision':item.date_precision,
             'date_proposal':data.get('date_proposal'), 'value_review':data.get('value_review'),
             'intermediate_repairs':data.get('intermediate_repairs',[]),
-            'mapping_status':data.get('snomed_mapping_status','needs_review'),
-            'mapping_reason':data.get('snomed_mapping_reason',''),'fact_type':item.fact_type,
+            'mapping_status':coding.get('status','needs_review'),
+            'mapping_reason':coding.get('note') or '','fact_type':item.fact_type,
             'source_relations':data.get('source_relations',[]),
             'relation_review':data.get('relation_review',{})}
         base={'id':rid,'extension':[extension('extraction-context',json.dumps(details,ensure_ascii=False)),
-            extension('review-status','needs-review' if item.status=='needs_review' or not concept.get('coding') else 'proposed')]}
+            extension('review-status','needs-review' if item.status=='needs_review' or not concept.get('coding')
+                      else 'confirmed' if coding.get('status')=='confirmed' else 'proposed')]}
         subject=data.get('experiencer')
         if subject=='family' and item.assertion=='present':
             event={**base,'resourceType':'FamilyMemberHistory','status':'partial','patient':reference(self.patient),

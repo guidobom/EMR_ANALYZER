@@ -38,7 +38,8 @@ from ..prompt_catalog import (
 
 _PROMPT_ROLE = {
     "compact_events_system": "atomic_evidence",
-    "snomed_mapping_system": "atomic_evidence",
+    "snomed_concept_coding_system": "atomic_evidence",
+    "snomed_query_translation_system": "atomic_evidence",
     "patient_identity_system": "document",
     "patient_identity_task": "document",
     "clinical_text_system": "document",
@@ -93,27 +94,49 @@ class PromptPreviewWorker(QThread):
                     "warnings": result.warnings,
                     "redaction_counts": result.redaction_counts,
                 }
-            elif mode == "snomed_extraction":
-                from ..clinical.grounded_sources import catalog_snapshot
+            elif mode in {"snomed_extraction", "snomed_coding"}:
+                from ..clinical.event_extraction import EventExtractor
+                from ..clinical.evidence_utils import content_hash
+                from ..clinical.grounded_sources import catalog_snapshot, METHOD
                 repo = self.request.get("shared_lexicon_repo")
-                if mode == "snomed_extraction":
-                    from ..clinical.event_extraction import EventExtractor
-                    from ..clinical.evidence_utils import content_hash
-                    gps = getattr(repo, 'snomed_catalog', None)
-                    if self.request['prompt_key'] != 'compact_events_system' and (gps is None or not gps.available):
-                        raise ValueError('Importa il catalogo SNOMED CT prima della prova.')
-                    extractor = EventExtractor(self.llm, snomed_catalog=gps, catalog=catalog_snapshot(repo))
+                stored = [item for item in (self.request.get("stored_events") or [])
+                          if item.extraction_method == METHOD]
+                atoms = stored if (mode == "snomed_coding" and stored) else None
+                metrics = {}
+                if atoms is None:
+                    extractor = EventExtractor(self.llm, catalog=catalog_snapshot(repo))
                     if self.request['prompt_key'] == 'compact_events_system':
                         extractor.system = self.request['system_prompt']
-                    else:
-                        extractor.mapping_system = self.request['system_prompt']
-                    extractor.prompt_digest = content_hash(extractor.system, extractor.mapping_system)
-                atoms = extractor.extract_document(
-                    patient_id=self.request["patient_id"], document_id=self.request["document_id"],
-                    document_type=self.request.get("document_type") or "",
-                    document_date=self.request.get("document_date"), text=self.request["text"])
-                output = json.dumps([atom.to_atomic_dict() for atom in atoms], ensure_ascii=False, indent=2)
-                extra = {"evidence_count": len(atoms), "pipeline_metrics": extractor.last_extraction_metrics()}
+                        extractor.prompt_digest = content_hash(extractor.system)
+                    atoms = extractor.extract_document(
+                        patient_id=self.request["patient_id"], document_id=self.request["document_id"],
+                        document_type=self.request.get("document_type") or "",
+                        document_date=self.request.get("document_date"), text=self.request["text"])
+                    metrics = extractor.last_extraction_metrics()
+                if mode == "snomed_coding":
+                    from ..clinical.snomed_coding import (ConceptCoder, MemoryConceptMappings,
+                                                          collect_concepts)
+                    snomed = getattr(repo, 'snomed_catalog', None)
+                    if snomed is None or not snomed.available:
+                        raise ValueError('Importa il catalogo SNOMED CT prima della prova.')
+                    key = self.request['prompt_key']
+                    coder = ConceptCoder(self.llm, snomed, MemoryConceptMappings(), **{
+                        'coding_system' if key == 'snomed_concept_coding_system'
+                        else 'translation_system': self.request['system_prompt']})
+                    metrics = coder.code_events(atoms)
+                    concepts = collect_concepts(atoms)
+                    mapped = coder.mappings.get_many(concepts.keys())
+                    output = json.dumps([{"etichetta": concept.label, "tipo": concept.fact_type,
+                                          "occorrenze": concept.count,
+                                          "query_inglese": mapped.get(key_, {}).get("english"),
+                                          "codice": mapped.get(key_, {}).get("code"),
+                                          "fsn": mapped.get(key_, {}).get("fsn"),
+                                          "esito": mapped.get(key_, {}).get("status", "non codificato")}
+                                         for key_, concept in concepts.items()],
+                                        ensure_ascii=False, indent=2)
+                else:
+                    output = json.dumps([atom.to_atomic_dict() for atom in atoms], ensure_ascii=False, indent=2)
+                extra = {"evidence_count": len(atoms), "pipeline_metrics": metrics}
 
             else:
                 output = self.llm.generate_text(
@@ -483,8 +506,12 @@ class PromptManagerDialog(QDialog):
                 **base, "mode": "clinical_text",
                 "system_prompt": system, "task_prompt": task,
             }
-        if key in {'compact_events_system', 'snomed_mapping_system'}:
+        if key == 'compact_events_system':
             return {**base, 'mode':'snomed_extraction', 'prompt_key':key, 'system_prompt':edited_text}
+        if key in {'snomed_concept_coding_system', 'snomed_query_translation_system'}:
+            evidence = self._services.get("evidence_repo")
+            return {**base, 'mode':'snomed_coding', 'prompt_key':key, 'system_prompt':edited_text,
+                    'stored_events': evidence.get_by_document(document.id) if evidence else []}
 
         system, task = self._paired_prompts(key, edited_text)
         user_prompt = (

@@ -47,6 +47,14 @@ class SharedLexiconRepository(LocalLexiconRepository):
         return self._snomed_catalog
 
     @property
+    def concept_mappings(self):
+        """Concept → SNOMED CT mappings, shared by every project of this user."""
+        if not hasattr(self, '_concept_mappings'):
+            from .concept_mapping_repo import ConceptMappingRepository
+            self._concept_mappings = ConceptMappingRepository(self.db)
+        return self._concept_mappings
+
+    @property
     def loinc_catalog(self):
         if not hasattr(self, '_loinc_catalog'):
             from ..clinical.loinc_catalog import LoincCatalog

@@ -73,7 +73,7 @@ class GroundedSourceReader:
         self.catalog = list(catalog)
         self.policy = policy or ClinicalPipelinePolicy()
         self.checkpoints = checkpoint_repo
-        self.system = system_prompt or load_prompt('snomed_mentions_system')
+        self.system = system_prompt or load_prompt('compact_events_system')
         self.prompt_version = VERSION
         self.prompt_digest = content_hash(self.system)
         self.catalog_digest = content_hash(json.dumps(self.catalog, sort_keys=True, ensure_ascii=False))
