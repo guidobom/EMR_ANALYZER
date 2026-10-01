@@ -124,24 +124,17 @@ restare un esempio del concetto con contesto Negato; un controesempio insegna
 invece a non attribuire quel tipo di evento. Il modello deve comunque conservare
 altri fatti espliciti eventualmente presenti nella stessa frase.
 
-Da **Storia clinica → Estrai evidenze**, la pipeline acquisisce una versione del
-registro e recupera fino a quattro esempi pertinenti più due esempi di contrasto
-per gruppo. Il limite complessivo è 5.000 caratteri; il testo sorgente e lo spazio
-necessario alla risposta hanno precedenza se il contesto del modello è piccolo.
-Nessun documento viene saltato perché non ha esempi corrispondenti.
+Durante l'estrazione degli eventi (**Eventi SNOMED → Elabora paziente** o
+**▶ Elabora pazienti**) la pipeline legge il catalogo confermato e, per ogni
+referto, invia come guida fino a dodici termini, scelti per sovrapposizione
+lessicale con il testo, con al massimo due esempi ciascuno e un limite di 6.000
+caratteri: il testo sorgente e la risposta hanno precedenza. Nessun documento
+viene saltato perché non ha esempi corrispondenti, e gli esempi non limitano gli
+eventi estraibili.
 
-La ricerca è lessicale e, se `paraphrase-multilingual-MiniLM-L12-v2` è già
-presente nella cache locale, anche semantica. Non vengono scaricati pesi durante
-l'estrazione. In assenza del modello, o se non è caricabile, resta disponibile
-la ricerca lessicale. Dopo l'installazione di un modello occorre riavviare l'app.
-Il riepilogo dell'estrazione indica modalità e numero di esempi disponibili.
-
-I campi standard restano strutturati come prima; gli attributi personalizzati
-sono conservati in `typed_payload.details` e nell'export atomico. Le evidenze
-registrano impronta del lessico e identificativi degli esempi forniti. Modificare
-esempi, contesti o schede invalida i risultati precedenti della pipeline: alla
-successiva estrazione vengono ricalcolati i documenti narrativi inclusi nella
-nuova esecuzione, invece di riutilizzare risultati prodotti con istruzioni obsolete.
+Un referto viene rielaborato solo se cambia la guida effettivamente inviata per
+quel testo: modificare un termine o un esempio non pertinente non invalida le
+estrazioni già fatte.
 
 Gli esempi sono guida, non fonti per il paziente corrente. Date e valori devono
 provenire dal referto corrente. I controlli strutturali non garantiscono la
@@ -153,7 +146,7 @@ quelli usati per guidare il modello. Non è stato effettuato fine-tuning.
 ## Proposte LLM nel documento attivo
 
 Il pulsante **Analizza documento con LLM**, sopra il testo, analizza l'intero
-documento attivo usando il modello configurato per le evidenze atomiche. Se il
+documento attivo usando il modello configurato per estrazione e codifica. Se il
 modello non è disponibile, un messaggio indica dove configurarlo: non viene
 scelto silenziosamente un altro modello. Il nome del modello, il documento e
 l'avanzamento sono mostrati durante l'analisi. **Interrompi analisi** richiede
@@ -195,20 +188,19 @@ scaricare o importare modelli e aprire la diagnostica del motore.
 
 Le preferenze sono salvate nel file applicativo `settings.json`, nella sezione
 `pipeline_llm`, separatamente per ogni funzione. La configurazione del Lessico
-non sostituisce quella ricordata per l’estrazione delle evidenze atomiche.
+non sostituisce quella ricordata per l’estrazione degli eventi.
 Le preferenze sopravvivono al riavvio e sono condivise tra workspace; al primo
 utilizzo vengono proposte le precedenti impostazioni del ruolo corrispondente.
 
-Lo stesso meccanismo è disponibile per documenti, evidenze atomiche, creazione
-e deduplicazione degli eventi, profilo narrativo, interrogazioni, ipotesi,
-analisi e consolidamento irAE, e prove dei singoli prompt. Le code multipaziente
-chiedono il modello una sola volta per tutta la coda. Le fasi deterministiche,
-come la preparazione della validazione, non aprono questa finestra.
-La precedente azione globale **Configura LLM** è stata rimossa dalla toolbar.
+Lo stesso meccanismo è disponibile per la normalizzazione dei documenti, per
+l'estrazione e codifica degli eventi e per le prove dei singoli prompt. La coda
+multipaziente chiede il modello una sola volta per tutta la coda.
 
 
-Il catalogo confermato alimenta ora la fase **Storia clinica → Estrai evidenze**.
-Vedi [riconoscimento, date e deduplicazione](LEXICON_EXTRACTION.md).
+Gli esempi del catalogo confermato guidano l'estrazione degli eventi
+(**Eventi SNOMED → Elabora paziente** e **▶ Elabora pazienti**): per ogni referto
+vengono inviati soltanto gli esempi dei termini più pertinenti. Modificare un
+termine non pertinente a un referto non lo fa rielaborare.
 
 
 ### Esempi scritti senza documento

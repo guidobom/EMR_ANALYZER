@@ -1,80 +1,97 @@
 # EMR Analyzer
 
-Applicazione desktop locale e offline per trasformare dossier clinici PDF in
-un database longitudinale interrogabile a scopo di ricerca, audit e revisione
-della pratica clinica.
+Applicazione desktop locale e offline che legge i referti anonimizzati dei
+pazienti di un progetto, ne estrae gli eventi clinici ancorati al testo, li
+codifica in SNOMED CT e li esporta in FHIR R4. Ogni evento resta collegato al
+frammento del referto da cui proviene e può essere revisionato.
 
 > **Stato del progetto:** sviluppo sperimentale. Non è un dispositivo medico e
 > non deve essere utilizzato per decisioni cliniche senza verifica umana.
 
-La pipeline di estrazione delle evidenze atomiche usa il catalogo del Lessico
-condiviso: riconoscimento delle entità, date documentate e deduplicazione entro
-15 giorni dalla prima osservazione, conservando tutte le fonti.
-Vedi [Estrazione dal Lessico](docs/LEXICON_EXTRACTION.md).
+## Flusso di lavoro
 
-La scheda **Lessico condiviso** permette di selezionare frammenti del testo estratto
-e associarli a termini sintetici condivisi fra tutti i progetti sul computer: [guida all’annotazione](docs/LOCAL_LEXICON.md).
+1. **Progetto e pazienti.** Ogni progetto è una cartella con un database
+   `emr_registry.db` e una cartella per paziente.
+2. **Importazione.** I documenti (PDF, immagini, TXT/MD/HL7, CSV, XML/CDA, JSON,
+   DOCX, XLSX) vengono attribuiti al paziente; le attribuzioni incerte si
+   risolvono nella scheda **✓ Attribuzioni**.
+3. **Anonimizzazione e testo clinico.** Estrazione PDF (`pdfplumber → PyMuPDF →
+   OCR locale`), pseudonimizzazione deterministica e filtro del testo clinico.
+   Il risultato è `extraction/DOC_….md`; le correzioni manuali del testo sono
+   salvate come versioni (overlay) senza modificare l'originale.
+4. **Laboratorio.** Il parser deterministico legge i risultati tabellari (valore,
+   comparatore, unità, range, flag, campione, data) nella scheda **🔬 Laboratorio**.
+5. **Estrazione degli eventi.** Un modello locale annota gli eventi dei referti
+   narrativi: ogni evento cita il proprio frammento tramite indirizzi di parole
+   verificati dal programma, con asserzione, certezza, soggetto, temporalità,
+   date e attributi. I referti di laboratorio già letti dal parser non vengono
+   inviati al modello.
+6. **Codifica SNOMED CT.** Ogni concetto (etichetta normalizzata + tipo di evento)
+   viene codificato una sola volta, scegliendo fra candidati del catalogo
+   International filtrati per gerarchia; la codifica vale per tutte le sue
+   occorrenze, in tutti i pazienti. I risultati tabellari restano su LOINC.
+7. **Revisione.** Nella scheda **🧬 Eventi SNOMED** si ispezionano eventi e
+   frammenti e si modifica tutto: codice (per occorrenza o per concetto),
+   frammento, attributi, eventi mancanti o errati, testo del referto. La finestra
+   **🧬 Concetti SNOMED** rivede le codifiche dell'intero progetto per frequenza.
+8. **FHIR.** Un Bundle per paziente (`<paziente>/clinical_events.fhir.json`) e un
+   export di progetto in NDJSON (**File → Esporta FHIR del progetto**).
 
-## Obiettivi
+**▶ Elabora pazienti** esegue i punti 5–8 per i pazienti selezionati con un'unica
+coda: i documenti di tutti i pazienti condividono gli slot del modello e ogni
+paziente viene chiuso, con il suo file FHIR, appena finiscono i suoi documenti.
+Un'elaborazione interrotta riprende dai documenti e dai gruppi già completati.
 
-- una workspace indipendente per ciascun paziente;
-- importazione e attribuzione automatica dei documenti al paziente;
-- estrazione PDF tramite `pdfplumber → PyMuPDF → OCR locale`;
-- normalizzazione conservativa del testo clinico con un modello locale
-  (llama.cpp);
-- pseudonimizzazione deterministica prima e dopo l’elaborazione LLM;
-- estrazione strutturata dei valori di laboratorio con unità, range, flag,
-  data e pagina sorgente;
-- registro clinico evidence-first con prima evidenza, prima documentazione,
-  precisione temporale e provenienza verificabile;
-- fusione delle fonti duplicate, separazione delle recidive e conservazione
-  delle informazioni contraddittorie;
-- trend di laboratorio, corsi farmacologici e linee di terapia oncologica;
-- correlazioni cliniche prudenti fra sintomi, laboratorio, imaging e terapie;
-- interrogazione individuale o di coorti mediante modelli locali configurabili;
-- revisione persistente, audit append-only ed esportazione JSON, CSV, XLSX,
-  Markdown, TXT, PDF e DOCX.
-- gold set clinico con doppia annotazione cieca, adjudication, blocco del test,
-  confronto con le predizioni ed export JSONL.
+## Dati e tracciabilità
+
+| Livello | Dove | Contenuto |
+|---|---|---|
+| Occorrenze estratte | `clinical_evidence` (progetto) | Evento, citazione e intervallo esatto nel testo, qualificatori, date con provenienza |
+| Codifiche per concetto | `concept_mappings` (Lessico condiviso) | Codice SNOMED proposto o confermato, candidati, esempi; una conferma non viene mai sovrascritta |
+| Decisioni del revisore | `event_overrides` (progetto) | Conferma, correzione, scarto, evento aggiunto, codice della singola occorrenza; istantanea completa dell'evento |
+| FHIR | file per paziente e NDJSON | Proiezione ricostruibile degli eventi revisionati e dei risultati di laboratorio |
+
+Le decisioni sono legate all'occorrenza sorgente e sopravvivono a una nuova
+estrazione. Se l'occorrenza cambia contenuto la conferma decade; se il testo del
+referto cambia, il frammento viene ricollocato quando è univoco, altrimenti
+l'evento è segnalato «da ricontrollare». Gli eventi scartati non entrano nel FHIR;
+le estensioni `review-status` e `coding-status` indicano lo stato di revisione.
+Dettagli in [docs/FHIR_EVENT_REGISTRY.md](docs/FHIR_EVENT_REGISTRY.md).
+
+## Terminologie
+
+- **SNOMED CT International** (RF2 Snapshot): importare il pacchetto da
+  **Lessico condiviso → Catalogo SNOMED CT…**. La distribuzione richiede una
+  licenza SNOMED (Affiliate o tramite il National Release Center) e non è inclusa
+  nel repository. Vedi [docs/SNOMED_INTERNATIONAL_RF2.md](docs/SNOMED_INTERNATIONAL_RF2.md).
+- **LOINC**: importare `Loinc.csv` o lo ZIP ufficiale da **Lessico condiviso →
+  Catalogo LOINC…**; associazioni confermate legate ad analita, campione e unità.
+
+Il **Lessico condiviso** raccoglie esempi e controesempi usati come guida
+dell'estrazione: [guida all'annotazione](docs/LOCAL_LEXICON.md).
 
 ## Principi di sicurezza
 
-L’applicazione è progettata per funzionare senza servizi cloud. PDF, database,
-testi estratti, chiavi di identità e modelli locali rimangono sul computer.
-I motori LLM locali sono llama.cpp e, opzionalmente su Linux/NVIDIA, vLLM:
-l’applicazione avvia e ferma da sé i propri processi, senza alcun servizio
-esterno da tenere in vita.
+L'applicazione funziona senza servizi cloud: PDF, database, testi estratti,
+chiavi di identità e modelli rimangono sul computer. Il processo Python blocca le
+connessioni di rete non locali; i modelli girano con llama.cpp (oppure vLLM su
+Linux/NVIDIA) gestiti dall'applicazione.
 
 Il repository non deve contenere dati sanitari reali. La `.gitignore` esclude
-per impostazione predefinita:
-
-- PDF, immagini e file DICOM;
-- database SQLite ed esportazioni Excel/CSV;
-- workspace, cache, log e livelli di estrazione;
-- chiavi, file `.env` e pesi dei modelli.
-
-Usare nei test pubblicabili esclusivamente documenti sintetici.
+PDF, immagini, database, workspace, cache, log, chiavi, pesi dei modelli, le
+distribuzioni SNOMED/LOINC e la cartella `.clinical-evaluation/`. Nei test si
+usano solo dati sintetici.
 
 ## Requisiti
 
-- macOS o Linux;
-- Python 3.12;
-- ambiente Conda consigliato;
+- macOS o Linux; Python 3.12; ambiente Conda consigliato;
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) con modelli GGUF e un
-  runtime Metal/CUDA importato e verificato dall'applicazione, oppure vLLM con
-  modelli Hugging Face già locali su Linux/NVIDIA.
+  runtime Metal/CUDA verificato dall'applicazione, oppure vLLM con modelli
+  Hugging Face locali su Linux/NVIDIA.
 
-La configurazione dei modelli, della temperatura, del contesto e dell’output
-avviene dall’interfaccia tramite **Configura LLM**.
-
-I ruoli condividono un solo processo e una sola copia dei pesi quando usano lo
-stesso backend e modello con uguali parametri motore (contesto e concorrenza;
-per vLLM anche precisione, quota GPU e tensor parallel). Temperatura,
-top-p/top-k, seed e limite di output restano
-indipendenti perché sono parametri della singola richiesta. La finestra mostra
-se i server fisici sono condivisi o distinti, gli slot realmente caricati e
-una stima complessiva della memoria; cambiando contesto o slot, **Salva e
-applica** sostituisce il runtime precedente.
+Due ruoli LLM si configurano da **Configura LLM**: *documenti* (normalizzazione
+dei referti) ed *estrazione e codifica*. Per l'estrazione si consigliano
+temperatura 0 e più slot paralleli; l'app chiede conferma sopra 0,2.
 
 ## Installazione
 
@@ -84,249 +101,63 @@ conda activate emr-analyzer
 pip install -r requirements.txt
 ```
 
-Su DGX OS/Ubuntu possono servire anche le librerie di sistema Qt/XCB:
+Su DGX OS/Ubuntu possono servire le librerie di sistema Qt/XCB:
 
 ```bash
-sudo apt update
 sudo apt install -y libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0
 ```
 
-La compilazione e l'importazione del runtime `llama-server` gestito sono
-descritte in
-[docs/LLAMA_SERVER_RUNTIME.md](docs/LLAMA_SERVER_RUNTIME.md). Non affidarsi a
-una build Homebrew senza verificare che esponga realmente Metal.
-
-Evitare di mescolare nella stessa environment i runtime Qt forniti da Conda e
-quelli installati da `pip`: scegliere una sola distribuzione PyQt5. L'app prova
-comunque a risolvere automaticamente il percorso dei plugin Qt di Conda.
-
-Registrazione dei modelli: se Ollama è (stato) installato, lo script di setup
-copia i GGUF già presenti in `~/.ollama/models/blobs` in
-`~/.emr_analyzer/models/` senza scaricare nulla:
-
-```bash
-python tools/setup_llama_backend.py
-```
-
-In alternativa, scarica un GGUF (ad es. `qwen3-14b`) e registralo
-manualmente in `~/.emr_analyzer/models/` con `index.json`.
+Runtime `llama-server` gestito: [docs/LLAMA_SERVER_RUNTIME.md](docs/LLAMA_SERVER_RUNTIME.md).
+I GGUF vanno registrati in `~/.emr_analyzer/models/` (lo script
+`python tools/setup_llama_backend.py` importa quelli già presenti nell'archivio
+Ollama). vLLM su DGX Spark: [docs/VLLM_DGX_SPARK.md](docs/VLLM_DGX_SPARK.md).
 
 Avvio:
 
 ```bash
-python run.py
+python run.py        # oppure ./run.sh
 ```
 
-Anche `./run.sh` è multipiattaforma: usa il `python3` dell'ambiente attivo.
-Per un launcher desktop è possibile fissare l'interprete con
-`EMR_ANALYZER_PYTHON=/percorso/env/bin/python3 ./run.sh`.
+Per elaborazioni lunghe su macOS conviene impedire lo stop del sistema, ad
+esempio avviando l'app con `caffeinate -di python run.py`.
 
-### Linux / NVIDIA DGX Spark
-
-Su DGX Spark è possibile scegliere per ogni ruolo sia llama.cpp sia vLLM.
-Per vLLM, eseguire prima la diagnostica non invasiva:
-
-```bash
-python tools/setup_vllm_backend.py
-```
-
-L'installazione esplicita (`--install`), la preparazione offline dei modelli e
-i parametri consigliati sono descritti in
-[docs/VLLM_DGX_SPARK.md](docs/VLLM_DGX_SPARK.md).
-
-Il backend llama.cpp dell’app è indipendente dalla piattaforma: la gestione
-dei processi, le porte, il parallelismo multi-slot e i modelli GGUF sono
-identici su macOS e Linux. Su DGX Spark (DGX OS, Linux `aarch64`, Grace
-Blackwell GB10 / compute capability 12.1, `sm_121`, 128 GB di memoria
-coerente unificata):
-
-1. compila una build CUDA autosufficiente di llama.cpp:
-
-   ```bash
-   git clone --depth 1 https://github.com/ggml-org/llama.cpp
-   cd llama.cpp
-   cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121 \
-     -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF
-   cmake --build build --config Release -j
-   python tools/setup_llama_backend.py --server-binary build/bin/llama-server
-   ```
-
-   oppure usa un container NGC con llama.cpp già compilato;
-
-2. registra i GGUF in `~/.emr_analyzer/models/` (su DGX Spark non esiste
-   lo storage Ollama: scarica direttamente i file GGUF);
-
-3. `python tools/setup_llama_backend.py` stampa le stesse istruzioni quando
-   il binario manca.
-
-Il dimensionamento dei worker riconosce DGX Spark e usa la RAM di sistema,
-non il contatore VRAM di `nvidia-smi` (che su GB10 può risultare non
-supportato). Conserva almeno il 10%/12 GiB per sistema, applicazione e CUDA;
-il limite reale va confermato con il benchmark e con dossier rappresentativi,
-perché contesto, quantizzazione e cache del modello incidono sulla memoria per
-slot.
-
-I dati runtime vengono salvati fuori dal repository in:
-
-```text
-~/.emr_analyzer/
-```
-
-## Domande generiche su pazienti e coorti
-
-Da **Strumenti → Interroga referti: paziente o coorte...** puoi selezionare
-uno o più pazienti e applicare lo stesso prompt ai Markdown clinici attivi (`DOC_….md`),
-anche senza aver costruito il registro clinico. Il modello di analisi locale
-legge i referti per blocchi; le citazioni testuali restituite vengono verificate
-contro il testo sorgente. Documenti mancanti, pagine non verificabili ed errori
-sono indicati nella copertura del report.
-
-Report individuali JSON/Markdown e report di coorte vengono salvati in
-`<workspace>/query_reports/<timestamp_id>/`. La copertura di elaborazione non
-misura la sensibilità clinica e le sintesi richiedono revisione. I file `*_raw.md`, `*_source.txt` e `*_cleaned_source.md` non vengono usati
-come ripiego. Se manca il Markdown attivo, completare la preparazione del referto.
-Le citazioni sono verificate sul Markdown attivo; ciò non certifica la sua
-completezza rispetto al PDF né la sua anonimizzazione.
-
-La [revisione del codice e della pipeline](docs/CODE_AUDIT_2026-09-09.md)
-descrive correzioni, limiti, duplicazioni e priorità successive.
+I dati di configurazione e i cataloghi condivisi sono in `~/.emr_analyzer/`.
 
 ## Struttura
 
 ```text
 emr_analyzer/
-├── clinical/    # evidenze, episodi, registro, correlazioni e query
+├── clinical/    # estrazione eventi, codifica SNOMED, revisione, FHIR
 ├── database/    # SQLite, migrazioni e repository
-├── evaluation/  # metriche e runner per gold set a livello paziente
-├── export/      # export completi e verificabili del registro
-├── extraction/  # LLM locale, laboratorio e normalizzazione
+├── extraction/  # client LLM, laboratorio, testo clinico
 ├── gui/         # interfaccia desktop PyQt5
+├── llm_backend/ # runtime e gestione dei modelli locali
 ├── models/      # modelli del dominio
-├── pipeline/    # parsing PDF, routing e pseudonimizzazione
+├── pipeline/    # parsing PDF, attribuzione e pseudonimizzazione
 ├── security/    # vincoli offline
 └── utils/
 ```
 
-## Modelli e riproducibilità
+## Test
 
-I modelli locali (GGUF tramite llama.cpp oppure checkpoint Hugging Face tramite
-vLLM) sono configurabili
-separatamente per:
+```bash
+QT_QPA_PLATFORM=offscreen python -m pytest tests
+```
 
-1. isolamento del testo clinico dai singoli documenti;
-2. estrazione delle evidenze atomiche;
-3. fusione e assemblaggio degli eventi/episodi clinici;
-4. analisi e interrogazione longitudinale del registro.
+La suite usa progetti temporanei, un catalogo SNOMED sintetico e modelli
+simulati: verifica orchestrazione, codifica, revisione, FHIR e interfaccia, non
+la qualità clinica dei modelli reali. Per quella esiste una valutazione su un
+campione revisionato, tenuta fuori dal repository.
 
-Le impostazioni precedenti a quattro ruoli vengono migrate automaticamente:
-il vecchio modello Clinical State è assegnato inizialmente a evidenze, eventi
-e analisi, senza invalidare i checkpoint atomici già compatibili.
+## Limiti noti
 
-Da **Configura LLM → Scarica o importa modelli** è possibile:
+- La qualità dell'estrazione dipende dal modello locale e va misurata su
+  referti revisionati; nessuna configurazione è validata clinicamente.
+- La ricerca dei candidati SNOMED parte da etichette italiane su un catalogo
+  inglese (traduzione della query con il modello); i concetti senza candidato
+  adatto restano da codificare a mano.
+- Il FHIR è controllato strutturalmente in locale; non è dichiarata conformità
+  a un Implementation Guide.
 
-- importare selettivamente un GGUF già presente nell'archivio Ollama;
-- chiedere a Ollama di scaricare un nuovo tag e registrarlo;
-- scaricare direttamente un singolo file GGUF da un URL HTTPS, verificando
-  facoltativamente la checksum SHA-256.
-
-Download e copia mostrano l'avanzamento, possono essere interrotti e usano un
-file temporaneo che viene rinominato soltanto dopo la validazione. I modelli
-sono registrati in `~/.emr_analyzer/models/index.json` e diventano subito
-selezionabili. Il processo clinico resta offline: il processo separato di
-installazione riceve soltanto identificativo/URL del modello e non accede ai
-workspace. I GGUF suddivisi in più file non sono ancora installabili dalla
-finestra.
-
-Prompt, modello e parametri di generazione vengono versionati nei metadati e
-nei log di audit per favorire la riproducibilità delle analisi. La matrice dei
-modelli e il protocollo di benchmark sono in
-[docs/MODEL_SELECTION.md](docs/MODEL_SELECTION.md).
-
-## Registro clinico v2
-
-La descrizione di schema, datazione, fusione, revisione, query, valutazione e
-bonifica dei metadati legacy è in
-[docs/CLINICAL_REGISTRY_V2.md](docs/CLINICAL_REGISTRY_V2.md).
-
-Il registro viene costruito a valle dell'estrazione: i testi normalizzati e le
-righe di laboratorio preesistenti non vengono modificati. Le decisioni manuali
-sono overlay tracciati e sopravvivono alle ricostruzioni automatiche.
-
-I nuovi Markdown normalizzati riportano una testata deterministica con la data
-del referto (`document_date`), distinta dalle date degli eventi. Date assenti o
-non valide sono indicate come non disponibili. L’interrogazione riceve questo
-metadato dal database per ogni frammento, anche per i Markdown precedenti.
-Per aggiornare i file esistenti: `python tools/add_report_dates.py /percorso/progetto`
-mostra il numero di file; aggiungere `--apply` per applicare la modifica con backup
-in `metadata_backups/`. Sono inclusi solo i documenti con metadati di anonimizzazione.
-
-
-## Estrazione essenziale: PDF originale e Markdown clinico
-
-L’estrazione legge ogni originale una volta per elaborazione e mantiene testo,
-tabelle e geometria in memoria. Salva esclusivamente `extraction/DOC_….md`,
-con data del referto e riferimenti alle pagine quando il parser li fornisce.
-Non produce più `_raw.md`, `_source.txt`, `_cleaned_source.md`, `.json`,
-`_pages.jsonl`, `_words.jsonl` o `_tables.json` per ciascun documento.
-I metadati di elaborazione rimangono nel database del progetto.
-
-Il testo viene anonimizzato e filtrato per pagina con regole deterministiche:
-le porzioni conservate sono copiate dal testo anonimizzato senza riscrittura LLM.
-Righe amministrative riconosciute (anagrafica, recapiti, intestazioni istituzionali,
-firme digitali, informative privacy) vengono eliminate. Le righe miste con
-contenuto clinico o ambiguo vengono conservate e segnalate per revisione: non è
-possibile garantire automaticamente l’eliminazione di ogni amministrativo senza
-rischiare omissioni cliniche. Risultati e righe numeriche cliniche sono conservati.
-Il database registra intervalli conservati/rimossi e hash del testo anonimizzato
-per pagina (`clinical_text.retention_audit`), senza copie del testo identificativo.
-Il filtro v2 riconosce anche celle amministrative affiancate a note o terapie:
-un recapito nella colonna del personale non deve eliminare la posologia nella
-colonna accanto. Rimuove margini vuoti e righe di spazi, conservando la spaziatura
-interna delle tabelle; l'audit distingue esclusioni amministrative e formattazione.
-L'anonimizzazione v2 protegge le date complete dalle false identificazioni come
-numeri telefonici e non unisce numeri su righe diverse.
-Il filtro v3 aggiunge il riconoscimento di avvertenze amministrative su più righe,
-firme nel loro contesto e moduli generici italiani (anche ASL, ASST, IRCCS e case
-di cura). Nei PDF con una colonna del personale chiaramente identificabile,
-usa le coordinate delle parole per separarla dalla colonna clinica, preservando
-le celle della terapia e registrando gli indici esclusi nell'audit. Non applica
-un ritaglio fisso a tutti i documenti. L'anonimizzazione v3 riconosce anche le
-varianti della data di nascita nota, ad esempio ISO e giorno/mese senza zeri.
-Docling rimane un parser di ripiego; la normalizzazione ne conserva ora la
-provenienza per pagina. Le sue intestazioni sono esaminate dal filtro, perché
-possono contenere date cliniche. Il livello BODY di Docling non equivale a
-contenuto clinico: può contenere segreterie e altre informazioni amministrative.
-Il filtro v4 produce Markdown continuo, senza separatori di pagina, e rimuove
-timestamp isolati ripetuti in testa alle pagine. I nomi dei sanitari introdotti
-da titoli o campi espliciti sono sostituiti con `[MEDICO]`; le indicazioni cliniche
-che li accompagnano rimangono. La mappa pagina/intervalli del testo finale e il
-suo hash restano in `clinical_text.retention_audit` nel database. Le interrogazioni
-verificano l'hash prima di usare questa mappa per le citazioni, continuando a
-supportare i vecchi Markdown con separatori. Non vengono creati file aggiuntivi.
-
-Per ispezionare l'estrazione, selezionare un documento e premere **Confronta PDF
-e Markdown** (disponibile anche nel menu contestuale). La finestra mostra PDF e
-Markdown affiancati, con pannelli ridimensionabili, navigazione e zoom del PDF,
-ricerca nel Markdown e ricaricamento del testo. L'ispezione è in sola lettura.
-I Markdown prodotti con il filtro precedente devono essere riestratti dai PDF
-per recuperare eventuali date oscurate o righe cliniche omesse. Le impaginazioni
-con testo già sovrapposto tra colonne possono ancora richiedere revisione.
-
-La coda **Non normalizzati** include anche i documenti di laboratorio. Parsing e
-filtraggio sono un unico passaggio; la concorrenza usa il numero di worker
-configurato per il ruolo documentale. La selezione del testo non richiede un modello.
-L’eventuale verifica di attribuzione del documento può ancora usare il modello
-configurato; interrogazioni e analisi successive continuano a usare i propri LLM.
-La rielaborazione riparte dal PDF originale. Le geometrie per le evidenze sono
-ricostruibili dal PDF senza salvare copie JSON. I vecchi prompt di riscrittura del
-testo clinico non sono più esposti nella finestra dei prompt attivi.
-
-I test automatici verificano file prodotti, anonimizzazione su esempi sintetici,
-provenienza, errori e integrazione. Non dimostrano la sensibilità clinica del modello
-locale sul corpus reale e non costituiscono un benchmark di velocità.
-
-## Nuovo registro eventi FHIR
-
-Il pulsante **Storia clinica → Genera registro FHIR** scrive un Bundle R4 per paziente.
-Importazione SNOMED CT e LOINC: **Lessico condiviso → Catalogo SNOMED CT / Catalogo LOINC**.
-Dettagli, limiti e stato della validazione: [Registro eventi FHIR](docs/FHIR_EVENT_REGISTRY.md).
+I documenti delle versioni precedenti dell'applicazione sono in
+[docs/archive/](docs/archive/).

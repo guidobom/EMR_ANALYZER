@@ -47,10 +47,17 @@ FSN e preferred term sono campi distinti. Il termine preferito è selezionato da
 refset US English, con fallback GB English e descrizione attiva se necessario.
 La ricerca lessicale include FSN e sinonimi attivi accettati in US/GB; dà priorità
 alle corrispondenze esatte e alle associazioni italiane approvate. I candidati
-sono deduplicati per conceptId e includono fino a quattro genitori inferiti,
-utilizzati dal prompt di disambiguazione. Il modello può scegliere solo tra i
-codici candidati attivi oppure astenersi. Non si attribuiscono al paziente
+sono deduplicati per conceptId, limitati alle gerarchie ammesse per il tipo di
+evento (per esempio disorder/finding per le diagnosi, substance/product per i
+farmaci, observable entity/procedure per gli esami) e includono i genitori
+inferiti usati per disambiguare. Il modello può scegliere solo tra i codici
+candidati attivi oppure astenersi. Non si attribuiscono al paziente
 caratteristiche cliniche soltanto perché appartengono alla gerarchia di un codice.
+
+La codifica avviene per concetto (etichetta normalizzata + tipo di evento), una
+sola volta: il risultato è salvato in `concept_mappings` nel Lessico condiviso e
+vale per tutte le occorrenze. Una codifica confermata dal revisore diventa anche
+associazione italiana e non viene mai sostituita da una proposta automatica.
 
 Sono disponibili API locali `lookup`, `synonyms`, `parents`, `relationships` e
 `is_descendant_of`. La ricerca vettoriale opzionale resta basata su un modello
