@@ -105,7 +105,15 @@ class SnomedCatalog:
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO sct_aliases VALUES (?,?)', (' '.join(words(text)), code))
 
-    def build_vectors(self, model_path, progress=None, cancelled=None):
+    def build_vectors(self, model_path, progress=None, cancelled=None, *, tags=None, device=None,
+                      batch_size=256):
+        """Multilingual vector index of the concepts used to code clinical events.
+
+        One vector per active concept, from its preferred term (the semantic
+        tag of the FSN adds no meaning to an entity name), restricted by
+        default to the hierarchies admissible for extracted events. Vectors
+        are stored as float16 next to the catalog.
+        """
         import numpy as np
         from sentence_transformers import SentenceTransformer
         if not self.available:
@@ -113,19 +121,27 @@ class SnomedCatalog:
         model_path = str(Path(model_path).resolve())
         if not Path(model_path).is_dir():
             raise ValueError('Seleziona una cartella locale con un modello SentenceTransformer multilingue.')
-        encoder = SentenceTransformer(model_path, local_files_only=True)
+        if tags is None:
+            from .snomed_coding import FACT_TYPE_TAGS
+            tags = sorted({tag for values in FACT_TYPE_TAGS.values() for tag in values})
+        encoder = SentenceTransformer(model_path, local_files_only=True, device=device)
         fingerprint = self.metadata()['sha256']
-        rows = self.db.execute('SELECT code,fsn FROM sct_concepts WHERE active=1 ORDER BY code').fetchall()
+        marks = ','.join('?' for _ in tags)
+        rows = self.db.execute(
+            f'SELECT code,term,fsn FROM sct_concepts WHERE active=1 AND tag IN ({marks}) ORDER BY code',
+            tuple(tags)).fetchall()
         codes, parts = [], []
-        for start in range(0, len(rows), 256):
+        for start in range(0, len(rows), batch_size):
             if cancelled and cancelled():
                 raise InterruptedError('Indicizzazione annullata.')
-            batch = rows[start:start+256]
-            parts.append(encoder.encode([r['fsn'] for r in batch], normalize_embeddings=True, show_progress_bar=False))
+            batch = rows[start:start+batch_size]
+            names = [r['term'] or re.sub(r'\s*\([^()]*\)$', '', r['fsn']) for r in batch]
+            parts.append(encoder.encode(names, normalize_embeddings=True, show_progress_bar=False,
+                                        batch_size=batch_size).astype('float16'))
             codes.extend(r['code'] for r in batch)
             if progress:
                 progress(f'Indicizzati {len(codes):,}/{len(rows):,} concetti…')
-        vectors = np.concatenate(parts).astype('float32')
+        vectors = np.concatenate(parts)
         index = self.path.with_suffix('.vectors.npz')
         temporary = index.with_suffix('.tmp.npz')
         np.savez(temporary, codes=np.array(codes), vectors=vectors, fingerprint=np.array(fingerprint))
@@ -136,7 +152,7 @@ class SnomedCatalog:
             temporary.replace(index)
             self.db.execute('INSERT OR REPLACE INTO sct_meta VALUES (?,?)', ('embedding_model', model_path))
             self.db.execute('INSERT OR REPLACE INTO sct_meta VALUES (?,?)', ('embedding_revision', file_digest(index)))
-            self._vectors = (np.array(codes), vectors)
+            self._vectors = (np.array(codes), vectors.astype('float32'))
             self._encoder = encoder
             self._loaded_revision = (fingerprint, self.metadata()['embedding_revision'])
         return self.metadata()
@@ -193,7 +209,7 @@ class SnomedCatalog:
                     with np.load(self.path.with_suffix('.vectors.npz'), allow_pickle=False) as data:
                         if str(data['fingerprint']) != meta['sha256']:
                             raise ValueError('Indice vettoriale obsoleto: ricostruiscilo.')
-                        self._vectors = (data['codes'].copy(), data['vectors'].copy())
+                        self._vectors = (data['codes'].copy(), data['vectors'].astype('float32'))
                         self._loaded_revision = revision
                 if self._encoder is None:
                     self._encoder = SentenceTransformer(meta['embedding_model'], local_files_only=True)

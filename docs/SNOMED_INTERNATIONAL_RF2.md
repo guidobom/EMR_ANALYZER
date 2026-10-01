@@ -79,3 +79,23 @@ preparazione e non acquisisce automaticamente il nuovo database.
 Riferimenti di implementazione: [language reference sets](https://docs.snomed.org/snomed-ct-specifications/snomed-ct-release-file-specification/reference-set-release-file-specification/5.2-reference-set-types/5.2.2.1-language-reference-set),
 [FSN](https://docs.snomed.org/snomed-international-documents/snomed-ct-glossary/f/fully-specified-name),
 [URI delle edizioni e versioni](https://docs.snomed.org/snomed-ct-specifications/snomed-ct-uri-standard/2-snomed-ct-uri-space).
+
+## Indice vettoriale multilingue
+
+Per cercare i concetti direttamente dalle etichette italiane si usa SapBERT
+XLM-R (`cambridgeltl/SapBERT-UMLS-2020AB-all-lang-from-XLMR`, revisione
+`47b6bd04`), un modello di entity linking biomedico multilingue addestrato su
+UMLS 2020AB. La scheda del modello non dichiara una licenza propria (il codice
+del progetto è MIT): va usato localmente e non ridistribuito.
+
+Il modello è salvato una sola volta in
+`~/.emr_analyzer/embeddings/sapbert-xlmr-cls` come modello sentence-transformers
+con rappresentazione del token [CLS], come indicano gli autori. Dalla finestra
+**Catalogo SNOMED CT** si costruisce l'indice scegliendo quella cartella:
+un vettore per concetto attivo, dal termine preferito, limitato alle gerarchie
+usate per gli eventi; l'indice (`snomed_ct.vectors.npz`, float16) è legato
+all'impronta del catalogo e va ricostruito dopo una nuova importazione RF2.
+Con l'indice presente la codifica non chiede più al modello linguistico le query
+inglesi: i candidati vengono dalla ricerca vettoriale e lessicale e il modello
+sceglie fra loro.
+

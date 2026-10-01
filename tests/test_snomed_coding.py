@@ -184,3 +184,42 @@ def test_patient_processing_codes_concepts_and_exports_them(tmp_path, workspace)
     project.close()
     catalog.db.close()
     shared_db.close()
+
+
+class FakeEncoder:
+    """Deterministic stand-in for a multilingual entity encoder."""
+    AXES = (("hyperten", "ipertens"), ("aspirin", "aspirin"), ("dyspn", "dispn"), ("systolic", "sistolic"))
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def encode(self, texts, normalize_embeddings=True, **kwargs):
+        import numpy as np
+        rows = []
+        for text in texts:
+            text = text.casefold()
+            vector = np.array([1.0 if any(key in text for key in axis) else 0.0 for axis in self.AXES] + [0.1])
+            rows.append(vector / np.linalg.norm(vector))
+        return np.array(rows, dtype="float32")
+
+
+def test_vector_index_links_italian_labels_without_translation(tmp_path, monkeypatch):
+    import sentence_transformers
+
+    monkeypatch.setattr(sentence_transformers, "SentenceTransformer", FakeEncoder)
+    catalog = make_catalog(tmp_path / "snomed_ct.db")
+    model_dir = tmp_path / "encoder"
+    model_dir.mkdir()
+    catalog.build_vectors(model_dir)
+    assert catalog.metadata()["embedding_model"] == str(model_dir.resolve())
+    found = catalog.search("ipertensione arteriosa", "", limit=3, tags=("disorder", "finding"))
+    assert found[0]["code"] == "38341003"
+    assert all(row["tag"] in ("disorder", "finding") for row in found)
+
+    db = DatabaseEngine(tmp_path / "shared.db")
+    llm = ScriptedLlm()
+    ConceptCoder(llm, catalog, ConceptMappingRepository(db)).code_events(
+        [event("Ipertensione arteriosa", "diagnosis"), event("Dispnea", "symptom")])
+    assert llm.calls == ["select"]                     # no translation call
+    catalog.db.close()
+    db.close()
