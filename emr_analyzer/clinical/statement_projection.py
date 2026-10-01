@@ -174,6 +174,7 @@ def _row(item, occurrence, *, patient_id, text, start, end, quote, document_date
                             "carrier_document_id": carrier_document_id,
                             "carrier_document_date": carrier_document_date},
         "extraction_pipeline": fields.get("prompt_version"),
+        "snomed_mapping_status": "pending",
     }
     row = ClinicalEvidence(
         patient_id=patient_id, document_id=occurrence.document_id, category=item["category"],

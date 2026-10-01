@@ -455,12 +455,20 @@ class ExtractionPipeline:
             text = plan.texts.get(doc.id)
             if not text or self.extractor is None:
                 continue
-            projected, missed = self.project_document(doc, text)
-            missed_ids = {item["occurrence_id"] for item in missed}
             occurrences = {item.occurrence_id: item
                            for item in self.statements.for_document(doc.id)}
+            stored = [row for row in self.evidence_repo.get_by_document(doc.id)
+                      if getattr(row, "extraction_method", None) == METHOD]
+            repeated = any(item.role == "copy" for item in occurrences.values())
+            projected_now = [row for row in stored
+                             if ((row.data or {}).get("statement_reuse") or {}).get("role") == "copy"]
+            if not repeated and not projected_now:
+                # Nothing repeats here: the rows stand exactly as extracted.
+                continue
+            projected, missed = self.project_document(doc, text)
+            missed_ids = {item["occurrence_id"] for item in missed}
             kept = []
-            for row in self.evidence_repo.get_by_document(doc.id):
+            for row in stored:
                 if getattr(row, "extraction_method", None) != METHOD:
                     continue
                 if ((row.data or {}).get("statement_reuse") or {}).get("role") == "copy":
