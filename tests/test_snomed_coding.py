@@ -223,3 +223,33 @@ def test_vector_index_links_italian_labels_without_translation(tmp_path, monkeyp
     assert llm.calls == ["select"]                     # no translation call
     catalog.db.close()
     db.close()
+
+
+def test_stale_index_degrades_instead_of_stopping(tmp_path, monkeypatch):
+    """A new SNOMED release must not break coding: it falls back and asks a rebuild."""
+    import sentence_transformers
+
+    monkeypatch.setattr(sentence_transformers, "SentenceTransformer", FakeEncoder)
+    catalog = make_catalog(tmp_path / "snomed_ct.db")
+    model_dir = tmp_path / "encoder"
+    model_dir.mkdir()
+    assert catalog.vector_status()["state"] == "missing"
+    catalog.build_vectors(model_dir)
+    assert catalog.vector_status()["state"] == "ready"
+
+    # Importing another release changes the catalogue fingerprint.
+    with catalog.db:
+        catalog.db.execute("INSERT OR REPLACE INTO sct_meta VALUES ('sha256','release-2027')")
+    stato = catalog.vector_status()
+    assert stato["state"] == "stale" and "ricostruito" in stato["reason"]
+    assert isinstance(catalog.search("ipertensione arteriosa", "", limit=3,
+                                     tags=("disorder", "finding")), list)
+
+    db = DatabaseEngine(tmp_path / "shared.db")
+    llm = ScriptedLlm()
+    metrics = ConceptCoder(llm, catalog, ConceptMappingRepository(db)).code_events(
+        [event("Ipertensione arteriosa", "diagnosis")])
+    assert metrics["vectors"] == "stale"
+    assert "translate" in llm.calls          # without usable vectors the label is translated
+    catalog.db.close()
+    db.close()

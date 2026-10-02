@@ -105,8 +105,9 @@ class ConceptCoder:
     def code_events(self, events, *, cancel_check=None, progress=None) -> dict:
         """Code every concept of ``events`` that has no mapping yet."""
         concepts = collect_concepts(events)
+        vettori = self.snomed.vector_status()['state'] if self.snomed is not None else 'unavailable'
         self.metrics = dict(concepts=len(concepts), cached=0, aliases=0, coded=0, abstained=0,
-                            no_candidates=0, errors=0, llm_calls=0)
+                            no_candidates=0, errors=0, llm_calls=0, vectors=vettori)
         if not concepts or not self.available:
             return dict(self.metrics)
         known = self.mappings.get_many(concepts.keys())
@@ -129,7 +130,9 @@ class ConceptCoder:
                 self.metrics["aliases"] += 1
             else:
                 remaining.append(concept)
-        english = {} if self.snomed.metadata().get("embedding_model") else self._translate(remaining, check)
+        # The index is usable only while it matches the catalogue in use: after
+        # a new SNOMED release it is stale, and the labels are translated again.
+        english = {} if self.metrics["vectors"] == "ready" else self._translate(remaining, check)
         candidates = {}
         for concept in remaining:
             check()

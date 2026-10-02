@@ -105,6 +105,63 @@ class SnomedCatalog:
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO sct_aliases VALUES (?,?)', (' '.join(words(text)), code))
 
+    def vector_status(self):
+        """State of the multilingual index for the catalogue in use.
+
+        The index carries the fingerprint of the catalogue it was built from:
+        importing a new release (or re-importing the same one) makes it stale.
+        """
+        if not self.available:
+            return {'state': 'unavailable', 'model': None, 'reason': 'nessun catalogo importato'}
+        meta = self.metadata()
+        model = meta.get('embedding_model')
+        if not model:
+            return {'state': 'missing', 'model': None,
+                    'reason': 'indice vettoriale non creato'}
+        index = self.path.with_suffix('.vectors.npz')
+        if not Path(index).exists():
+            return {'state': 'stale', 'model': model, 'reason': 'file dell’indice assente'}
+        try:
+            import numpy as np
+            with np.load(index, allow_pickle=False) as data:
+                fingerprint = str(data['fingerprint'])
+        except Exception:
+            return {'state': 'stale', 'model': model, 'reason': 'indice illeggibile'}
+        if fingerprint != meta.get('sha256'):
+            return {'state': 'stale', 'model': model,
+                    'reason': 'il catalogo è cambiato: l’indice va ricostruito'}
+        return {'state': 'ready', 'model': model, 'reason': ''}
+
+    def _ready_vectors(self, meta):
+        """Vectors for the current catalogue revision, or (None, None) if unusable.
+
+        A stale index degrades to text search instead of stopping the coding
+        run: the next build restores it.
+        """
+        if not meta.get('embedding_model'):
+            return None, None
+        revision = (meta.get('sha256'), meta.get('embedding_revision'))
+        with self._lock:
+            if getattr(self, '_loaded_revision', None) != revision:
+                self._vectors = self._encoder = None
+            if getattr(self, '_stale_revision', None) == revision:
+                return None, None
+            if self._vectors is None:
+                import numpy as np
+                from sentence_transformers import SentenceTransformer
+                try:
+                    with np.load(self.path.with_suffix('.vectors.npz'), allow_pickle=False) as data:
+                        if str(data['fingerprint']) != meta.get('sha256'):
+                            self._stale_revision = revision
+                            return None, None
+                        self._vectors = (data['codes'].copy(), data['vectors'].astype('float32'))
+                except (OSError, ValueError, KeyError):
+                    self._stale_revision = revision
+                    return None, None
+                self._encoder = SentenceTransformer(meta['embedding_model'], local_files_only=True)
+                self._loaded_revision = revision
+            return self._vectors, self._encoder
+
     def build_vectors(self, model_path, progress=None, cancelled=None, *, tags=None, device=None,
                       batch_size=256):
         """Multilingual vector index of the concepts used to code clinical events.
@@ -197,31 +254,18 @@ class SnomedCatalog:
                         'WHERE sct_search MATCH ? AND c.active=1' + tag_sql
                         + ' ORDER BY bm25(sct_search) LIMIT 200', (expression, *tags))]
                     rankings.append(list(dict.fromkeys(found))[:40])
-        meta = self.metadata()
-        if meta.get('embedding_model'):
+        vectors, encoder = self._ready_vectors(self.metadata())
+        if encoder is not None:
             import numpy as np
-            from sentence_transformers import SentenceTransformer
-            with self._lock:
-                revision = (meta['sha256'], meta.get('embedding_revision'))
-                if getattr(self, '_loaded_revision', None) != revision:
-                    self._vectors = self._encoder = None
-                if self._vectors is None:
-                    with np.load(self.path.with_suffix('.vectors.npz'), allow_pickle=False) as data:
-                        if str(data['fingerprint']) != meta['sha256']:
-                            raise ValueError('Indice vettoriale obsoleto: ricostruiscilo.')
-                        self._vectors = (data['codes'].copy(), data['vectors'].astype('float32'))
-                        self._loaded_revision = revision
-                if self._encoder is None:
-                    self._encoder = SentenceTransformer(meta['embedding_model'], local_files_only=True)
-                codes, vectors = self._vectors
-                vector = self._encoder.encode([text], normalize_embeddings=True, show_progress_bar=False)[0]
-                scores = vectors @ vector
-                count = min(200 if tags else 40, len(scores))
-                best = np.argpartition(-scores, count-1)[:count]
-                ranked = [str(codes[i]) for i in sorted(best, key=lambda i: -scores[i])]
-                if tags:
-                    ranked = [code for code in ranked if allowed(self.lookup(code))]
-                rankings.append(ranked[:40])
+            codes, matrix = vectors
+            vector = encoder.encode([text], normalize_embeddings=True, show_progress_bar=False)[0]
+            scores = matrix @ vector
+            count = min(200 if tags else 40, len(scores))
+            best = np.argpartition(-scores, count-1)[:count]
+            ranked = [str(codes[i]) for i in sorted(best, key=lambda i: -scores[i])]
+            if tags:
+                ranked = [code for code in ranked if allowed(self.lookup(code))]
+            rankings.append(ranked[:40])
         scores = {}
         for ranking in rankings:
             for rank, code in enumerate(ranking):

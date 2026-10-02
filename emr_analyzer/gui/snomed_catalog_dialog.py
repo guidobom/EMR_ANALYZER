@@ -85,8 +85,22 @@ class SnomedCatalogDialog(QDialog):
         self.enabled.blockSignals(False)
         self.enabled.setEnabled(False)
         self.vector_button.setEnabled(self.catalog.available)
-        self.status.setText((f"Release {meta.get('release')} · International RF2 · {int(meta.get('active',0)):,} attivi / {int(meta.get('total',0)):,} totali · "
-            + ('ricerca testuale + vettoriale' if meta.get('embedding_model') else 'ricerca testuale')) if self.catalog.available else 'Nessun catalogo SNOMED CT importato (formato supportato: International RF2 Snapshot).')
+        if not self.catalog.available:
+            self.status.setText('Nessun catalogo SNOMED CT importato (formato supportato: International RF2 Snapshot).')
+            self.vector_button.setText('Crea indice vettoriale da modello locale…')
+            return
+        stato = self.catalog.vector_status()
+        ricerca = {'ready': 'ricerca testuale + vettoriale',
+                   'missing': 'ricerca testuale (indice vettoriale non ancora creato)',
+                   'stale': 'ricerca testuale (indice vettoriale da ricostruire)',
+                   'unavailable': 'ricerca testuale'}.get(stato['state'], 'ricerca testuale')
+        self.status.setText(f"Release {meta.get('release')} · International RF2 · "
+                            f"{int(meta.get('active',0)):,} attivi / {int(meta.get('total',0)):,} totali · {ricerca}")
+        if stato['state'] == 'stale':
+            self.status.setText(self.status.text() + f" — {stato['reason']}. "
+                                "Premi «Aggiorna indice vettoriale» per usare di nuovo la ricerca multilingue.")
+        self.vector_button.setText('Aggiorna indice vettoriale…' if stato['state'] == 'stale'
+                                   else 'Crea indice vettoriale da modello locale…')
 
     def import_rf2(self):
         source = QFileDialog.getExistingDirectory(self,'Seleziona la cartella SNOMED CT International RF2',str(Path.home()/'Desktop'))
