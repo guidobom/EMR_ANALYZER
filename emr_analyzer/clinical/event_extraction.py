@@ -14,7 +14,7 @@ from .referenced_annotations import ReferencedSourceReader
 from .sentence_groups import plan_selected_groups, statement_group_plan
 from ..prompt_catalog import load_prompt
 
-VERSION = 'fhir_events_referenced_v9'
+VERSION = 'fhir_events_referenced_v10'
 
 
 class EventExtractor(ReferencedSourceReader):

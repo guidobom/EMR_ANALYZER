@@ -138,7 +138,9 @@ def statement_group_plan(text, roles, count_tokens, target_tokens=1000):
 def _statement_group(spans, start, end, roles):
     body = spans[start:end]
     copies = tuple(s for s in body if roles.get(s.sentence_id) == 'copy')
-    targets = tuple(s for s in body if roles.get(s.sentence_id) != 'copy')
+    # Only the origins of the index are targets: a sentence the index does not
+    # carry (the report-date header) is metadata and stays context.
+    targets = tuple(s for s in body if roles.get(s.sentence_id) == 'origin')
     base = _group(spans, start, end)
     copies += tuple(s for s in base.context
                     if roles.get(s.sentence_id) == 'copy' and s not in copies)

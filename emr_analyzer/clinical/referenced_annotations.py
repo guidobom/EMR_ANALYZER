@@ -14,6 +14,7 @@ from .evidence_utils import content_hash
 
 WORDS = re.compile(r'\S+')
 TODAY = re.compile(r'\b(?:in data odierna|oggi)\b', re.I)
+LETTERS = re.compile(r'[^\W\d_]', re.UNICODE)
 GENERIC = re.compile(r'^(?:in (?:aumento|riduzione|diminuzione)|aumento|riduzione|'
                      r'stabile|stabilità|nei limiti|normale|conservata|negativo|positivo)$',re.I)
 NUMERIC = re.compile(r'^\s*(<=|>=|<|>|≤|≥)?\s*([+-]?\d+(?:[.,]\d+)?)\s*$')
@@ -151,8 +152,12 @@ class ReferencedSourceReader(CompactSourceReader):
                     raise ValueError(f'Intervallo parole non valido: S{raw["s"]} contiene {len(words)} parole')
                 start,end = source.start+words[first-1].start(),source.start+words[last-1].end()
                 quote = text[start:end]
-                if not raw['label'].strip(' .;:') or GENERIC.fullmatch(raw['label'].strip(' .;:')):
+                label = raw['label'].strip(' .;:')
+                if not label or GENERIC.fullmatch(label):
                     raise ValueError('Attributo isolato: collega valore/andamento a un concetto clinico nominato')
+                if not LETTERS.search(label):
+                    # A number or a punctuation run is a value, never a concept.
+                    raise ValueError('Etichetta senza parole: un valore non è un concetto clinico')
                 prepared, repairs, warnings = self._temporal(raw,group,quote)
                 prepared.pop('span')
                 prepared['anchor']=quote

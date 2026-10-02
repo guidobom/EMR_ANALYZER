@@ -180,3 +180,17 @@ def test_invalidation_forgets_what_a_document_contributed(project):
             if row.extraction_method == METHOD] == []
     # The other document of the patient is untouched.
     assert len(index.for_document("DOC_B")) == 3
+
+
+def test_metadata_sentences_are_never_targets():
+    from emr_analyzer.clinical.sentence_groups import plan_statement_groups
+
+    text = ("<!-- emr-report-date:v1 -->\nData del referto (metadato): 2026-10-01.\n"
+            "<!-- /emr-report-date -->\n\nIl paziente riferisce tosse.\n")
+    occurrences = index_document("DOC_A", "2026-10-01", text)
+    roles = {item.ordinal: item.role for item in occurrences}
+    assert 2 not in roles                      # the header is not in the index
+    groups = plan_statement_groups(text, roles, lambda value: 10, 1000)
+    targets = [s.text for group in groups for s in group.targets]
+    assert targets == ["Il paziente riferisce tosse."]
+    assert all("Data del referto" not in target for target in targets)
