@@ -99,3 +99,20 @@ Con l'indice presente la codifica non chiede più al modello linguistico le quer
 inglesi: i candidati vengono dalla ricerca vettoriale e lessicale e il modello
 sceglie fra loro.
 
+**Stato e aggiornamento.** Il dialogo del catalogo dichiara sempre lo stato
+dell'indice: non creato, pronto, oppure da ricostruire. L'indice è legato
+all'impronta del catalogo, quindi importare una nuova release lo rende
+obsoleto; in quel caso la codifica non si ferma — torna a tradurre le etichette
+e a cercare in inglese — e il pulsante diventa «Aggiorna indice vettoriale…».
+Ricostruirlo richiede qualche minuto di calcolo locale (270.281 concetti attivi
+delle gerarchie usate: 3 min 44 s su MPS, 414 MB) e non tocca codifiche o
+associazioni già salvate.
+
+**Limite noto.** La ricerca vettoriale non riproduce sempre gli stessi candidati
+della via con traduzione: su un campione di 150 concetti già codificati, il
+codice scelto in precedenza compare fra i primi dieci candidati dell'indice nel
+36% dei casi. Non è una misura di qualità — in diversi confronti l'indice
+propone concetti migliori di quelli scelti col percorso precedente — ma dice che
+le due vie non sono equivalenti e che la scelta resta del modello, da confermare
+in revisione.
+
