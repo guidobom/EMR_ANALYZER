@@ -153,7 +153,8 @@ def test_a_decision_can_reach_every_copy(project):
                                 overlay_repo=project.overlays, audit_repo=None, snomed=None)
     events = [event for event in review.events("P001") if event.label == "tosse"]
     assert len(events) == 2 and len({event.statement_key for event in events}) == 1
-    assert [event.document_id for event in events] == ["DOC_001", "DOC_002"]
+    # The two copies come from documents extracted concurrently: order is not promised.
+    assert sorted(event.document_id for event in events) == ["DOC_001", "DOC_002"]
 
     review.correct(events[0], {"certainty": "suspected"}, fanout=True)
 
